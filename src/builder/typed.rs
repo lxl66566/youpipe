@@ -3,8 +3,8 @@ use std::{marker::PhantomData, sync::Arc};
 use super::config::{PipelineConfig, Workload};
 use crate::{
     executor::compute::ComputePool,
-    handoff::{SharedWaitGroup, channel::channel},
-    state::run_ordered_collect,
+    handoff::{Receiver, Sender, SharedWaitGroup, channel::channel},
+    state::{FenceBarrier, FenceMode, run_ordered_collect},
     sync::CancellationToken,
 };
 
@@ -505,6 +505,79 @@ pub struct StreamPipeline {
     cancel: Option<CancellationToken>,
 }
 
+// ── Streaming stage helpers (used by the fence pipeline) ──
+
+/// Spawn `parallelism` workers on `pool` that pull from `rx`, apply `stage`,
+/// and forward to `tx`. Each worker loops until its receiver disconnects.
+///
+/// The supplied `rx`/`tx` are consumed: clones are handed to workers and the
+/// originals dropped here, so channel close propagates correctly once all
+/// workers exit (no external `WaitGroup` needed for completion signalling).
+#[allow(clippy::needless_pass_by_value)] // ownership transfer is intentional:
+// taking the endpoints by value ensures the caller cannot retain a clone that
+// would keep the channel open after the workers have finished.
+fn spawn_stage<I, O>(
+    pool: &ComputePool,
+    rx: Receiver<I>,
+    tx: Sender<O>,
+    parallelism: usize,
+    stage: impl Fn(I) -> O + Send + Sync + 'static,
+) where
+    I: Send + 'static,
+    O: Send + 'static,
+{
+    let stage = Arc::new(stage);
+    for _ in 0..parallelism {
+        let stage = stage.clone();
+        let rx = rx.clone();
+        let tx = tx.clone();
+        pool.submit(move || {
+            while let Ok(item) = rx.recv() {
+                if tx.send(stage(item)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// Fence forwarder: drains `mid_rx` into a [`FenceBarrier`] and releases
+/// batches to `fenced_tx` according to `mode`.
+///
+/// In [`FenceMode::Barrier`] mode nothing is forwarded until `mid_rx`
+/// disconnects (stage 1 fully done) — a hard barrier. In
+/// [`FenceMode::Chunked`] mode batches flow as they accumulate, letting
+/// stage 2 overlap stage 1.
+///
+/// Draining `mid_rx` eagerly (rather than waiting on a separate barrier
+/// first) is what keeps stage 1 from blocking on a full channel: this is the
+/// fix for the previous wait-before-drain deadlock.
+#[allow(clippy::needless_pass_by_value)] // runs inside a `thread::spawn(move …)`:
+// the endpoints must be owned so they are dropped (closing the channels) when
+// forwarding completes.
+fn forward_fenced<M>(mid_rx: Receiver<M>, fenced_tx: Sender<M>, mode: FenceMode)
+where
+    M: Send + 'static,
+{
+    let mut fence = FenceBarrier::<M>::new(mode);
+    while let Ok(item) = mid_rx.recv() {
+        if let Some(batch) = fence.push(item) {
+            for it in batch {
+                if fenced_tx.send(it).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+    if let Some(remaining) = fence.flush() {
+        for it in remaining {
+            if fenced_tx.send(it).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 impl StreamPipeline {
     /// Create a new streaming pipeline with the given config.
     #[must_use]
@@ -869,13 +942,18 @@ impl StreamPipeline {
         results
     }
 
-    /// Run two stages with a fence barrier between them.
+    /// Run two stages separated by a fence whose isolation strength is
+    /// controlled by `mode`.
+    ///
+    /// [`FenceMode::Barrier`] fully drains stage 1 before stage 2 sees any
+    /// item (hard isolation). [`FenceMode::Chunked`] releases batches as they
+    /// form so the stages overlap — the right default for mixed CPU/IO loads.
     pub fn run_with_fence<I, M, O>(
         &self,
         items: Vec<I>,
         stage1: impl Fn(I) -> M + Send + Sync + Clone + 'static,
         stage2: impl Fn(M) -> O + Send + Sync + Clone + 'static,
-        fence_chunk_size: Option<usize>,
+        mode: FenceMode,
         ordered: bool,
     ) -> Vec<O>
     where
@@ -884,9 +962,9 @@ impl StreamPipeline {
         O: Send + 'static,
     {
         if ordered {
-            self.run_with_fence_ordered(items, stage1, stage2, fence_chunk_size)
+            self.run_with_fence_ordered(items, stage1, stage2, mode)
         } else {
-            self.run_with_fence_unordered(items, stage1, stage2, fence_chunk_size)
+            self.run_with_fence_unordered(items, stage1, stage2, mode)
         }
     }
 
@@ -895,7 +973,7 @@ impl StreamPipeline {
         items: Vec<I>,
         stage1: impl Fn(I) -> M + Send + Sync + Clone + 'static,
         stage2: impl Fn(M) -> O + Send + Sync + Clone + 'static,
-        fence_chunk_size: Option<usize>,
+        mode: FenceMode,
     ) -> Vec<O>
     where
         I: Send + 'static,
@@ -906,7 +984,14 @@ impl StreamPipeline {
         if n == 0 {
             return Vec::new();
         }
-        let parallelism = self.config.compute_workers;
+        // Split workers across the two stages so the total count of blocking
+        // pool jobs never exceeds the pool size. Submitting `parallelism`
+        // workers per stage (2× oversubscription) starves the pool: stage 2
+        // jobs can't get scheduled while stage 1 jobs block, deadlocking the
+        // pipeline. This mirrors `run_multi_stage`'s invariant.
+        let parallelism = self.config.compute_workers.min(n);
+        let par1 = (parallelism / 2).max(1);
+        let par2 = parallelism.saturating_sub(par1).max(1);
         let pool = ComputePool::global();
         let buffer_size = self.config.buffer_size;
 
@@ -923,76 +1008,29 @@ impl StreamPipeline {
             }
         });
 
-        let s1 = Arc::new(stage1);
-        let s2 = Arc::new(stage2);
+        // Thread seq through the tuple so input order survives the fence.
+        spawn_stage(
+            pool,
+            in_rx,
+            mid_tx,
+            par1,
+            move |(seq, item): (u64, I)| (seq, stage1(item)),
+        );
 
-        let wg1 = SharedWaitGroup::new();
-        wg1.add(parallelism);
-        for _ in 0..parallelism {
-            let s = s1.clone();
-            let rx = in_rx.clone();
-            let tx = mid_tx.clone();
-            let wg = wg1.clone();
-            pool.submit(move || {
-                while let Ok((seq, item)) = rx.recv() {
-                    let out = s(item);
-                    if tx.send((seq, out)).is_err() {
-                        break;
-                    }
-                }
-                wg.done();
-            });
-        }
-        drop(in_rx);
-        drop(mid_tx);
+        let fence_thread = std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode));
 
-        let chunk = fence_chunk_size;
-        let fence_thread = std::thread::spawn(move || {
-            wg1.wait();
-            let chunk_size = chunk.unwrap_or(n);
-            let mut batch: Vec<(u64, M)> = Vec::new();
-            while let Ok(item) = mid_rx.recv() {
-                batch.push(item);
-                if batch.len() >= chunk_size {
-                    for it in batch.drain(..) {
-                        if fenced_tx.send(it).is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-            for it in batch {
-                if fenced_tx.send(it).is_err() {
-                    return;
-                }
-            }
-        });
-
-        let wg2 = SharedWaitGroup::new();
-        wg2.add(parallelism);
-        for _ in 0..parallelism {
-            let s = s2.clone();
-            let rx = fenced_rx.clone();
-            let tx = out_tx.clone();
-            let wg = wg2.clone();
-            pool.submit(move || {
-                while let Ok((seq, item)) = rx.recv() {
-                    let out = s(item);
-                    if tx.send((seq, out)).is_err() {
-                        break;
-                    }
-                }
-                wg.done();
-            });
-        }
-        drop(fenced_rx);
-        drop(out_tx);
+        spawn_stage(
+            pool,
+            fenced_rx,
+            out_tx,
+            par2,
+            move |(seq, mid): (u64, M)| (seq, stage2(mid)),
+        );
 
         let collector = std::thread::spawn(move || run_ordered_collect(&out_rx, n));
 
         feeder.join().unwrap();
         fence_thread.join().unwrap();
-        wg2.wait();
         collector.join().unwrap()
     }
 
@@ -1001,7 +1039,7 @@ impl StreamPipeline {
         items: Vec<I>,
         stage1: impl Fn(I) -> M + Send + Sync + Clone + 'static,
         stage2: impl Fn(M) -> O + Send + Sync + Clone + 'static,
-        fence_chunk_size: Option<usize>,
+        mode: FenceMode,
     ) -> Vec<O>
     where
         I: Send + 'static,
@@ -1012,7 +1050,10 @@ impl StreamPipeline {
         if n == 0 {
             return Vec::new();
         }
-        let parallelism = self.config.compute_workers;
+        // See `run_with_fence_ordered`: keep total blocking jobs ≤ pool size.
+        let parallelism = self.config.compute_workers.min(n);
+        let par1 = (parallelism / 2).max(1);
+        let par2 = parallelism.saturating_sub(par1).max(1);
         let pool = ComputePool::global();
         let buffer_size = self.config.buffer_size;
 
@@ -1029,80 +1070,23 @@ impl StreamPipeline {
             }
         });
 
-        let s1 = Arc::new(stage1);
-        let s2 = Arc::new(stage2);
+        spawn_stage(pool, in_rx, mid_tx, par1, stage1);
 
-        let wg1 = SharedWaitGroup::new();
-        wg1.add(parallelism);
-        for _ in 0..parallelism {
-            let s = s1.clone();
-            let rx = in_rx.clone();
-            let tx = mid_tx.clone();
-            let wg = wg1.clone();
-            pool.submit(move || {
-                while let Ok(item) = rx.recv() {
-                    let out = s(item);
-                    if tx.send(out).is_err() {
-                        break;
-                    }
-                }
-                wg.done();
-            });
-        }
-        drop(in_rx);
-        drop(mid_tx);
+        let fence_thread = std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode));
 
-        let chunk = fence_chunk_size;
-        let fence_thread = std::thread::spawn(move || {
-            wg1.wait();
-            let chunk_size = chunk.unwrap_or(n);
-            let mut batch: Vec<M> = Vec::new();
-            while let Ok(item) = mid_rx.recv() {
-                batch.push(item);
-                if batch.len() >= chunk_size {
-                    for it in batch.drain(..) {
-                        if fenced_tx.send(it).is_err() {
-                            return;
-                        }
-                    }
-                }
+        spawn_stage(pool, fenced_rx, out_tx, par2, stage2);
+
+        let collector = std::thread::spawn(move || {
+            let mut results = Vec::with_capacity(n);
+            while let Ok(item) = out_rx.recv() {
+                results.push(item);
             }
-            for it in batch {
-                if fenced_tx.send(it).is_err() {
-                    return;
-                }
-            }
+            results
         });
-
-        let wg2 = SharedWaitGroup::new();
-        wg2.add(parallelism);
-        for _ in 0..parallelism {
-            let s = s2.clone();
-            let rx = fenced_rx.clone();
-            let tx = out_tx.clone();
-            let wg = wg2.clone();
-            pool.submit(move || {
-                while let Ok(item) = rx.recv() {
-                    let out = s(item);
-                    if tx.send(out).is_err() {
-                        break;
-                    }
-                }
-                wg.done();
-            });
-        }
-        drop(fenced_rx);
-        drop(out_tx);
-
-        let mut results = Vec::with_capacity(n);
-        while let Ok(item) = out_rx.recv() {
-            results.push(item);
-        }
 
         feeder.join().unwrap();
         fence_thread.join().unwrap();
-        wg2.wait();
-        results
+        collector.join().unwrap()
     }
 }
 

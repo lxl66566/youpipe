@@ -49,5 +49,5 @@ pub use runtime::Runtime;
 #[cfg(feature = "tokio-runtime")]
 pub use runtime::TokioRuntime;
 pub use scope::{PipelineScope, ScopedPipeline, scope};
-pub use state::{FenceBarrier, ReorderBuffer, StreamExecutor};
+pub use state::{FenceBarrier, FenceMode, ReorderBuffer, StreamExecutor};
 pub use sync::CancellationToken;

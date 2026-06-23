@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -92,7 +93,13 @@ fn test_stream_with_fence() {
     let config = youpipe::PipelineConfig::default();
     let sp = youpipe::StreamPipeline::new(config);
     let items: Vec<i32> = (0..100).collect();
-    let result = sp.run_with_fence(items, |x: i32| x + 1, |x: i32| x * 5, Some(25), false);
+    let result = sp.run_with_fence(
+        items,
+        |x: i32| x + 1,
+        |x: i32| x * 5,
+        youpipe::FenceMode::Chunked(NonZeroUsize::new(25).unwrap()),
+        false,
+    );
     let mut r = result;
     r.sort_unstable();
     let expected: Vec<i32> = (0..100).map(|x| (x + 1) * 5).collect();
@@ -104,9 +111,44 @@ fn test_stream_with_fence_full_barrier() {
     let config = youpipe::PipelineConfig::default();
     let sp = youpipe::StreamPipeline::new(config);
     let items: Vec<i32> = (0..50).collect();
-    let result = sp.run_with_fence(items, |x: i32| x + 1, |x: i32| x * 2, None, true);
+    let result = sp.run_with_fence(
+        items,
+        |x: i32| x + 1,
+        |x: i32| x * 2,
+        youpipe::FenceMode::Barrier,
+        true,
+    );
     let expected: Vec<i32> = (0..50).map(|x| (x + 1) * 2).collect();
     assert_eq!(result, expected);
+}
+
+/// Regression: `run_with_fence` previously deadlocked whenever the input size
+/// exceeded the inter-stage channel buffer (256 by default). These run with a
+/// large input far above that buffer to lock in the eager-drain fix.
+#[test]
+fn test_stream_fence_large_input_no_deadlock() {
+    let config = youpipe::PipelineConfig::default();
+    let n = 5_000; // well above the default 256-slot channel buffer
+
+    // Chunked, unordered.
+    let sp = youpipe::StreamPipeline::new(config.clone());
+    let items: Vec<i32> = (0..n).collect();
+    let mut r = sp.run_with_fence(
+        items,
+        |x: i32| x + 1,
+        |x: i32| x * 3,
+        youpipe::FenceMode::Chunked(NonZeroUsize::new(64).unwrap()),
+        false,
+    );
+    r.sort_unstable();
+    let expected: Vec<i32> = (0..n).map(|x| (x + 1) * 3).collect();
+    assert_eq!(r, expected);
+
+    // Barrier, ordered — the exact shape that hung the bench.
+    let sp = youpipe::StreamPipeline::new(config);
+    let items: Vec<i32> = (0..n).collect();
+    let r = sp.run_with_fence(items, |x: i32| x + 1, |x: i32| x * 3, youpipe::FenceMode::Barrier, true);
+    assert_eq!(r, expected);
 }
 
 #[test]

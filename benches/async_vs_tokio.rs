@@ -1,4 +1,5 @@
 use std::hint::black_box as bb;
+use std::num::NonZeroUsize;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
@@ -61,7 +62,7 @@ fn bench_stream_pipeline(c: &mut Criterion) {
                     data.clone(),
                     |x: u64| bb(cpu_work(x)),
                     |x: u64| bb(x.wrapping_add(1)),
-                    Some(500),
+                    youpipe::FenceMode::Chunked(NonZeroUsize::new(500).unwrap()),
                     false,
                 );
                 bb(r)

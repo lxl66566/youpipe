@@ -173,7 +173,7 @@ When a pipeline contains `fence`, `ordered`, or other runtime semantics, stages 
 |---|---|
 | `run()` | Single-stage streaming execution |
 | `run_multi_stage()` | Two-stage pipeline (stage1 → channel → stage2) |
-| `run_with_fence()` | Barrier mode: stage1 completes → fence thread forwards in chunks → stage2 processes |
+| `run_with_fence()` | Configurable isolation (`FenceMode`): `Barrier` (stage1 fully drains before stage2 starts) or `Chunked(k)` (forward every k items, stages overlap) |
 | `run_nested()` | Expand mode: outer_stage 1:N expansion → inner_stage parallel processing |
 
 All streaming methods accept `ordered: bool`, using `ReorderBuffer` to restore original order. Optional `CancellationToken` enables cooperative cancellation — feeder and workers check `is_cancelled()` per iteration.
@@ -284,14 +284,18 @@ Counter barrier: `add(n)` increments, `done()` decrements, `wait()` blocks until
 
 ## 7. Fence Barrier (`state/fence.rs` + `StreamPipeline::run_with_fence`)
 
-Fence ensures the prior stage fully completes before the next stage begins:
+A fence lets the caller decide how strictly two adjacent stages are isolated, via `FenceMode`:
+
+- **`FenceMode::Barrier`** — hard isolation: stage 1 must fully drain before stage 2 receives any item.
+- **`FenceMode::Chunked(k)`** — soft batching: forward a batch of `k` items as soon as it accumulates, so stage 2 overlaps stage 1 (the right default for mixed CPU/IO workloads).
+
+Data flow:
 
 1. Stage1 workers pull from `in_rx` → process → send to `mid_tx`
-2. `WaitGroup` tracks stage1 worker completion
-3. Fence thread waits on `wg1.wait()` → reads from `mid_rx` → chunks by `chunk_size` → forwards to `fenced_tx`
-4. Stage2 workers pull from `fenced_rx` → process → send to `out_tx`
+2. Fence thread **eagerly drains** `mid_rx` into a `FenceBarrier<T>`, releasing batches to `fenced_tx` per `mode` (immediately in `Chunked`, or all at once on disconnect in `Barrier`)
+3. Stage2 workers pull from `fenced_rx` → process → send to `out_tx`
 
-`FenceBarrier<T>` provides chunked aggregation: auto-flushes when buffer reaches `chunk_size`.
+Stage completion is signalled purely by channel disconnect (all sender clones dropped) — no `WaitGroup` is needed. Eager draining is essential: it prevents stage 1 from blocking on a full `mid` channel, which previously deadlocked when `items.len()` exceeded the channel buffer.
 
 ---
 

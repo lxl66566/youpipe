@@ -173,7 +173,7 @@ pub fn try_par_map<I, F, R, E>(iter: I, f: F) -> Result<Vec<R>, E>
 |------|------|
 | `run()` | 单阶段流式执行 |
 | `run_multi_stage()` | 双阶段流水线（stage1 → channel → stage2） |
-| `run_with_fence()` | 屏障模式：stage1 全部完成 → fence 线程分块转发 → stage2 处理 |
+| `run_with_fence()` | 可配置隔离（`FenceMode`）：`Barrier`（stage1 全部排空后 stage2 才启动）或 `Chunked(k)`（每 k 个转发一批，两阶段重叠） |
 | `run_nested()` | 展开模式：outer_stage 1:N 展开 → inner_stage 并行处理 |
 
 所有流式方法支持 `ordered: bool` 参数，通过 `ReorderBuffer` 恢复原始顺序。可选的 `CancellationToken` 支持协作式取消——feeder 和 worker 每次迭代检查 `is_cancelled()`。
@@ -284,14 +284,18 @@ Lock-free SPSC 环形缓冲区，特性：
 
 ## 7. Fence 屏障 (`state/fence.rs` + `StreamPipeline::run_with_fence`)
 
-Fence 确保前阶段全部完成后才开始后阶段：
+Fence 让调用者通过 `FenceMode` 决定两个相邻 stage 的隔离强度：
+
+- **`FenceMode::Barrier`** —— 硬隔离：stage1 必须全部排空后，stage2 才会收到任何元素。
+- **`FenceMode::Chunked(k)`** —— 软分批：每凑满 `k` 个就转发一批，使 stage2 与 stage1 重叠（混合 CPU/IO 负载下的推荐默认值）。
+
+数据流：
 
 1. Stage1 workers 从 `in_rx` 拉取 → 处理 → 发送到 `mid_tx`
-2. `WaitGroup` 跟踪 stage1 workers 完成
-3. Fence 线程等待 `wg1.wait()` → 从 `mid_rx` 读取 → 按 `chunk_size` 分块 → 转发到 `fenced_tx`
-4. Stage2 workers 从 `fenced_rx` 拉取 → 处理 → 发送到 `out_tx`
+2. Fence 线程**主动排空** `mid_rx` 进 `FenceBarrier<T>`，按 `mode` 把批次释放到 `fenced_tx`（`Chunked` 立即释放；`Barrier` 在断开连接时一次性释放）
+3. Stage2 workers 从 `fenced_rx` 拉取 → 处理 → 发送到 `out_tx`
 
-`FenceBarrier<T>` 提供分块聚合：当 buffer 达到 `chunk_size` 时自动 flush。
+阶段完成完全由 channel 断开（所有 sender clone 被释放）来通知——不需要 `WaitGroup`。主动排空是关键：它防止 stage1 因 `mid` 通道填满而阻塞——此前当 `items.len()` 超过通道缓冲时就因此死锁。
 
 ---
 
