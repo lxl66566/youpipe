@@ -33,7 +33,7 @@ where
     F: Fn(T) -> R + Sync,
 {
     if splits_left == 0 || items.len() <= 1 {
-        return items.into_iter().map(|x| f(x)).collect();
+        return items.into_iter().map(f).collect();
     }
     let mid = items.len() / 2;
     let right = items.split_off(mid);
@@ -55,7 +55,7 @@ where
     F: Fn(T) -> Result<R, E> + Sync,
 {
     if splits_left == 0 || items.len() <= 1 {
-        return items.into_iter().map(|x| f(x)).collect();
+        return items.into_iter().map(f).collect();
     }
     let mid = items.len() / 2;
     let right = items.split_off(mid);
@@ -143,14 +143,19 @@ where
 }
 
 /// Recursive join-based chunked map.
-fn join_chunks_map<T, R, F>(mut items: Vec<T>, chunk_size: usize, f: &F, splits_left: usize) -> Vec<R>
+fn join_chunks_map<T, R, F>(
+    mut items: Vec<T>,
+    chunk_size: usize,
+    f: &F,
+    splits_left: usize,
+) -> Vec<R>
 where
     T: Send,
     R: Send,
     F: Fn(&[T]) -> Vec<R> + Sync,
 {
     if splits_left == 0 || items.len() <= chunk_size {
-        return items.chunks(chunk_size).flat_map(|c| f(c)).collect();
+        return items.chunks(chunk_size).flat_map(f).collect();
     }
     // Split at a chunk boundary.
     let mid = ((items.len() / 2) / chunk_size) * chunk_size;
@@ -1015,13 +1020,9 @@ impl StreamPipeline {
         });
 
         // Thread seq through the tuple so input order survives the fence.
-        spawn_stage(
-            pool,
-            in_rx,
-            mid_tx,
-            par1,
-            move |(seq, item): (u64, I)| (seq, stage1(item)),
-        );
+        spawn_stage(pool, in_rx, mid_tx, par1, move |(seq, item): (u64, I)| {
+            (seq, stage1(item))
+        });
 
         let fence_thread = std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode));
 

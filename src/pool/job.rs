@@ -4,12 +4,9 @@
 //! type-erased `Job` with no vtable indirection. Jobs may live on the stack
 //! (`StackJob`) or the heap (`HeapJob`).
 
-use std::any::Any;
-use std::cell::UnsafeCell;
-use std::mem;
+use std::{any::Any, cell::UnsafeCell, mem};
 
-use super::latch::Latch;
-use super::unwind;
+use super::{latch::Latch, unwind};
 
 /// Result of executing a job's closure.
 pub(crate) enum JobResult<T> {
@@ -48,12 +45,13 @@ impl JobRef {
         T: Job,
     {
         JobRef {
-            pointer: data as *const (),
+            pointer: data.cast::<()>(),
             execute_fn: <T as Job>::execute,
         }
     }
 
-    /// Opaque identity for comparison (used by `join` to detect self-popped job).
+    /// Opaque identity for comparison (used by `join` to detect self-popped
+    /// job).
     #[inline]
     pub(crate) fn id(&self) -> (usize, usize) {
         (self.pointer as usize, self.execute_fn as usize)
@@ -116,11 +114,11 @@ where
 {
     unsafe fn execute(this: *const ()) {
         unsafe {
-            let this = &*(this as *const Self);
+            let this = &*this.cast::<Self>();
             let abort = unwind::AbortIfPanic;
             let func = (*this.func.get()).take().unwrap();
             (*this.result.get()) = JobResult::call(func);
-            Latch::set(&this.latch);
+            Latch::set(&raw const this.latch);
             mem::forget(abort);
         }
     }
@@ -138,6 +136,7 @@ impl<BODY> HeapJob<BODY>
 where
     BODY: FnOnce() + Send,
 {
+    #[allow(clippy::unnecessary_box_returns)]
     pub(crate) fn new(job: BODY) -> Box<Self> {
         Box::new(HeapJob { job })
     }

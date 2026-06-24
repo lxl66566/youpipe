@@ -24,6 +24,7 @@ impl StreamExecutor {
         }
     }
 
+    #[must_use]
     pub fn with_pool(pool: Arc<ComputePool>) -> Self {
         Self { pool, cancel: None }
     }

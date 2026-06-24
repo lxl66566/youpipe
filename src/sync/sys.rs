@@ -1,8 +1,8 @@
 //! Miri-transparent Mutex + Condvar abstraction.
 //!
-//! In production this is a zero-cost re-export of `parking_lot::{Mutex, Condvar}`,
-//! which are fairer than their std counterparts and never poison — so there is
-//! no panic path on the (cold) injector lock.
+//! In production this is a zero-cost re-export of `parking_lot::{Mutex,
+//! Condvar}`, which are fairer than their std counterparts and never poison —
+//! so there is no panic path on the (cold) injector lock.
 //!
 //! Under Miri we instead back the same API with `std::sync::{Mutex, Condvar}`,
 //! because `parking_lot_core` resolves `WaitOnAddress` through
@@ -21,8 +21,7 @@ pub(crate) use self::shim::{Condvar, Mutex, MutexGuard};
 
 #[cfg(miri)]
 mod shim {
-    use std::sync as s;
-    use std::time::Duration;
+    use std::{sync as s, time::Duration};
 
     pub(crate) struct Mutex<T: ?Sized>(s::Mutex<T>);
     pub(crate) struct MutexGuard<'a, T: ?Sized>(s::MutexGuard<'a, T>);
@@ -65,10 +64,7 @@ mod shim {
 
         #[inline]
         pub(crate) fn wait<'a, T>(&self, guard: &mut MutexGuard<'a, T>) {
-            let _ = self
-                .0
-                .wait(&mut guard.0)
-                .unwrap_or_else(|e| e.into_inner());
+            let _ = self.0.wait(&mut guard.0).unwrap_or_else(|e| e.into_inner());
         }
 
         #[inline]

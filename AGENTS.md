@@ -20,6 +20,7 @@ temperature: 0
 - 性能是最高要求
 - 项目仍处于初级阶段，不需要考虑向前兼容性。
 - 写出符合工程实践的代码，多复用，注重性能优化。不要为了偷懒写出一些性能差的 naive 实现。
+- 不希望引入 crossbeam_deque 库，因为 crossbeam_epoch 不兼容 miri。
 
 ## 项目愿景
 

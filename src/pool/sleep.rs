@@ -2,11 +2,16 @@
 //! the fast path (posting work while threads are awake) is pure atomics — no
 //! Mutex/Condvar in the hot path. Adapted from rayon-core (RFC #5).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use crate::sync::sys::{Condvar, Mutex};
-use std::thread;
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
+};
 
 use super::latch::CoreLatch;
+use crate::{
+    sync::sys::{Condvar, Mutex},
+    util::CachePadded,
+};
 
 // ── Packed counter layout ──
 
@@ -198,7 +203,7 @@ impl Sleep {
     pub(crate) fn new(n_threads: usize) -> Sleep {
         assert!(n_threads <= THREADS_MAX);
         Sleep {
-            worker_sleep_states: (0..n_threads).map(|_| Default::default()).collect(),
+            worker_sleep_states: (0..n_threads).map(|_| CachePadded::default()).collect(),
             counters: AtomicCounters::new(),
         }
     }
@@ -214,8 +219,10 @@ impl Sleep {
     }
 
     #[inline]
+    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn work_found(&self) {
         let threads_to_wake = self.counters.sub_inactive_thread();
+        // `sub_inactive_thread` returns at most 2, safe to truncate
         self.wake_any_threads(threads_to_wake as u32);
     }
 
@@ -319,10 +326,12 @@ impl Sleep {
     }
 
     #[inline]
+    #[allow(clippy::cast_possible_truncation)]
     fn new_jobs(&self, num_jobs: u32, queue_was_empty: bool) {
         let counters = self
             .counters
             .increment_jobs_event_counter_if(JobsEventCounter::is_sleepy);
+        // Both values are bounded by THREADS_MAX (≤65535 on 64-bit), safe to truncate
         let num_awake_but_idle = counters.awake_but_idle_threads() as u32;
         let num_sleepers = counters.sleeping_threads() as u32;
 

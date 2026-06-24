@@ -6,13 +6,14 @@
 //! other work while waiting for it to complete. This is the core work-stealing
 //! strategy.
 
-use std::any::Any;
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
-use super::job::StackJob;
-use super::latch::{AsCoreLatch, SpinLatch};
-use super::registry::{Registry, WorkerThread};
-use super::unwind;
+use super::{
+    job::StackJob,
+    latch::{AsCoreLatch, SpinLatch},
+    registry::{Registry, WorkerThread},
+    unwind,
+};
 
 /// Takes two closures and *potentially* runs them in parallel. Returns both
 /// results.
@@ -75,21 +76,18 @@ where
 
     // Now try to pop and run B, or wait for it if stolen.
     while !job_b.latch.probe() {
-        match worker_thread.try_pop_local() {
-            Some(job) => {
-                if job_b_id == job.id() {
-                    // Found B! Run it inline.
-                    let result_b = unsafe { job_b.run_inline(injected) };
-                    return (result_a, result_b);
-                }
-                unsafe { worker_thread.execute(job) };
+        if let Some(job) = worker_thread.try_pop_local() {
+            if job_b_id == job.id() {
+                // Found B! Run it inline.
+                let result_b = unsafe { job_b.run_inline(injected) };
+                return (result_a, result_b);
             }
-            None => {
-                // Local deque empty (B was stolen). Steal work while waiting.
-                unsafe { worker_thread.wait_until(job_b.latch.as_core_latch()) };
-                debug_assert!(job_b.latch.probe());
-                break;
-            }
+            unsafe { WorkerThread::execute(job) };
+        } else {
+            // Local deque empty (B was stolen). Steal work while waiting.
+            unsafe { worker_thread.wait_until(job_b.latch.as_core_latch()) };
+            debug_assert!(job_b.latch.probe());
+            break;
         }
     }
 

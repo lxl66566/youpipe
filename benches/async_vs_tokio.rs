@@ -1,5 +1,4 @@
-use std::hint::black_box as bb;
-use std::num::NonZeroUsize;
+use std::{hint::black_box as bb, num::NonZeroUsize};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 

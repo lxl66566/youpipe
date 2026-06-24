@@ -1,8 +1,6 @@
 use std::{marker::PhantomData, sync::Arc};
 
-use crate::sync::sys::Mutex;
-
-use crate::util::split_chunks;
+use crate::{sync::sys::Mutex, util::split_chunks};
 
 /// Opens a scoped execution context for non-`'static` closures.
 ///
@@ -82,11 +80,8 @@ impl<'env, T: Send + 'static> ScopedPipeline<'env, T> {
         let chunks = split_chunks(items, parallelism);
         let num_chunks = chunks.len();
 
-        let slots: SlotCollector<O> = Arc::new(
-            (0..num_chunks)
-                .map(|_| Mutex::new(Vec::new()))
-                .collect(),
-        );
+        let slots: SlotCollector<O> =
+            Arc::new((0..num_chunks).map(|_| Mutex::new(Vec::new())).collect());
 
         let mut runners = self.runners;
         for (idx, chunk) in chunks.into_iter().enumerate() {

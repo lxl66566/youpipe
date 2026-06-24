@@ -51,11 +51,11 @@ impl ComputePool {
             .into_iter()
             .map(|f| pool::job::HeapJob::new(f).into_static_job_ref())
             .collect();
-        self.registry
-            .inject_batch(job_refs.into_iter());
+        self.registry.inject_batch(job_refs.into_iter());
     }
 
     /// Number of worker threads in this pool.
+    #[must_use]
     pub fn num_workers(&self) -> usize {
         self.registry.num_threads()
     }

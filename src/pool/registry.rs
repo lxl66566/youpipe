@@ -2,21 +2,28 @@
 //! rayon-core's `registry.rs`, simplified (no broadcast, no FIFO, no
 //! cross-registry, no custom spawn).
 
-use std::cell::Cell;
-use std::hash::{DefaultHasher, Hasher};
-use std::mem;
-use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::thread;
+use std::{
+    cell::Cell,
+    hash::{DefaultHasher, Hasher},
+    mem, ptr,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+};
 
-use st3::lifo::{Stealer, Worker};
-use st3::StealError;
+use st3::{
+    StealError,
+    lifo::{Stealer, Worker},
+};
 
-use super::job::{HeapJob, JobRef, StackJob};
-use super::latch::{AsCoreLatch, CoreLatch, Latch, LatchRef, LockLatch, OnceLatch};
-use super::sleep::Sleep;
-use super::unwind;
+use super::{
+    job::{HeapJob, JobRef, StackJob},
+    latch::{AsCoreLatch, CoreLatch, Latch, LatchRef, LockLatch, OnceLatch},
+    sleep::Sleep,
+    unwind,
+};
 
 /// Capacity of each worker's local (LIFO) deque. Rounded up to a power of two
 /// by `st3`. When the local queue saturates, overflow spills into the global
@@ -36,11 +43,12 @@ pub(crate) struct Registry {
     /// block-based algorithm crossbeam's `Injector` used (WRITE/READ/DESTROY
     /// slot flags + direct `Box::from_raw` reclamation), but in a crate that
     /// does **not** pull in `crossbeam-epoch` (the source of the Miri UB that
-    /// prompted the st3 migration). Its empty `pop` is 2 Acquire loads + a SeqCst
-    /// fence with no CAS, which is cheaper on this 99%-empty hot path than a
-    /// `Mutex<VecDeque>` *plus* a hand-maintained `AtomicUsize` length counter
-    /// (measured: the extra `fetch_add`/`fetch_sub` on every push/pop costs more
-    /// than it saves). Unbounded, so local-queue overflow never drops work.
+    /// prompted the st3 migration). Its empty `pop` is 2 Acquire loads + a
+    /// SeqCst fence with no CAS, which is cheaper on this 99%-empty hot
+    /// path than a `Mutex<VecDeque>` *plus* a hand-maintained `AtomicUsize`
+    /// length counter (measured: the extra `fetch_add`/`fetch_sub` on every
+    /// push/pop costs more than it saves). Unbounded, so local-queue
+    /// overflow never drops work.
     injected_jobs: concurrent_queue::ConcurrentQueue<JobRef>,
 
     // When this reaches 0, all work on this registry must be complete. The
@@ -105,7 +113,7 @@ impl Registry {
 
     /// Opaque identity for this registry.
     fn id(&self) -> usize {
-        self as *const Self as usize
+        std::ptr::from_ref::<Self>(self) as usize
     }
 
     pub(crate) fn num_threads(&self) -> usize {
@@ -173,7 +181,7 @@ impl Registry {
 
     /// Make the current worker thread wait on `latch`, stealing work in the
     /// meantime. Only valid when the current thread is a pool worker.
-    pub(crate) fn wait_until_worker(&self, latch: &CoreLatch) {
+    pub(crate) fn wait_until_worker(latch: &CoreLatch) {
         let wt = WorkerThread::current();
         debug_assert!(!wt.is_null());
         unsafe { (*wt).wait_until(latch) };
@@ -230,7 +238,7 @@ impl Registry {
         if self.terminate_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             for (i, info) in self.thread_infos.iter().enumerate() {
                 unsafe {
-                    OnceLatch::set_and_tickle_one(&info.terminate, self, i);
+                    OnceLatch::set_and_tickle_one(&raw const info.terminate, self, i);
                 }
             }
         }
@@ -373,7 +381,7 @@ impl WorkerThread {
         'outer: while !latch.probe() {
             // Check for local work before going idle.
             if let Some(job) = self.take_local_job() {
-                unsafe { self.execute(job) };
+                unsafe { Self::execute(job) };
                 continue;
             }
 
@@ -381,13 +389,12 @@ impl WorkerThread {
             while !latch.probe() {
                 if let Some(job) = self.find_work() {
                     self.registry.sleep.work_found();
-                    unsafe { self.execute(job) };
+                    unsafe { Self::execute(job) };
                     continue 'outer;
-                } else {
-                    self.registry
-                        .sleep
-                        .no_work_found(&mut idle, latch, || self.has_injected_job());
                 }
+                self.registry
+                    .sleep
+                    .no_work_found(&mut idle, latch, || self.has_injected_job());
             }
 
             self.registry.sleep.work_found();
@@ -405,10 +412,10 @@ impl WorkerThread {
         }
         // Drain remaining local work.
         while let Some(job) = self.take_local_job() {
-            unsafe { self.execute(job) };
+            unsafe { Self::execute(job) };
         }
         // Let registry know we are done.
-        unsafe { Latch::set(&registry.thread_infos[index].stopped) };
+        unsafe { Latch::set(&raw const registry.thread_infos[index].stopped) };
     }
 
     fn find_work(&self) -> Option<JobRef> {
@@ -419,7 +426,7 @@ impl WorkerThread {
     }
 
     #[inline]
-    pub(crate) unsafe fn execute(&self, job: JobRef) {
+    pub(crate) unsafe fn execute(job: JobRef) {
         unsafe { job.execute() };
     }
 
@@ -487,11 +494,11 @@ unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usiz
     let worker_thread_ref: &WorkerThread = &worker_thread;
     // SAFETY: `worker_thread_ref` outlives main_loop (it IS the stack frame).
     // The raw pointer in TLS is valid until we null it on drop.
-    unsafe { WorkerThread::set_current(worker_thread_ref as *const _) };
+    unsafe { WorkerThread::set_current(std::ptr::from_ref(worker_thread_ref)) };
 
     let registry = worker_thread_ref.registry();
     // Signal that we're ready.
-    unsafe { Latch::set(&registry.thread_infos[index].primed) };
+    unsafe { Latch::set(&raw const registry.thread_infos[index].primed) };
 
     let abort_guard = unwind::AbortIfPanic;
     unsafe { worker_thread_ref.wait_until_out_of_work() };
@@ -517,10 +524,10 @@ struct XorShift64Star {
 
 impl XorShift64Star {
     fn new() -> Self {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let mut seed = 0u64;
         while seed == 0 {
             let mut hasher = DefaultHasher::new();
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
             hasher.write_usize(COUNTER.fetch_add(1, Ordering::Relaxed));
             seed = hasher.finish();
         }
@@ -539,7 +546,9 @@ impl XorShift64Star {
         x.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn next_usize(&self, n: usize) -> usize {
+        // Result bounded by `n` (usize), safe to truncate on 32-bit
         (self.next() % n as u64) as usize
     }
 }

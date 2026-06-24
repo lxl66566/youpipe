@@ -51,7 +51,8 @@ impl<T> FenceBarrier<T> {
     }
 
     /// Preallocate the internal buffer with the given capacity. Useful in
-    /// [`FenceMode::Barrier`] mode where the final batch size is known up front.
+    /// [`FenceMode::Barrier`] mode where the final batch size is known up
+    /// front.
     #[must_use]
     pub fn with_capacity(mode: FenceMode, capacity: usize) -> Self {
         Self {

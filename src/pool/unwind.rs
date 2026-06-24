@@ -1,8 +1,10 @@
 //! Package up unwind recovery. Adapted from rayon-core.
 
-use std::any::Any;
-use std::panic::{self, AssertUnwindSafe};
-use std::thread;
+use std::{
+    any::Any,
+    panic::{self, AssertUnwindSafe},
+    thread,
+};
 
 /// Executes `f` and captures any panic, translating it into an `Err`.
 pub(crate) fn halt_unwinding<F, R>(func: F) -> thread::Result<R>

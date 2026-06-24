@@ -1,7 +1,9 @@
-use std::num::NonZeroUsize;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 fn cpu_heavy(x: u64) -> u64 {
@@ -157,7 +159,13 @@ fn test_stream_fence_large_input_no_deadlock() {
     // Barrier, ordered — the exact shape that hung the bench.
     let sp = youpipe::StreamPipeline::new(config);
     let items: Vec<i32> = (0..n).collect();
-    let r = sp.run_with_fence(items, |x: i32| x + 1, |x: i32| x * 3, youpipe::FenceMode::Barrier, true);
+    let r = sp.run_with_fence(
+        items,
+        |x: i32| x + 1,
+        |x: i32| x * 3,
+        youpipe::FenceMode::Barrier,
+        true,
+    );
     assert_eq!(r, expected);
 }
 

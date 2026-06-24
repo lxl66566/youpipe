@@ -3,13 +3,17 @@
 //! A latch starts as false. Eventually `set()` makes it true. Once `probe()`
 //! returns true, all memory effects from before `set()` are visible.
 
-use std::marker::PhantomData;
-use std::ops::Deref;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use crate::sync::sys::{Condvar, Mutex};
+use std::{
+    marker::PhantomData,
+    ops::Deref,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use super::registry::Registry;
+use crate::sync::sys::{Condvar, Mutex};
 
 /// Trait for latches that can be set. Operates on `*const Self` to allow the
 /// latch to become dangling during `set` (the waiter may wake and deallocate).
@@ -54,7 +58,8 @@ impl CoreLatch {
     }
 
     /// Invoked by owning thread as it prepares to sleep. Returns `true` if it
-    /// may proceed to fall asleep, `false` if the latch was set in the meantime.
+    /// may proceed to fall asleep, `false` if the latch was set in the
+    /// meantime.
     #[inline]
     pub(crate) fn get_sleepy(&self) -> bool {
         self.state
@@ -75,12 +80,9 @@ impl CoreLatch {
     #[inline]
     pub(crate) fn wake_up(&self) {
         if !self.probe() {
-            let _ = self.state.compare_exchange(
-                SLEEPING,
-                UNSET,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            );
+            let _ =
+                self.state
+                    .compare_exchange(SLEEPING, UNSET, Ordering::SeqCst, Ordering::Relaxed);
         }
     }
 
@@ -89,7 +91,8 @@ impl CoreLatch {
     ///
     /// # Safety
     ///
-    /// After this returns `true`, `this` may be invalidated by the woken thread.
+    /// After this returns `true`, `this` may be invalidated by the woken
+    /// thread.
     #[inline]
     pub(crate) unsafe fn set(this: *const Self) -> bool {
         let old_state = unsafe { (*this).state.swap(SET, Ordering::SeqCst) };
@@ -146,11 +149,11 @@ impl Latch for SpinLatch<'_> {
         unsafe {
             // Read all needed fields BEFORE the set, because `set` may
             // invalidate `this` once the owning thread wakes.
-            let registry = &*(*this).registry;
+            let registry = (*this).registry;
             let registry = Arc::clone(registry);
             let target_worker_index = (*this).target_worker_index;
 
-            if CoreLatch::set(&(*this).core) {
+            if CoreLatch::set(&raw const (*this).core) {
                 registry.notify_worker_latch_is_set(target_worker_index);
             }
         }
@@ -223,7 +226,7 @@ impl OnceLatch {
         registry: &Registry,
         target_worker_index: usize,
     ) {
-        if unsafe { CoreLatch::set(&(*this).core) } {
+        if unsafe { CoreLatch::set(&raw const (*this).core) } {
             registry.notify_worker_latch_is_set(target_worker_index);
         }
     }
@@ -244,8 +247,8 @@ pub(crate) struct CountLatch {
 }
 
 enum CountLatchKind {
-    /// A latch for scopes created on a pool worker thread which will participate
-    /// in work stealing while it waits.
+    /// A latch for scopes created on a pool worker thread which will
+    /// participate in work stealing while it waits.
     Stealing {
         latch: CoreLatch,
         registry: Arc<Registry>,
@@ -299,7 +302,7 @@ impl CountLatch {
                 worker_index,
             } => {
                 debug_assert!(registry.num_threads() > *worker_index);
-                registry.wait_until_worker(latch);
+                Registry::wait_until_worker(latch);
             }
             CountLatchKind::Blocking { latch } => latch.wait(),
         }
