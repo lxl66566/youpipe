@@ -3,7 +3,6 @@
 //! cross-registry, no custom spawn).
 
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hasher};
 use std::mem;
 use std::ptr;
@@ -17,7 +16,6 @@ use st3::StealError;
 use super::job::{HeapJob, JobRef, StackJob};
 use super::latch::{AsCoreLatch, CoreLatch, Latch, LatchRef, LockLatch, OnceLatch};
 use super::sleep::Sleep;
-use crate::sync::sys::Mutex;
 use super::unwind;
 
 /// Capacity of each worker's local (LIFO) deque. Rounded up to a power of two
@@ -32,17 +30,18 @@ pub(crate) struct Registry {
     thread_infos: Vec<ThreadInfo>,
     sleep: Sleep,
     /// Global injector queue for jobs coming from outside the pool or
-    /// overflowing a worker's local deque. This is a cold path (external
-    /// submissions and local-queue overflow), so a plain mutex-protected
-    /// unbounded deque is both simplest and fast enough — mirroring what the
-    /// tokio scheduler does for its own inject queue. The mutex itself comes
-    /// from [`super::sys`]: `parking_lot` in production, `std::sync` under Miri.
-    injected_jobs: Mutex<VecDeque<JobRef>>,
-    /// Lock-free length of `injected_jobs`. Idle workers check this *before*
-    /// taking the mutex on every spin round (`pop_injected_job`), so the
-    /// overwhelmingly common "injector is empty" case never contends on the
-    /// mutex at all. Updated with `Release` on push, read with `Acquire`.
-    injected_len: AtomicUsize,
+    /// overflowing a worker's local deque.
+    ///
+    /// A lock-free, epoch-free MPMC queue (`concurrent_queue`) — the same
+    /// block-based algorithm crossbeam's `Injector` used (WRITE/READ/DESTROY
+    /// slot flags + direct `Box::from_raw` reclamation), but in a crate that
+    /// does **not** pull in `crossbeam-epoch` (the source of the Miri UB that
+    /// prompted the st3 migration). Its empty `pop` is 2 Acquire loads + a SeqCst
+    /// fence with no CAS, which is cheaper on this 99%-empty hot path than a
+    /// `Mutex<VecDeque>` *plus* a hand-maintained `AtomicUsize` length counter
+    /// (measured: the extra `fetch_add`/`fetch_sub` on every push/pop costs more
+    /// than it saves). Unbounded, so local-queue overflow never drops work.
+    injected_jobs: concurrent_queue::ConcurrentQueue<JobRef>,
 
     // When this reaches 0, all work on this registry must be complete. The
     // global pool has a ref that never gets released; a user-created pool
@@ -87,8 +86,7 @@ impl Registry {
         let registry = Arc::new(Registry {
             thread_infos: stealers.into_iter().map(ThreadInfo::new).collect(),
             sleep: Sleep::new(num_threads),
-            injected_jobs: Mutex::new(VecDeque::new()),
-            injected_len: AtomicUsize::new(0),
+            injected_jobs: concurrent_queue::ConcurrentQueue::unbounded(),
             terminate_count: AtomicUsize::new(1),
         });
 
@@ -130,55 +128,40 @@ impl Registry {
 
     /// Inject a job from outside the pool.
     pub(crate) fn inject(&self, job_ref: JobRef) {
-        let queue_was_empty = {
-            let mut queue = self.injected_jobs.lock();
-            let was_empty = queue.is_empty();
-            queue.push_back(job_ref);
-            was_empty
-        };
-        self.injected_len.fetch_add(1, Ordering::Release);
+        // `was_empty` drives the wake heuristic; read before the push. A
+        // concurrent consumer draining the queue makes it racy, but it is only
+        // an optimization hint — correctness rests on `new_injected_jobs`'
+        // SeqCst fence + condvar-notify protocol.
+        let queue_was_empty = self.injected_jobs.is_empty();
+        // Unbounded queue, never closed → push cannot fail.
+        let _ = self.injected_jobs.push(job_ref);
         self.sleep.new_injected_jobs(1, queue_was_empty);
     }
 
     /// Inject multiple jobs from outside the pool, notifying sleepers once.
     pub(crate) fn inject_batch(&self, job_refs: impl ExactSizeIterator<Item = JobRef>) {
-        let (count, queue_was_empty) = {
-            let mut queue = self.injected_jobs.lock();
-            let was_empty = queue.is_empty();
-            let mut count = 0u32;
-            for job_ref in job_refs {
-                queue.push_back(job_ref);
-                count += 1;
-            }
-            (count, was_empty)
-        };
+        let queue_was_empty = self.injected_jobs.is_empty();
+        let mut count = 0u32;
+        for job_ref in job_refs {
+            let _ = self.injected_jobs.push(job_ref);
+            count += 1;
+        }
         if count > 0 {
-            self.injected_len
-                .fetch_add(count as usize, Ordering::Release);
             self.sleep.new_injected_jobs(count, queue_was_empty);
         }
     }
 
     fn has_injected_job(&self) -> bool {
-        // Lock-free: the empty case is the norm during fork-join, so we avoid
-        // serializing all idle workers on the mutex just to discover emptiness.
-        // Correctness against a missed wakeup rests on the same SeqCst fence +
-        // condvar-notify protocol in `Sleep::new_injected_jobs` that the
-        // lock-based check relied on.
-        self.injected_len.load(Ordering::Acquire) > 0
+        !self.injected_jobs.is_empty()
     }
 
     fn pop_injected_job(&self) -> Option<JobRef> {
-        // Fast path: skip the mutex entirely when the injector is empty — the
-        // overwhelmingly common case once external injection has been consumed.
-        if self.injected_len.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        let job = self.injected_jobs.lock().pop_front();
-        if job.is_some() {
-            self.injected_len.fetch_sub(1, Ordering::Release);
-        }
-        job
+        // `ConcurrentQueue::pop`'s empty path is 2 Acquire loads + a SeqCst
+        // fence with no CAS — cheap enough that no separate length fast-path is
+        // warranted (verified: a hand-maintained `AtomicUsize` length was
+        // measurably slower, since its per-push/per-pop `fetch_add`/`fetch_sub`
+        // bounce a cache line on every operation).
+        self.injected_jobs.pop().ok()
     }
 
     // ── Worker coordination ──
@@ -449,6 +432,13 @@ impl WorkerThread {
             return None;
         }
 
+        // Scan all victims each call. Unlike uniform async task pools, our
+        // work arrives via divide-and-conquer `join`, so at any instant only a
+        // few victims hold (large) sub-trees. Bounding the probe (e.g. to 4)
+        // measurably *slows* work discovery — the latency of missing the
+        // victim-with-work across rounds outweighs the empty-steal coherence
+        // traffic, which is anyway parallelized across cores. So we keep the
+        // classic rayon-style full randomized scan.
         loop {
             let mut retry = false;
             let start = self.rng.next_usize(num_threads);
