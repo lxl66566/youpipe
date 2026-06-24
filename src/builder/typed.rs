@@ -512,8 +512,15 @@ pub struct StreamPipeline {
 
 // ── Streaming stage helpers (used by the fence pipeline) ──
 
+/// True iff `cancel` is set and the pipeline should stop feeding new work.
+#[inline]
+fn cancel_active(cancel: Option<&CancellationToken>) -> bool {
+    cancel.is_some_and(CancellationToken::is_cancelled)
+}
+
 /// Spawn `parallelism` workers on `pool` that pull from `rx`, apply `stage`,
-/// and forward to `tx`. Each worker loops until its receiver disconnects.
+/// and forward to `tx`. Each worker loops until its receiver disconnects or the
+/// supplied cancellation token (if any) is signalled.
 ///
 /// The supplied `rx`/`tx` are consumed: clones are handed to workers and the
 /// originals dropped here, so channel close propagates correctly once all
@@ -526,6 +533,7 @@ fn spawn_stage<I, O>(
     rx: Receiver<I>,
     tx: Sender<O>,
     parallelism: usize,
+    cancel: Option<CancellationToken>,
     stage: impl Fn(I) -> O + Send + Sync + 'static,
 ) where
     I: Send + 'static,
@@ -536,8 +544,12 @@ fn spawn_stage<I, O>(
         let stage = stage.clone();
         let rx = rx.clone();
         let tx = tx.clone();
+        let cancel = cancel.clone();
         pool.submit(move || {
             while let Ok(item) = rx.recv() {
+                if cancel_active(cancel.as_ref()) {
+                    break;
+                }
                 if tx.send(stage(item)).is_err() {
                     break;
                 }
@@ -641,10 +653,7 @@ impl StreamPipeline {
         let feeder_cancel = self.cancel.clone();
         let feeder_handle = std::thread::spawn(move || {
             for (seq, item) in items.into_iter().enumerate() {
-                if feeder_cancel
-                    .as_ref()
-                    .is_some_and(CancellationToken::is_cancelled)
-                {
+                if cancel_active(feeder_cancel.as_ref()) {
                     break;
                 }
                 if in_tx.send((seq as u64, item)).is_err() {
@@ -664,10 +673,7 @@ impl StreamPipeline {
             let worker_cancel = self.cancel.clone();
             pool.submit(move || {
                 while let Ok((seq, item)) = rx.recv() {
-                    if worker_cancel
-                        .as_ref()
-                        .is_some_and(CancellationToken::is_cancelled)
-                    {
+                    if cancel_active(worker_cancel.as_ref()) {
                         break;
                     }
                     let output = stage(item);
@@ -710,10 +716,7 @@ impl StreamPipeline {
         let feeder_cancel = self.cancel.clone();
         let feeder_handle = std::thread::spawn(move || {
             for item in items {
-                if feeder_cancel
-                    .as_ref()
-                    .is_some_and(CancellationToken::is_cancelled)
-                {
+                if cancel_active(feeder_cancel.as_ref()) {
                     break;
                 }
                 if in_tx.send(item).is_err() {
@@ -733,10 +736,7 @@ impl StreamPipeline {
             let worker_cancel = self.cancel.clone();
             pool.submit(move || {
                 while let Ok(item) = rx.recv() {
-                    if worker_cancel
-                        .as_ref()
-                        .is_some_and(CancellationToken::is_cancelled)
-                    {
+                    if cancel_active(worker_cancel.as_ref()) {
                         break;
                     }
                     let output = stage(item);
@@ -795,16 +795,25 @@ impl StreamPipeline {
         if n == 0 {
             return Vec::new();
         }
-        let parallelism = self.config.compute_workers;
+        let parallelism = self.config.compute_workers.min(n);
         let pool = ComputePool::global();
-        let buffer_size = self.config.buffer_size;
+        // Floor each stage at one worker so a small `compute_workers` (e.g. a
+        // single-threaded pool) still runs both stages instead of silently
+        // starving one of them.
+        let par1 = (parallelism / 2).max(1);
+        let par2 = parallelism.saturating_sub(par1).max(1);
+        let buffer_size = self.config.buffer_size.max(par1.max(par2) * 4);
 
         let (in_tx, in_rx) = channel::<(u64, I)>(buffer_size);
         let (mid_tx, mid_rx) = channel::<(u64, M)>(buffer_size);
         let (out_tx, out_rx) = channel::<(u64, O)>(buffer_size);
 
+        let feeder_cancel = self.cancel.clone();
         let feeder = std::thread::spawn(move || {
             for (seq, item) in items.into_iter().enumerate() {
+                if cancel_active(feeder_cancel.as_ref()) {
+                    break;
+                }
                 if in_tx.send((seq as u64, item)).is_err() {
                     break;
                 }
@@ -814,11 +823,6 @@ impl StreamPipeline {
         let s1 = Arc::new(stage1);
         let s2 = Arc::new(stage2);
         let wg = SharedWaitGroup::new();
-        // Floor each stage at one worker so a small `compute_workers` (e.g. a
-        // single-threaded pool) still runs both stages instead of silently
-        // starving one of them.
-        let par1 = (parallelism / 2).max(1);
-        let par2 = parallelism.saturating_sub(par1).max(1);
         wg.add(par1 + par2);
 
         for _ in 0..par1 {
@@ -826,8 +830,12 @@ impl StreamPipeline {
             let rx = in_rx.clone();
             let tx = mid_tx.clone();
             let wg = wg.clone();
+            let worker_cancel = self.cancel.clone();
             pool.submit(move || {
                 while let Ok((seq, item)) = rx.recv() {
+                    if cancel_active(worker_cancel.as_ref()) {
+                        break;
+                    }
                     let out = s(item);
                     if tx.send((seq, out)).is_err() {
                         break;
@@ -842,8 +850,12 @@ impl StreamPipeline {
             let rx = mid_rx.clone();
             let tx = out_tx.clone();
             let wg = wg.clone();
+            let worker_cancel = self.cancel.clone();
             pool.submit(move || {
                 while let Ok((seq, item)) = rx.recv() {
+                    if cancel_active(worker_cancel.as_ref()) {
+                        break;
+                    }
                     let out = s(item);
                     if tx.send((seq, out)).is_err() {
                         break;
@@ -880,16 +892,25 @@ impl StreamPipeline {
         if n == 0 {
             return Vec::new();
         }
-        let parallelism = self.config.compute_workers;
+        let parallelism = self.config.compute_workers.min(n);
         let pool = ComputePool::global();
-        let buffer_size = self.config.buffer_size;
+        // Floor each stage at one worker so a small `compute_workers` (e.g. a
+        // single-threaded pool) still runs both stages instead of silently
+        // starving one of them.
+        let par1 = (parallelism / 2).max(1);
+        let par2 = parallelism.saturating_sub(par1).max(1);
+        let buffer_size = self.config.buffer_size.max(par1.max(par2) * 4);
 
         let (in_tx, in_rx) = channel::<I>(buffer_size);
         let (mid_tx, mid_rx) = channel::<M>(buffer_size);
         let (out_tx, out_rx) = channel::<O>(buffer_size);
 
+        let feeder_cancel = self.cancel.clone();
         let feeder = std::thread::spawn(move || {
             for item in items {
+                if cancel_active(feeder_cancel.as_ref()) {
+                    break;
+                }
                 if in_tx.send(item).is_err() {
                     break;
                 }
@@ -899,11 +920,6 @@ impl StreamPipeline {
         let s1 = Arc::new(stage1);
         let s2 = Arc::new(stage2);
         let wg = SharedWaitGroup::new();
-        // Floor each stage at one worker so a small `compute_workers` (e.g. a
-        // single-threaded pool) still runs both stages instead of silently
-        // starving one of them.
-        let par1 = (parallelism / 2).max(1);
-        let par2 = parallelism.saturating_sub(par1).max(1);
         wg.add(par1 + par2);
 
         for _ in 0..par1 {
@@ -911,8 +927,12 @@ impl StreamPipeline {
             let rx = in_rx.clone();
             let tx = mid_tx.clone();
             let wg = wg.clone();
+            let worker_cancel = self.cancel.clone();
             pool.submit(move || {
                 while let Ok(item) = rx.recv() {
+                    if cancel_active(worker_cancel.as_ref()) {
+                        break;
+                    }
                     let out = s(item);
                     if tx.send(out).is_err() {
                         break;
@@ -927,8 +947,12 @@ impl StreamPipeline {
             let rx = mid_rx.clone();
             let tx = out_tx.clone();
             let wg = wg.clone();
+            let worker_cancel = self.cancel.clone();
             pool.submit(move || {
                 while let Ok(item) = rx.recv() {
+                    if cancel_active(worker_cancel.as_ref()) {
+                        break;
+                    }
                     let out = s(item);
                     if tx.send(out).is_err() {
                         break;
@@ -1004,15 +1028,19 @@ impl StreamPipeline {
         let par1 = (parallelism / 2).max(1);
         let par2 = parallelism.saturating_sub(par1).max(1);
         let pool = ComputePool::global();
-        let buffer_size = self.config.buffer_size;
+        let buffer_size = self.config.buffer_size.max(par1.max(par2) * 4);
 
         let (in_tx, in_rx) = channel::<(u64, I)>(buffer_size);
         let (mid_tx, mid_rx) = channel::<(u64, M)>(buffer_size);
         let (fenced_tx, fenced_rx) = channel::<(u64, M)>(buffer_size);
         let (out_tx, out_rx) = channel::<(u64, O)>(buffer_size);
 
+        let feeder_cancel = self.cancel.clone();
         let feeder = std::thread::spawn(move || {
             for (seq, item) in items.into_iter().enumerate() {
+                if cancel_active(feeder_cancel.as_ref()) {
+                    break;
+                }
                 if in_tx.send((seq as u64, item)).is_err() {
                     break;
                 }
@@ -1020,9 +1048,14 @@ impl StreamPipeline {
         });
 
         // Thread seq through the tuple so input order survives the fence.
-        spawn_stage(pool, in_rx, mid_tx, par1, move |(seq, item): (u64, I)| {
-            (seq, stage1(item))
-        });
+        spawn_stage(
+            pool,
+            in_rx,
+            mid_tx,
+            par1,
+            self.cancel.clone(),
+            move |(seq, item): (u64, I)| (seq, stage1(item)),
+        );
 
         let fence_thread = std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode));
 
@@ -1031,6 +1064,7 @@ impl StreamPipeline {
             fenced_rx,
             out_tx,
             par2,
+            self.cancel.clone(),
             move |(seq, mid): (u64, M)| (seq, stage2(mid)),
         );
 
@@ -1062,26 +1096,30 @@ impl StreamPipeline {
         let par1 = (parallelism / 2).max(1);
         let par2 = parallelism.saturating_sub(par1).max(1);
         let pool = ComputePool::global();
-        let buffer_size = self.config.buffer_size;
+        let buffer_size = self.config.buffer_size.max(par1.max(par2) * 4);
 
         let (in_tx, in_rx) = channel::<I>(buffer_size);
         let (mid_tx, mid_rx) = channel::<M>(buffer_size);
         let (fenced_tx, fenced_rx) = channel::<M>(buffer_size);
         let (out_tx, out_rx) = channel::<O>(buffer_size);
 
+        let feeder_cancel = self.cancel.clone();
         let feeder = std::thread::spawn(move || {
             for item in items {
+                if cancel_active(feeder_cancel.as_ref()) {
+                    break;
+                }
                 if in_tx.send(item).is_err() {
                     break;
                 }
             }
         });
 
-        spawn_stage(pool, in_rx, mid_tx, par1, stage1);
+        spawn_stage(pool, in_rx, mid_tx, par1, self.cancel.clone(), stage1);
 
         let fence_thread = std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode));
 
-        spawn_stage(pool, fenced_rx, out_tx, par2, stage2);
+        spawn_stage(pool, fenced_rx, out_tx, par2, self.cancel.clone(), stage2);
 
         let collector = std::thread::spawn(move || {
             let mut results = Vec::with_capacity(n);
@@ -1139,19 +1177,23 @@ impl StreamPipeline {
             })
             .collect();
 
-        let parallelism = self.config.compute_workers;
-        let pool = ComputePool::global();
-        let buffer_size = self.config.buffer_size;
         let n = expanded.len();
         if n == 0 {
             return Vec::new();
         }
+        let parallelism = self.config.compute_workers.min(n);
+        let pool = ComputePool::global();
+        let buffer_size = self.config.buffer_size.max(parallelism * 4);
 
         let (in_tx, in_rx) = channel::<(u64, N)>(buffer_size);
         let (out_tx, out_rx) = channel::<(u64, O)>(buffer_size);
 
+        let feeder_cancel = self.cancel.clone();
         let feeder = std::thread::spawn(move || {
             for item in expanded {
+                if cancel_active(feeder_cancel.as_ref()) {
+                    break;
+                }
                 if in_tx.send(item).is_err() {
                     break;
                 }
@@ -1160,15 +1202,18 @@ impl StreamPipeline {
 
         let inner = Arc::new(inner_stage);
         let wg = SharedWaitGroup::new();
-        let effective = parallelism.min(n);
-        wg.add(effective);
-        for _ in 0..effective {
+        wg.add(parallelism);
+        for _ in 0..parallelism {
             let inner = inner.clone();
             let rx = in_rx.clone();
             let tx = out_tx.clone();
             let wg = wg.clone();
+            let worker_cancel = self.cancel.clone();
             pool.submit(move || {
                 while let Ok((seq, item)) = rx.recv() {
+                    if cancel_active(worker_cancel.as_ref()) {
+                        break;
+                    }
                     let out = inner(item);
                     if tx.send((seq, out)).is_err() {
                         break;
@@ -1200,19 +1245,23 @@ impl StreamPipeline {
     {
         let expanded: Vec<N> = items.into_iter().flat_map(outer_stage).collect();
 
-        let parallelism = self.config.compute_workers;
-        let pool = ComputePool::global();
-        let buffer_size = self.config.buffer_size;
         let n = expanded.len();
         if n == 0 {
             return Vec::new();
         }
+        let parallelism = self.config.compute_workers.min(n);
+        let pool = ComputePool::global();
+        let buffer_size = self.config.buffer_size.max(parallelism * 4);
 
         let (in_tx, in_rx) = channel::<N>(buffer_size);
         let (out_tx, out_rx) = channel::<O>(buffer_size);
 
+        let feeder_cancel = self.cancel.clone();
         let feeder = std::thread::spawn(move || {
             for item in expanded {
+                if cancel_active(feeder_cancel.as_ref()) {
+                    break;
+                }
                 if in_tx.send(item).is_err() {
                     break;
                 }
@@ -1221,15 +1270,18 @@ impl StreamPipeline {
 
         let inner = Arc::new(inner_stage);
         let wg = SharedWaitGroup::new();
-        let effective = parallelism.min(n);
-        wg.add(effective);
-        for _ in 0..effective {
+        wg.add(parallelism);
+        for _ in 0..parallelism {
             let inner = inner.clone();
             let rx = in_rx.clone();
             let tx = out_tx.clone();
             let wg = wg.clone();
+            let worker_cancel = self.cancel.clone();
             pool.submit(move || {
                 while let Ok(item) = rx.recv() {
+                    if cancel_active(worker_cancel.as_ref()) {
+                        break;
+                    }
                     let out = inner(item);
                     if tx.send(out).is_err() {
                         break;
@@ -1395,5 +1447,56 @@ mod tests {
         let mut expected: Vec<i32> = (0..5).flat_map(|x| vec![x * 2, (x + 100) * 2]).collect();
         expected.sort_unstable();
         assert_eq!(result, expected);
+    }
+
+    /// Regression: `with_cancel` previously only worked for `run`. The
+    /// multi-stage / fence / nested paths ignored the token; this test guards
+    /// against that regression by exercising all three with a pre-cancelled
+    /// token + per-item sleep so that under cancellation none of them should
+    /// process the full input.
+    #[test]
+    fn test_stream_cancel_all_variants() {
+        use std::num::NonZeroUsize;
+        use std::time::Duration;
+
+        fn sleep_map<T: Copy>(x: T) -> T {
+            std::thread::sleep(Duration::from_micros(50));
+            x
+        }
+
+        let mk = || {
+            let token = crate::sync::CancellationToken::new();
+            let sp = StreamPipeline::new(PipelineConfig::default()).with_cancel(token.clone());
+            (token, sp)
+        };
+        let items: Vec<i32> = (0..1000).collect();
+
+        // multi_stage
+        {
+            let (token, sp) = mk();
+            token.cancel();
+            let r = sp.run_multi_stage(items.clone(), sleep_map, sleep_map, false);
+            assert!(r.len() < 1000, "multi_stage cancel failed: {}", r.len());
+        }
+        // with_fence
+        {
+            let (token, sp) = mk();
+            token.cancel();
+            let r = sp.run_with_fence(
+                items.clone(),
+                sleep_map,
+                sleep_map,
+                FenceMode::Chunked(NonZeroUsize::new(32).unwrap()),
+                false,
+            );
+            assert!(r.len() < 1000, "with_fence cancel failed: {}", r.len());
+        }
+        // nested
+        {
+            let (token, sp) = mk();
+            token.cancel();
+            let r = sp.run_nested(items, |x| vec![x, x + 1], sleep_map, false);
+            assert!(r.len() < 2000, "nested cancel failed: {}", r.len());
+        }
     }
 }
