@@ -4,4 +4,4 @@ pub mod stream;
 
 pub use fence::{FenceBarrier, FenceMode};
 pub use reorder::ReorderBuffer;
-pub use stream::{StreamExecutor, feed_items, run_ordered_collect, run_unordered_collect};
+pub use stream::run_ordered_collect;

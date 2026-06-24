@@ -25,7 +25,6 @@
 
 pub mod builder;
 pub mod executor;
-pub mod graph;
 pub mod handoff;
 pub(crate) mod pool;
 pub mod runtime;
@@ -49,5 +48,5 @@ pub use runtime::Runtime;
 #[cfg(feature = "tokio-runtime")]
 pub use runtime::TokioRuntime;
 pub use scope::{PipelineScope, ScopedPipeline, scope};
-pub use state::{FenceBarrier, FenceMode, ReorderBuffer, StreamExecutor};
+pub use state::{FenceBarrier, FenceMode, ReorderBuffer};
 pub use sync::CancellationToken;
