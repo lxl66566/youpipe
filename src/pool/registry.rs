@@ -38,6 +38,11 @@ pub(crate) struct Registry {
     /// tokio scheduler does for its own inject queue. The mutex itself comes
     /// from [`super::sys`]: `parking_lot` in production, `std::sync` under Miri.
     injected_jobs: Mutex<VecDeque<JobRef>>,
+    /// Lock-free length of `injected_jobs`. Idle workers check this *before*
+    /// taking the mutex on every spin round (`pop_injected_job`), so the
+    /// overwhelmingly common "injector is empty" case never contends on the
+    /// mutex at all. Updated with `Release` on push, read with `Acquire`.
+    injected_len: AtomicUsize,
 
     // When this reaches 0, all work on this registry must be complete. The
     // global pool has a ref that never gets released; a user-created pool
@@ -83,6 +88,7 @@ impl Registry {
             thread_infos: stealers.into_iter().map(ThreadInfo::new).collect(),
             sleep: Sleep::new(num_threads),
             injected_jobs: Mutex::new(VecDeque::new()),
+            injected_len: AtomicUsize::new(0),
             terminate_count: AtomicUsize::new(1),
         });
 
@@ -130,6 +136,7 @@ impl Registry {
             queue.push_back(job_ref);
             was_empty
         };
+        self.injected_len.fetch_add(1, Ordering::Release);
         self.sleep.new_injected_jobs(1, queue_was_empty);
     }
 
@@ -146,16 +153,32 @@ impl Registry {
             (count, was_empty)
         };
         if count > 0 {
+            self.injected_len
+                .fetch_add(count as usize, Ordering::Release);
             self.sleep.new_injected_jobs(count, queue_was_empty);
         }
     }
 
     fn has_injected_job(&self) -> bool {
-        !self.injected_jobs.lock().is_empty()
+        // Lock-free: the empty case is the norm during fork-join, so we avoid
+        // serializing all idle workers on the mutex just to discover emptiness.
+        // Correctness against a missed wakeup rests on the same SeqCst fence +
+        // condvar-notify protocol in `Sleep::new_injected_jobs` that the
+        // lock-based check relied on.
+        self.injected_len.load(Ordering::Acquire) > 0
     }
 
     fn pop_injected_job(&self) -> Option<JobRef> {
-        self.injected_jobs.lock().pop_front()
+        // Fast path: skip the mutex entirely when the injector is empty — the
+        // overwhelmingly common case once external injection has been consumed.
+        if self.injected_len.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let job = self.injected_jobs.lock().pop_front();
+        if job.is_some() {
+            self.injected_len.fetch_sub(1, Ordering::Release);
+        }
+        job
     }
 
     // ── Worker coordination ──
