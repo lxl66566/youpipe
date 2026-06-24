@@ -81,7 +81,7 @@ pub fn par_map<I, F, R>(iter: I, f: F) -> Vec<R>
 where
     I: IntoIterator,
     I::Item: Send + 'static,
-    F: Fn(I::Item) -> R + Send + Sync + Clone + 'static,
+    F: Fn(I::Item) -> R + Send + Sync + 'static,
     R: Send + 'static,
 {
     par_map_with_workload(iter, f, Workload::Balanced)
@@ -96,7 +96,7 @@ pub fn par_map_with_workload<I, F, R>(iter: I, f: F, workload: Workload) -> Vec<
 where
     I: IntoIterator,
     I::Item: Send + 'static,
-    F: Fn(I::Item) -> R + Send + Sync + Clone + 'static,
+    F: Fn(I::Item) -> R + Send + Sync + 'static,
     R: Send + 'static,
 {
     let items: Vec<I::Item> = iter.into_iter().collect();
@@ -123,7 +123,7 @@ pub fn par_chunks_map<I, F, R>(iter: I, chunk_size: usize, f: F) -> Vec<R>
 where
     I: IntoIterator,
     I::Item: Send + 'static,
-    F: Fn(&[I::Item]) -> Vec<R> + Send + Sync + Clone + 'static,
+    F: Fn(&[I::Item]) -> Vec<R> + Send + Sync + 'static,
     R: Send + 'static,
 {
     let items: Vec<I::Item> = iter.into_iter().collect();
@@ -177,7 +177,7 @@ pub fn try_par_map<I, F, R, E>(iter: I, f: F) -> Result<Vec<R>, E>
 where
     I: IntoIterator,
     I::Item: Send + 'static,
-    F: Fn(I::Item) -> Result<R, E> + Send + Sync + Clone + 'static,
+    F: Fn(I::Item) -> Result<R, E> + Send + Sync + 'static,
     R: Send + 'static,
     E: Send + 'static,
 {
@@ -363,8 +363,8 @@ impl<S, T> Pipeline<S, T> {
     /// Append a synchronous map stage.
     pub fn map<O: Send + 'static>(
         self,
-        f: impl Fn(T) -> O + Send + Sync + Clone + 'static,
-    ) -> Pipeline<SyncMap<S, impl Fn(T) -> O + Send + Sync + Clone + 'static>, O>
+        f: impl Fn(T) -> O + Send + Sync + 'static,
+    ) -> Pipeline<SyncMap<S, impl Fn(T) -> O + Send + Sync + 'static>, O>
     where
         S: StageMarker<T, Output = T>,
     {
@@ -381,8 +381,8 @@ impl<S, T> Pipeline<S, T> {
     /// Append a filter stage. Keeps items where `f` returns `true`.
     pub fn filter(
         self,
-        f: impl Fn(&T) -> bool + Send + Sync + Clone + 'static,
-    ) -> Pipeline<Filter<S, impl Fn(&T) -> bool + Send + Sync + Clone + 'static>, T>
+        f: impl Fn(&T) -> bool + Send + Sync + 'static,
+    ) -> Pipeline<Filter<S, impl Fn(&T) -> bool + Send + Sync + 'static>, T>
     where
         S: StageMarker<T, Output = T>,
     {
@@ -443,7 +443,7 @@ impl<S, T> Pipeline<S, T> {
 
 impl<S, T> Pipeline<S, T>
 where
-    S: FusedStage<T> + Send + Sync + Clone + 'static,
+    S: FusedStage<T> + Send + Sync + 'static,
     T: Send + 'static,
     S::Output: Send + 'static,
 {
@@ -617,7 +617,7 @@ impl StreamPipeline {
     pub fn run<I, O>(
         &self,
         items: Vec<I>,
-        stage: impl Fn(I) -> O + Send + Sync + Clone + 'static,
+        stage: impl Fn(I) -> O + Send + Sync + 'static,
         ordered: bool,
     ) -> Vec<O>
     where
@@ -634,7 +634,7 @@ impl StreamPipeline {
     fn run_ordered<I, O>(
         &self,
         items: Vec<I>,
-        stage: impl Fn(I) -> O + Send + Sync + Clone + 'static,
+        stage: impl Fn(I) -> O + Send + Sync + 'static,
     ) -> Vec<O>
     where
         I: Send + 'static,
@@ -697,7 +697,7 @@ impl StreamPipeline {
     fn run_unordered<I, O>(
         &self,
         items: Vec<I>,
-        stage: impl Fn(I) -> O + Send + Sync + Clone + 'static,
+        stage: impl Fn(I) -> O + Send + Sync + 'static,
     ) -> Vec<O>
     where
         I: Send + 'static,
@@ -764,8 +764,8 @@ impl StreamPipeline {
     pub fn run_multi_stage<I, M, O>(
         &self,
         items: Vec<I>,
-        stage1: impl Fn(I) -> M + Send + Sync + Clone + 'static,
-        stage2: impl Fn(M) -> O + Send + Sync + Clone + 'static,
+        stage1: impl Fn(I) -> M + Send + Sync + 'static,
+        stage2: impl Fn(M) -> O + Send + Sync + 'static,
         ordered: bool,
     ) -> Vec<O>
     where
@@ -783,8 +783,8 @@ impl StreamPipeline {
     fn run_multi_stage_ordered<I, M, O>(
         &self,
         items: Vec<I>,
-        stage1: impl Fn(I) -> M + Send + Sync + Clone + 'static,
-        stage2: impl Fn(M) -> O + Send + Sync + Clone + 'static,
+        stage1: impl Fn(I) -> M + Send + Sync + 'static,
+        stage2: impl Fn(M) -> O + Send + Sync + 'static,
     ) -> Vec<O>
     where
         I: Send + 'static,
@@ -880,8 +880,8 @@ impl StreamPipeline {
     fn run_multi_stage_unordered<I, M, O>(
         &self,
         items: Vec<I>,
-        stage1: impl Fn(I) -> M + Send + Sync + Clone + 'static,
-        stage2: impl Fn(M) -> O + Send + Sync + Clone + 'static,
+        stage1: impl Fn(I) -> M + Send + Sync + 'static,
+        stage2: impl Fn(M) -> O + Send + Sync + 'static,
     ) -> Vec<O>
     where
         I: Send + 'static,
@@ -986,8 +986,8 @@ impl StreamPipeline {
     pub fn run_with_fence<I, M, O>(
         &self,
         items: Vec<I>,
-        stage1: impl Fn(I) -> M + Send + Sync + Clone + 'static,
-        stage2: impl Fn(M) -> O + Send + Sync + Clone + 'static,
+        stage1: impl Fn(I) -> M + Send + Sync + 'static,
+        stage2: impl Fn(M) -> O + Send + Sync + 'static,
         mode: FenceMode,
         ordered: bool,
     ) -> Vec<O>
@@ -1006,8 +1006,8 @@ impl StreamPipeline {
     fn run_with_fence_ordered<I, M, O>(
         &self,
         items: Vec<I>,
-        stage1: impl Fn(I) -> M + Send + Sync + Clone + 'static,
-        stage2: impl Fn(M) -> O + Send + Sync + Clone + 'static,
+        stage1: impl Fn(I) -> M + Send + Sync + 'static,
+        stage2: impl Fn(M) -> O + Send + Sync + 'static,
         mode: FenceMode,
     ) -> Vec<O>
     where
@@ -1078,8 +1078,8 @@ impl StreamPipeline {
     fn run_with_fence_unordered<I, M, O>(
         &self,
         items: Vec<I>,
-        stage1: impl Fn(I) -> M + Send + Sync + Clone + 'static,
-        stage2: impl Fn(M) -> O + Send + Sync + Clone + 'static,
+        stage1: impl Fn(I) -> M + Send + Sync + 'static,
+        stage2: impl Fn(M) -> O + Send + Sync + 'static,
         mode: FenceMode,
     ) -> Vec<O>
     where
@@ -1141,8 +1141,8 @@ impl StreamPipeline {
     pub fn run_nested<I, O, N>(
         &self,
         items: Vec<I>,
-        outer_stage: impl Fn(I) -> Vec<N> + Send + Sync + Clone + 'static,
-        inner_stage: impl Fn(N) -> O + Send + Sync + Clone + 'static,
+        outer_stage: impl Fn(I) -> Vec<N> + Send + Sync + 'static,
+        inner_stage: impl Fn(N) -> O + Send + Sync + 'static,
         ordered: bool,
     ) -> Vec<O>
     where
@@ -1160,8 +1160,8 @@ impl StreamPipeline {
     fn run_nested_ordered<I, O, N>(
         &self,
         items: Vec<I>,
-        outer_stage: impl Fn(I) -> Vec<N> + Send + Sync + Clone + 'static,
-        inner_stage: impl Fn(N) -> O + Send + Sync + Clone + 'static,
+        outer_stage: impl Fn(I) -> Vec<N> + Send + Sync + 'static,
+        inner_stage: impl Fn(N) -> O + Send + Sync + 'static,
     ) -> Vec<O>
     where
         I: Send + 'static,
@@ -1235,8 +1235,8 @@ impl StreamPipeline {
     fn run_nested_unordered<I, O, N>(
         &self,
         items: Vec<I>,
-        outer_stage: impl Fn(I) -> Vec<N> + Send + Sync + Clone + 'static,
-        inner_stage: impl Fn(N) -> O + Send + Sync + Clone + 'static,
+        outer_stage: impl Fn(I) -> Vec<N> + Send + Sync + 'static,
+        inner_stage: impl Fn(N) -> O + Send + Sync + 'static,
     ) -> Vec<O>
     where
         I: Send + 'static,
