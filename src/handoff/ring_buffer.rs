@@ -7,10 +7,18 @@ use std::{
     },
 };
 
-#[repr(C, align(64))]
-struct CachePadded<T>(T);
+use crate::util::CachePadded;
 
 /// Lock-free single-producer single-consumer ring buffer (power-of-2 capacity).
+///
+/// # Soundness contract
+///
+/// Despite the `&self` API, this is **single-producer / single-consumer**.
+/// At most ONE thread may call `push`/`push_batch` and at most ONE (other)
+/// thread may call `pop`/`pop_batch` for the lifetime of the buffer. The
+/// [`Send`] + [`Sync`] impls only assert that *items* can cross threads; they
+/// do not license multi-producer or multi-consumer access. Violating the SPSC
+/// contract is undefined behavior (data race on the underlying slots).
 pub struct RingBuffer<T> {
     buffer: Box<[UnsafeCell<MaybeUninit<T>>]>,
     cap: usize,

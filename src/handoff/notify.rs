@@ -4,9 +4,7 @@ use std::sync::{
 };
 
 use crate::sync::sys::{Condvar, Mutex};
-
-#[repr(C, align(64))]
-struct CachePadded<T>(T);
+use crate::util::CachePadded;
 
 pub struct EventCount {
     state: CachePadded<AtomicUsize>,
