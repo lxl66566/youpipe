@@ -134,8 +134,8 @@ mod tests {
             run_sync_stage(&|x: i32| x * 2, &in_rx, &out_tx, &pool, 4);
         });
 
-        for i in 0..100 {
-            in_tx.send((i as u64, i)).unwrap();
+        for i in 0u64..100 {
+            in_tx.send((i, i32::try_from(i).unwrap())).unwrap();
         }
         drop(in_tx);
 
@@ -156,8 +156,8 @@ mod tests {
             run_sync_stage(&|x: i32| x * 2, &in_rx, &out_tx, &pool, 4);
         });
 
-        for i in 0..100 {
-            in_tx.send((i as u64, i)).unwrap();
+        for i in 0u64..100 {
+            in_tx.send((i, i32::try_from(i).unwrap())).unwrap();
         }
         drop(in_tx);
 

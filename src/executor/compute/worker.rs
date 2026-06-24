@@ -162,7 +162,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<i32>();
         let pool_ref = pool.clone();
         pool.submit(move || {
-            let sum = recursive_sum(pool_ref, 0, 64);
+            let sum = recursive_sum(&pool_ref, 0, 64);
             tx.send(sum).unwrap();
         });
         let result = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
@@ -170,16 +170,14 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    fn recursive_sum(pool: Arc<ComputePool>, start: i32, end: i32) -> i32 {
+    fn recursive_sum(pool: &Arc<ComputePool>, start: i32, end: i32) -> i32 {
         if end - start <= 8 {
             return (start..end).sum();
         }
         let mid = start + (end - start) / 2;
-        let p1 = pool.clone();
-        let p2 = pool.clone();
         let (left, right) = pool.join(
-            move || recursive_sum(p1, start, mid),
-            move || recursive_sum(p2, mid, end),
+            move || recursive_sum(pool, start, mid),
+            move || recursive_sum(pool, mid, end),
         );
         left + right
     }
