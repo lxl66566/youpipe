@@ -6,7 +6,7 @@
 
 - **编译时融合** — `.map().filter().map()` 编译为每个 worker 的单次闭包调用，零中间分配
 - **负载提示** — `Workload::Balanced`（零原子操作）或 `Workload::Unbalanced`（自适应 fetch-add）
-- **工作窃取线程池** — 基于 `crossbeam-deque` 的无锁调度，EventCount 唤醒
+- **工作窃取线程池** — 基于 `st3` 的无锁 LIFO deque 调度，EventCount 唤醒
 - **流式管道** — 多阶段通道管道，支持有序/无序输出
 - **可失败并行** — `try_par_map` 首次错误即终止
 - **取消支持** — `CancellationToken` 协作式 StreamPipeline 关闭

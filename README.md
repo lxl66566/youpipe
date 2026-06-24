@@ -6,7 +6,7 @@ High-performance Rust concurrent pipeline batch processing framework with compil
 
 - **Compile-Time Fusion** — `.map().filter().map()` compiles to a single closure per worker, zero intermediate allocations
 - **Workload Hints** — `Workload::Balanced` (zero-atomics) or `Workload::Unbalanced` (adaptive fetch-add)
-- **Work-Stealing Pool** — Lock-free `crossbeam-deque` scheduler with EventCount wake-up
+- **Work-Stealing Pool** — Lock-free `st3` LIFO deque scheduler with EventCount wake-up
 - **Streaming Pipelines** — Multi-stage channel pipelines with ordered/unordered output
 - **Fallible Parallelism** — `try_par_map` with early termination on first error
 - **Cancellation** — `CancellationToken` for cooperative StreamPipeline shutdown

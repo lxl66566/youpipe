@@ -43,7 +43,7 @@ src/
 │   ├── config.rs     # PipelineConfig, Workload 枚举
 │   └── typed.rs      # Pipeline<S,T>, par_map(), StreamPipeline, FusedStage, ConsumedBuffer
 ├── executor/
-│   ├── compute/      # 基于 crossbeam-deque 的工作窃取 CPU 线程池
+│   ├── compute/      # 基于 st3 的工作窃取 CPU 线程池
 │   │   ├── mod.rs    # ComputePool 单元测试
 │   │   └── worker.rs # ComputePool 实现：Injector/Stealer/EventCount 唤醒/优雅关闭/join
 │   ├── async_pool/   # Tokio 异步任务池（feature-gated）
@@ -67,7 +67,6 @@ src/
 │   └── mod.rs
 ├── sync/             # 同步原语
 │   ├── cancel.rs     # CancellationToken（Arc<AtomicBool>）
-│   ├── sys.rs        # cfg(miri) 抽象：生产用 parking_lot，Miri 用 std::sync
 │   └── mod.rs
 ├── runtime/          # 异步运行时抽象
 │   ├── traits.rs     # Runtime trait（spawn / spawn_blocking / block_on）
@@ -206,8 +205,8 @@ Worker₂ ←→ Stealer₂
 Worker₃ ←→ Stealer₃
 ```
 
-- 基于 `crossbeam-deque`：每个 worker 有本地 FIFO deque，其他 worker 通过 `Stealer` 窃取
-- 全局 `Injector` 接收外部提交的任务
+- 基于 `st3`（有界无锁 LIFO deque）：每个 worker 有本地 LIFO deque（FIFO 窃取），其他 worker 通过 `Stealer` 窃取
+- 全局 injector（mutex 保护的 `VecDeque`）接收外部提交的任务及本地队列溢出
 - `EventCount`（条件变量）唤醒空闲 worker
 
 ### 任务提交流程
@@ -263,7 +262,7 @@ Lock-free SPSC 环形缓冲区，特性：
 
 - `notify()` / `notify_one()` → 递增 state + Condvar 唤醒
 - `wait()` → 记住当前 state key，Condvar 等待直到 key 变化
-- `cfg(miri)` 分支使用 `std::sync` 而非 `parking_lot`
+- 直接使用 `parking_lot::{Condvar, Mutex}`（`cfg(miri)` 锁切换位于 `pool/sys`，供 injector 使用）
 
 ### 5.4 WaitGroup (`notify.rs`)
 
@@ -301,14 +300,14 @@ Fence 让调用者通过 `FenceMode` 决定两个相邻 stage 的隔离强度：
 
 ## 8. Miri 兼容性
 
-`sync::sys` 模块通过 `cfg(miri)` 提供统一 API：
+`pool/sys` 模块通过 `cfg(miri)` 提供统一的 `Mutex` API：
 
-| 环境 | Mutex | Condvar |
-|------|-------|---------|
-| 生产 | `parking_lot::Mutex` | `parking_lot::Condvar` |
-| Miri | `std::sync::Mutex`（`Option<MutexGuard>` 包装） | `std::sync::Condvar` |
+| 环境 | injector 锁 |
+|------|------------|
+| 生产 | `parking_lot::Mutex`（零成本 re-export —— 更公平、无 poisoning） |
+| Miri | `std::sync::Mutex`（newtype 包装，暴露相同的无失败 `lock()`） |
 
-`parking_lot` 使用 Windows FFI（`GetModuleHandleA`），Miri 无法处理。统一 API 使两种实现对调用方透明。
+`parking_lot_core` 通过 `GetModuleHandleA` 解析 `WaitOnAddress`，这是 Miri 无法模拟的 Windows 外部函数；而 std 的 mutex/condvar 原生支持。统一 API 让调用方只需写一次 `mutex.lock()`，对后端切换无感。
 
 ---
 

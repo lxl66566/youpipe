@@ -6,7 +6,8 @@
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::Arc;
+use crate::sync::sys::{Condvar, Mutex};
 
 use super::registry::Registry;
 
@@ -175,17 +176,17 @@ impl LockLatch {
 
     /// Block until latch is set, then reset so it can be reused.
     pub(crate) fn wait_and_reset(&self) {
-        let mut guard = self.m.lock().unwrap();
+        let mut guard = self.m.lock();
         while !*guard {
-            guard = self.v.wait(guard).unwrap();
+            self.v.wait(&mut guard);
         }
         *guard = false;
     }
 
     pub(crate) fn wait(&self) {
-        let mut guard = self.m.lock().unwrap();
+        let mut guard = self.m.lock();
         while !*guard {
-            guard = self.v.wait(guard).unwrap();
+            self.v.wait(&mut guard);
         }
     }
 }
@@ -194,7 +195,7 @@ impl Latch for LockLatch {
     #[inline]
     unsafe fn set(this: *const Self) {
         unsafe {
-            let mut guard = (*this).m.lock().unwrap();
+            let mut guard = (*this).m.lock();
             *guard = true;
             (*this).v.notify_all();
         }

@@ -122,11 +122,10 @@ pub fn feed_items<T: Send + 'static>(items: Vec<T>, tx: &Sender<(u64, T)>) {
 mod tests {
     use super::*;
     use crate::handoff::channel::channel;
-    use crate::util::miri_pool_size;
 
     #[test]
     fn test_sync_stage_unordered() {
-        let pool = Arc::new(ComputePool::new(miri_pool_size(4)));
+        let pool = Arc::new(ComputePool::new(4));
         let (in_tx, in_rx) = channel::<(u64, i32)>(256);
         let (out_tx, out_rx) = channel::<(u64, i32)>(256);
 
@@ -148,7 +147,7 @@ mod tests {
 
     #[test]
     fn test_sync_stage_ordered() {
-        let pool = Arc::new(ComputePool::new(miri_pool_size(4)));
+        let pool = Arc::new(ComputePool::new(4));
         let (in_tx, in_rx) = channel::<(u64, i32)>(256);
         let (out_tx, out_rx) = channel::<(u64, i32)>(256);
 

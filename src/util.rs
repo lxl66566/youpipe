@@ -35,25 +35,6 @@ pub(crate) fn split_chunks<T>(items: Vec<T>, num_chunks: usize) -> Vec<Vec<T>> {
     chunks
 }
 
-/// Pool-size helper for tests that build an explicit `ComputePool`.
-///
-/// `crossbeam-epoch` 0.9.x (pulled in transitively by `crossbeam-deque`) is
-/// incompatible with Miri's Stacked Borrows: its intrusive `Local` list
-/// reborrows pointers that were allocated by *other* threads inside
-/// `element_of`, which Miri rightly rejects as UB. This is purely an upstream
-/// limitation — a standalone program using only `crossbeam-deque` reproduces
-/// the identical violation, so it is not something this crate can fix.
-///
-/// The UB is only reached when the pool has more than one worker and actually
-/// performs cross-thread `Stealer::steal` (which triggers epoch GC). Under Miri
-/// we therefore collapse to a single worker. That still exercises our own
-/// job/latch/join/registry unsafe code — and `WorkerThread::steal` early-exits
-/// when `num_threads <= 1`, so the offending epoch-GC path is never taken.
-#[cfg(test)]
-pub(crate) fn miri_pool_size(n: usize) -> usize {
-    if cfg!(miri) { 1 } else { n }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

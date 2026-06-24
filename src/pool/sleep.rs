@@ -3,7 +3,7 @@
 //! Mutex/Condvar in the hot path. Adapted from rayon-core (RFC #5).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use crate::sync::sys::{Condvar, Mutex};
 use std::thread;
 
 use super::latch::CoreLatch;
@@ -262,7 +262,7 @@ impl Sleep {
         }
 
         let sleep_state = &self.worker_sleep_states[worker_index];
-        let mut is_blocked = sleep_state.is_blocked.lock().unwrap();
+        let mut is_blocked = sleep_state.is_blocked.lock();
 
         if !latch.fall_asleep() {
             idle.wake_fully();
@@ -291,7 +291,7 @@ impl Sleep {
         } else {
             *is_blocked = true;
             while *is_blocked {
-                is_blocked = sleep_state.condvar.wait(is_blocked).unwrap();
+                sleep_state.condvar.wait(&mut is_blocked);
             }
         }
 
@@ -355,7 +355,7 @@ impl Sleep {
 
     fn wake_specific_thread(&self, index: usize) -> bool {
         let sleep_state = &self.worker_sleep_states[index];
-        let mut is_blocked = sleep_state.is_blocked.lock().unwrap();
+        let mut is_blocked = sleep_state.is_blocked.lock();
         if *is_blocked {
             *is_blocked = false;
             sleep_state.condvar.notify_one();

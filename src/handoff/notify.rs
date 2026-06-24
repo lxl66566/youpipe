@@ -2,11 +2,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-#[cfg(miri)]
-use std::sync::{Condvar, Mutex};
-
-#[cfg(not(miri))]
-use parking_lot::{Condvar, Mutex};
+use crate::sync::sys::{Condvar, Mutex};
 
 #[repr(C, align(64))]
 struct CachePadded<T>(T);
@@ -29,30 +25,14 @@ impl EventCount {
 
     pub fn notify(&self) {
         self.state.0.fetch_add(1, Ordering::Release);
-        #[cfg(not(miri))]
-        {
-            let _guard = self.lock.lock();
-            self.cvar.notify_all();
-        }
-        #[cfg(miri)]
-        {
-            let _guard = self.lock.lock().unwrap();
-            self.cvar.notify_all();
-        }
+        let _guard = self.lock.lock();
+        self.cvar.notify_all();
     }
 
     pub fn notify_one(&self) {
         self.state.0.fetch_add(1, Ordering::Release);
-        #[cfg(not(miri))]
-        {
-            let _guard = self.lock.lock();
-            self.cvar.notify_one();
-        }
-        #[cfg(miri)]
-        {
-            let _guard = self.lock.lock().unwrap();
-            self.cvar.notify_one();
-        }
+        let _guard = self.lock.lock();
+        self.cvar.notify_one();
     }
 
     pub fn wait(&self) {
@@ -66,53 +46,24 @@ impl EventCount {
     }
 
     fn wait_impl(&self, expected_key: usize) {
-        #[cfg(not(miri))]
-        {
-            let mut guard = self.lock.lock();
-            while self.state.0.load(Ordering::Acquire) == expected_key {
-                self.cvar.wait(&mut guard);
-            }
-        }
-        #[cfg(miri)]
-        {
-            let mut guard = self.lock.lock().unwrap();
-            while self.state.0.load(Ordering::Acquire) == expected_key {
-                guard = self.cvar.wait(guard).unwrap();
-            }
+        let mut guard = self.lock.lock();
+        while self.state.0.load(Ordering::Acquire) == expected_key {
+            self.cvar.wait(&mut guard);
         }
     }
 
     fn wait_timeout_impl(&self, expected_key: usize, timeout: std::time::Duration) -> bool {
-        #[cfg(not(miri))]
-        {
-            let mut guard = self.lock.lock();
-            let start = std::time::Instant::now();
-            loop {
-                if self.state.0.load(Ordering::Acquire) != expected_key {
-                    return true;
-                }
-                let remaining = timeout.saturating_sub(start.elapsed());
-                if remaining.is_zero() {
-                    return self.state.0.load(Ordering::Acquire) != expected_key;
-                }
-                self.cvar.wait_for(&mut guard, remaining);
+        let mut guard = self.lock.lock();
+        let start = std::time::Instant::now();
+        loop {
+            if self.state.0.load(Ordering::Acquire) != expected_key {
+                return true;
             }
-        }
-        #[cfg(miri)]
-        {
-            let mut guard = self.lock.lock().unwrap();
-            let start = std::time::Instant::now();
-            loop {
-                if self.state.0.load(Ordering::Acquire) != expected_key {
-                    return true;
-                }
-                let remaining = timeout.saturating_sub(start.elapsed());
-                if remaining.is_zero() {
-                    return self.state.0.load(Ordering::Acquire) != expected_key;
-                }
-                let result = self.cvar.wait_timeout(guard, remaining).unwrap();
-                guard = result.0;
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return self.state.0.load(Ordering::Acquire) != expected_key;
             }
+            self.cvar.wait_for(&mut guard, remaining);
         }
     }
 }
@@ -185,33 +136,15 @@ impl WaitGroup {
     pub fn done(&self) {
         let prev = self.count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            #[cfg(not(miri))]
-            {
-                let _guard = self.lock.lock();
-                self.cvar.notify_all();
-            }
-            #[cfg(miri)]
-            {
-                let _guard = self.lock.lock().unwrap();
-                self.cvar.notify_all();
-            }
+            let _guard = self.lock.lock();
+            self.cvar.notify_all();
         }
     }
 
     pub fn wait(&self) {
-        #[cfg(not(miri))]
-        {
-            let mut guard = self.lock.lock();
-            while self.count.load(Ordering::Acquire) > 0 {
-                self.cvar.wait(&mut guard);
-            }
-        }
-        #[cfg(miri)]
-        {
-            let mut guard = self.lock.lock().unwrap();
-            while self.count.load(Ordering::Acquire) > 0 {
-                guard = self.cvar.wait(guard).unwrap();
-            }
+        let mut guard = self.lock.lock();
+        while self.count.load(Ordering::Acquire) > 0 {
+            self.cvar.wait(&mut guard);
         }
     }
 }

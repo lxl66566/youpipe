@@ -1,5 +1,7 @@
 use std::{marker::PhantomData, sync::Arc};
 
+use crate::sync::sys::Mutex;
+
 use crate::util::split_chunks;
 
 /// Opens a scoped execution context for non-`'static` closures.
@@ -33,7 +35,7 @@ impl<'env> PipelineScope<'env> {
     }
 }
 
-type SlotCollector<T> = Arc<Vec<std::sync::Mutex<Vec<T>>>>;
+type SlotCollector<T> = Arc<Vec<Mutex<Vec<T>>>>;
 
 /// A pipeline that can borrow non-`'static` data from the enclosing scope.
 pub struct ScopedPipeline<'env, T: Send + 'static> {
@@ -82,7 +84,7 @@ impl<'env, T: Send + 'static> ScopedPipeline<'env, T> {
 
         let slots: SlotCollector<O> = Arc::new(
             (0..num_chunks)
-                .map(|_| std::sync::Mutex::new(Vec::new()))
+                .map(|_| Mutex::new(Vec::new()))
                 .collect(),
         );
 
@@ -92,7 +94,7 @@ impl<'env, T: Send + 'static> ScopedPipeline<'env, T> {
             let slots = slots.clone();
             runners.push(Box::new(move || {
                 let mapped: Vec<O> = chunk.into_iter().map(f).collect();
-                *slots[idx].lock().unwrap() = mapped;
+                *slots[idx].lock() = mapped;
             }));
         }
 
@@ -120,7 +122,7 @@ impl<'env, T: Send + 'static> ScopedPipeline<'env, T> {
         if let Some((slots, num_chunks)) = self.result_collector {
             let mut result = Vec::new();
             for i in 0..num_chunks {
-                result.extend(std::mem::take(&mut *slots[i].lock().unwrap()));
+                result.extend(std::mem::take(&mut *slots[i].lock()));
             }
             return result;
         }

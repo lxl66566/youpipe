@@ -128,13 +128,12 @@ fn test_stream_with_fence_full_barrier() {
 ///
 /// Skipped under Miri: the regression requires the stage-1 and stage-2 pool
 /// jobs to run *concurrently* (the design keeps total blocking jobs ≤ pool
-/// size). Under Miri the global pool is pinned to a single worker to avoid the
-/// upstream `crossbeam-epoch` Stacked-Borrows UB (see `util::miri_pool_size`),
-/// so two concurrent stage jobs can't both be scheduled and the pipeline
-/// deadlocks once input exceeds the buffer. Raising the pool to 2 workers
-/// would re-trigger that UB, so this backpressure path is untestable under
-/// Miri. The fence code paths themselves are still exercised here by the
-/// smaller-input `test_stream_with_fence*` tests.
+/// size), i.e. a global pool of at least 2 workers. Miri reports
+/// `available_parallelism() == 1`, so the global pool (`PipelineConfig`'s
+/// default) has a single worker and the two stage jobs can't both be scheduled
+/// — the pipeline then deadlocks once input exceeds the buffer. This is a
+/// test-environment constraint, not a code defect. The fence code paths are
+/// still exercised here by the smaller-input `test_stream_with_fence*` tests.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn test_stream_fence_large_input_no_deadlock() {

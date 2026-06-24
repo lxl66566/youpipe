@@ -3,6 +3,7 @@
 //! cross-registry, no custom spawn).
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hasher};
 use std::mem;
 use std::ptr;
@@ -10,19 +11,33 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
-use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use st3::lifo::{Stealer, Worker};
+use st3::StealError;
 
 use super::job::{HeapJob, JobRef, StackJob};
 use super::latch::{AsCoreLatch, CoreLatch, Latch, LatchRef, LockLatch, OnceLatch};
 use super::sleep::Sleep;
+use crate::sync::sys::Mutex;
 use super::unwind;
+
+/// Capacity of each worker's local (LIFO) deque. Rounded up to a power of two
+/// by `st3`. When the local queue saturates, overflow spills into the global
+/// injector — the same design used by the tokio scheduler, which keeps the hot
+/// local queue bounded and cache-friendly.
+const LOCAL_DEQUE_CAPACITY: usize = 256;
 
 // ── Registry ──
 
 pub(crate) struct Registry {
     thread_infos: Vec<ThreadInfo>,
     sleep: Sleep,
-    injected_jobs: Injector<JobRef>,
+    /// Global injector queue for jobs coming from outside the pool or
+    /// overflowing a worker's local deque. This is a cold path (external
+    /// submissions and local-queue overflow), so a plain mutex-protected
+    /// unbounded deque is both simplest and fast enough — mirroring what the
+    /// tokio scheduler does for its own inject queue. The mutex itself comes
+    /// from [`super::sys`]: `parking_lot` in production, `std::sync` under Miri.
+    injected_jobs: Mutex<VecDeque<JobRef>>,
 
     // When this reaches 0, all work on this registry must be complete. The
     // global pool has a ref that never gets released; a user-created pool
@@ -58,7 +73,7 @@ impl Registry {
 
         let (workers, stealers): (Vec<_>, Vec<_>) = (0..num_threads)
             .map(|_| {
-                let worker = Worker::new_lifo();
+                let worker = Worker::<JobRef>::new(LOCAL_DEQUE_CAPACITY);
                 let stealer = worker.stealer();
                 (worker, stealer)
             })
@@ -67,7 +82,7 @@ impl Registry {
         let registry = Arc::new(Registry {
             thread_infos: stealers.into_iter().map(ThreadInfo::new).collect(),
             sleep: Sleep::new(num_threads),
-            injected_jobs: Injector::new(),
+            injected_jobs: Mutex::new(VecDeque::new()),
             terminate_count: AtomicUsize::new(1),
         });
 
@@ -109,36 +124,38 @@ impl Registry {
 
     /// Inject a job from outside the pool.
     pub(crate) fn inject(&self, job_ref: JobRef) {
-        let queue_was_empty = self.injected_jobs.is_empty();
-        self.injected_jobs.push(job_ref);
+        let queue_was_empty = {
+            let mut queue = self.injected_jobs.lock();
+            let was_empty = queue.is_empty();
+            queue.push_back(job_ref);
+            was_empty
+        };
         self.sleep.new_injected_jobs(1, queue_was_empty);
     }
 
     /// Inject multiple jobs from outside the pool, notifying sleepers once.
     pub(crate) fn inject_batch(&self, job_refs: impl ExactSizeIterator<Item = JobRef>) {
-        let queue_was_empty = self.injected_jobs.is_empty();
-        let mut count = 0u32;
-        for job_ref in job_refs {
-            self.injected_jobs.push(job_ref);
-            count += 1;
-        }
+        let (count, queue_was_empty) = {
+            let mut queue = self.injected_jobs.lock();
+            let was_empty = queue.is_empty();
+            let mut count = 0u32;
+            for job_ref in job_refs {
+                queue.push_back(job_ref);
+                count += 1;
+            }
+            (count, was_empty)
+        };
         if count > 0 {
             self.sleep.new_injected_jobs(count, queue_was_empty);
         }
     }
 
     fn has_injected_job(&self) -> bool {
-        !self.injected_jobs.is_empty()
+        !self.injected_jobs.lock().is_empty()
     }
 
     fn pop_injected_job(&self) -> Option<JobRef> {
-        loop {
-            match self.injected_jobs.steal() {
-                Steal::Success(job) => return Some(job),
-                Steal::Empty => return None,
-                Steal::Retry => std::hint::spin_loop(),
-            }
-        }
+        self.injected_jobs.lock().pop_front()
     }
 
     // ── Worker coordination ──
@@ -303,8 +320,15 @@ impl WorkerThread {
     #[inline]
     pub(crate) unsafe fn push(&self, job: JobRef) {
         let queue_was_empty = self.worker.is_empty();
-        self.worker.push(job);
-        self.registry.sleep.new_internal_jobs(1, queue_was_empty);
+        match self.worker.push(job) {
+            Ok(()) => {
+                self.registry.sleep.new_internal_jobs(1, queue_was_empty);
+            }
+            // Local deque is full (256 slots): spill into the global injector.
+            // This is the tokio overflow strategy — keeps the local queue
+            // bounded and cache-friendly without dropping work.
+            Err(overflow) => self.registry.inject(overflow),
+        }
     }
 
     #[inline]
@@ -396,7 +420,7 @@ impl WorkerThread {
     /// Steal a single job from another worker. Only called when the local
     /// deque is empty.
     fn steal(&self) -> Option<JobRef> {
-        let thread_infos = &self.registry.thread_infos.as_slice();
+        let thread_infos = self.registry.thread_infos.as_slice();
         let num_threads = thread_infos.len();
         if num_threads <= 1 {
             return None;
@@ -410,10 +434,12 @@ impl WorkerThread {
                 .filter(|&i| i != self.index)
                 .find_map(|victim_index| {
                     let victim = &thread_infos[victim_index];
-                    match victim.stealer.steal() {
-                        Steal::Success(job) => Some(job),
-                        Steal::Empty => None,
-                        Steal::Retry => {
+                    // `steal_and_pop` with a budget of 1 returns the stolen job
+                    // directly without pushing anything into our own deque.
+                    match victim.stealer.steal_and_pop(&self.worker, |_| 1) {
+                        Ok((job, _)) => Some(job),
+                        Err(StealError::Empty) => None,
+                        Err(StealError::Busy) => {
                             retry = true;
                             None
                         }

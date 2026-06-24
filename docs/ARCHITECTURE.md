@@ -43,7 +43,7 @@ src/
 │   ├── config.rs     # PipelineConfig, Workload enum
 │   └── typed.rs      # Pipeline<S,T>, par_map(), StreamPipeline, FusedStage, ConsumedBuffer
 ├── executor/
-│   ├── compute/      # crossbeam-deque work-stealing CPU thread pool
+│   ├── compute/      # st3 work-stealing CPU thread pool
 │   │   ├── mod.rs    # ComputePool unit tests
 │   │   └── worker.rs # ComputePool: Injector/Stealer/EventCount wake/graceful shutdown/join
 │   ├── async_pool/   # Tokio async task pool (feature-gated)
@@ -67,7 +67,6 @@ src/
 │   └── mod.rs
 ├── sync/             # Synchronization primitives
 │   ├── cancel.rs     # CancellationToken (Arc<AtomicBool>)
-│   ├── sys.rs        # cfg(miri) abstraction: parking_lot in prod, std::sync under Miri
 │   └── mod.rs
 ├── runtime/          # Async runtime abstraction
 │   ├── traits.rs     # Runtime trait (spawn / spawn_blocking / block_on)
@@ -206,8 +205,8 @@ Worker₂ ←→ Stealer₂
 Worker₃ ←→ Stealer₃
 ```
 
-- Built on `crossbeam-deque`: each worker has a local FIFO deque, other workers steal via `Stealer`
-- Global `Injector` accepts externally submitted tasks
+- Built on `st3` (bounded lock-free LIFO deque): each worker has a local LIFO deque (FIFO stealing); other workers steal via `Stealer`
+- Global injector (mutex-protected `VecDeque`) accepts externally submitted tasks and local-queue overflow
 - `EventCount` (condvar) wakes idle workers
 
 ### Task Submission Flow
@@ -263,7 +262,7 @@ Condvar wrapper for ComputePool worker wake-up:
 
 - `notify()` / `notify_one()` → increment state + condvar wake
 - `wait()` → remember current state key, condvar wait until key changes
-- `cfg(miri)` branch uses `std::sync` instead of `parking_lot`
+- Uses `parking_lot::{Condvar, Mutex}` directly (the `cfg(miri)` mutex switch lives in `pool/sys`, used by the injector)
 
 ### 5.4 WaitGroup (`notify.rs`)
 
@@ -301,14 +300,14 @@ Stage completion is signalled purely by channel disconnect (all sender clones dr
 
 ## 8. Miri Compatibility
 
-The `sync::sys` module provides a unified API via `cfg(miri)`:
+The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
-| Environment | Mutex | Condvar |
-|---|---|---|
-| Production | `parking_lot::Mutex` | `parking_lot::Condvar` |
-| Miri | `std::sync::Mutex` (wrapped with `Option<MutexGuard>`) | `std::sync::Condvar` |
+| Environment | Injector mutex |
+|---|---|
+| Production | `parking_lot::Mutex` (zero-cost re-export — fairer, no poisoning) |
+| Miri | `std::sync::Mutex` wrapped in a newtype exposing the same infallible `lock()` |
 
-`parking_lot` uses Windows FFI (`GetModuleHandleA`) that Miri cannot handle. The unified API makes both implementations transparent to callers.
+`parking_lot_core` resolves `WaitOnAddress` through `GetModuleHandleA`, a Windows foreign function Miri cannot emulate, whereas the std mutex/condvar are natively supported. The unified API lets callers write `mutex.lock()` once and stay transparent to which backend is active.
 
 ---
 

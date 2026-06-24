@@ -16,9 +16,9 @@ default       = ["tokio-runtime"]
 tokio-runtime = ["tokio"]
 
 [dependencies]
-crossbeam-deque = "0.8"
-crossfire       = "3.1"
-parking_lot     = "0.12"
+crossfire   = "3.1"
+parking_lot = "0.12"
+st3         = "0.4"
 tokio           = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
 
 [dev-dependencies]
