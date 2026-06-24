@@ -41,6 +41,23 @@ mod shim {
         }
     }
 
+    impl<T: Default + Send> Default for Mutex<T> {
+        #[inline]
+        fn default() -> Self {
+            Self::new(T::default())
+        }
+    }
+
+    impl<T> std::fmt::Debug for Mutex<T>
+    where
+        s::Mutex<T>: std::fmt::Debug,
+    {
+        #[inline]
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Debug::fmt(&self.0, f)
+        }
+    }
+
     impl<T: ?Sized> std::ops::Deref for MutexGuard<'_, T> {
         type Target = T;
         #[inline]
@@ -56,30 +73,71 @@ mod shim {
         }
     }
 
+    impl Default for Condvar {
+        #[inline]
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl std::fmt::Debug for Condvar {
+        #[inline]
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Debug::fmt(&self.0, f)
+        }
+    }
+
     impl Condvar {
         #[inline]
         pub(crate) fn new() -> Self {
             Self(s::Condvar::new())
         }
 
+        /// Park the current thread until notified.
+        ///
+        /// Matches the `parking_lot::Condvar::wait(&self, &mut MutexGuard)`
+        /// signature even though `std::sync::Condvar::wait` consumes the
+        /// guard and returns it. We move the inner std guard out via
+        /// `ptr::read`, hand it to std by value, then write the returned
+        /// guard back through the same reference.
+        ///
+        /// # Safety of the move
+        ///
+        /// Between the `ptr::read` and `ptr::write`, `guard.0` is logically
+        /// uninitialized but we never observe it. `std::Condvar::wait` only
+        /// returns `Err` on poison (which we unwrap back into a usable
+        /// guard), so a panic here would leak the original guard rather than
+        /// double-free — acceptable for the test-only Miri path.
         #[inline]
         pub(crate) fn wait<'a, T>(&self, guard: &mut MutexGuard<'a, T>) {
-            let _ = self.0.wait(&mut guard.0).unwrap_or_else(|e| e.into_inner());
+            // SAFETY: see method-level comment.
+            let taken = unsafe { std::ptr::read(&guard.0) };
+            let returned = self.0.wait(taken).unwrap_or_else(|e| e.into_inner());
+            // SAFETY: see method-level comment.
+            unsafe { std::ptr::write(&mut guard.0, returned) };
         }
 
+        /// Park the current thread until notified or `timeout` elapses.
+        /// Returns `true` if notified before the timeout, `false` otherwise.
+        /// See [`Self::wait`] for the move-dance rationale.
         #[inline]
         pub(crate) fn wait_for<'a, T>(
             &self,
             guard: &mut MutexGuard<'a, T>,
             timeout: Duration,
         ) -> bool {
-            match self.0.wait_timeout(&mut guard.0, timeout) {
-                Ok((_, result)) => !result.timed_out(),
+            // SAFETY: see `wait` method-level comment.
+            let taken = unsafe { std::ptr::read(&guard.0) };
+            let (returned, result) = match self.0.wait_timeout(taken, timeout) {
+                Ok((g, r)) => (g, r),
                 Err(e) => {
-                    let (_, result) = e.into_inner();
-                    !result.timed_out()
+                    let (g, r) = e.into_inner();
+                    (g, r)
                 }
-            }
+            };
+            // SAFETY: see `wait` method-level comment.
+            unsafe { std::ptr::write(&mut guard.0, returned) };
+            !result.timed_out()
         }
 
         #[inline]
