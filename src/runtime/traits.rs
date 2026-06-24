@@ -1,6 +1,6 @@
 use std::{future::Future, pin::Pin};
 
-type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pub trait Runtime: Send + Sync + 'static {
     fn spawn<F>(&self, future: F)

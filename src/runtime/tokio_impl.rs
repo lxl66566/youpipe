@@ -1,8 +1,6 @@
-use std::{future::Future, pin::Pin};
+use std::future::Future;
 
-use super::traits::Runtime;
-
-type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+use super::traits::{BoxFuture, Runtime};
 
 pub struct TokioRuntime {
     runtime: tokio::runtime::Runtime,
