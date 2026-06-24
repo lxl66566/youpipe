@@ -1,0 +1,16 @@
+# Miri configuration.
+#
+# The global compute pool (`ComputePool::global()`, held in a `OnceLock`)
+# deliberately keeps its worker threads alive for the entire process lifetime
+# — exactly like rayon's global pool — so they can be reused across pipeline
+# runs. Under Miri this surfaces as
+#   "the main thread terminated without waiting for all remaining threads"
+# because those daemon-like workers are still parked when the test binary's
+# main thread exits. The threads are intentionally leaked, not a bug, so we
+# disable Miri's strict leak check. Per-test `ComputePool`s are dropped and
+# joined cleanly via `Registry::drop`, so this only affects the by-design
+# global pool.
+#
+# `force = false` (the default) keeps any caller-supplied `MIRIFLAGS`.
+[env]
+MIRIFLAGS = { value = "-Zmiri-ignore-leaks", force = false }

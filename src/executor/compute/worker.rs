@@ -92,10 +92,11 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+    use crate::util::miri_pool_size;
 
     #[test]
     fn test_pool_basic() {
-        let pool = ComputePool::new(2);
+        let pool = ComputePool::new(miri_pool_size(2));
         let (tx, rx) = mpsc::channel();
         pool.submit(move || {
             tx.send(42i32).unwrap();
@@ -108,7 +109,7 @@ mod tests {
 
     #[test]
     fn test_pool_multiple() {
-        let pool = Arc::new(ComputePool::new(4));
+        let pool = Arc::new(ComputePool::new(miri_pool_size(4)));
         let (tx, rx) = mpsc::channel();
         for i in 0..10 {
             let tx = tx.clone();
@@ -124,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_pool_work_stealing() {
-        let pool = Arc::new(ComputePool::new(4));
+        let pool = Arc::new(ComputePool::new(miri_pool_size(4)));
         let (tx, rx) = mpsc::channel();
         let total = 1000;
         for i in 0..total {
@@ -145,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_join_basic() {
-        let pool = Arc::new(ComputePool::new(4));
+        let pool = Arc::new(ComputePool::new(miri_pool_size(4)));
         let (tx, rx) = mpsc::channel::<(i32, i32)>();
         let pool_ref = pool.clone();
         pool.submit(move || {
@@ -158,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_join_recursive() {
-        let pool = Arc::new(ComputePool::new(4));
+        let pool = Arc::new(ComputePool::new(miri_pool_size(4)));
         let (tx, rx) = mpsc::channel::<i32>();
         let pool_ref = pool.clone();
         pool.submit(move || {
@@ -186,7 +187,7 @@ mod tests {
 
     #[test]
     fn test_join_external_thread() {
-        let pool = ComputePool::new(4);
+        let pool = ComputePool::new(miri_pool_size(4));
         let (a, b) = pool.join(|| 10 + 20, || 30 + 40);
         assert_eq!(a, 30);
         assert_eq!(b, 70);

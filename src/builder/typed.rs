@@ -809,8 +809,11 @@ impl StreamPipeline {
         let s1 = Arc::new(stage1);
         let s2 = Arc::new(stage2);
         let wg = SharedWaitGroup::new();
-        let par1 = parallelism / 2;
-        let par2 = parallelism - par1;
+        // Floor each stage at one worker so a small `compute_workers` (e.g. 1
+        // under Miri, or a constrained pool) still runs both stages instead of
+        // silently starving one of them.
+        let par1 = (parallelism / 2).max(1);
+        let par2 = parallelism.saturating_sub(par1).max(1);
         wg.add(par1 + par2);
 
         for _ in 0..par1 {
@@ -891,8 +894,11 @@ impl StreamPipeline {
         let s1 = Arc::new(stage1);
         let s2 = Arc::new(stage2);
         let wg = SharedWaitGroup::new();
-        let par1 = parallelism / 2;
-        let par2 = parallelism - par1;
+        // Floor each stage at one worker so a small `compute_workers` (e.g. 1
+        // under Miri, or a constrained pool) still runs both stages instead of
+        // silently starving one of them.
+        let par1 = (parallelism / 2).max(1);
+        let par2 = parallelism.saturating_sub(par1).max(1);
         wg.add(par1 + par2);
 
         for _ in 0..par1 {
