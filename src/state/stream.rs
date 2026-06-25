@@ -1,7 +1,4 @@
-use crate::{
-    handoff::Receiver,
-    state::ReorderBuffer,
-};
+use crate::{handoff::Receiver, state::ReorderBuffer};
 
 /// Drain `input_rx` in input-order (sequence-tagged) fashion, returning the
 /// fully ordered result vector.

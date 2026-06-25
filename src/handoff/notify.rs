@@ -3,8 +3,10 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use crate::sync::sys::{Condvar, Mutex};
-use crate::util::CachePadded;
+use crate::{
+    sync::sys::{Condvar, Mutex},
+    util::CachePadded,
+};
 
 pub struct EventCount {
     state: CachePadded<AtomicUsize>,

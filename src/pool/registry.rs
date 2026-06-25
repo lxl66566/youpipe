@@ -271,9 +271,7 @@ static GLOBAL_REGISTRY: OnceLock<Arc<Registry>> = OnceLock::new();
 
 pub(crate) fn global_registry() -> &'static Arc<Registry> {
     GLOBAL_REGISTRY.get_or_init(|| {
-        let cpus = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(4);
+        let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         let registry = Registry::new(cpus);
         registry.wait_until_primed();
         registry
@@ -419,10 +417,17 @@ impl WorkerThread {
     }
 
     fn find_work(&self) -> Option<JobRef> {
-        // Preference: local deque → steal from others → injected jobs.
+        // Preference: local deque → injected jobs → steal from peers.
+        //
+        // Checking the global injector *before* peer-stealing matches rayon's
+        // order and matters for external-submit workloads (e.g. StreamPipeline,
+        // where every task arrives via `pool.submit` → `inject`): the injector
+        // pop is a single CAS-free dequeue, whereas `steal()` does a full
+        // randomized peer-scan whose coherence traffic is wasted when the work
+        // is actually sitting in the injector.
         self.take_local_job()
-            .or_else(|| self.steal())
             .or_else(|| self.registry.pop_injected_job())
+            .or_else(|| self.steal())
     }
 
     #[inline]

@@ -41,7 +41,8 @@ src/
 ├── builder/          # Strongly-typed Pipeline API + compile-time fusion + StreamPipeline
 │   ├── mod.rs        # Public re-exports
 │   ├── config.rs     # PipelineConfig, Workload enum
-│   └── typed.rs      # Pipeline<S,T>, par_map(), StreamPipeline, FusedStage, ConsumedBuffer
+│   └── typed.rs      # Pipeline<S,T>, par_map(), StreamPipeline, FusedStage,
+│                     # Slots<T> index-based parallel map core, RangeOp
 ├── executor/
 │   ├── compute/      # st3 work-stealing CPU thread pool
 │   │   ├── mod.rs    # ComputePool unit tests
@@ -49,7 +50,6 @@ src/
 │   ├── async_pool/   # Tokio async task pool (feature-gated)
 │   │   ├── mod.rs
 │   │   └── driver.rs # AsyncPool (tokio::runtime::Handle wrapper)
-│   ├── scheduler.rs  # SchedulerConfig
 │   └── mod.rs
 ├── handoff/          # Data transfer layer
 │   ├── channel.rs    # MPMC channels (crossfire wrapper: sync + async)
@@ -60,22 +60,28 @@ src/
 ├── state/            # Ordered output & streaming execution
 │   ├── reorder.rs    # ReorderBuffer<T> (min-heap for restoring ordered output)
 │   ├── fence.rs      # FenceBarrier<T> (configurable chunk_size barrier)
-│   ├── stream.rs     # StreamExecutor, run_sync_stage, run_ordered/unordered_collect, feed_items
+│   ├── stream.rs     # run_ordered_collect helper
 │   └── mod.rs
 ├── scope/            # Non-'static lifetime support
 │   ├── pipeline_scope.rs # scope(), PipelineScope, ScopedPipeline (std::thread::scope)
 │   └── mod.rs
 ├── sync/             # Synchronization primitives
 │   ├── cancel.rs     # CancellationToken (Arc<AtomicBool>)
+│   ├── sys.rs        # Miri-transparent Mutex/Condvar (parking_lot ↔ std)
 │   └── mod.rs
 ├── runtime/          # Async runtime abstraction
 │   ├── traits.rs     # Runtime trait (spawn / spawn_blocking / block_on)
 │   ├── tokio_impl.rs # TokioRuntime implementation
 │   └── mod.rs
-└── graph/            # Logical pipeline DAG representation (future use)
-    ├── node.rs
-    ├── edge.rs
-    └── mod.rs
+├── pool/             # Rayon-style work-stealing scheduler core
+│   ├── registry.rs   # Registry, WorkerThread, find_work, steal
+│   ├── sleep.rs      # AtomicCounters sleep/wake governance
+│   ├── latch.rs      # CoreLatch / SpinLatch / LockLatch / CountLatch
+│   ├── job.rs        # JobRef (type-erased), StackJob, HeapJob
+│   ├── join.rs       # fork-join
+│   ├── unwind.rs     # AbortIfPanic, halt/resume_unwinding
+│   └── mod.rs
+└── util.rs           # CachePadded<T>
 ```
 
 ---
@@ -86,26 +92,45 @@ src/
 
 ```rust
 pub enum Workload {
-    Balanced,    // static range assignment, zero atomics
-    Unbalanced,  // adaptive fetch-add with 4× oversplit
+    Balanced,    // 4× oversplit via recursive join
+    Unbalanced,  // 8× oversplit for finer-grained stealing
 }
 ```
 
-- `Balanced`: items split into N contiguous ranges (`start = id * base + remainder.min(id)`). Each worker iterates its range via `ptr::read`. Zero atomic ops per item.
-- `Unbalanced`: uses `ConsumedBuffer` with `AtomicUsize` stride counter. Workers `fetch_add(stride)` to claim work dynamically. 4× oversplit ensures good load balance for skewed workloads.
+Both variants use the same recursive `join`-based index splitting (see 3.2).
+The oversplit factor controls how many leaf tasks the recursion produces:
+`Unbalanced` creates more, smaller leaves so that a thread blocked on a slow
+item can have its remaining leaves stolen by idle workers.
 
-### 3.2 `ConsumedBuffer<T>` — Zero-Copy Input Buffer
+### 3.2 `Slots<T>` — Index-Based Zero-Copy Buffers
 
 ```rust
-struct ConsumedBuffer<T> {
-    ptr: NonNull<T>,
-    cap: usize,
+pub(crate) struct Slots<T> {
+    buf: Box<[UnsafeCell<MaybeUninit<T>>]>,
 }
 ```
 
-Wraps a `Vec<T>` via `ManuallyDrop`. Workers consume items via `ptr::read` (no clone, no allocation). Drop only deallocates memory — items must be fully consumed or explicitly dropped.
+The parallel map/collect core never copies data between recursive levels. Two
+`Slots` buffers are allocated once:
 
-Used by `par_map_fine`, `par_map_adaptive`, `try_par_map`, and `collect_adaptive`.
+- **input** (`from_vec`): reinterprets the user's `Vec<T>` in place — items are
+  not moved, only the allocation's type is reinterpreted. `read(i)` does a
+  `ptr::read`, leaving slot `i` uninit.
+- **output** (`uninit(n)`): a `with_capacity(n) + set_len(n)` box of
+  uninitialized slots (no O(n) init loop). `write(i, val)` marks slot `i` init.
+
+Recursive `join` splits the **index range** `[0, n)`, not the data. Each leaf
+reads `input[i]`, applies the transform, writes `output[i]`. No `split_off`,
+no `extend`, no per-level reallocation — this is the key difference from a
+naïve recursive `Vec` split, and the reason the warm-input throughput is
+competitive with rayon's pre-allocated `collect`.
+
+Panic safety: leaves wrap their loop in `catch_unwind`; on panic, a leaf drops
+exactly the slots it touched (`output[start..i)` written, `input[i+1..end)`
+unread). Internal nodes propagate the first `Err` and drop the
+already-completed sibling's output range. `MAY_FILTER = false` guarantees
+written ranges have no holes, so `drop_range` is sound without per-slot
+validity tracking. Miri (tree-borrows) passes on all paths.
 
 ### 3.3 `Pipeline<S, T>` — Compile-Time Fused Pipeline
 
@@ -132,23 +157,29 @@ pub struct Pipeline<S = Identity, T = ()> {
 | `.fence()` | `Pipeline<Fence<...>, T>` |
 | `.ordered()` | `Pipeline<Ordered<...>, T>` |
 
-`collect()` requires `S: FusedStage<T> + Send + Clone + 'static`. The stage is cloned to each worker.
-
 ### 3.4 `FusedStage` Trait — Zero-Dispatch Execution
 
 ```rust
 pub trait FusedStage<T> {
     type Output;
+    /// Whether the chain can drop items (contains a `Filter`).
+    const MAY_FILTER: bool = false;
     fn apply(&self, item: T) -> Option<Self::Output>;
 }
 ```
 
 - `SyncMap::apply()` → `self.prev.apply(item).map(|v| (self.f)(v))`
-- `Filter::apply()` → `self.prev.apply(item).filter(|v| (self.f)(v))`
+- `Filter::apply()` → `self.prev.apply(item).filter(|v| (self.f)(v))` (sets `MAY_FILTER = true`)
 - `Fence::apply()` → passthrough (fence semantics handled by `StreamPipeline` at runtime)
 - `Ordered::apply()` → passthrough (ordering handled by `ReorderBuffer`)
 
-Returning `Option` allows filter semantics to integrate naturally into the fusion chain.
+`MAY_FILTER` is propagated through `SyncMap` / `Fence` / `Ordered` from the
+preceding stage. `collect()` uses it as a compile-time switch: when `false`,
+the stage chain is driven by the index-based `Slots` fast path (output
+cardinality equals input cardinality); when `true`, it falls back to the
+per-leaf-`Vec` merge path (filters change cardinality, so fixed-index writes
+are impossible). Returning `Option` lets filter semantics integrate naturally
+into the fusion chain.
 
 ### 3.5 `par_map()` — Convenience Parallel Map
 
@@ -160,9 +191,12 @@ pub fn try_par_map<I, F, R, E>(iter: I, f: F) -> Result<Vec<R>, E>
 ```
 
 - `par_map`: delegates to `par_map_with_workload(..., Balanced)`
-- `par_map_with_workload`: dispatches to `par_map_fine` (ConsumedBuffer + static range) or `par_map_adaptive` (ConsumedBuffer + fetch-add) based on Workload
-- `par_chunks_map`: splits into worker ranges, each subdivides into chunk_size sub-chunks. Preserves LLVM SIMD auto-vectorization.
-- `try_par_map`: `AtomicBool` error flag + `Mutex<Option<E>>` error slot. Workers check flag per item; first error stored, remaining items dropped. Uses `ConsumedBuffer` + static range.
+- `par_map_with_workload`: allocates input + output `Slots` once, then drives
+  the recursive index-based core (`par_index_rec`) via `FnMap` (a never-filter
+  `RangeOp`). Workload only changes the oversplit factor.
+- `par_chunks_map`: splits items into worker ranges, each subdivides into chunk_size sub-chunks. Preserves LLVM SIMD auto-vectorization.
+- `try_par_map`: still uses the recursive `Vec`-merge path (early-error return
+  with `join`); not on the hot benchmark path.
 
 ### 3.6 `StreamPipeline` — Streaming Multi-Stage Pipeline
 
@@ -313,35 +347,68 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
 ## 9. Performance Benchmarks
 
-### CPU-Heavy par_map vs rayon
+> All numbers below are from a 32-core AMD (Zen) Linux machine, `criterion`
+> `--sample-size 30 --measurement-time 5`. Methodology note: `par_map` takes
+> ownership of the input, so a benchmark iteration must rebuild the input
+> (`warm_clone`). glibc's large `memcpy` uses non-temporal stores that bypass
+> the cache, so a naïve `data.clone()` arrives **cold-from-RAM** — measuring
+> allocator/memory latency rather than the framework. The `sync_vs_rayon` bench
+> therefore warms the input in the (untimed) setup so the timed region is a
+> fair, like-for-like comparison with rayon's warm `par_iter` borrow. A
+> `_cold` variant is kept for the lightweight group to document the one-shot
+> cold-memory cost.
+
+### CPU-Heavy par_map vs rayon (`sync_cpu_heavy`, 100 iters/item, warm input)
 
 | Size | youpipe | rayon | Result |
 |---|---|---|---|
-| 1K | ~130µs | ~130µs | Tie |
-| 10K | ~1.1ms | ~1.1ms | Tie |
-| 100K | ~10.6ms | ~10.6ms | Tie |
+| 1K | ~21 µs | ~39 µs | **youpipe ~1.9× faster** |
+| 10K | ~77 µs | ~97 µs | **youpipe ~1.3× faster** |
+| 100K | ~375 µs | ~395 µs | Tie |
 
-### Pipeline Fusion (3 stages) vs rayon chain
+### Pipeline Fusion (3 stages) vs rayon chain (`pipeline_fusion`, warm input)
 
 | Size | youpipe fused | rayon chain | Result |
 |---|---|---|---|
-| 10K | 3.2µs | 10.6µs | **youpipe 3.3x faster** |
-| 100K | 32µs | 105µs | **youpipe 3.3x faster** |
+| 10K | ~134 µs | ~70 µs | rayon ~1.9× faster |
+| 100K | ~164 µs | ~115 µs | rayon ~1.4× faster |
 
-### Mixed Load vs tokio::spawn_blocking
+The fused stage chain still trails rayon's `par_iter` because rayon's consumer
+is a highly-tuned length-splitting fold/collect, whereas youpipe drives the
+index-based `Slots` core through a generic `RangeOp`. The gap is the next
+optimization target.
 
-| Size | youpipe stream | spawn_blocking | Result |
+### Lightweight par_map vs rayon (`sync_lightweight`, `x+1`)
+
+| Size | youpipe (warm) | youpipe (cold) | rayon |
 |---|---|---|---|
-| 100 | 1.29ms | 1.42ms | 1.1x faster |
-| 500 | 2.32ms | 4.58ms | **2.0x faster** |
-| 1000 | 3.07ms | 8.93ms | **2.9x faster** |
+| 10K | ~43 µs | ~38 µs | ~69 µs |
+| 100K | ~128 µs | ~175 µs | ~117 µs |
+| 1M | ~730 µs | ~4.25 ms | ~290 µs |
+
+Warm-input lightweight 1M improved from ~1.9 ms (pre-optimization) to ~730 µs
+(~2.6× faster). The cold variant documents the read-compute-write sensitivity
+to cold-from-RAM input (glibc's non-temporal memcpy bypasses the cache); rayon
+on an equally-cold clone measures ~800 µs at 1M.
+
+### Mixed Load — StreamPipeline vs `tokio::spawn_blocking` (`mixed_load`)
+
+| Size | youpipe stream | spawn_blocking | rayon (CPU-only) | Result |
+|---|---|---|---|---|
+| 100 | ~129 µs | ~229 µs | ~19 µs | **youpipe ~1.8× faster** than tokio |
+| 500 | ~418 µs | ~1.25 ms | ~29 µs | **youpipe ~3× faster** |
+| 1000 | ~1.0 ms | ~2.5 ms | ~37 µs | **youpipe ~2.5× faster** |
+
+StreamPipeline comfortably beats `tokio::spawn_blocking` (the design target for
+mixed CPU/IO). `rayon::par_iter` is fastest here because this benchmark is
+pure-CPU and rayon's direct fork-join skips channel handoff entirely.
 
 ### Channel Throughput
 
 | Size | crossfire | crossbeam-channel | std_mpsc | Result |
 |---|---|---|---|---|
 | 10K | 45.5 Melem/s | 46.5 Melem/s | 62.4 Melem/s | Tie (MPMC) |
-| 100K | 76.6 Melem/s | 74.8 Melem/s | 125.5 Melem/s | **crossfire 1.02x vs crossbeam** |
+| 100K | 76.6 Melem/s | 74.8 Melem/s | 125.5 Melem/s | **crossfire 1.02× vs crossbeam** |
 
 ---
 

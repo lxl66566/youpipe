@@ -1,4 +1,11 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::{
+    any::Any,
+    cell::UnsafeCell,
+    marker::PhantomData,
+    mem::MaybeUninit,
+    panic::{self, AssertUnwindSafe},
+    sync::Arc,
+};
 
 use super::config::{PipelineConfig, Workload};
 use crate::{
@@ -8,42 +15,280 @@ use crate::{
     sync::CancellationToken,
 };
 
-// ── Join-based parallel helpers ──
+// ── Slots: index-addressable buffer for zero-copy parallel map ──
 
-/// Compute the number of recursive split levels. Aiming for ~4 tasks per
-/// thread gives good work-stealing without excessive task overhead.
-fn split_depth(n: usize, num_threads: usize) -> usize {
-    let desired_tasks = (num_threads * 4).max(1);
-    let by_threads = desired_tasks.next_power_of_two().trailing_zeros() as usize;
-    let by_len = n.max(1).next_power_of_two().trailing_zeros() as usize;
-    by_threads.min(by_len).max(1)
+/// Boxed slot array backing the range-based parallel map.
+///
+/// Each slot is `UnsafeCell<MaybeUninit<T>>`. The `MaybeUninit` layer
+/// suppresses item drops when the box itself is dropped, so the box's `Drop`
+/// only frees memory — every slot that holds a live `T` must be dropped by the
+/// caller before the buffer goes out of scope (the recursion in
+/// [`par_index_rec`] guarantees this on both the success and panic paths).
+///
+/// Ranges processed by different worker threads are disjoint, so non-atomic
+/// `read`/`write`/`drop_range` on disjoint indices is sound. `Sync` is sound
+/// because items (`T: Send`) may legitimately move between threads.
+pub(crate) struct Slots<T> {
+    buf: Box<[UnsafeCell<MaybeUninit<T>>]>,
 }
 
-/// Recursive join-based map. Splits `items` in half at each level until
-/// `splits_left` hits 0, then processes each leaf sequentially. Results are
-/// returned in input order.
+// SAFETY: access is governed by the disjoint-index discipline documented on
+// `Slots`. Items of type `T` may cross threads, so we require `T: Send`.
+unsafe impl<T: Send> Send for Slots<T> {}
+unsafe impl<T: Send> Sync for Slots<T> {}
+
+impl<T> Slots<T> {
+    /// Take ownership of a `Vec<T>` and re-interpret it as an all-init slot
+    /// array. Items are not moved — only the allocation's type is
+    /// reinterpreted.
+    fn from_vec(vec: Vec<T>) -> Self {
+        let len = vec.len();
+        let box_t: Box<[T]> = vec.into_boxed_slice();
+        // SAFETY: `[T]` and `[UnsafeCell<MaybeUninit<T>>]` are layout-identical:
+        // `UnsafeCell` is `#[repr(transparent)]` over its field, and
+        // `MaybeUninit<T>` has the same size/align/ABI as `T`.
+        let ptr = Box::into_raw(box_t).cast::<UnsafeCell<MaybeUninit<T>>>();
+        let buf = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) };
+        Slots { buf }
+    }
+
+    /// Allocate an all-uninit slot array of length `n`.
+    ///
+    /// Uses `set_len` after `with_capacity` so we never touch the backing
+    /// memory — the slots are `MaybeUninit`, so uninitialized is a valid state.
+    /// A `.collect()`-based init here would be a sequential O(n) loop that
+    /// dominates lightweight workloads (measured: ~2 ms for 1 M slots).
+    fn uninit(n: usize) -> Self {
+        let mut v: Vec<UnsafeCell<MaybeUninit<T>>> = Vec::with_capacity(n);
+        // SAFETY: the capacity is `n` and `MaybeUninit<T>` is valid uninitialized,
+        // so the slots do not need to be written before being read via `read`.
+        unsafe { v.set_len(n) };
+        Slots {
+            buf: v.into_boxed_slice(),
+        }
+    }
+
+    /// Move item `i` out, leaving slot `i` uninit.
+    ///
+    /// # Safety
+    ///
+    /// Slot `i` must be init. Caller must ensure exclusive access to index `i`.
+    #[inline]
+    unsafe fn read(&self, i: usize) -> T {
+        // SAFETY: caller guarantees `i < len`; disjoint-index discipline.
+        unsafe { (*self.buf.get_unchecked(i).get()).assume_init_read() }
+    }
+
+    /// Write `val` into slot `i`, marking it init.
+    ///
+    /// # Safety
+    ///
+    /// Slot `i` must be uninit. Caller must ensure exclusive access to index
+    /// `i`.
+    #[inline]
+    unsafe fn write(&self, i: usize, val: T) {
+        unsafe {
+            (*self.buf.get_unchecked(i).get()).write(val);
+        }
+    }
+
+    /// Drop slots `[start, end)`. All of them must be init.
+    ///
+    /// # Safety
+    ///
+    /// Every slot in `[start, end)` must hold a live `T`. Only valid for ranges
+    /// produced by operations that never filter (see `RangeOp::MAY_FILTER`).
+    #[inline]
+    unsafe fn drop_range(&self, start: usize, end: usize) {
+        for i in start..end {
+            unsafe { (*self.buf.get_unchecked(i).get()).assume_init_drop() };
+        }
+    }
+
+    /// Reclaim the buffer as a `Vec<T>` without dropping any slot. All slots
+    /// must be init and owned by the caller.
+    fn into_vec(self) -> Vec<T> {
+        let len = self.buf.len();
+        let ptr = Box::into_raw(self.buf).cast::<T>();
+        // SAFETY: layout-identical to `[T]` (see `from_vec`); all slots are init
+        // by contract. Rebuild as a boxed slice and convert via the idiomatic
+        // `Box::into_vec` (cap == len, exactly matching the boxed slice).
+        let boxed: Box<[T]> =
+            unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) };
+        boxed.into_vec()
+    }
+}
+
+// ── RangeOp: how a leaf transforms an input item ──
+
+/// Compile-time-fused transform applied to every item by the range-based core.
 ///
-/// The recursive split is the key to handling unbalanced workloads: if one
-/// half is expensive, the thread processing the cheap half finishes and steals
-/// sub-tasks from the expensive half's deque.
-fn join_map<T, R, F>(mut items: Vec<T>, f: &F, splits_left: usize) -> Vec<R>
+/// `MAY_FILTER = false` guarantees `apply` always returns `Some`, so every
+/// written output slot is init and `Slots::drop_range` is sound over arbitrary
+/// sub-ranges. This lets the panic-cleanup code drop sibling output ranges
+/// without per-slot validity tracking.
+trait RangeOp<T>: Sync {
+    type Out: Send;
+    const MAY_FILTER: bool;
+    fn apply(&self, item: T) -> Option<Self::Out>;
+}
+
+/// Map closure wrapper (`Fn(T) -> R`, never filters).
+struct FnMap<F>(F);
+
+impl<T, R, F> RangeOp<T> for FnMap<F>
+where
+    F: Fn(T) -> R + Sync,
+    R: Send,
+{
+    type Out = R;
+    const MAY_FILTER: bool = false;
+    #[inline]
+    fn apply(&self, item: T) -> Option<R> {
+        Some((self.0)(item))
+    }
+}
+
+type PanicPayload = Box<dyn Any + Send>;
+
+/// Recursive index-based parallel fill. Each leaf claims a disjoint index range
+/// `[start, end)` and writes outputs into `output[start..end)` by index — no
+/// `split_off`, no `extend`, no per-level reallocation.
+///
+/// Panic safety: a panicking leaf catches the unwind, drops the partial state
+/// of its own range (outputs written so far + unread inputs), and returns
+/// `Err`. Internal nodes propagate the first `Err`, dropping the
+/// already-completed sibling's output range. On return, the whole `[start,
+/// end)` range is fully resolved: every output slot is either init (success
+/// path) or dropped, and every input slot is consumed.
+fn par_index_rec<T, R, OP>(
+    input: &Slots<T>,
+    output: &Slots<R>,
+    start: usize,
+    end: usize,
+    op: &OP,
+    splits_left: usize,
+) -> Result<(), PanicPayload>
 where
     T: Send,
     R: Send,
-    F: Fn(T) -> R + Sync,
+    OP: RangeOp<T, Out = R>,
 {
-    if splits_left == 0 || items.len() <= 1 {
-        return items.into_iter().map(f).collect();
+    if splits_left == 0 || end - start <= 1 {
+        return par_index_leaf(input, output, start, end, op);
     }
-    let mid = items.len() / 2;
-    let right = items.split_off(mid);
-    let (left_r, right_r) = ComputePool::global().join(
-        || join_map(items, f, splits_left - 1),
-        || join_map(right, f, splits_left - 1),
+    let mid = start + (end - start) / 2;
+    let (l, r) = ComputePool::global().join(
+        || par_index_rec(input, output, start, mid, op, splits_left - 1),
+        || par_index_rec(input, output, mid, end, op, splits_left - 1),
     );
-    let mut result = left_r;
-    result.extend(right_r);
-    result
+    match (l, r) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(p), Ok(())) => {
+            // SAFETY: right sibling completed without filter (MAY_FILTER=false),
+            // so [mid, end) is fully init and safe to drop.
+            unsafe { output.drop_range(mid, end) };
+            Err(p)
+        }
+        (Ok(()), Err(p)) => {
+            unsafe { output.drop_range(start, mid) };
+            Err(p)
+        }
+        (Err(p), Err(_)) => {
+            unsafe {
+                output.drop_range(start, mid);
+                output.drop_range(mid, end);
+            }
+            Err(p)
+        }
+    }
+}
+
+/// Process `[start, end)` sequentially on the current thread. Wraps the loop in
+/// `catch_unwind` so that a panic in `op` leaves a precisely-known slot state
+/// (`i` = index that panicked: input `[start..=i]` consumed, output
+/// `[start..i)` written) which we drop before returning `Err`.
+fn par_index_leaf<T, R, OP>(
+    input: &Slots<T>,
+    output: &Slots<R>,
+    start: usize,
+    end: usize,
+    op: &OP,
+) -> Result<(), PanicPayload>
+where
+    T: Send,
+    R: Send,
+    OP: RangeOp<T, Out = R>,
+{
+    let mut i = start;
+    let r = panic::catch_unwind(AssertUnwindSafe(|| {
+        while i < end {
+            // SAFETY: disjoint index; slot i is init (input) / uninit (output).
+            let item = unsafe { input.read(i) };
+            if let Some(out) = op.apply(item) {
+                unsafe { output.write(i, out) };
+            }
+            i += 1;
+        }
+    }));
+    match r {
+        Ok(()) => Ok(()),
+        Err(p) => {
+            // At the panic point: input[start..=i] had been read (item `i` was
+            // moved into `op`), output[start..i) was written, and
+            // input[i+1..end) was untouched. `MAY_FILTER=false` guarantees
+            // output[start..i) has no holes, so `drop_range` is sound there.
+            unsafe {
+                output.drop_range(start, i);
+                input.drop_range(i + 1, end);
+            }
+            Err(p)
+        }
+    }
+}
+
+/// Drive `par_index_rec` over `[0, n)` and convert the output buffer into a
+/// `Vec<R>`. Propagates panics after dropping all partial state.
+fn par_index_collect<T, R, OP>(items: Vec<T>, op: &OP, splits: usize) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    OP: RangeOp<T, Out = R>,
+{
+    let n = items.len();
+    debug_assert!(n > 0);
+    debug_assert!(
+        !OP::MAY_FILTER,
+        "par_index_collect requires a non-filtering op (drop_range assumes fully-init ranges)"
+    );
+    let input = Slots::from_vec(items);
+    let output = Slots::<R>::uninit(n);
+    let result = par_index_rec(&input, &output, 0, n, op, splits);
+    match result {
+        Ok(()) => {
+            // Input fully consumed (all uninit): dropping the box just frees
+            // memory. Output fully init: transmute into the result Vec.
+            drop(input);
+            output.into_vec()
+        }
+        Err(p) => {
+            // Recursion already dropped every live slot; freeing buffers is safe.
+            drop(input);
+            drop(output);
+            panic::resume_unwind(p);
+        }
+    }
+}
+
+// ── Join-based parallel helpers ──
+
+/// Compute the number of recursive split levels. Aiming for ~`oversplit` tasks
+/// per thread gives good work-stealing without excessive task overhead.
+fn split_depth(n: usize, num_threads: usize, oversplit: usize) -> usize {
+    let desired_tasks = (num_threads * oversplit).max(1);
+    let by_threads = desired_tasks.next_power_of_two().trailing_zeros() as usize;
+    let by_len = n.max(1).next_power_of_two().trailing_zeros() as usize;
+    by_threads.min(by_len).max(1)
 }
 
 /// Fallible recursive join-based map. Returns the first error encountered.
@@ -89,9 +334,10 @@ where
 
 /// Parallel map with explicit [`Workload`] hint.
 ///
-/// Uses recursive `join`-based splitting for both variants. `Unbalanced`
-/// creates more split points (finer granularity) to improve work-stealing
-/// when per-item cost varies widely.
+/// Uses the index-based range core (pre-allocated output, no `split_off` /
+/// `extend`) driven by recursive `join` splitting. `Unbalanced` creates more
+/// split points (finer task granularity) so that slow items spread across more
+/// leaves and can be stolen by idle workers.
 pub fn par_map_with_workload<I, F, R>(iter: I, f: F, workload: Workload) -> Vec<R>
 where
     I: IntoIterator,
@@ -109,12 +355,15 @@ where
         return items.into_iter().map(f).collect();
     }
 
-    let splits = match workload {
-        Workload::Balanced => split_depth(n, num_threads),
-        Workload::Unbalanced => split_depth(n, num_threads * 2),
+    // Oversplit: more leaves than threads so work-stealing can balance skewed
+    // loads. Unbalanced uses a higher factor for finer granularity.
+    let oversplit = match workload {
+        Workload::Balanced => 4,
+        Workload::Unbalanced => 8,
     };
+    let splits = split_depth(n, num_threads, oversplit);
 
-    join_map(items, &f, splits)
+    par_index_collect(items, &FnMap(f), splits)
 }
 
 /// Parallel chunked map — splits items into `chunk_size` slices and calls `f`
@@ -138,7 +387,7 @@ where
         return items.chunks(chunk_size).flat_map(&f).collect();
     }
 
-    let splits = split_depth(num_chunks, num_threads);
+    let splits = split_depth(num_chunks, num_threads, 4);
     join_chunks_map(items, chunk_size, &f, splits)
 }
 
@@ -191,7 +440,7 @@ where
         return items.into_iter().map(f).collect();
     }
 
-    let splits = split_depth(n, num_threads);
+    let splits = split_depth(n, num_threads, 4);
     join_try_map(items, &f, splits)
 }
 
@@ -275,6 +524,13 @@ where
 /// without intermediate allocations.
 pub trait FusedStage<T> {
     type Output;
+
+    /// Whether `apply` may return `None` for an input it received (i.e. the
+    /// stage chain contains a `Filter`). When `false`, the index-based collect
+    /// fast path can assume every output slot it visits is init, which makes
+    /// panic cleanup trivially sound (no per-slot validity tracking).
+    const MAY_FILTER: bool = false;
+
     fn apply(&self, item: T) -> Option<Self::Output>;
 }
 
@@ -291,6 +547,7 @@ where
     F: Fn(Prev::Output) -> O,
 {
     type Output = O;
+    const MAY_FILTER: bool = Prev::MAY_FILTER;
     fn apply(&self, item: I) -> Option<O> {
         self.prev.apply(item).map(|v| (self.f)(v))
     }
@@ -302,6 +559,8 @@ where
     F: Fn(&Prev::Output) -> bool,
 {
     type Output = Prev::Output;
+    // A filter can drop items, so the fast path cannot assume all slots init.
+    const MAY_FILTER: bool = true;
     fn apply(&self, item: I) -> Option<Prev::Output> {
         self.prev.apply(item).filter(|v| (self.f)(v))
     }
@@ -312,6 +571,7 @@ where
     Prev: FusedStage<I>,
 {
     type Output = Prev::Output;
+    const MAY_FILTER: bool = Prev::MAY_FILTER;
     fn apply(&self, item: I) -> Option<Prev::Output> {
         self.prev.apply(item)
     }
@@ -322,6 +582,7 @@ where
     Prev: FusedStage<I>,
 {
     type Output = Prev::Output;
+    const MAY_FILTER: bool = Prev::MAY_FILTER;
     fn apply(&self, item: I) -> Option<Prev::Output> {
         self.prev.apply(item)
     }
@@ -441,6 +702,23 @@ impl<S, T> Pipeline<S, T> {
 
 // ── Collect for fully-fused sync pipelines ──
 
+/// `RangeOp` wrapper around a `FusedStage` so the index-based core can drive
+/// the compile-time-fused stage chain.
+struct FusedOp<S>(S);
+
+impl<S, T> RangeOp<T> for FusedOp<S>
+where
+    S: FusedStage<T> + Sync,
+    S::Output: Send,
+{
+    type Out = S::Output;
+    const MAY_FILTER: bool = S::MAY_FILTER;
+    #[inline]
+    fn apply(&self, item: T) -> Option<S::Output> {
+        FusedStage::apply(&self.0, item)
+    }
+}
+
 impl<S, T> Pipeline<S, T>
 where
     S: FusedStage<T> + Send + Sync + 'static,
@@ -449,8 +727,11 @@ where
 {
     /// Execute the fused pipeline over `items` and collect results.
     ///
-    /// Uses recursive `join`-based splitting for both balanced and unbalanced
-    /// workloads. The recursive split enables work-stealing of sub-tasks.
+    /// Uses the index-based range core (pre-allocated output, no per-level
+    /// `split_off`/`extend`) when the stage chain cannot filter
+    /// (`S::MAY_FILTER == false`), and falls back to the recursive merge path
+    /// otherwise (filters change output cardinality, so fixed-index writes are
+    /// not possible).
     pub fn collect<I: IntoIterator<Item = T>>(self, items: I) -> Vec<S::Output> {
         let items: Vec<T> = items.into_iter().collect();
         let n = items.len();
@@ -465,16 +746,24 @@ where
                 .collect();
         }
 
-        let splits = match self.config.workload {
-            Workload::Balanced => split_depth(n, num_threads),
-            Workload::Unbalanced => split_depth(n, num_threads * 2),
+        let oversplit = match self.config.workload {
+            Workload::Balanced => 4,
+            Workload::Unbalanced => 8,
         };
+        let splits = split_depth(n, num_threads, oversplit);
 
-        join_fused_collect(items, &self.stages, splits)
+        if S::MAY_FILTER {
+            join_fused_collect(items, &self.stages, splits)
+        } else {
+            let op = FusedOp(self.stages);
+            par_index_collect(items, &op, splits)
+        }
     }
 }
 
-/// Recursive join-based collect for fused pipeline stages.
+/// Recursive merge-based collect for fused stages that may filter. Used only as
+/// the `MAY_FILTER == true` fallback; output cardinality is unknown up front so
+/// each leaf produces its own `Vec` and results are concatenated.
 fn join_fused_collect<S, T>(mut items: Vec<T>, stages: &S, splits_left: usize) -> Vec<S::Output>
 where
     S: FusedStage<T> + Sync,
@@ -1351,6 +1640,116 @@ mod tests {
         assert_eq!(r, (0..100).map(|x: i32| x * 3).collect::<Vec<_>>());
     }
 
+    /// Correctness on a large input that exercises the recursive index split
+    /// across many leaves.
+    #[test]
+    fn test_par_map_large() {
+        let n: usize = 200_000;
+        let items: Vec<u64> = (0..n).map(|x| x as u64).collect();
+        let result = par_map(items.clone(), |x: u64| x.wrapping_mul(3).wrapping_add(1));
+        assert_eq!(result.len(), n);
+        for (i, r) in result.iter().enumerate() {
+            assert_eq!(*r, (i as u64).wrapping_mul(3).wrapping_add(1));
+        }
+    }
+
+    /// Validates that input items are consumed exactly once and output slots
+    /// hold the right values, using a Drop type. A double-free or
+    /// use-after-free would surface under Miri or as a wrong count.
+    #[test]
+    fn test_par_map_drop_type() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Debug)]
+        struct Tracker(Arc<AtomicUsize>);
+        impl PartialEq for Tracker {
+            fn eq(&self, other: &Self) -> bool {
+                Arc::ptr_eq(&self.0, &other.0)
+            }
+        }
+        impl Drop for Tracker {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let counter = Arc::new(AtomicUsize::new(0));
+        let items: Vec<Tracker> = (0..5000).map(|_| Tracker(counter.clone())).collect();
+        let arcs: Vec<Arc<AtomicUsize>> = par_map(items, |t| {
+            let c = t.0.clone();
+            drop(t);
+            c
+        })
+        .into_iter()
+        .collect();
+        assert_eq!(arcs.len(), 5000);
+        // All input Trackers have been dropped (moved into the closure and consumed).
+        assert_eq!(counter.load(Ordering::SeqCst), 5000);
+        // The returned Arcs are still live — dropping them must not touch counter.
+        drop(arcs);
+        assert_eq!(counter.load(Ordering::SeqCst), 5000);
+    }
+
+    /// Panic propagation + cleanup for the index-based par_map path. Uses a
+    /// Drop-tracking type so a leak or double-free shows up as a wrong drop
+    /// count (and as UB under Miri).
+    #[test]
+    fn test_par_map_panic_safety() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Tracker {
+            idx: usize,
+            counter: Arc<AtomicUsize>,
+        }
+        impl Drop for Tracker {
+            fn drop(&mut self) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let counter = Arc::new(AtomicUsize::new(0));
+        let panic_idx: usize = 1500;
+        let n = 4000;
+        let items: Vec<Tracker> = (0..n)
+            .map(|idx| Tracker {
+                idx,
+                counter: counter.clone(),
+            })
+            .collect();
+
+        let panic_idx_closure = panic_idx;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            par_map(items, move |t| {
+                let idx = t.idx;
+                drop(t);
+                assert!(idx != panic_idx_closure, "induced panic at idx {idx}");
+                idx as u64
+            });
+        }));
+        assert!(result.is_err(), "par_map should propagate the panic");
+        // Every input Tracker must have been dropped exactly once: the ones
+        // consumed before the panic, plus the ones cleaned up by the recursion.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            n,
+            "expected all {n} Trackers dropped exactly once"
+        );
+    }
+
+    /// Panic safety for the fused collect fast path (no filter).
+    #[test]
+    fn test_fused_collect_panic_safety() {
+        let items: Vec<i32> = (0..2000).collect();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Pipeline::from_vec(Vec::<i32>::new())
+                .map(|x: i32| if x == 1500 { panic!("boom") } else { x + 1 })
+                .collect(items);
+        }));
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_stream_single_stage_unordered() {
         let config = PipelineConfig::default();
@@ -1456,8 +1855,7 @@ mod tests {
     /// process the full input.
     #[test]
     fn test_stream_cancel_all_variants() {
-        use std::num::NonZeroUsize;
-        use std::time::Duration;
+        use std::{num::NonZeroUsize, time::Duration};
 
         fn sleep_map<T: Copy>(x: T) -> T {
             std::thread::sleep(Duration::from_micros(50));
