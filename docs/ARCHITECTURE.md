@@ -370,33 +370,39 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
 | Size | youpipe | rayon | Result |
 |---|---|---|---|
-| 1K | ~21 µs | ~39 µs | **youpipe ~1.9× faster** |
-| 10K | ~77 µs | ~97 µs | **youpipe ~1.3× faster** |
-| 100K | ~375 µs | ~395 µs | Tie |
+| 1K | ~21 µs | ~39 µs | **youpipe ~1.8× faster** |
+| 10K | ~85 µs | ~90 µs | youpipe slightly faster |
+| 100K | ~440 µs | ~322 µs | rayon ~1.4× faster |
 
 ### Pipeline Fusion (3 stages) vs rayon chain (`pipeline_fusion`, warm input)
 
 | Size | youpipe fused | rayon chain | Result |
 |---|---|---|---|
-| 10K | ~134 µs | ~70 µs | rayon ~1.9× faster |
-| 100K | ~164 µs | ~115 µs | rayon ~1.4× faster |
+| 10K | ~133 µs | ~70 µs | rayon ~1.9× faster |
+| 100K | ~166 µs | ~113 µs | rayon ~1.5× faster |
 
 The fused stage chain still trails rayon's `par_iter` because rayon's consumer
-is a highly-tuned length-splitting fold/collect, whereas youpipe drives the
-index-based `Slots` core through a generic `RangeOp`. The gap is the next
-optimization target.
+is a highly-tuned length-splitting fold/collect; youpipe drives the index-based
+`Slots` core through a generic `RangeOp`. Closing this gap is the next
+optimization target — see `§3.2` for the current `&[T]`/`&mut [R]` leaf view
+that already closed most of the lightweight-`par_map` gap.
 
 ### Lightweight par_map vs rayon (`sync_lightweight`, `x+1`)
 
 | Size | youpipe (warm) | youpipe (cold) | rayon |
 |---|---|---|---|
-| 10K | ~43 µs | ~38 µs | ~69 µs |
-| 100K | ~128 µs | ~175 µs | ~117 µs |
-| 1M | ~730 µs | ~4.25 ms | ~290 µs |
+| 10K | ~38 µs | ~38 µs | ~68 µs |
+| 100K | ~124 µs | ~172 µs | ~114 µs |
+| 1M | **~390 µs** | ~4.3 ms | ~290 µs |
 
-Warm-input lightweight 1M improved from ~1.9 ms (pre-optimization) to ~730 µs
-(~2.6× faster). The cold variant documents the read-compute-write sensitivity
-to cold-from-RAM input (glibc's non-temporal memcpy bypasses the cache); rayon
+Warm-input lightweight 1M improved from ~1.9 ms (pre-`Slots`) → ~730 µs
+(after `Slots`) → **~390 µs** after switching the leaf loop to a `&[T]` /
+`&mut [R]` slice view (`Slots::as_slice` / `as_mut_slice`). That last step
+closed a 2.5× gap with rayon down to ~1.35×: the previous `&Slots<u64>` for
+both input and output blocked LLVM's auto-vectorizer because the alias
+analysis could not prove the two `UnsafeCell`-wrapped buffers were disjoint.
+The cold variant documents the read-compute-write sensitivity to
+cold-from-RAM input (glibc's non-temporal memcpy bypasses the cache); rayon
 on an equally-cold clone measures ~800 µs at 1M.
 
 ### Mixed Load — StreamPipeline vs `tokio::spawn_blocking` (`mixed_load`)
