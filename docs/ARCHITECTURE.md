@@ -26,7 +26,7 @@ All data flows through typed channels (`crossfire` MPMC). Each stage owns its in
 
 ### Non-`'static` Lifetime Support
 
-The `scope()` API is built on `std::thread::scope`, allowing closures to borrow stack-local variables without `'static` bounds.
+The `scope()` API allows closures to borrow stack-local variables without `'static` bounds. The `'env` lifetime is threaded through `ScopedPipeline` and propagated to `ComputePool::join`, whose `Registry::in_worker_cold` blocks the calling thread until every spawned sub-task finishes — guaranteeing borrowed references outlive the pool's access to them.
 
 ### Runtime Agnostic
 
@@ -63,7 +63,7 @@ src/
 │   ├── stream.rs     # run_ordered_collect helper
 │   └── mod.rs
 ├── scope/            # Non-'static lifetime support
-│   ├── pipeline_scope.rs # scope(), PipelineScope, ScopedPipeline (std::thread::scope)
+│   ├── pipeline_scope.rs # scope(), PipelineScope, ScopedPipeline (work-stealing, 'env closures)
 │   └── mod.rs
 ├── sync/             # Synchronization primitives
 │   ├── cancel.rs     # CancellationToken (Arc<AtomicBool>)
@@ -216,13 +216,21 @@ All streaming methods accept `ordered: bool`, using `ReorderBuffer` to restore o
 ```rust
 youpipe::scope(|s| {
     let factor = 10;
-    s.pipeline(items)
+    s.pipeline()
         .map(|x: i32| x * factor)   // borrows stack-local factor
-        .collect()
+        .collect(items)
 })
 ```
 
-Uses `std::thread::scope` internally. Closures are `Box<dyn FnOnce() + Send + 'env>`.
+Mirrors `Pipeline`'s compile-time-fused stage chain (`SyncMap` / `Filter` /
+etc.) but with `'env` (non-`'static`) closure bounds. `.collect()` drives the
+same recursive work-stealing `par_index_collect` core as `Pipeline::collect`
+— exposed via the `pub(crate) fused_collect_scoped` entry point — so the
+soundness story rests on `ComputePool::join`: the calling thread blocks in
+`Registry::in_worker_cold` until every sub-task finishes, which guarantees
+every `'env` reference captured by a scoped closure outlives the pool's
+access to it. (No `std::thread::scope` or per-chunk `Mutex<Vec<T>>` is
+involved — the previous design paid for both.)
 
 ---
 

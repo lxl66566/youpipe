@@ -187,7 +187,9 @@ fn test_scope_non_static() {
     let factor = 7i32;
     let result = youpipe::scope(|s| {
         let items: Vec<i32> = (0..20).collect();
-        s.pipeline(items).map(|x: i32| x * factor).collect()
+        s.pipeline()
+            .map(|x: i32| x * factor)
+            .collect(items)
     });
     let expected: Vec<i32> = (0..20).map(|x| x * 7).collect();
     assert_eq!(result, expected);
@@ -198,11 +200,9 @@ fn test_scope_par_map() {
     let offset = 100i32;
     let result = youpipe::scope(|s| {
         let items: Vec<i32> = (0..50).collect();
-        s.pipeline(items).par_map(|x: i32| x + offset, 4).collect()
+        s.pipeline().map(|x: i32| x + offset).collect(items)
     });
-    let mut r = result;
-    r.sort_unstable();
-    assert_eq!(r, (100..150).collect::<Vec<_>>());
+    assert_eq!(result, (100..150).collect::<Vec<_>>());
 }
 
 #[test]

@@ -4,10 +4,10 @@ fn main() {
     let multiplier = 7i32;
     let result = scope(|s| {
         let items: Vec<i32> = (0..20).collect();
-        s.pipeline(items)
+        s.pipeline()
             .map(|x: i32| x * multiplier)
-            .par_map(|x: i32| x + 1, 4)
-            .collect()
+            .map(|x: i32| x + 1)
+            .collect(items)
     });
 
     let mut sorted = result;

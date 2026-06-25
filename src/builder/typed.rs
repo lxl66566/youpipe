@@ -541,8 +541,8 @@ impl<T> StageMarker<T> for Identity {
 /// Synchronous map stage: `Fn(T) -> O`.
 #[derive(Clone)]
 pub struct SyncMap<Prev, F> {
-    prev: Prev,
-    f: F,
+    pub(crate) prev: Prev,
+    pub(crate) f: F,
 }
 
 impl<Prev, F, I, O> StageMarker<I> for SyncMap<Prev, F>
@@ -556,8 +556,8 @@ where
 /// Filter stage: keeps items where `Fn(&T) -> bool` returns `true`.
 #[derive(Clone)]
 pub struct Filter<Prev, F> {
-    prev: Prev,
-    f: F,
+    pub(crate) prev: Prev,
+    pub(crate) f: F,
 }
 
 impl<Prev, F, I> StageMarker<I> for Filter<Prev, F>
@@ -763,7 +763,7 @@ impl<S, T> Pipeline<S, T> {
         f: impl Fn(T) -> O + Send + Sync + 'static,
     ) -> Pipeline<SyncMap<S, impl Fn(T) -> O + Send + Sync + 'static>, O>
     where
-        S: StageMarker<T, Output = T>,
+        S: StageMarker<T>,
     {
         Pipeline {
             stages: SyncMap {
@@ -781,7 +781,7 @@ impl<S, T> Pipeline<S, T> {
         f: impl Fn(&T) -> bool + Send + Sync + 'static,
     ) -> Pipeline<Filter<S, impl Fn(&T) -> bool + Send + Sync + 'static>, T>
     where
-        S: StageMarker<T, Output = T>,
+        S: StageMarker<T>,
     {
         Pipeline {
             stages: Filter {
@@ -898,6 +898,50 @@ where
             let op = FusedOp(self.stages);
             par_index_collect(items, &op, splits)
         }
+    }
+}
+
+/// `pub(crate)` entry point for scoped pipelines. Identical to
+/// `Pipeline::collect` but without `'static` bounds — driven by
+/// `crate::scope::ScopedPipeline`, whose closure/stage lifetime is `'env`
+/// (the surrounding `scope` block).
+///
+/// Soundness rests on the same `ComputePool::join` invariant that rayon-style
+/// scoped parallelism relies on: the calling thread blocks inside
+/// `Registry::in_worker_cold` until every recursively spawned sub-task
+/// finishes, so every `'env` reference captured by `stages` outlives the
+/// pool's access to them.
+pub(crate) fn fused_collect_scoped<S, T>(
+    items: Vec<T>,
+    stages: S,
+    workload: Workload,
+) -> Vec<S::Output>
+where
+    S: FusedStage<T> + Sync,
+    T: Send,
+    S::Output: Send,
+{
+    let n = items.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let num_threads = ComputePool::global().num_workers();
+    if n <= 1 || num_threads <= 1 {
+        return items
+            .into_iter()
+            .filter_map(|item| stages.apply(item))
+            .collect();
+    }
+    let oversplit = match workload {
+        Workload::Balanced => 4,
+        Workload::Unbalanced => 8,
+    };
+    let splits = split_depth(n, num_threads, oversplit);
+    if S::MAY_FILTER {
+        join_fused_collect(items, &stages, splits)
+    } else {
+        let op = FusedOp(stages);
+        par_index_collect(items, &op, splits)
     }
 }
 

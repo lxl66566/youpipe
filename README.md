@@ -72,10 +72,10 @@ use youpipe::scope;
 
 let factor = 7;
 let result = scope(|s| {
-    s.pipeline((0..100).collect())
+    s.pipeline()
         .map(|x: i32| x * factor)
-        .par_map(|x: i32| x + 1, 4)
-        .collect()
+        .map(|x: i32| x + 1)
+        .collect((0..100).collect())
 });
 ```
 

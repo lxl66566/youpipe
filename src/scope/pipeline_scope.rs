@@ -1,10 +1,25 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
-use crate::{sync::sys::Mutex, util::split_chunks};
+use crate::builder::{
+    Filter, FusedStage, Identity, PipelineConfig, StageMarker, SyncMap, Workload,
+    fused_collect_scoped,
+};
 
 /// Opens a scoped execution context for non-`'static` closures.
 ///
-/// Closures can borrow local variables by reference.
+/// Closures passed to [`ScopedPipeline`]'s `.map()` / `.filter()` / `.collect()`
+/// may borrow local variables by shared reference for the duration of `scope`.
+///
+/// ```rust
+/// # use youpipe::scope;
+/// let factor = 7i32;
+/// let result = scope(|s| {
+///     let items: Vec<i32> = (0..10).collect();
+///     s.pipeline()
+///         .map(|x: i32| x * factor)   // borrows stack-local `factor`
+///         .collect(items)
+/// });
+/// ```
 pub fn scope<'env, F, R>(f: F) -> R
 where
     F: FnOnce(&PipelineScope<'env>) -> R,
@@ -15,114 +30,110 @@ where
     f(&scope)
 }
 
-/// Scoped execution context — allows borrowing non-`'static` data.
+/// Scoped execution context — the lifetime `'env` brands every closure passed
+/// to [`ScopedPipeline`] so the borrow checker enforces "outlives the scope".
 pub struct PipelineScope<'env> {
     _marker: PhantomData<&'env ()>,
 }
 
 impl<'env> PipelineScope<'env> {
-    /// Create a scoped pipeline from a `Vec<T>`.
+    /// Start a scoped, lazily-fused pipeline. `T` is inferred from the first
+    /// `.map` / `.filter` call, so callers do not need to spell it out.
     #[must_use]
-    pub fn pipeline<T: Send + 'static>(&self, items: Vec<T>) -> ScopedPipeline<'env, T> {
+    pub fn pipeline<T: Send>(&self) -> ScopedPipeline<'env, Identity, T> {
         ScopedPipeline {
-            items: Some(items),
-            runners: Vec::new(),
-            result_collector: None,
+            stages: Identity,
+            config: PipelineConfig::default(),
             _marker: PhantomData,
         }
     }
 }
 
-type SlotCollector<T> = Arc<Vec<Mutex<Vec<T>>>>;
-
-/// A pipeline that can borrow non-`'static` data from the enclosing scope.
-pub struct ScopedPipeline<'env, T: Send + 'static> {
-    items: Option<Vec<T>>,
-    runners: Vec<Box<dyn FnOnce() + Send + 'env>>,
-    result_collector: Option<(SlotCollector<T>, usize)>,
-    _marker: PhantomData<&'env ()>,
+/// A pipeline that may borrow non-`'static` data from the enclosing
+/// [`scope`]. Mirrors [`crate::builder::Pipeline`]'s stage chain but with the
+/// `'env` lifetime propagated through every bound, so closures like
+/// `|x| x * factor` can capture stack-local `factor` by reference.
+///
+/// Unlike the previous `ScopedPipeline` (which required `T: 'static`,
+/// pre-allocating `parallelism` chunks, and serialising results through
+/// `Arc<Vec<Mutex<Vec<T>>>>`), this version:
+///
+/// - has no `'static` bound on `T` or the closure,
+/// - fuses `.map`/`.filter`/`.par_map` at compile time (lazy chain),
+/// - drives `.collect()` through the same recursive work-stealing
+///   `par_index_collect` core as the top-level `Pipeline`.
+pub struct ScopedPipeline<'env, S = Identity, T = ()> {
+    stages: S,
+    config: PipelineConfig,
+    _marker: PhantomData<(&'env (), T)>,
 }
 
-impl<'env, T: Send + 'static> ScopedPipeline<'env, T> {
-    /// Sequential map within the scope.
-    pub fn map<O: Send + 'static>(
-        self,
-        f: impl Fn(T) -> O + Send + Clone + 'env,
-    ) -> ScopedPipeline<'env, O> {
-        let items = self.items.expect("items already consumed");
-        let mapped_items = items.into_iter().map(f).collect();
-        ScopedPipeline {
-            items: Some(mapped_items),
-            runners: self.runners,
-            result_collector: None,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Parallel map within the scope using `parallelism` workers.
-    pub fn par_map<O: Send + 'static>(
-        self,
-        f: impl Fn(T) -> O + Send + Sync + Clone + 'env,
-        parallelism: usize,
-    ) -> ScopedPipeline<'env, O> {
-        let items = self.items.expect("items already consumed");
-        let n = items.len();
-        if n == 0 || parallelism <= 1 {
-            let mapped: Vec<O> = items.into_iter().map(&f).collect();
-            return ScopedPipeline {
-                items: Some(mapped),
-                runners: self.runners,
-                result_collector: None,
-                _marker: PhantomData,
-            };
-        }
-
-        let chunks = split_chunks(items, parallelism);
-        let num_chunks = chunks.len();
-
-        let slots: SlotCollector<O> =
-            Arc::new((0..num_chunks).map(|_| Mutex::new(Vec::new())).collect());
-
-        let mut runners = self.runners;
-        for (idx, chunk) in chunks.into_iter().enumerate() {
-            let f = f.clone();
-            let slots = slots.clone();
-            runners.push(Box::new(move || {
-                let mapped: Vec<O> = chunk.into_iter().map(f).collect();
-                *slots[idx].lock() = mapped;
-            }));
-        }
-
-        ScopedPipeline {
-            items: None,
-            runners,
-            result_collector: Some((slots as SlotCollector<O>, num_chunks)),
-            _marker: PhantomData,
-        }
-    }
-
-    /// Execute all deferred work and collect results.
+impl<'env, S, T> ScopedPipeline<'env, S, T> {
+    /// Override the default [`PipelineConfig`].
     #[must_use]
-    pub fn collect(self) -> Vec<T> {
-        if let Some(items) = self.items {
-            return items;
-        }
-        let runners = self.runners;
-        std::thread::scope(|s| {
-            for runner in runners {
-                s.spawn(runner);
-            }
-        });
+    pub fn with_config(mut self, config: PipelineConfig) -> Self {
+        self.config = config;
+        self
+    }
 
-        if let Some((slots, num_chunks)) = self.result_collector {
-            let mut result = Vec::new();
-            for i in 0..num_chunks {
-                result.extend(std::mem::take(&mut *slots[i].lock()));
-            }
-            return result;
+    /// Append a synchronous map stage.
+    pub fn map<O>(
+        self,
+        f: impl Fn(T) -> O + Sync + 'env,
+    ) -> ScopedPipeline<'env, SyncMap<S, impl Fn(T) -> O + Sync + 'env>, O>
+    where
+        S: StageMarker<T, Output = T>,
+        O: Send,
+    {
+        ScopedPipeline {
+            stages: SyncMap {
+                prev: self.stages,
+                f,
+            },
+            config: self.config,
+            _marker: PhantomData,
         }
+    }
 
-        Vec::new()
+    /// Append a filter stage.
+    pub fn filter(
+        self,
+        f: impl Fn(&T) -> bool + Sync + 'env,
+    ) -> ScopedPipeline<'env, Filter<S, impl Fn(&T) -> bool + Sync + 'env>, T>
+    where
+        S: StageMarker<T, Output = T>,
+    {
+        ScopedPipeline {
+            stages: Filter {
+                prev: self.stages,
+                f,
+            },
+            config: self.config,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'env, S, T> ScopedPipeline<'env, S, T>
+where
+    S: FusedStage<T> + Sync + 'env,
+    T: Send + 'env,
+    S::Output: Send + 'env,
+{
+    /// Execute the fused pipeline over `items` and collect results.
+    ///
+    /// Uses the same recursive work-stealing `par_index_collect` core as
+    /// top-level `Pipeline::collect` — no `'static` bound required. When the
+    /// stage chain contains a `Filter`, falls back to per-leaf `Vec` merge.
+    pub fn collect(self, items: Vec<T>) -> Vec<S::Output> {
+        fused_collect_scoped(items, self.stages, self.config.workload)
+    }
+
+    /// Tune the workload split factor. Default is `Workload::Balanced`.
+    #[must_use]
+    pub fn with_workload(mut self, workload: Workload) -> Self {
+        self.config.workload = workload;
+        self
     }
 }
 
@@ -135,30 +146,72 @@ mod tests {
         let multiplier = 3i32;
         let result = scope(|s| {
             let items = vec![1, 2, 3, 4, 5];
-            s.pipeline(items).map(|x: i32| x * multiplier).collect()
+            s.pipeline()
+                .map(|x: i32| x * multiplier)
+                .collect(items)
         });
         assert_eq!(result, vec![3, 6, 9, 12, 15]);
     }
 
     #[test]
-    fn test_scope_par_map() {
+    fn test_scope_par_map_via_collect() {
+        // ScopedPipeline::collect now drives the recursive work-stealing core,
+        // so large inputs parallelise automatically.
         let offset = 100i32;
         let result = scope(|s| {
-            let items: Vec<i32> = (0..20).collect();
-            s.pipeline(items).par_map(|x: i32| x + offset, 4).collect()
+            let items: Vec<i32> = (0..1000).collect();
+            s.pipeline().map(|x: i32| x + offset).collect(items)
         });
-        let mut r = result;
-        r.sort_unstable();
-        let expected: Vec<i32> = (100..120).collect();
-        assert_eq!(r, expected);
+        let expected: Vec<i32> = (100..1100).collect();
+        assert_eq!(result, expected);
     }
 
     #[test]
-    fn test_scope_non_static_borrow() {
-        let factor = 10i32;
-        scope(|s| {
-            let items: Vec<i32> = (0..5).collect();
-            let _results = s.pipeline(items).map(|x: i32| x * factor).collect();
+    fn test_scope_chained_map_filter() {
+        let factor = 7i32;
+        let result = scope(|s| {
+            let items: Vec<i32> = (0..30).collect();
+            s.pipeline()
+                .map(|x: i32| x * factor)
+                .filter(|x: &i32| *x % 2 == 0)
+                .map(|x: i32| x + 1)
+                .collect(items)
         });
+        let expected: Vec<i32> = (0..30)
+            .map(|x| x * 7)
+            .filter(|x| x % 2 == 0)
+            .map(|x| x + 1)
+            .collect();
+        assert_eq!(result, expected);
+    }
+
+    /// The headline scope feature: borrow a *non-Copy, non-`'static`* value
+    /// from outside the scope and use it inside the parallel closures. The
+    /// previous `T: 'static` bound made this impossible — the closure would
+    /// have failed to capture `&cached` because `'env` did not satisfy
+    /// `'static`.
+    #[test]
+    fn test_scope_truly_non_static_borrow() {
+        let cached: Vec<String> = (0..5).map(|i| format!("val{i}^2={}", i * i)).collect();
+        // Borrow `cached` (non-Copy, lifetime-locked to the test frame) inside
+        // the closure. Same-type map (`usize -> usize`) keeps us inside the
+        // type-state constraint that `Pipeline` also imposes.
+        let expected: Vec<usize> = cached.iter().map(String::len).collect();
+        let result: Vec<usize> = scope(|s| {
+            let items: Vec<usize> = (0..cached.len()).collect();
+            s.pipeline()
+                .map(|i: usize| cached[i].len())
+                .collect(items)
+        });
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_scope_empty() {
+        let result = scope(|s| {
+            let items: Vec<i32> = vec![];
+            s.pipeline().map(|x: i32| x * 2).collect(items)
+        });
+        assert!(result.is_empty());
     }
 }
