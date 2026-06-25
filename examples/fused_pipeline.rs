@@ -2,7 +2,7 @@ use youpipe::{Pipeline, PipelineConfig, Workload};
 
 fn main() {
     let items: Vec<i32> = (0..10_000).collect();
-    let result = Pipeline::from_vec(items.clone())
+    let result = Pipeline::new()
         .map(|x: i32| x + 1)
         .filter(|x: &i32| x % 3 == 0)
         .map(|x: i32| x * 10)

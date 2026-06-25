@@ -11,7 +11,7 @@ This document is for contributors and developers who want to understand how youp
 youpipe uses **generic nested types** for compile-time pipeline fusion — similar to the iterator `Map<Filter<Iter, F1>, F2>` pattern. When the user chains `.map().filter().map()`, there are no intermediate `Vec`s or virtual dispatch overhead:
 
 ```rust
-Pipeline::from_vec(items)
+Pipeline::new()
     .map(|x: i32| x + 1)      // SyncMap<Identity, F1>
     .filter(|x: &i32| *x > 0) // Filter<SyncMap<Identity, F1>, F2>
     .map(|x: i32| x * 2)      // SyncMap<Filter<...>, F3>
@@ -151,7 +151,7 @@ pub struct Pipeline<S = Identity, T = ()> {
 
 | Method call | Type change |
 |---|---|
-| `Pipeline::from_vec(items)` | `Pipeline<Identity, T>` |
+| `Pipeline::new()` | `Pipeline<Identity, T>` |
 | `.map(\|x\| f(x))` | `Pipeline<SyncMap<Identity, F>, O>` |
 | `.filter(\|x\| p(x))` | `Pipeline<Filter<SyncMap<...>, F>, T>` |
 | `.fence()` | `Pipeline<Fence<...>, T>` |

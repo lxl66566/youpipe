@@ -46,7 +46,7 @@ let results: Result<Vec<i32>, String> = try_par_map(0..100, |x| {
 ```rust
 use youpipe::Pipeline;
 
-let result = Pipeline::from_vec(vec![])
+let result = Pipeline::new()
     .map(|x: i32| x + 1)
     .filter(|x: &i32| x % 2 == 0)
     .map(|x: i32| x * 10)
@@ -87,7 +87,7 @@ let result = scope(|s| {
 | `par_map_with_workload(iter, f, Workload)` | Parallel map with workload hint |
 | `par_chunks_map(iter, chunk_size, f)` | Chunked parallel map |
 | `try_par_map(iter, f)` | Fallible parallel map |
-| `Pipeline::from_vec()` → `.map()` → `.filter()` → `.collect()` | Fused pipeline |
+| `Pipeline::new()` → `.map()` → `.filter()` → `.collect()` | Fused pipeline |
 | `StreamPipeline::new(config)` → `.run()` | Streaming pipeline |
 | `CancellationToken` | Cooperative cancellation |
 | `scope(\|s\| ...)` | Non-`'static` scoped execution |

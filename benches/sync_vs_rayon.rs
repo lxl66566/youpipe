@@ -88,7 +88,7 @@ fn bench_pipeline_fusion(c: &mut Criterion) {
                     || warm_clone(data),
                     |v| {
                         black_box(
-                            youpipe::Pipeline::from_vec(Vec::<u64>::new())
+                            youpipe::Pipeline::new()
                                 .map(|x: u64| x + 1)
                                 .map(|x: u64| x * 3)
                                 .map(|x: u64| x - 2)

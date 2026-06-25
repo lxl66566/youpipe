@@ -716,7 +716,7 @@ where
 /// A type-state pipeline builder. Stages are fused at compile time into a
 /// single pass over the data when possible (no `fence` / `ordered` boundaries).
 ///
-/// Use [`Pipeline::from_vec`] to start, chain `.map()` / `.filter()` calls,
+/// Use [`Pipeline::new`] to start, chain `.map()` / `.filter()` calls,
 /// then call `.collect(items)` to execute.
 pub struct Pipeline<S = Identity, T = ()> {
     stages: S,
@@ -726,13 +726,26 @@ pub struct Pipeline<S = Identity, T = ()> {
 
 impl<T: Send + 'static> Pipeline<Identity, T> {
     /// Create a new pipeline (type-state entry point).
+    ///
+    /// `T` is inferred from the first staged method (e.g. `.map(|x: i32| ...)`),
+    /// so callers do not need to spell it out — the previous `from_vec(vec![])`
+    /// entry point existed only as a type hint and silently discarded its
+    /// argument, which was both wasteful and confusing.
     #[must_use]
-    pub fn from_vec(_items: Vec<T>) -> Self {
+    pub fn new() -> Self {
         Self {
             stages: Identity,
             config: PipelineConfig::default(),
             _marker: PhantomData,
         }
+    }
+}
+
+impl<T: Send + 'static> Default for Pipeline<Identity, T> {
+    /// `Pipeline: Default` lets downstream code write `Pipeline::<T>::default()`
+    /// or rely on type inference from the first `.map` / `.filter` call.
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1727,7 +1740,7 @@ mod tests {
     #[test]
     fn test_fused_sync_collect() {
         let items: Vec<i32> = (0..100).collect();
-        let result = Pipeline::from_vec(items.clone())
+        let result = Pipeline::new()
             .map(|x: i32| x * 2)
             .map(|x: i32| x + 1)
             .collect(items);
@@ -1740,7 +1753,7 @@ mod tests {
     #[test]
     fn test_fused_filter() {
         let items: Vec<i32> = (0..20).collect();
-        let result = Pipeline::from_vec(items.clone())
+        let result = Pipeline::new()
             .filter(|x: &i32| x % 2 == 0)
             .map(|x: i32| x * 10)
             .collect(items);
@@ -1752,7 +1765,7 @@ mod tests {
     #[test]
     fn test_empty_input() {
         let items: Vec<i32> = vec![];
-        let result = Pipeline::from_vec(items.clone())
+        let result = Pipeline::new()
             .map(|x: i32| x * 2)
             .collect(items);
         assert!(result.is_empty());
@@ -1870,7 +1883,7 @@ mod tests {
     fn test_fused_collect_panic_safety() {
         let items: Vec<i32> = (0..2000).collect();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Pipeline::from_vec(Vec::<i32>::new())
+            Pipeline::new()
                 .map(|x: i32| if x == 1500 { panic!("boom") } else { x + 1 })
                 .collect(items);
         }));

@@ -42,7 +42,7 @@ fn test_par_map_single() {
 #[test]
 fn test_pipeline_fusion_3_stages() {
     let items: Vec<i32> = (0..500).collect();
-    let result = youpipe::Pipeline::from_vec(items.clone())
+    let result = youpipe::Pipeline::new()
         .map(|x: i32| x + 1)
         .map(|x: i32| x * 3)
         .map(|x: i32| x - 7)
@@ -58,7 +58,7 @@ fn test_pipeline_fusion_3_stages() {
 #[test]
 fn test_pipeline_filter_map() {
     let items: Vec<i32> = (0..100).collect();
-    let result = youpipe::Pipeline::from_vec(items.clone())
+    let result = youpipe::Pipeline::new()
         .filter(|x: &i32| x % 3 == 0)
         .map(|x: i32| x * 10)
         .collect(items);

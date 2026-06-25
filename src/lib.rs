@@ -10,7 +10,7 @@
 //! let results = par_map(0..1000, |x| x * 2);
 //!
 //! // Fused pipeline (compile-time stage fusion)
-//! let results = Pipeline::from_vec(vec![])
+//! let results = Pipeline::new()
 //!     .map(|x: i32| x + 1)
 //!     .filter(|x: &i32| x % 2 == 0)
 //!     .collect(0..1000);
