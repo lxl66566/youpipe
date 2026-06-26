@@ -181,6 +181,13 @@ pub(crate) struct Sleep {
     /// Per-worker sleep state.
     worker_sleep_states: Vec<crate::util::CachePadded<WorkerSleepState>>,
     counters: AtomicCounters,
+    /// Rotating start index for `wake_any_threads`' linear scan. Without this
+    /// every wake scan begins at worker 0, making worker 0's `is_blocked` mutex
+    /// a hot lock under churn (measured: ~200 k wake attempts per 100 k-item
+    /// run, most finding the target awake). A monotonic cursor spreads the
+    /// remaining lock acquisitions across workers; exact rotation is irrelevant
+    /// to correctness.
+    wake_cursor: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -196,8 +203,27 @@ pub(crate) struct IdleState {
     jobs_counter: JobsEventCounter,
 }
 
-const ROUNDS_UNTIL_SLEEPY: u32 = 32;
-const ROUNDS_UNTIL_SLEEPING: u32 = ROUNDS_UNTIL_SLEEPY + 1;
+/// Idle rounds spent busy-spinning (the `pause` instruction) before yielding
+/// the OS thread.
+///
+/// Stolen `join` work typically arrives within microseconds. A `sched_yield`
+/// here costs ~1 µs *and* may migrate the worker off its warm core (dropping
+/// its cache), and with ~400 k idle rounds per 100 k-item run
+/// (hotpath-measured) that syscall overhead was the dominant gap vs rayon,
+/// which also busy-spins before yielding. Burn a little CPU instead — the pool
+/// parks for real one round past `ROUNDS_UNTIL_SLEEPY`, so long-idle CPU cost
+/// stays bounded.
+///
+/// Measured (32-core, A/B vs the all-yield predecessor): `sync_cpu_heavy`
+/// youpipe `pipe().map().collect()` improved −14 % @ 10 k, −18 % @ 100 k;
+/// `pipeline_fusion` and `sync_lightweight` improved −5…−13 %. The 1 k batch is
+/// unchanged because it hits the serial short-circuit and never reaches here.
+const ROUNDS_SPIN: u32 = 32;
+/// Idle rounds spent in `sched_yield` (cooperate but stay runnable) after the
+/// busy-spin phase. At this round the worker announces "sleepy" (bumps the JEC
+/// so a later poster can detect it), yields once more, and then the next idle
+/// round falls through to the actual `condvar` park in `sleep()`.
+const ROUNDS_UNTIL_SLEEPY: u32 = ROUNDS_SPIN + 32;
 
 impl Sleep {
     pub(crate) fn new(n_threads: usize) -> Sleep {
@@ -205,6 +231,7 @@ impl Sleep {
         Sleep {
             worker_sleep_states: (0..n_threads).map(|_| CachePadded::default()).collect(),
             counters: AtomicCounters::new(),
+            wake_cursor: AtomicUsize::new(0),
         }
     }
 
@@ -235,14 +262,16 @@ impl Sleep {
         latch: &CoreLatch,
         has_injected_jobs: impl FnOnce() -> bool,
     ) {
-        if idle.rounds < ROUNDS_UNTIL_SLEEPY {
+        if idle.rounds < ROUNDS_SPIN {
+            // Busy-spin phase: stay on-core, keep cache warm, no syscall.
+            std::hint::spin_loop();
+            idle.rounds += 1;
+        } else if idle.rounds < ROUNDS_UNTIL_SLEEPY {
+            // Yield phase: cooperate with the OS scheduler but stay runnable.
             thread::yield_now();
             idle.rounds += 1;
         } else if idle.rounds == ROUNDS_UNTIL_SLEEPY {
             idle.jobs_counter = self.announce_sleepy();
-            idle.rounds += 1;
-            thread::yield_now();
-        } else if idle.rounds < ROUNDS_UNTIL_SLEEPING {
             idle.rounds += 1;
             thread::yield_now();
         } else {
@@ -359,8 +388,13 @@ impl Sleep {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn wake_any_threads(&self, mut num_to_wake: u32) {
         if num_to_wake > 0 {
-            for i in 0..self.worker_sleep_states.len() {
-                if self.wake_specific_thread(i) {
+            let n = self.worker_sleep_states.len();
+            // Rotate the scan start so worker 0's `is_blocked` mutex isn't a
+            // hot lock under churn (see `wake_cursor`). n ≥ 1 (a pool always
+            // has at least one worker), so the modulo is sound.
+            let start = self.wake_cursor.fetch_add(1, Ordering::Relaxed) % n;
+            for i in 0..n {
+                if self.wake_specific_thread((start + i) % n) {
                     num_to_wake -= 1;
                     if num_to_wake == 0 {
                         return;

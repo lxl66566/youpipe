@@ -224,9 +224,30 @@ const SERIAL_ITEMS_PER_THREAD: usize = 64;
 /// Whether a batch of `n` items should run sequentially on the calling thread
 /// instead of being split across the pool. `num_threads` is read once by the
 /// caller and passed in to avoid a second `ComputePool::global()` TLS hit.
-#[inline]
-fn prefers_serial(n: usize, num_threads: usize) -> bool {
-    n <= 1 || num_threads <= 1 || n <= num_threads * SERIAL_ITEMS_PER_THREAD
+///
+/// The serial↔parallel crossover is `parallel_fixed_overhead / per_item_cost`.
+/// We don't know `per_item_cost`, so the `Workload` hint selects a per-thread
+/// item count that the batch must exceed before we pay the pool's ~120 µs
+/// fixed dispatch cost:
+///
+/// - `Balanced`: uniform items, low average cost → high threshold
+///   (`SERIAL_ITEMS_PER_THREAD`, ~2 k on 32 cores). Measured cpu_heavy
+///   crossover is ~3 k; below it the pool is slower than a plain loop.
+/// - `Unbalanced`: carries an expensive tail, so the average per-item cost is
+///   higher and the crossover lands at a smaller `n` (measured on a 1000×-
+///   spread skewed workload: crossover ~450). Serialize only truly tiny batches
+///   (`/8`). The expensive tail makes *over*-serializing catastrophic — a 1 k
+///   skewed batch is ~7× slower serially than in parallel — so the Unbalanced
+///   multiplier stays small.
+fn prefers_serial(n: usize, num_threads: usize, workload: Workload) -> bool {
+    if n <= 1 || num_threads <= 1 {
+        return true;
+    }
+    let per_thread = match workload {
+        Workload::Balanced => SERIAL_ITEMS_PER_THREAD,
+        Workload::Unbalanced => SERIAL_ITEMS_PER_THREAD / 8,
+    };
+    n <= num_threads * per_thread
 }
 
 /// Compute the number of recursive split levels. Aiming at ~`oversplit` tasks
@@ -472,7 +493,7 @@ where
             return Vec::new();
         }
         let num_threads = ComputePool::global().num_workers();
-        if prefers_serial(n, num_threads) {
+        if prefers_serial(n, num_threads, self.config.workload) {
             return items
                 .into_iter()
                 .filter_map(|item| self.stages.apply(item))
@@ -628,7 +649,7 @@ where
             return Ok(Vec::new());
         }
         let num_threads = ComputePool::global().num_workers();
-        if prefers_serial(n, num_threads) {
+        if prefers_serial(n, num_threads, self.config.workload) {
             let mut out = Vec::with_capacity(n);
             for item in items {
                 if let Some(o) = self.stages.try_apply(item)? {
@@ -675,7 +696,7 @@ where
         return Vec::new();
     }
     let num_threads = ComputePool::global().num_workers();
-    if prefers_serial(n, num_threads) {
+    if prefers_serial(n, num_threads, workload) {
         return items
             .into_iter()
             .filter_map(|item| stages.apply(item))
