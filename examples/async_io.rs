@@ -10,10 +10,41 @@
 //! ```text
 //! cargo run --example async_io
 //! ```
+//!
+//! ## API shape
+//!
+//! The simple form needs **zero** configuration — sensible defaults pick a
+//! worker count, an `io_concurrency`, and lazily build a tokio runtime the
+//! first time `stage_async` runs in a `run()` call:
+//!
+//! ```text
+//! stream(items)
+//!     .stage_async(|x| async move { ... })
+//!     .run();
+//! ```
+//!
+//! Tune only when you outgrow the defaults:
+//!
+//! ```text
+//! use youpipe::prelude::*;
+//!
+//! //! // 1. Raise the in-flight IO cap (default 128).
+//! items.stream()
+//!     .with_config(PipelineConfig::default().with_io_concurrency(512))
+//!     .stage_async(|x| async move { ... })
+//!     .run();
+//!
+//! // 2. Reuse one runtime across many `run()` calls (criterion benches,
+//! //    long-lived services). Construction (~ms) is paid once.
+//! let pool = AsyncPool::from_default().expect("async runtime");
+//! items0.stream().with_async_pool(pool).stage_async(...).run();
+//! // (the pool is moved into the run; rebuild per call or wrap a Handle
+//! // yourself to truly share across runs.)
+//! ```
 
 use std::time::{Duration, Instant};
 
-use youpipe::{AsyncPool, PipelineConfig, stream};
+use youpipe::prelude::*;
 
 /// Async IO work: yields the OS thread back to the runtime while sleeping.
 /// Real network/disk IO behaves the same way (`.await` is the yield point).
@@ -44,19 +75,15 @@ const SIZE: usize = 200;
 fn main() {
     let tasks = skewed_io(SIZE);
 
-    // ── youpipe stream().stage_async(): M:N concurrency ──
-    // The async pool is built once and reused (runtime construction is ~ms
-    // and would otherwise dominate this small workload).
-    let pool = AsyncPool::from_global(
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4),
-    )
-    .expect("async runtime");
+    // ── youpipe stream().stage_async(): defaults only, no tuning ──
+    // `io_concurrency` defaults to 128; the tokio runtime is built lazily on
+    // the first `acquire_async()` inside this `run()` and reused for the rest
+    // of the call. Compare with the "tune io_concurrency + reuse pool" form
+    // documented in the module header above.
     let yp_start = Instant::now();
-    let yp_result = stream(tasks.clone())
-        .with_config(PipelineConfig::default().with_io_concurrency(512))
-        .with_async_pool(pool)
+    let yp_result = tasks
+        .clone()
+        .stream()
         .stage_async(|(x, dur): (u64, Duration)| async move { async_io(x, dur).await })
         .run();
     let yp_elapsed = yp_start.elapsed();
@@ -89,7 +116,7 @@ fn main() {
         yp_sorted.len()
     );
     println!(
-        "  youpipe stage_async: {:>10.3?}   (M:N, io_concurrency=512)",
+        "  youpipe stage_async: {:>10.3?}   (M:N, default io_concurrency=128)",
         yp_elapsed
     );
     println!(

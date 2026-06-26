@@ -4,13 +4,13 @@
 //! cargo run --example basic_pipe
 //! ```
 
-use youpipe::pipe;
+use youpipe::prelude::*;
 
 fn main() {
     // `pipe` consumes any `IntoIterator` and returns a fused, chainable
     // pipeline. `.collect()` executes the chain on the work-stealing compute
     // pool and returns a `Vec`.
-    let result: Vec<i32> = pipe(0..10_000).map(|x| x * 2).collect();
+    let result: Vec<i32> = (0..10_000).pipe().map(|x| x * 2).collect();
 
     assert_eq!(result.len(), 10_000);
     assert_eq!(result[0], 0);
@@ -20,7 +20,8 @@ fn main() {
     // Chained stages fuse at compile time — no intermediate Vec between
     // map/filter steps, the way rayon's `par_iter().map().filter().collect()`
     // does.
-    let filtered: Vec<i32> = pipe(0..100)
+    let filtered: Vec<i32> = (0..100)
+        .pipe()
         .map(|x| x + 1)
         .filter(|x: &i32| x % 3 == 0)
         .map(|x| x * 10)

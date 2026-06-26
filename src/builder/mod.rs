@@ -9,5 +9,5 @@ pub use config::{PipelineConfig, Workload};
 pub(crate) use typed::fused_collect_scoped;
 pub use typed::{
     Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, Pipe, StageMarker,
-    StreamPipe, SyncMap, TryMap, TryPipe, pipe, stream,
+    StreamPipe, StreamStart, SyncMap, TryMap, TryPipe, pipe, stream,
 };

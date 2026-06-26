@@ -11,7 +11,7 @@
 
 use std::{thread, time::Duration};
 
-use youpipe::{CancellationToken, stream};
+use youpipe::prelude::*;
 
 fn main() {
     let token = CancellationToken::new();
@@ -33,7 +33,7 @@ fn main() {
     };
 
     let start = std::time::Instant::now();
-    let result = stream(items).with_cancel(token).stage(slow).run();
+    let result = items.stream().with_cancel(token).stage(slow).run();
     let elapsed = start.elapsed();
 
     cancel_handle.join().unwrap();

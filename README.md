@@ -1,159 +1,186 @@
 # youpipe
 
-High-performance Rust concurrent pipeline batch processing framework with compile-time fusion.
+English | [简体中文](./README.zh-CN.md)
 
-## Features
+youpipe is a high-performance, data-first parallel pipeline supporting mixed
+CPU workloads and streaming async IO. Items enter at the front, stages chain
+naturally, and a single terminal call (`.collect()` / `.run()`) executes the
+whole chain. Two pipeline engines cover different regimes:
 
-- **Data-First API** — `pipe(items).map().filter().collect()`; data enters at the front, not at the end
-- **Compile-Time Fusion** — `.map().filter().map()` compiles to a single closure per worker, zero intermediate allocations
-- **Workload Hints** — `.with_workload(Workload::Balanced)` (zero-atomics) or `Workload::Unbalanced` (adaptive fetch-add)
-- **Work-Stealing Pool** — Lock-free `st3` LIFO deque scheduler with EventCount wake-up
-- **Streaming Pipelines** — `stream(items).stage().stage_async()` with channels between stages, ordered/unordered output
-- **Async IO Stages** — `.stage_async()` for M:N IO concurrency on a tokio runtime
-- **Fallible Chains** — `.try_map()` / `.try_collect()` with early termination on first error
-- **Cancellation** — `.with_cancel(token)` for cooperative StreamPipe shutdown
-- **Scoped Execution** — `scope()` for non-`'static` closures that borrow stack-local data
-- **1-to-N Expansion** — `.expand()` for flatMap-style stages
+- `Pipe` — compile-time fused CPU chains. `.map().filter().map()` becomes a
+  single monomorphized closure per worker with no intermediate allocations.
+- `StreamPipe` — channel-backed streaming for cases fusion cannot cover:
+  async IO, cancellation, fences, 1-to-N expansion, and more.
 
-## Pipe vs StreamPipe
+A rayon-style work-stealing scheduler (`st3` LIFO deque + `EventCount`)
+handles balanced and unbalanced loads. `scope()` supports non-`'static`
+closures that borrow stack-local data.
 
-| 维度 | `Pipe` (fused) | `StreamPipe` (stream) |
-|---|---|---|
-| **组合方式** | 编译时类型状态链，零成本抽象 | 运行时闭包 + channel 连接 |
-| **执行引擎** | `par_index_collect` work-stealing join，单次预分配 | producer-consumer channel + compute pool workers |
-| **内存** | 无中间分配，最终 `Vec<O>` 一次性填充 | 每阶段一个 channel pair，额外 buffer |
-| **异步/IO** | ❌ 不支持 | ✅ `.stage_async()` |
-| **取消** | ❌ 不支持 | ✅ `.with_cancel(token)` |
-| **阶段数** | 编译期固定（链式） | 可变（`.stage()` / `.expand()` / `.fence()`） |
-| **闭包生命周期** | `'static` | `'static` |
-| **开销** | 接近手写循环 | channel 同步 + 内存拷贝 |
-| **适用场景** | 纯 CPU map-filter 流水线 | 异步 IO、取消、运行时阶段拼接 |
+Usage: `cargo add youpipe`.
 
-`Pipe` 适合纯 CPU 密集任务，追求极致性能；`StreamPipe` 覆盖异步 IO、取消、运行时阶段组合等前者无法处理的场景，以少量同步开销换取灵活性。两者执行引擎完全不同（work-stealing join vs channel），不可互相替代。
+## API
 
-## Quick Start
-
-```toml
-[dependencies]
-youpipe = "0.2"
-```
-
-### Fused Pipe (CPU-bound)
+`pipe(items)` / `items.pipe()` produce the same types — either works.
 
 ```rust
 use youpipe::pipe;
+let r: Vec<i32> = pipe(0..1000).map(|x| x + 1).collect();
+// same as
+use youpipe::prelude::*;
+let r: Vec<i32> = (0..1000).pipe().map(|x| x + 1).collect();
+```
 
-// Data-first: items enter at the front, stages chain, `.collect()` executes.
-let result: Vec<i32> = pipe(0..1000)
+Pick the entry point by workload:
+
+| Workload                     | Entry                                                |
+| ---------------------------- | ---------------------------------------------------- |
+| Pure CPU map/filter          | `pipe(items)`                                        |
+| Async IO, mixed sync+async   | `stream(items).stage_async(...)`                     |
+| Unbalanced CPU workloads     | `pipe(items).with_workload(Unbalanced)`              |
+| Cancellation, fences, expand | `stream(items).with_cancel(..).fence(..).expand(..)` |
+| Borrow stack-local data      | `scope(\|s\| s.pipe(..)....)`                        |
+
+Below ~10 µs of total work or ~100 ns per item, youpipe is not recommended —
+the parallel setup overhead won't pay off. Sequential `iter().map().collect()`
+is faster in that range.
+
+## Examples
+
+youpipe does **not** wait for one stage to finish completely before starting
+the next. Use a fence between stages if you need strict stage isolation.
+
+```rust
+use std::num::NonZeroUsize;
+use youpipe::prelude::*;
+
+// fused CPU bound
+let r: Vec<i32> = (0..1000).pipe()
     .map(|x| x + 1)
     .filter(|x: &i32| x % 2 == 0)
     .map(|x| x * 10)
     .collect();
 
-// Unbalanced workload → finer-grained task stealing.
-use youpipe::Workload;
-let r: Vec<i32> = pipe(0..1000)
-    .with_workload(Workload::Unbalanced)
-    .map(|x| expensive(x))
-    .collect();
-```
-
-### Fallible chain
-
-```rust
-use youpipe::pipe;
-
-// Interleave `.try_map()` and `.map()`; `.try_collect()` short-circuits on the
-// first `Err`.
-let result: Result<Vec<String>, &str> = pipe(0..100)
+// fallable
+let r: Result<Vec<String>, _> = (0..100).pipe()
     .try_map(|x: i32| if x == 50 { Err("bad") } else { Ok(x * 2) })
     .map(|x| format!("{x}"))
     .try_collect();
-```
 
-### Streaming Pipe (channels between stages)
+// sync CPU stage + async IO stage (overlap on separate pools)
+let r: Vec<u64> = (0..1000).stream()
+    .stage(|x: u64| x + 1)
+    .stage_async(|x: u64| async move { fetch(x).await })
+    .run();
 
-```rust
-use youpipe::stream;
-
-// Stages connected by lock-free channels; output arrives in completion order.
-// Add `.ordered()` to restore input order via a ReorderBuffer.
-let result = stream(0..1000)
+// fence: batch every 64 items between two adjacent stages
+let r: Vec<i32> = (0..1000).stream()
     .stage(|x: i32| x + 1)
+    .fence(FenceMode::Chunked(NonZeroUsize::new(64).unwrap()))
     .stage(|x: i32| x * 2)
-    .ordered()
     .run();
-```
 
-### Async IO stage (mixed sync CPU + async IO)
-
-`.stage_async()` runs an async stage as `io_concurrency` tasks on a tokio
-runtime (M:N concurrency for yielding IO — network/disk, `tokio::time::sleep`).
-Reuse the runtime across runs by attaching it via `.with_async_pool(...)`.
-
-```rust
-use youpipe::{stream, AsyncPool, PipelineConfig};
-
-let pool = AsyncPool::from_global(8).unwrap();
-let r = stream(vec![1u64, 2, 3])
-    .with_config(PipelineConfig::default().with_io_concurrency(256))
-    .with_async_pool(pool)
-    .stage(|x: u64| x + 1)                       // sync CPU on compute pool
-    .stage_async(|m: u64| async move { m * 2 })  // async IO on runtime (M:N)
-    .run();
-```
-
-### Scoped Pipe (non-`'static` closures)
-
-```rust
-use youpipe::scope;
-
-let factor: usize = 7;
+// scope borrows local `factor` and `table`, no clone
+let factor = 7;
 let table: Vec<String> = (0..100).map(|i| format!("row-{i}")).collect();
-// Borrow `factor` and `&table` from every worker — no clone, no Arc.
-let result: Vec<usize> = scope(|s| {
-    s.pipe(0..table.len())
-        .map(|i: usize| table[i].len() * factor)
-        .collect()
+let r: Vec<usize> = scope(|s| {
+    s.pipe(0..table.len()).map(|i: usize| table[i].len() * factor).collect()
 });
 ```
 
-## API
+## Performance
 
-| Function / Type | Description |
-|---|---|
-| `pipe(iter)` → `.map()` → `.filter()` → `.collect()` | Data-first fused CPU pipeline |
-| `pipe(iter).try_map().map().try_collect()` | Fallible fused chain (short-circuits) |
-| `.with_workload(Workload)` / `.with_config(config)` | Tune oversplit / config |
-| `stream(iter)` → `.stage()` → `.expand()` → `.fence()` → `.run()` | Streaming pipeline (channels between stages) |
-| `.stage_async(fut)` | Async IO stage on the tokio runtime (M:N) |
-| `.ordered()` | Restore input order via `ReorderBuffer` |
-| `.with_cancel(token)` / `.with_async_pool(pool)` | Cancellation / runtime reuse |
-| `scope(\|s\| s.pipe(iter)…)` | Non-`'static` scoped fused pipeline |
-| `CancellationToken` | Cooperative cancellation |
-| `ComputePool` | Work-stealing thread pool |
-| `channel(cap)` / `async_channel(cap)` | MPMC channels |
+7945HX 32-core Linux. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#9-performance-benchmarks).
 
-## Benchmarks
+fused `pipe()` — CPU-heavy (100 iters/item):
 
-```bash
-cargo bench --bench channel_bench    # Channel throughput
-cargo bench --bench sync_vs_rayon    # CPU-heavy, fusion, lightweight
-cargo bench --bench unbalanced       # Unbalanced workloads
-cargo bench --bench mixed_load       # Mixed CPU/IO (blocking)
-cargo bench --bench io_async         # Async IO (pure + mixed sync+async)
-cargo bench --bench async_vs_tokio   # Stream vs tokio spawn_blocking
+| Size | youpipe | rayon  |
+| ---- | ------- | ------ |
+| 1K   | 72 µs   | 38 µs  |
+| 10K  | 133 µs  | 90 µs  |
+| 100K | 366 µs  | 313 µs |
+
+fused `pipe()` — lightweight `x+1`:
+
+| Size | youpipe | rayon  |
+| ---- | ------- | ------ |
+| 10K  | 120 µs  | 66 µs  |
+| 100K | 142 µs  | 114 µs |
+| 1M   | 739 µs  | 291 µs |
+
+streaming `stream()` — single sync stage (`cpu_work`, 100 iters/item):
+
+| Size | youpipe | tokio spawn_blocking |
+| ---- | ------- | -------------------- |
+| 1K   | 801 µs  | 2.45 ms              |
+| 10K  | 7.73 ms | 23.2 ms              |
+
+Async IO (`tokio::time::sleep`, ~1 ms latency, `io_concurrency = 512`), 500 items:
+
+| Topology                              | Time    |
+| ------------------------------------- | ------- |
+| youpipe: pure async IO                | 9.82 ms |
+| tokio: native async                   | 9.33 ms |
+| youpipe: mixed sync CPU + async IO    | 9.93 ms |
+| tokio: mixed spawn_blocking           | 10.1 ms |
+| youpipe: mixed sync CPU + blocking IO | 60.0 ms |
+
+## Advanced usage
+
+Defaults: `compute_workers = async_workers = available_parallelism`,
+`io_concurrency = 128`, `buffer_size = 256`, `Workload::Balanced`. The tokio
+runtime is built lazily on first `.run()` and reused for that run; pass an
+`AsyncPool` to share one across runs.
+
+```rust
+use youpipe::prelude::*;
+
+// Unbalanced: ~10% slow items, 1000× cost spread → raises oversplit factor
+let r: Vec<_> = (0..5_000).pipe()
+    .with_workload(Workload::Unbalanced)
+    .map(|x| expensive(x))
+    .collect();
+
+// Tuned config + reused runtime
+let cfg = PipelineConfig::default()
+    .with_compute_workers(16)
+    .with_async_workers(8)
+    .with_io_concurrency(512)
+    .with_buffer_size(1024);
+let pool = AsyncPool::from_default()?;
+let r = items.stream()
+    .with_config(cfg)
+    .with_async_pool(pool)
+    .stage_async(|x| async move { io(x).await })
+    .run();
+
+// Cancellation
+let token = CancellationToken::new();
+let r = (0..10_000).stream()
+    .with_cancel(token.clone())
+    .stage(|x| expensive(x))
+    .run();
 ```
 
-Results for individual benches are documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+`io_concurrency` is the M:N multiplier — async tasks yield the OS thread
+while waiting, so it can be far larger than `async_workers` (the thread
+count). Bound it to cap memory.
 
-## Testing
+`.fence(mode)` acts on one adjacent stage boundary. `FenceMode::Barrier`
+drains upstream fully before downstream starts; `FenceMode::Chunked(k)`
+releases every `k` items as they form (the default for mixed CPU/IO).
+`.run()` returns results in completion order; append `.ordered()` to restore
+input order via a `ReorderBuffer`.
 
-```bash
-cargo test
-MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo miri test
-```
+## How it works
 
-## License
+`Pipe` composes a compile-time typestate chain that monomorphises into a
+single closure per worker — no `dyn`, no per-stage `Vec`. The fused hot path
+allocates input/output buffers once and recurses on the index range `[0, n)`,
+handing each leaf a `&[T]` / `&mut [R]` slice view so the leaf loop stays
+branch-free and vectorisable.
 
-MIT
+`StreamPipe` walks the chain at `.run()` time, spawning workers per stage
+over channels. Sync stages run on the `ComputePool`; async stages multiplex
+`io_concurrency` tokio tasks on `async_workers` OS threads. Full design
+rationale, module walkthrough and panic-safety discussion in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).

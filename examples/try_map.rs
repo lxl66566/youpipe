@@ -8,7 +8,7 @@
 //! cargo run --example try_map
 //! ```
 
-use youpipe::pipe;
+use youpipe::prelude::*;
 
 #[derive(Debug)]
 enum ParseError {
@@ -21,7 +21,8 @@ fn main() {
 
     // Chain: parse → range-check → format. The first `Err` aborts the chain;
     // `.try_collect()` returns `Result<Vec<_>, _>`.
-    let result = pipe(inputs)
+    let result = inputs
+        .pipe()
         .try_map(|s: &str| s.parse::<i32>().map_err(|_| ParseError::NotANumber))
         .try_map(|n| {
             if !(0..=50).contains(&n) {
@@ -40,7 +41,8 @@ fn main() {
 
     // A clean run — same chain, no errors.
     let clean: Vec<&str> = vec!["1", "23", "42"];
-    let ok = pipe(clean)
+    let ok = clean
+        .pipe()
         .try_map(|s: &str| s.parse::<i32>().map_err(|_| ParseError::NotANumber))
         .try_map(|n| -> Result<i32, ParseError> { Ok(n * n) })
         .try_collect()

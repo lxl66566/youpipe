@@ -50,6 +50,22 @@ impl AsyncPool {
         })
     }
 
+    /// Convenience wrapper around [`Self::from_global`] that picks the worker
+    /// count from `available_parallelism()` (clamped to ≥ 4 on failure).
+    ///
+    /// Useful when the caller just wants "one OS thread per core" without
+    /// having to thread the count through. For `StreamPipe` users this is
+    /// rarely needed — omitting `with_async_pool` gives the same effect lazily
+    /// inside a single `run()` call.
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` if the tokio runtime cannot be built.
+    pub fn from_default() -> std::io::Result<Self> {
+        let n = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        Self::from_global(n)
+    }
+
     pub fn spawn<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,

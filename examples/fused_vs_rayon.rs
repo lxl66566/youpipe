@@ -11,7 +11,7 @@
 //! ```
 
 use rayon::prelude::*;
-use youpipe::pipe;
+use youpipe::prelude::*;
 
 const SIZE: usize = 1_000_000;
 
@@ -29,7 +29,9 @@ fn main() {
 
     // ── youpipe: fused pipe().map().map().map().collect() ──
     let yp_start = std::time::Instant::now();
-    let yp_result: Vec<u64> = pipe(data.clone())
+    let yp_result: Vec<u64> = data
+        .clone()
+        .pipe()
         .map(|x| x.wrapping_add(1))
         .map(|x| x.wrapping_mul(3))
         .map(|x| x.wrapping_sub(2))

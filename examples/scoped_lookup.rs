@@ -16,7 +16,7 @@
 use std::time::Instant;
 
 use rayon::prelude::*;
-use youpipe::scope;
+use youpipe::prelude::*;
 
 const TABLE_SIZE: usize = 200_000;
 const LOOKUPS: usize = 1_000_000;

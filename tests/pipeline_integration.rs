@@ -213,6 +213,63 @@ fn test_stream_expand() {
     assert_eq!(result, expected);
 }
 
+// ── Async stage regression coverage (gated by tokio-runtime) ──
+//
+// These exercise the lazy-pool path: no `with_async_pool` is attached, so
+// `StreamCtx::acquire_async` must build one runtime per `run()` and reuse it
+// across every bridge / async consumer in that call. A regression that
+// builds a runtime per `acquire_async` call would still pass these (the
+// output is unchanged) but would silently wreck small-workload latency; the
+// real correctness guard is that none of these hang or panic when the
+// lazily-built runtime is dropped at the end of `run()`.
+
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_stage_async_without_explicit_pool() {
+    // The simplest async path: no config, no `with_async_pool`. Should "just
+    // work" with sensible defaults.
+    let items: Vec<u64> = (0..100).collect();
+    let mut result = stream(items)
+        .stage_async(|x: u64| async move { x.wrapping_mul(3) })
+        .run();
+    result.sort_unstable();
+    let expected: Vec<u64> = (0..100).map(|x| x * 3).collect();
+    assert_eq!(result, expected);
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_mixed_sync_async_without_explicit_pool() {
+    // sync CPU stage → async IO stage, no explicit pool. Exercises the
+    // sync→async bridge plus the async consumer, both of which call
+    // `acquire_async` — they must share the lazily-built runtime.
+    let items: Vec<u64> = (0..100).collect();
+    let result: Vec<u64> = stream(items)
+        .stage(|x: u64| x + 1)
+        .stage_async(|x: u64| async move { x * 2 })
+        .ordered()
+        .run();
+    let expected: Vec<u64> = (0..100).map(|x| (x + 1) * 2).collect();
+    assert_eq!(result, expected);
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_two_async_stages_share_lazy_pool() {
+    // Two consecutive async stages — the hardest case for the lazy pool.
+    // Both stages' consumers and the async→async bridge all call
+    // `acquire_async`; they must observe the same lazily-built runtime, and
+    // the runtime must outlive every detached bridge task.
+    let items: Vec<u64> = (0..50).collect();
+    let result: Vec<u64> = stream(items)
+        .stage_async(|x: u64| async move { x + 1 })
+        .stage_async(|x: u64| async move { x * 10 })
+        .ordered()
+        .run();
+    let expected: Vec<u64> = (0..50).map(|x| (x + 1) * 10).collect();
+    assert_eq!(result, expected);
+}
+
 #[test]
 fn test_scope_non_static() {
     let factor = 7i32;
@@ -278,4 +335,46 @@ fn test_pipe_with_workload_unbalanced() {
     let mut sorted = r;
     sorted.sort_unstable();
     assert_eq!(sorted, (0..1000).map(|x| x * 3).collect::<Vec<_>>());
+}
+
+// ── Prelude: extension-trait style must match the free-function style ──
+
+#[test]
+fn test_prelude_pipe_matches_free_function() {
+    use youpipe::prelude::IterExt;
+
+    let free: Vec<i32> = pipe(0..100).map(|x: i32| x * 2).collect();
+    let method: Vec<i32> = (0..100).pipe().map(|x: i32| x * 2).collect();
+    assert_eq!(free, method);
+    assert_eq!(free, (0..100).map(|x| x * 2).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_prelude_stream_matches_free_function() {
+    use youpipe::prelude::IterExt;
+
+    let mut free = youpipe::stream(0..50).stage(|x: i32| x + 1).run();
+    free.sort_unstable();
+    let mut method = (0..50).stream().stage(|x: i32| x + 1).run();
+    method.sort_unstable();
+    assert_eq!(free, method);
+}
+
+/// The prelude trait is a blanket impl over `IntoIterator` — exercises a few
+/// iterator sources beyond plain ranges to confirm there's no hidden bound.
+#[test]
+fn test_prelude_iterext_on_various_sources() {
+    use youpipe::prelude::IterExt;
+
+    // Vec
+    let v: Vec<i32> = vec![1, 2, 3].pipe().map(|x| x + 1).collect();
+    assert_eq!(v, vec![2, 3, 4]);
+
+    // Slice reference
+    let s: Vec<i32> = [1, 2, 3].iter().copied().pipe().map(|x| x * 10).collect();
+    assert_eq!(s, vec![10, 20, 30]);
+
+    // Stream from a Vec
+    let r: Vec<i32> = vec![1, 2, 3].stream().stage(|x: i32| x - 1).ordered().run();
+    assert_eq!(r, vec![0, 1, 2]);
 }

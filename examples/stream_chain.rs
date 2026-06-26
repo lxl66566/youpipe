@@ -12,7 +12,7 @@
 
 use std::hint::black_box as bb;
 
-use youpipe::stream;
+use youpipe::prelude::*;
 
 /// Two-stage CPU chain — compute, then post-process. Both stages are CPU-bound.
 fn stage1(x: u64) -> u64 {
@@ -34,7 +34,9 @@ fn main() {
 
     // ── youpipe: stream().stage(s1).stage(s2).run() ──
     let yp_start = std::time::Instant::now();
-    let yp_result = stream(data.clone())
+    let yp_result = data
+        .clone()
+        .stream()
         .stage(|x: u64| bb(stage1(x)))
         .stage(|x: u64| bb(stage2(x)))
         .run();

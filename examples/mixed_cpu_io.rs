@@ -10,10 +10,25 @@
 //! ```text
 //! cargo run --example mixed_cpu_io
 //! ```
+//!
+//! ## API shape
+//!
+//! Sync CPU and async IO stages chain directly — no runtime plumbing needed,
+//! the async pool is built lazily inside `run()` on first use:
+//!
+//! ```text
+//! stream(items)
+//!     .stage(|x| cpu(x))                 // sync CPU on compute pool
+//!     .stage_async(|x| async move { io(x).await })  // async IO on runtime
+//!     .run();
+//! ```
+//!
+//! To tune `io_concurrency` or reuse a runtime across `run()` calls, see the
+//! tuning snippets in `examples/async_io.rs`.
 
 use std::time::{Duration, Instant};
 
-use youpipe::{AsyncPool, PipelineConfig, stream};
+use youpipe::prelude::*;
 
 /// Variable-cost CPU work, skewed: ~90 % fast (5 iters), ~10 % slow (5000).
 fn cpu_work(x: u64, iters: u32) -> u64 {
@@ -53,21 +68,15 @@ fn skewed(size: usize) -> Vec<((u64, u32), Duration)> {
 
 const SIZE: usize = 200;
 
-fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(4)
-}
-
 fn main() {
     let items = skewed(SIZE);
 
     // ── youpipe: CPU stage on compute pool → async IO stage ──
-    let pool = AsyncPool::from_global(num_cpus()).expect("async runtime");
+    // Default config: io_concurrency=128, async runtime built lazily.
     let yp_start = Instant::now();
-    let yp_result = stream(items.clone())
-        .with_config(PipelineConfig::default().with_io_concurrency(512))
-        .with_async_pool(pool)
+    let yp_result = items
+        .clone()
+        .stream()
         .stage(|((x, iters), dur): ((u64, u32), Duration)| {
             // Sync CPU stage on the work-stealing compute pool.
             (cpu_work(x, iters), dur)

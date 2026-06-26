@@ -30,6 +30,7 @@
 use std::hint::black_box;
 
 use hotpath::{Format, HotpathGuardBuilder};
+use youpipe::prelude::*;
 
 fn cpu_heavy(x: u64) -> u64 {
     let mut r = x;
@@ -70,7 +71,7 @@ fn run_sweep() {
         let data: Vec<u64> = (0..size as u64).collect();
         for _ in 0..50 {
             let v = data.clone();
-            let out: Vec<u64> = youpipe::pipe(v).map(|x| black_box(cpu_heavy(x))).collect();
+            let out: Vec<u64> = v.pipe().map(|x| black_box(cpu_heavy(x))).collect();
             black_box(out);
         }
         println!("ran size={size}");
@@ -83,9 +84,9 @@ fn run_focused(size: usize, light: bool, iters: usize) {
     for _ in 0..iters {
         let v = data.clone();
         let out: Vec<u64> = if light {
-            youpipe::pipe(v).map(|x| black_box(cpu_light(x))).collect()
+            v.pipe().map(|x| black_box(cpu_light(x))).collect()
         } else {
-            youpipe::pipe(v).map(|x| black_box(cpu_heavy(x))).collect()
+            v.pipe().map(|x| black_box(cpu_heavy(x))).collect()
         };
         black_box(out);
     }

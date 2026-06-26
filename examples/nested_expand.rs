@@ -13,7 +13,7 @@
 use std::time::Instant;
 
 use rayon::prelude::*;
-use youpipe::stream;
+use youpipe::prelude::*;
 
 const N_INPUTS: usize = 1000;
 
@@ -36,7 +36,9 @@ fn main() {
     // 1-to-1 input↔output mapping for its sequence-tag reorder buffer; expand
     // produces 1-to-N which doesn't fit that model.)
     let yp_start = Instant::now();
-    let mut yp_result = stream(inputs.clone())
+    let mut yp_result = inputs
+        .clone()
+        .stream()
         .expand(|i: i32| expand(i))
         .stage(|x: i32| postprocess(x))
         .run();

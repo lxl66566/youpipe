@@ -6,7 +6,7 @@ mod traits;
 pub(crate) use self::fused::fused_collect_scoped;
 pub use self::{
     fused::{Pipe, TryPipe, pipe},
-    stream::{StreamPipe, stream},
+    stream::{StreamPipe, StreamStart, stream},
     traits::{
         Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, StageMarker, SyncMap,
         TryMap,

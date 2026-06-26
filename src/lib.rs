@@ -17,7 +17,7 @@
 //!     .try_collect();
 //! ```
 
-#![warn(clippy::pedantic)]
+#![warn(clippy::pedantic, clippy::cargo)]
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
@@ -28,6 +28,7 @@ pub mod builder;
 pub mod executor;
 pub mod handoff;
 pub(crate) mod pool;
+pub mod prelude;
 pub mod runtime;
 pub mod scope;
 pub mod state;
@@ -36,7 +37,7 @@ pub(crate) mod util;
 
 pub use builder::{
     Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, Pipe, PipelineConfig,
-    StageMarker, StreamPipe, SyncMap, TryMap, TryPipe, Workload, pipe, stream,
+    StageMarker, StreamPipe, StreamStart, SyncMap, TryMap, TryPipe, Workload, pipe, stream,
 };
 #[cfg(feature = "tokio-runtime")]
 pub use executor::AsyncPool;

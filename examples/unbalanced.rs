@@ -17,7 +17,7 @@
 use std::time::Instant;
 
 use rayon::prelude::*;
-use youpipe::{Workload, pipe};
+use youpipe::prelude::*;
 
 const SIZE: usize = 5_000;
 
@@ -45,14 +45,18 @@ fn main() {
 
     // ── youpipe: default Balanced (4× oversplit) ──
     let yp_balanced_start = Instant::now();
-    let yp_balanced: Vec<u64> = pipe(items.clone())
+    let yp_balanced: Vec<u64> = items
+        .clone()
+        .pipe()
         .map(|(x, iters)| cpu_work(x, iters))
         .collect();
     let yp_balanced_elapsed = yp_balanced_start.elapsed();
 
     // ── youpipe: Unbalanced (8× oversplit, finer task granularity) ──
     let yp_unbal_start = Instant::now();
-    let yp_unbal: Vec<u64> = pipe(items.clone())
+    let yp_unbal: Vec<u64> = items
+        .clone()
+        .pipe()
         .with_workload(Workload::Unbalanced)
         .map(|(x, iters)| cpu_work(x, iters))
         .collect();

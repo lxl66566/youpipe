@@ -40,3 +40,4 @@ temperature: 0
   HOTPATH_OUTPUT_FORMAT=json-pretty HOTPATH_OUTPUT_PATH=target/hotpath-report.json \
   cargo run --release --example hotpath_profile --features hotpath
   ```
+- miri 测试：`MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo miri test`

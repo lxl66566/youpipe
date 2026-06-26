@@ -1,5 +1,7 @@
 #[cfg(feature = "tokio-runtime")]
 use std::future::Future;
+#[cfg(feature = "tokio-runtime")]
+use std::sync::OnceLock;
 use std::{marker::PhantomData, sync::Arc};
 
 #[cfg(feature = "tokio-runtime")]
@@ -305,6 +307,22 @@ pub struct StreamCtx<'a> {
     pub per_stage_parallelism: usize,
     #[cfg(feature = "tokio-runtime")]
     pub async_pool: Option<crate::executor::AsyncPool>,
+    /// Lazily-constructed runtime for this single `run()` call, used when the
+    /// caller did not attach one via [`StreamPipe::with_async_pool`].
+    ///
+    /// Without this cache every `acquire_async()` call (one per async stage
+    /// plus one per sync→async bridge) would build a *fresh* tokio runtime —
+    /// each costing ~ms — silently wrecking small workloads. The cache keeps
+    /// the "no config needed" default path fast: a single runtime is built on
+    /// first use and dropped at the end of `run()`.
+    ///
+    /// Stored as `io::Result` (not just `AsyncPool`) so a construction failure
+    /// is reported identically to every caller — `OnceLock::get_or_init`
+    /// runs the initializer exactly once and hands back the same outcome to
+    /// every subsequent `acquire_async()` call. (`OnceLock::get_or_try_init`
+    /// would be the natural fit but is still unstable as of 1.85.)
+    #[cfg(feature = "tokio-runtime")]
+    pub(crate) cached_pool: OnceLock<std::io::Result<crate::executor::AsyncPool>>,
 }
 
 impl StreamCtx<'_> {
@@ -312,17 +330,37 @@ impl StreamCtx<'_> {
         self.config.buffer_size.max(parallelism * 4)
     }
 
-    /// Acquire an async runtime for this run: a handle-only wrapper around the
-    /// attached runtime (if any), otherwise a fresh owning runtime built from
-    /// `config.async_workers`.
+    /// Acquire an async runtime for this run.
+    ///
+    /// - If the caller attached a pool via `with_async_pool`, wrap its handle
+    ///   (cheap — `Handle` is internally `Arc`-refcounted).
+    /// - Otherwise build one lazily on first call and cache it in
+    ///   [`StreamCtx::cached_pool`] so subsequent calls in the same `run()`
+    ///   reuse the same runtime instead of paying the ~ms construction cost
+    ///   again.
     #[cfg(feature = "tokio-runtime")]
     pub fn acquire_async(&self) -> std::io::Result<crate::executor::AsyncPool> {
-        match &self.async_pool {
-            Some(p) => Ok(crate::executor::AsyncPool::new(
+        if let Some(p) = &self.async_pool {
+            return Ok(crate::executor::AsyncPool::new(
+                p.handle().clone(),
+                self.config.async_workers,
+            ));
+        }
+        // First caller builds; everyone else in this `run()` reuses the same
+        // runtime. `get_or_init` is thread-safe — bridges from different
+        // stages may race on first call.
+        let cached = self
+            .cached_pool
+            .get_or_init(|| crate::executor::AsyncPool::from_global(self.config.async_workers));
+        match cached {
+            Ok(p) => Ok(crate::executor::AsyncPool::new(
                 p.handle().clone(),
                 self.config.async_workers,
             )),
-            None => crate::executor::AsyncPool::from_global(self.config.async_workers),
+            // Rebuild an equivalent error so the same failure is surfaced
+            // afresh to every caller rather than moving the singleton out of
+            // the lock (`io::Error` is not `Clone`).
+            Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
         }
     }
 }
@@ -692,11 +730,37 @@ impl<S, I, O> StreamPipe<S, I, O> {
         }
     }
 
-    /// Insert a fence (materialisation barrier) between the preceding stages
-    /// and any stages added afterwards. [`FenceMode::Barrier`] fully drains
-    /// the upstream before downstream starts (hard isolation);
-    /// [`FenceMode::Chunked`] releases batches as they form so the stages
-    /// overlap — the right default for mixed CPU/IO loads.
+    /// Insert a fence (materialisation barrier) between the stages chained
+    /// **before** this call and the stages chained **after** it.
+    ///
+    /// # Scope — one boundary, not the whole stream
+    ///
+    /// A fence controls exactly **one** adjacent stage transition — the
+    /// boundary between whatever precedes it and whatever follows it. It does
+    /// *not* impose a barrier across the entire pipeline. Each `.fence()`
+    /// call is an independent boundary, so a chain may insert as many as the
+    /// topology needs:
+    ///
+    /// ```text
+    /// stream(..)
+    ///     .stage(s1)
+    ///     .fence(m1)        // ← boundary between s1 and (s2, s3)
+    ///     .stage(s2)
+    ///     .stage(s3)
+    ///     .fence(m2)        // ← boundary between (s2, s3) and s4
+    ///     .stage(s4)
+    ///     .run();
+    /// ```
+    ///
+    /// This keeps the chain composable: each `.fence()` is local to its
+    /// position, never affecting upstream or downstream boundaries.
+    ///
+    /// # Modes
+    ///
+    /// - [`FenceMode::Barrier`] fully drains the upstream before downstream
+    ///   starts (hard isolation; max peak memory, no staging overlap).
+    /// - [`FenceMode::Chunked`] releases batches as soon as they form so the
+    ///   two sides overlap — the right default for mixed CPU/IO loads.
     pub fn fence(self, mode: FenceMode) -> StreamPipe<FenceLink<S>, I, O> {
         StreamPipe {
             items: self.items,
@@ -789,6 +853,8 @@ where
             per_stage_parallelism,
             #[cfg(feature = "tokio-runtime")]
             async_pool,
+            #[cfg(feature = "tokio-runtime")]
+            cached_pool: OnceLock::new(),
         };
 
         let buffer = ctx.buffer_size(per_stage_parallelism);
