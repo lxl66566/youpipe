@@ -9,8 +9,8 @@
 //! its thread and caps concurrency at the thread count.
 //!
 //! Groups:
-//! * `io_async_pure` — single IO stage. Compares youpipe `run_async` (M:N)
-//!   vs blocking approaches vs tokio-native async.
+//! * `io_async_pure` — single IO stage. Compares youpipe `run_async` (M:N) vs
+//!   blocking approaches vs tokio-native async.
 //! * `io_async_mixed` — CPU stage (sync) -> IO stage. Compares youpipe
 //!   `run_mixed_async` (sync CPU + async IO) vs the all-blocking
 //!   `run_multi_stage` vs tokio.
@@ -45,8 +45,8 @@ async fn async_io(x: u64, dur: Duration) -> u64 {
     x.wrapping_add(1)
 }
 
-/// Skewed IO latency: ~90% at `BASE`, ~10% at `BASE * 8` (realistic network/disk
-/// tail latency). Returns `(value, latency)`.
+/// Skewed IO latency: ~90% at `BASE`, ~10% at `BASE * 8` (realistic
+/// network/disk tail latency). Returns `(value, latency)`.
 ///
 /// `BASE` is deliberately ≥ the tokio coarse-timer granularity (~1 ms): sub-ms
 /// `tokio::time::sleep` durations round up to ~1 ms, which would make the bench
@@ -94,9 +94,8 @@ fn bench_pure_io_async(c: &mut Criterion) {
         // ~ms and would otherwise dominate smaller sizes).
         {
             let pool = AsyncPool::from_global(num_cpus()).expect("async runtime");
-            let sp =
-                StreamPipeline::new(PipelineConfig::default().with_io_concurrency(512))
-                    .with_async_pool(pool);
+            let sp = StreamPipeline::new(PipelineConfig::default().with_io_concurrency(512))
+                .with_async_pool(pool);
             group.bench_with_input(
                 BenchmarkId::new("youpipe_async", size),
                 &tasks,
@@ -120,8 +119,11 @@ fn bench_pure_io_async(c: &mut Criterion) {
             |b, tasks| {
                 let sp = StreamPipeline::new(PipelineConfig::default());
                 b.iter(|| {
-                    let r =
-                        sp.run(tasks.clone(), |(x, dur): (u64, Duration)| bb(blocking_io(x, dur)), false);
+                    let r = sp.run(
+                        tasks.clone(),
+                        |(x, dur): (u64, Duration)| bb(blocking_io(x, dur)),
+                        false,
+                    );
                     bb(r)
                 });
             },
@@ -138,8 +140,7 @@ fn bench_pure_io_async(c: &mut Criterion) {
                     rt.block_on(async {
                         let mut handles = Vec::with_capacity(tasks.len());
                         for &(x, dur) in tasks {
-                            handles
-                                .push(tokio::spawn(async move { bb(async_io(x, dur).await) }));
+                            handles.push(tokio::spawn(async move { bb(async_io(x, dur).await) }));
                         }
                         for h in handles {
                             bb(h.await.unwrap());
@@ -158,9 +159,8 @@ fn bench_pure_io_async(c: &mut Criterion) {
                     rt.block_on(async {
                         let mut handles = Vec::with_capacity(tasks.len());
                         for &(x, dur) in tasks {
-                            handles.push(tokio::task::spawn_blocking(move || {
-                                bb(blocking_io(x, dur))
-                            }));
+                            handles
+                                .push(tokio::task::spawn_blocking(move || bb(blocking_io(x, dur))));
                         }
                         for h in handles {
                             bb(h.await.unwrap());
@@ -193,9 +193,8 @@ fn bench_mixed_cpu_io(c: &mut Criterion) {
         // async runtime (overlapping stages).
         {
             let pool = AsyncPool::from_global(num_cpus()).expect("async runtime");
-            let sp =
-                StreamPipeline::new(PipelineConfig::default().with_io_concurrency(512))
-                    .with_async_pool(pool);
+            let sp = StreamPipeline::new(PipelineConfig::default().with_io_concurrency(512))
+                .with_async_pool(pool);
             group.bench_with_input(
                 BenchmarkId::new("youpipe_mixed_async", size),
                 &items,
@@ -206,9 +205,7 @@ fn bench_mixed_cpu_io(c: &mut Criterion) {
                             |((x, iters), dur): ((u64, u32), Duration)| {
                                 (bb(cpu_work(x, iters)), dur)
                             },
-                            |(val, dur): (u64, Duration)| async move {
-                                async_io(val, dur).await
-                            },
+                            |(val, dur): (u64, Duration)| async move { async_io(val, dur).await },
                             false,
                         );
                         bb(r)
@@ -250,9 +247,9 @@ fn bench_mixed_cpu_io(c: &mut Criterion) {
                     rt.block_on(async {
                         let mut cpu_handles = Vec::with_capacity(items.len());
                         for &((x, iters), dur) in items {
-                            cpu_handles.push(tokio::task::spawn_blocking(
-                                move || (bb(cpu_work(x, iters)), dur),
-                            ));
+                            cpu_handles.push(tokio::task::spawn_blocking(move || {
+                                (bb(cpu_work(x, iters)), dur)
+                            }));
                         }
                         let mut cpu_results = Vec::with_capacity(cpu_handles.len());
                         for h in cpu_handles {

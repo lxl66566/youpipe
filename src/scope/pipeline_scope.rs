@@ -7,8 +7,9 @@ use crate::builder::{
 
 /// Opens a scoped execution context for non-`'static` closures.
 ///
-/// Closures passed to [`ScopedPipeline`]'s `.map()` / `.filter()` / `.collect()`
-/// may borrow local variables by shared reference for the duration of `scope`.
+/// Closures passed to [`ScopedPipeline`]'s `.map()` / `.filter()` /
+/// `.collect()` may borrow local variables by shared reference for the duration
+/// of `scope`.
 ///
 /// ```rust
 /// # use youpipe::scope;
@@ -152,9 +153,7 @@ mod tests {
         let multiplier = 3i32;
         let result = scope(|s| {
             let items = vec![1, 2, 3, 4, 5];
-            s.pipeline()
-                .map(|x: i32| x * multiplier)
-                .collect(items)
+            s.pipeline().map(|x: i32| x * multiplier).collect(items)
         });
         assert_eq!(result, vec![3, 6, 9, 12, 15]);
     }
@@ -205,9 +204,7 @@ mod tests {
         let expected: Vec<usize> = cached.iter().map(String::len).collect();
         let result: Vec<usize> = scope(|s| {
             let items: Vec<usize> = (0..cached.len()).collect();
-            s.pipeline()
-                .map(|i: usize| cached[i].len())
-                .collect(items)
+            s.pipeline().map(|i: usize| cached[i].len()).collect(items)
         });
         assert_eq!(result, expected);
     }

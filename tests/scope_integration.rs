@@ -3,9 +3,7 @@ fn test_scope_basic() {
     let multiplier = 3i32;
     let result = youpipe::scope(|s| {
         let items = vec![1, 2, 3, 4, 5];
-        s.pipeline()
-            .map(|x: i32| x * multiplier)
-            .collect(items)
+        s.pipeline().map(|x: i32| x * multiplier).collect(items)
     });
     assert_eq!(result, vec![3, 6, 9, 12, 15]);
 }
@@ -82,9 +80,7 @@ fn test_scope_truly_non_static_borrow() {
     let expected: Vec<usize> = cached.iter().map(String::len).collect();
     let result: Vec<usize> = youpipe::scope(|s| {
         let items: Vec<usize> = (0..cached.len()).collect();
-        s.pipeline()
-            .map(|i: usize| cached[i].len())
-            .collect(items)
+        s.pipeline().map(|i: usize| cached[i].len()).collect(items)
     });
     assert_eq!(result, expected);
 }

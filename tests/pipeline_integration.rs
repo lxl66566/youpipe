@@ -187,9 +187,7 @@ fn test_scope_non_static() {
     let factor = 7i32;
     let result = youpipe::scope(|s| {
         let items: Vec<i32> = (0..20).collect();
-        s.pipeline()
-            .map(|x: i32| x * factor)
-            .collect(items)
+        s.pipeline().map(|x: i32| x * factor).collect(items)
     });
     let expected: Vec<i32> = (0..20).map(|x| x * 7).collect();
     assert_eq!(result, expected);

@@ -1,26 +1,20 @@
 use std::{
-    any::Any,
-    cell::UnsafeCell,
-    future::Future,
-    marker::PhantomData,
-    mem::MaybeUninit,
-    panic,
+    any::Any, cell::UnsafeCell, future::Future, marker::PhantomData, mem::MaybeUninit, panic,
     sync::Arc,
 };
 
 use super::config::{PipelineConfig, Workload};
-use crate::{
-    executor::compute::ComputePool,
-    handoff::{Receiver, Sender, SharedWaitGroup, channel::channel},
-    state::{FenceBarrier, FenceMode, run_ordered_collect},
-    sync::CancellationToken,
-};
-
 #[cfg(feature = "tokio-runtime")]
 use crate::{
     executor::AsyncPool,
     handoff::{async_channel, channel::TrySendError},
     state::ReorderBuffer,
+};
+use crate::{
+    executor::compute::ComputePool,
+    handoff::{Receiver, Sender, SharedWaitGroup, channel::channel},
+    state::{FenceBarrier, FenceMode, run_ordered_collect},
+    sync::CancellationToken,
 };
 
 // ── Slots: index-addressable buffer for zero-copy parallel map ──
@@ -128,7 +122,7 @@ impl<T> Slots<T> {
         // `UnsafeCell` lets us produce `&mut [T]` from `&self`. The slice is
         // exclusively ours for the leaf's lifetime (disjoint-index discipline).
         unsafe {
-            let ptr = self.buf.as_ptr().cast::<T>().add(start) as *mut T;
+            let ptr = self.buf.as_ptr().cast::<T>().add(start).cast_mut();
             std::slice::from_raw_parts_mut(ptr, end - start)
         }
     }
@@ -177,7 +171,7 @@ where
     R: Send,
 {
     type Out = R;
-    #[inline(always)]
+    #[inline]
     fn apply(&self, item: T) -> R {
         (self.0)(item)
     }
@@ -214,7 +208,8 @@ where
         // init, output[start..end) is fully uninit.
         let in_slice = unsafe { input.as_slice(start, end) };
         let out_slice = unsafe { output.as_mut_slice(start, end) };
-        return par_index_leaf(in_slice, out_slice, op);
+        par_index_leaf(in_slice, out_slice, op);
+        return Ok(());
     }
     let mid = start + (end - start) / 2;
     let (l, r) = ComputePool::global().join(
@@ -260,17 +255,12 @@ where
 /// warm `par_map` path. Slice references carry Rust's noalias guarantees into
 /// LLVM, which is what unlocks the same per-item throughput rayon's
 /// `par_iter().collect()` achieves.
-fn par_index_leaf<T, R, OP>(
-    input: &[T],
-    output: &mut [R],
-    op: &OP,
-) -> Result<(), PanicPayload>
+fn par_index_leaf<T, R, OP>(input: &[T], output: &mut [R], op: &OP)
 where
     T: Send,
     R: Send,
     OP: RangeOp<T, Out = R>,
 {
-    debug_assert_eq!(input.len(), output.len());
     /// RAII guard that drops the partial slot state on unwind. `Drop` only
     /// fires if the loop panics; the success path calls `mem::forget`.
     ///
@@ -299,11 +289,13 @@ where
                 }
                 let in_live = self.input.as_ptr();
                 for i in self.consumed..self.input.len() {
-                    std::ptr::drop_in_place(in_live.add(i) as *mut T);
+                    std::ptr::drop_in_place(in_live.add(i).cast_mut());
                 }
             }
         }
     }
+
+    debug_assert_eq!(input.len(), output.len());
 
     // Capture raw pointers up front so the loop can mutate `g.written` /
     // `g.consumed` (which borrow `&mut g`) without re-borrowing `input` /
@@ -331,7 +323,6 @@ where
 
     // Success: disarm the cleanup Drop.
     std::mem::forget(g);
-    Ok(())
 }
 
 /// Drive `par_index_rec` over `[0, n)` and convert the output buffer into a
@@ -633,7 +624,7 @@ pub trait FusedStage<T> {
     /// # Panics
     ///
     /// May panic (caught by the leaf's `catch_unwind`).
-    #[inline(always)]
+    #[inline]
     fn apply_pure(&self, item: T) -> Self::Output {
         // SAFETY: contract — only call `apply_pure` when `Self::MAY_FILTER`
         // is false throughout the chain. `Pipeline::collect` enforces this.
@@ -651,7 +642,7 @@ impl<T> FusedStage<T> for Identity {
     fn apply(&self, item: T) -> Option<T> {
         Some(item)
     }
-    #[inline(always)]
+    #[inline]
     fn apply_pure(&self, item: T) -> T {
         item
     }
@@ -667,7 +658,7 @@ where
     fn apply(&self, item: I) -> Option<O> {
         self.prev.apply(item).map(|v| (self.f)(v))
     }
-    #[inline(always)]
+    #[inline]
     fn apply_pure(&self, item: I) -> O {
         let v = self.prev.apply_pure(item);
         (self.f)(v)
@@ -698,7 +689,7 @@ where
     fn apply(&self, item: I) -> Option<Prev::Output> {
         self.prev.apply(item)
     }
-    #[inline(always)]
+    #[inline]
     fn apply_pure(&self, item: I) -> Prev::Output {
         self.prev.apply_pure(item)
     }
@@ -713,7 +704,7 @@ where
     fn apply(&self, item: I) -> Option<Prev::Output> {
         self.prev.apply(item)
     }
-    #[inline(always)]
+    #[inline]
     fn apply_pure(&self, item: I) -> Prev::Output {
         self.prev.apply_pure(item)
     }
@@ -743,10 +734,11 @@ pub struct Pipeline<S = Identity, I = (), O = ()> {
 impl<T: Send + 'static> Pipeline<Identity, T, T> {
     /// Create a new pipeline (type-state entry point).
     ///
-    /// `T` is inferred from the first staged method (e.g. `.map(|x: i32| ...)`),
-    /// so callers do not need to spell it out — the previous `from_vec(vec![])`
-    /// entry point existed only as a type hint and silently discarded its
-    /// argument, which was both wasteful and confusing.
+    /// `T` is inferred from the first staged method (e.g. `.map(|x: i32|
+    /// ...)`), so callers do not need to spell it out — the previous
+    /// `from_vec(vec![])` entry point existed only as a type hint and
+    /// silently discarded its argument, which was both wasteful and
+    /// confusing.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -758,8 +750,9 @@ impl<T: Send + 'static> Pipeline<Identity, T, T> {
 }
 
 impl<T: Send + 'static> Default for Pipeline<Identity, T, T> {
-    /// `Pipeline: Default` lets downstream code write `Pipeline::<T>::default()`
-    /// or rely on type inference from the first `.map` / `.filter` call.
+    /// `Pipeline: Default` lets downstream code write
+    /// `Pipeline::<T>::default()` or rely on type inference from the first
+    /// `.map` / `.filter` call.
     fn default() -> Self {
         Self::new()
     }
@@ -874,7 +867,7 @@ where
     S::Output: Send,
 {
     type Out = S::Output;
-    #[inline(always)]
+    #[inline]
     fn apply(&self, item: T) -> S::Output {
         self.0.apply_pure(item)
     }
@@ -1837,12 +1830,12 @@ impl StreamPipeline {
 //
 // Unlike the pure-sync streaming methods above, these run an IO stage as
 // `async` tasks on a dedicated async runtime (`AsyncPool`). The runtime's M:N
-// scheduler multiplexes `io_concurrency` concurrent IO tasks over `async_workers`
-// OS threads: each task yields its thread back to the runtime while it awaits
-// (e.g. `tokio::time::sleep`, real network/disk IO), so concurrency is bounded
-// by `io_concurrency`, NOT by the thread count. For truly async IO this beats
-// the blocking-thread-per-core model, which can only run as many concurrent
-// waits as it has OS threads.
+// scheduler multiplexes `io_concurrency` concurrent IO tasks over
+// `async_workers` OS threads: each task yields its thread back to the runtime
+// while it awaits (e.g. `tokio::time::sleep`, real network/disk IO), so
+// concurrency is bounded by `io_concurrency`, NOT by the thread count. For
+// truly async IO this beats the blocking-thread-per-core model, which can only
+// run as many concurrent waits as it has OS threads.
 //
 // Availability is gated behind `tokio-runtime` because the async stage needs a
 // reactor; the sync streaming API remains runtime-agnostic.
@@ -1853,8 +1846,9 @@ impl StreamPipeline {
     ///
     /// `stage` returns a [`Future`]; each item becomes a task on the async
     /// runtime. With [`PipelineConfig::io_concurrency`] ≫ cores this achieves
-    /// M:N concurrency for yielded (async) waits — the right choice for IO-bound
-    /// work whose waits actually yield (network/disk IO, `tokio::time::sleep`).
+    /// M:N concurrency for yielded (async) waits — the right choice for
+    /// IO-bound work whose waits actually yield (network/disk IO,
+    /// `tokio::time::sleep`).
     ///
     /// For work that *blocks* the OS thread (e.g. `std::thread::sleep`), prefer
     /// the sync [`Self::run`]: a blocking call inside a task stalls a runtime
@@ -1925,10 +1919,7 @@ impl StreamPipeline {
                 let c = cancel.clone();
                 consumers.push(tokio::spawn(async move {
                     loop {
-                        let item = match rx.recv().await {
-                            Ok(it) => it,
-                            Err(_) => break,
-                        };
+                        let Ok(item) = rx.recv().await else { break };
                         if cancel_active(c.as_ref()) {
                             break;
                         }
@@ -2002,9 +1993,8 @@ impl StreamPipeline {
                 let c = cancel.clone();
                 consumers.push(tokio::spawn(async move {
                     loop {
-                        let (seq, item) = match rx.recv().await {
-                            Ok(it) => it,
-                            Err(_) => break,
+                        let Ok((seq, item)) = rx.recv().await else {
+                            break;
                         };
                         if cancel_active(c.as_ref()) {
                             break;
@@ -2071,9 +2061,25 @@ impl StreamPipeline {
             .buffer_size
             .max(parallelism.max(io_concurrency) * 2);
         if ordered {
-            self.run_mixed_async_ordered(&pool, items, cpu_stage, io_stage, parallelism, io_concurrency, buffer_size)
+            self.run_mixed_async_ordered(
+                &pool,
+                items,
+                cpu_stage,
+                io_stage,
+                parallelism,
+                io_concurrency,
+                buffer_size,
+            )
         } else {
-            self.run_mixed_async_unordered(&pool, items, cpu_stage, io_stage, parallelism, io_concurrency, buffer_size)
+            self.run_mixed_async_unordered(
+                &pool,
+                items,
+                cpu_stage,
+                io_stage,
+                parallelism,
+                io_concurrency,
+                buffer_size,
+            )
         }
     }
 
@@ -2096,7 +2102,7 @@ impl StreamPipeline {
         AF: Fn(M) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = O> + Send + 'static,
     {
-        let n = items.len();
+        let total = items.len();
         // CPU stage (sync) channels + bridge into the async IO channels.
         let (in_tx, in_rx) = channel::<I>(buffer_size);
         let (mid_tx, mid_rx) = channel::<M>(buffer_size);
@@ -2168,21 +2174,18 @@ impl StreamPipeline {
             let io_stage = Arc::new(io_stage);
             let mut consumers = Vec::with_capacity(io_concurrency);
             for _ in 0..io_concurrency {
-                let s = io_stage.clone();
+                let stage = io_stage.clone();
                 let rx = a_in_rx.clone();
                 let tx = a_out_tx.clone();
-                let c = io_cancel.clone();
+                let cancel = io_cancel.clone();
                 consumers.push(tokio::spawn(async move {
                     loop {
-                        let m = match rx.recv().await {
-                            Ok(m) => m,
-                            Err(_) => break,
-                        };
-                        if cancel_active(c.as_ref()) {
+                        let Ok(item) = rx.recv().await else { break };
+                        if cancel_active(cancel.as_ref()) {
                             break;
                         }
-                        let o = s(m).await;
-                        if tx.send(o).await.is_err() {
+                        let out = stage(item).await;
+                        if tx.send(out).await.is_err() {
                             break;
                         }
                     }
@@ -2191,7 +2194,7 @@ impl StreamPipeline {
             drop(a_out_tx);
             drop(a_in_rx);
             // Drain concurrently with the IO consumers (see run_async_unordered).
-            let mut results = Vec::with_capacity(n);
+            let mut results = Vec::with_capacity(total);
             while let Ok(o) = a_out_rx.recv().await {
                 results.push(o);
             }
@@ -2225,7 +2228,7 @@ impl StreamPipeline {
         AF: Fn(M) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = O> + Send + 'static,
     {
-        let n = items.len();
+        let total = items.len();
         let (in_tx, in_rx) = channel::<(u64, I)>(buffer_size);
         let (mid_tx, mid_rx) = channel::<(u64, M)>(buffer_size);
         let (a_in_tx, a_in_rx) = async_channel::<(u64, M)>(buffer_size);
@@ -2293,21 +2296,20 @@ impl StreamPipeline {
             let io_stage = Arc::new(io_stage);
             let mut consumers = Vec::with_capacity(io_concurrency);
             for _ in 0..io_concurrency {
-                let s = io_stage.clone();
+                let stage = io_stage.clone();
                 let rx = a_in_rx.clone();
                 let tx = a_out_tx.clone();
-                let c = io_cancel.clone();
+                let cancel = io_cancel.clone();
                 consumers.push(tokio::spawn(async move {
                     loop {
-                        let (seq, m) = match rx.recv().await {
-                            Ok(it) => it,
-                            Err(_) => break,
+                        let Ok((seq, item)) = rx.recv().await else {
+                            break;
                         };
-                        if cancel_active(c.as_ref()) {
+                        if cancel_active(cancel.as_ref()) {
                             break;
                         }
-                        let o = s(m).await;
-                        if tx.send((seq, o)).await.is_err() {
+                        let out = stage(item).await;
+                        if tx.send((seq, out)).await.is_err() {
                             break;
                         }
                     }
@@ -2316,9 +2318,9 @@ impl StreamPipeline {
             drop(a_out_tx);
             drop(a_in_rx);
             // Drain + reorder concurrently with the IO consumers.
-            let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
+            let capacity = total.next_power_of_two().clamp(1 << 10, 1 << 20);
             let mut buffer = ReorderBuffer::new(capacity);
-            let mut results = Vec::with_capacity(n);
+            let mut results = Vec::with_capacity(total);
             while let Ok((seq, o)) = a_out_rx.recv().await {
                 results.extend(buffer.insert(seq, o));
             }
@@ -2367,16 +2369,15 @@ mod tests {
     #[test]
     fn test_empty_input() {
         let items: Vec<i32> = vec![];
-        let result = Pipeline::new()
-            .map(|x: i32| x * 2)
-            .collect(items);
+        let result = Pipeline::new().map(|x: i32| x * 2).collect(items);
         assert!(result.is_empty());
     }
 
     /// Type-changing maps must compile: `i32 -> String -> usize`. The previous
     /// `Pipeline<S, T>` overloaded `T` as both input and output, so any stage
-    /// that changed the element type failed to compile. With `Pipeline<S, I, O>`
-    /// the input type `I` stays fixed while `O` tracks the latest output.
+    /// that changed the element type failed to compile. With `Pipeline<S, I,
+    /// O>` the input type `I` stays fixed while `O` tracks the latest
+    /// output.
     #[test]
     fn test_type_changing_map() {
         let items: Vec<i32> = (0..5).collect();
@@ -2700,12 +2701,8 @@ mod tests {
     fn test_run_mixed_async_unordered() {
         let sp = StreamPipeline::new(PipelineConfig::default().with_io_concurrency(16));
         let items: Vec<u64> = (0..100).collect();
-        let mut r = sp.run_mixed_async(
-            items,
-            |x: u64| x + 1,
-            |m: u64| async move { m * 10 },
-            false,
-        );
+        let mut r =
+            sp.run_mixed_async(items, |x: u64| x + 1, |m: u64| async move { m * 10 }, false);
         r.sort_unstable();
         assert_eq!(r, (0..100u64).map(|x| (x + 1) * 10).collect::<Vec<_>>());
     }
@@ -2715,12 +2712,7 @@ mod tests {
     fn test_run_mixed_async_ordered() {
         let sp = StreamPipeline::new(PipelineConfig::default().with_io_concurrency(16));
         let items: Vec<u64> = (0..100).collect();
-        let r = sp.run_mixed_async(
-            items,
-            |x: u64| x + 1,
-            |m: u64| async move { m * 10 },
-            true,
-        );
+        let r = sp.run_mixed_async(items, |x: u64| x + 1, |m: u64| async move { m * 10 }, true);
         assert_eq!(r, (0..100u64).map(|x| (x + 1) * 10).collect::<Vec<_>>());
     }
 
