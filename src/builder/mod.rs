@@ -1,4 +1,5 @@
 mod config;
+
 mod typed;
 
 pub use config::{PipelineConfig, Workload};
