@@ -9,11 +9,11 @@
 //! its thread and caps concurrency at the thread count.
 //!
 //! Groups:
-//! * `io_async_pure`  — single IO stage. Compares youpipe `run_async` (M:N)
-//!                      vs blocking approaches vs tokio-native async.
-//! * `io_async_mixed` — CPU stage (sync) → IO stage. Compares youpipe
-//!                      `run_mixed_async` (sync CPU + async IO) vs the
-//!                      all-blocking `run_multi_stage` vs tokio.
+//! * `io_async_pure` — single IO stage. Compares youpipe `run_async` (M:N)
+//!   vs blocking approaches vs tokio-native async.
+//! * `io_async_mixed` — CPU stage (sync) -> IO stage. Compares youpipe
+//!   `run_mixed_async` (sync CPU + async IO) vs the all-blocking
+//!   `run_multi_stage` vs tokio.
 
 use std::{hint::black_box as bb, time::Duration};
 

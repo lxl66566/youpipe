@@ -724,15 +724,23 @@ where
 /// A type-state pipeline builder. Stages are fused at compile time into a
 /// single pass over the data when possible (no `fence` / `ordered` boundaries).
 ///
+/// Two type parameters carry the live element type through the chain:
+/// - `I` — the pipeline **input** type (fixed by the first `.map` closure).
+/// - `O` — the **current output** type (the input to the *next* stage).
+///
+/// Separating them (previously a single `T` overloaded both roles) is what
+/// lets a type-changing `.map(i32 -> String)` compile: the input type `I`
+/// stays `i32` while `O` tracks the latest transform's output.
+///
 /// Use [`Pipeline::new`] to start, chain `.map()` / `.filter()` calls,
 /// then call `.collect(items)` to execute.
-pub struct Pipeline<S = Identity, T = ()> {
+pub struct Pipeline<S = Identity, I = (), O = ()> {
     stages: S,
     config: PipelineConfig,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<(I, O)>,
 }
 
-impl<T: Send + 'static> Pipeline<Identity, T> {
+impl<T: Send + 'static> Pipeline<Identity, T, T> {
     /// Create a new pipeline (type-state entry point).
     ///
     /// `T` is inferred from the first staged method (e.g. `.map(|x: i32| ...)`),
@@ -749,7 +757,7 @@ impl<T: Send + 'static> Pipeline<Identity, T> {
     }
 }
 
-impl<T: Send + 'static> Default for Pipeline<Identity, T> {
+impl<T: Send + 'static> Default for Pipeline<Identity, T, T> {
     /// `Pipeline: Default` lets downstream code write `Pipeline::<T>::default()`
     /// or rely on type inference from the first `.map` / `.filter` call.
     fn default() -> Self {
@@ -757,7 +765,7 @@ impl<T: Send + 'static> Default for Pipeline<Identity, T> {
     }
 }
 
-impl<S, T> Pipeline<S, T> {
+impl<S, I, O> Pipeline<S, I, O> {
     /// Override the default [`PipelineConfig`].
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
@@ -765,13 +773,18 @@ impl<S, T> Pipeline<S, T> {
         self
     }
 
-    /// Append a synchronous map stage.
-    pub fn map<O: Send + 'static>(
+    /// Append a synchronous map stage: `Fn(O) -> N`.
+    ///
+    /// The output type changes to `N`; the pipeline input `I` is unchanged.
+    /// Type-changing maps (e.g. `i32 -> String`) are supported because `I` and
+    /// `O` are tracked as separate type parameters.
+    pub fn map<N: Send + 'static>(
         self,
-        f: impl Fn(T) -> O + Send + Sync + 'static,
-    ) -> Pipeline<SyncMap<S, impl Fn(T) -> O + Send + Sync + 'static>, O>
+        f: impl Fn(O) -> N + Send + Sync + 'static,
+    ) -> Pipeline<SyncMap<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N>
     where
-        S: StageMarker<T>,
+        S: StageMarker<I, Output = O>,
+        O: Send + 'static,
     {
         Pipeline {
             stages: SyncMap {
@@ -786,10 +799,10 @@ impl<S, T> Pipeline<S, T> {
     /// Append a filter stage. Keeps items where `f` returns `true`.
     pub fn filter(
         self,
-        f: impl Fn(&T) -> bool + Send + Sync + 'static,
-    ) -> Pipeline<Filter<S, impl Fn(&T) -> bool + Send + Sync + 'static>, T>
+        f: impl Fn(&O) -> bool + Send + Sync + 'static,
+    ) -> Pipeline<Filter<S, impl Fn(&O) -> bool + Send + Sync + 'static>, I, O>
     where
-        S: StageMarker<T>,
+        S: StageMarker<I, Output = O>,
     {
         Pipeline {
             stages: Filter {
@@ -802,9 +815,9 @@ impl<S, T> Pipeline<S, T> {
     }
 
     /// Append a fence (materialization barrier).
-    pub fn fence(self) -> Pipeline<Fence<S>, T>
+    pub fn fence(self) -> Pipeline<Fence<S>, I, O>
     where
-        S: StageMarker<T, Output = T>,
+        S: StageMarker<I, Output = O>,
     {
         Pipeline {
             stages: Fence {
@@ -817,9 +830,9 @@ impl<S, T> Pipeline<S, T> {
     }
 
     /// Append a chunked fence with the given chunk size.
-    pub fn fence_chunked(self, chunk_size: usize) -> Pipeline<Fence<S>, T>
+    pub fn fence_chunked(self, chunk_size: usize) -> Pipeline<Fence<S>, I, O>
     where
-        S: StageMarker<T, Output = T>,
+        S: StageMarker<I, Output = O>,
     {
         Pipeline {
             stages: Fence {
@@ -832,9 +845,9 @@ impl<S, T> Pipeline<S, T> {
     }
 
     /// Mark the output as order-preserving.
-    pub fn ordered(self) -> Pipeline<Ordered<S>, T>
+    pub fn ordered(self) -> Pipeline<Ordered<S>, I, O>
     where
-        S: StageMarker<T, Output = T>,
+        S: StageMarker<I, Output = O>,
     {
         Pipeline {
             stages: Ordered { prev: self.stages },
@@ -867,11 +880,11 @@ where
     }
 }
 
-impl<S, T> Pipeline<S, T>
+impl<S, I, O> Pipeline<S, I, O>
 where
-    S: FusedStage<T> + Send + Sync + 'static,
-    T: Send + 'static,
-    S::Output: Send + 'static,
+    S: FusedStage<I, Output = O> + Send + Sync + 'static,
+    I: Send + 'static,
+    O: Send + 'static,
 {
     /// Execute the fused pipeline over `items` and collect results.
     ///
@@ -880,8 +893,8 @@ where
     /// (`S::MAY_FILTER == false`), and falls back to the recursive merge path
     /// otherwise (filters change output cardinality, so fixed-index writes are
     /// not possible).
-    pub fn collect<I: IntoIterator<Item = T>>(self, items: I) -> Vec<S::Output> {
-        let items: Vec<T> = items.into_iter().collect();
+    pub fn collect<It: IntoIterator<Item = I>>(self, items: It) -> Vec<O> {
+        let items: Vec<I> = items.into_iter().collect();
         let n = items.len();
         if n == 0 {
             return Vec::new();
@@ -2358,6 +2371,34 @@ mod tests {
             .map(|x: i32| x * 2)
             .collect(items);
         assert!(result.is_empty());
+    }
+
+    /// Type-changing maps must compile: `i32 -> String -> usize`. The previous
+    /// `Pipeline<S, T>` overloaded `T` as both input and output, so any stage
+    /// that changed the element type failed to compile. With `Pipeline<S, I, O>`
+    /// the input type `I` stays fixed while `O` tracks the latest output.
+    #[test]
+    fn test_type_changing_map() {
+        let items: Vec<i32> = (0..5).collect();
+        // i32 -> String -> usize, with a filter on the String stage.
+        let result: Vec<usize> = Pipeline::new()
+            .map(|x: i32| x.to_string())
+            .filter(|s: &String| !s.is_empty())
+            .map(|s: String| s.len())
+            .collect(items);
+        assert_eq!(result, vec![1, 1, 1, 1, 1]);
+    }
+
+    /// Type-changing map ending in an ordered collect (exercises the `ordered`
+    /// builder with a non-identity output type).
+    #[test]
+    fn test_type_changing_map_ordered() {
+        let items: Vec<i32> = (0..5).collect();
+        let result: Vec<i64> = Pipeline::new()
+            .map(|x: i32| i64::from(x) * 10)
+            .ordered()
+            .collect(items);
+        assert_eq!(result, vec![0, 10, 20, 30, 40]);
     }
 
     #[test]

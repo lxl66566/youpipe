@@ -132,30 +132,40 @@ already-completed sibling's output range. `MAY_FILTER = false` guarantees
 written ranges have no holes, so `drop_range` is sound without per-slot
 validity tracking. Miri (tree-borrows) passes on all paths.
 
-### 3.3 `Pipeline<S, T>` — Compile-Time Fused Pipeline
+### 3.3 `Pipeline<S, I, O>` — Compile-Time Fused Pipeline
 
-`Pipeline` has two generic parameters:
+`Pipeline` has three generic parameters:
 
 - `S`: The stage chain (nested `SyncMap` / `Filter` / `Fence` / `Ordered` / `Identity`)
-- `T`: The current output type
+- `I`: The pipeline **input** type (fixed by the first `.map` closure)
+- `O`: The **current output** type (the input to the next stage)
 
 ```rust
-pub struct Pipeline<S = Identity, T = ()> {
+pub struct Pipeline<S = Identity, I = (), O = ()> {
     stages: S,
     config: PipelineConfig,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<(I, O)>,
 }
 ```
 
-**Type transition chain**:
+Separating `I` and `O` (previously a single `T` overloaded both roles) is what
+makes type-changing maps compile: the input type `I` stays fixed while `O`
+tracks the latest transform's output, so `.map(i32 -> String)` then
+`.map(String -> usize)` type-checks end to end.
+
+**Type transition chain** (`I₀` = initial input):
 
 | Method call | Type change |
 |---|---|
-| `Pipeline::new()` | `Pipeline<Identity, T>` |
-| `.map(\|x\| f(x))` | `Pipeline<SyncMap<Identity, F>, O>` |
-| `.filter(\|x\| p(x))` | `Pipeline<Filter<SyncMap<...>, F>, T>` |
-| `.fence()` | `Pipeline<Fence<...>, T>` |
-| `.ordered()` | `Pipeline<Ordered<...>, T>` |
+| `Pipeline::new()` | `Pipeline<Identity, I₀, I₀>` |
+| `.map(\|x\| f(x))` | `Pipeline<SyncMap<Identity, F>, I₀, O>` |
+| `.map(\|x\| g(x))` | `Pipeline<SyncMap<...>, I₀, N>` (output type changes) |
+| `.filter(\|x\| p(x))` | `Pipeline<Filter<...>, I₀, O>` (output unchanged) |
+| `.fence()` | `Pipeline<Fence<...>, I₀, O>` |
+| `.ordered()` | `Pipeline<Ordered<...>, I₀, O>` |
+
+`ScopedPipeline<'env, S, I, O>` mirrors this exactly with `'env` (non-`'static`)
+closure bounds.
 
 ### 3.4 `FusedStage` Trait — Zero-Dispatch Execution
 
@@ -487,7 +497,7 @@ all-blocking path splits one compute pool between two blocking stages.
 ### Adding a New Fused Stage
 
 1. Define a stage struct implementing `StageMarker<T>` and `FusedStage<T>`
-2. Add a builder method on `Pipeline<S, T>` returning `Pipeline<NewStage<S, ...>, O>`
+2. Add a builder method on `Pipeline<S, I, O>` returning `Pipeline<NewStage<S, ...>, I, NewO>`
 3. In `FusedStage::apply()`, compose `self.prev.apply(item)` with the new logic
 
 ### Adding a New Runtime

@@ -40,7 +40,7 @@ impl<'env> PipelineScope<'env> {
     /// Start a scoped, lazily-fused pipeline. `T` is inferred from the first
     /// `.map` / `.filter` call, so callers do not need to spell it out.
     #[must_use]
-    pub fn pipeline<T: Send>(&self) -> ScopedPipeline<'env, Identity, T> {
+    pub fn pipeline<T: Send>(&self) -> ScopedPipeline<'env, Identity, T, T> {
         ScopedPipeline {
             stages: Identity,
             config: PipelineConfig::default(),
@@ -54,6 +54,10 @@ impl<'env> PipelineScope<'env> {
 /// `'env` lifetime propagated through every bound, so closures like
 /// `|x| x * factor` can capture stack-local `factor` by reference.
 ///
+/// `I` / `O` track the pipeline input and current output types separately
+/// (same design as [`crate::builder::Pipeline`]), so type-changing maps like
+/// `i32 -> String` compile.
+///
 /// Unlike the previous `ScopedPipeline` (which required `T: 'static`,
 /// pre-allocating `parallelism` chunks, and serialising results through
 /// `Arc<Vec<Mutex<Vec<T>>>>`), this version:
@@ -62,13 +66,13 @@ impl<'env> PipelineScope<'env> {
 /// - fuses `.map`/`.filter`/`.par_map` at compile time (lazy chain),
 /// - drives `.collect()` through the same recursive work-stealing
 ///   `par_index_collect` core as the top-level `Pipeline`.
-pub struct ScopedPipeline<'env, S = Identity, T = ()> {
+pub struct ScopedPipeline<'env, S = Identity, I = (), O = ()> {
     stages: S,
     config: PipelineConfig,
-    _marker: PhantomData<(&'env (), T)>,
+    _marker: PhantomData<(&'env (), I, O)>,
 }
 
-impl<'env, S, T> ScopedPipeline<'env, S, T> {
+impl<'env, S, I, O> ScopedPipeline<'env, S, I, O> {
     /// Override the default [`PipelineConfig`].
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
@@ -76,14 +80,16 @@ impl<'env, S, T> ScopedPipeline<'env, S, T> {
         self
     }
 
-    /// Append a synchronous map stage.
-    pub fn map<O>(
+    /// Append a synchronous map stage: `Fn(O) -> N`. The output type changes
+    /// to `N`; the pipeline input `I` is unchanged.
+    pub fn map<N>(
         self,
-        f: impl Fn(T) -> O + Sync + 'env,
-    ) -> ScopedPipeline<'env, SyncMap<S, impl Fn(T) -> O + Sync + 'env>, O>
+        f: impl Fn(O) -> N + Sync + 'env,
+    ) -> ScopedPipeline<'env, SyncMap<S, impl Fn(O) -> N + Sync + 'env>, I, N>
     where
-        S: StageMarker<T, Output = T>,
+        S: StageMarker<I, Output = O>,
         O: Send,
+        N: Send,
     {
         ScopedPipeline {
             stages: SyncMap {
@@ -98,10 +104,10 @@ impl<'env, S, T> ScopedPipeline<'env, S, T> {
     /// Append a filter stage.
     pub fn filter(
         self,
-        f: impl Fn(&T) -> bool + Sync + 'env,
-    ) -> ScopedPipeline<'env, Filter<S, impl Fn(&T) -> bool + Sync + 'env>, T>
+        f: impl Fn(&O) -> bool + Sync + 'env,
+    ) -> ScopedPipeline<'env, Filter<S, impl Fn(&O) -> bool + Sync + 'env>, I, O>
     where
-        S: StageMarker<T, Output = T>,
+        S: StageMarker<I, Output = O>,
     {
         ScopedPipeline {
             stages: Filter {
@@ -114,18 +120,18 @@ impl<'env, S, T> ScopedPipeline<'env, S, T> {
     }
 }
 
-impl<'env, S, T> ScopedPipeline<'env, S, T>
+impl<'env, S, I, O> ScopedPipeline<'env, S, I, O>
 where
-    S: FusedStage<T> + Sync + 'env,
-    T: Send + 'env,
-    S::Output: Send + 'env,
+    S: FusedStage<I, Output = O> + Sync + 'env,
+    I: Send + 'env,
+    O: Send + 'env,
 {
     /// Execute the fused pipeline over `items` and collect results.
     ///
     /// Uses the same recursive work-stealing `par_index_collect` core as
     /// top-level `Pipeline::collect` — no `'static` bound required. When the
     /// stage chain contains a `Filter`, falls back to per-leaf `Vec` merge.
-    pub fn collect(self, items: Vec<T>) -> Vec<S::Output> {
+    pub fn collect(self, items: Vec<I>) -> Vec<O> {
         fused_collect_scoped(items, self.stages, self.config.workload)
     }
 
@@ -213,5 +219,20 @@ mod tests {
             s.pipeline().map(|x: i32| x * 2).collect(items)
         });
         assert!(result.is_empty());
+    }
+
+    /// Scoped pipelines support type-changing maps too (`i32 -> String`),
+    /// mirroring the top-level `Pipeline<S, I, O>` fix.
+    #[test]
+    fn test_scope_type_changing_map() {
+        let suffix = "!".to_string();
+        let result: Vec<String> = scope(|s| {
+            let items: Vec<i32> = (0..3).collect();
+            s.pipeline()
+                .map(|x: i32| x * 2)
+                .map(|x: i32| format!("{x}{suffix}"))
+                .collect(items)
+        });
+        assert_eq!(result, vec!["0!", "2!", "4!"]);
     }
 }
