@@ -2,6 +2,8 @@ use std::{hint::black_box as bb, num::NonZeroUsize};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
+use youpipe::{FenceMode, stream};
+
 fn cpu_work(x: u64) -> u64 {
     let mut r = x;
     for _ in 0..100 {
@@ -14,16 +16,16 @@ fn bench_stream_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("stream_pipeline");
     for size in [1_000, 10_000] {
         let data: Vec<u64> = (0..size).collect();
-        let config = youpipe::PipelineConfig::default();
 
         group.throughput(Throughput::Elements(size));
         group.bench_with_input(
             BenchmarkId::new("single_stage_unordered", size),
             &data,
             |b, data| {
-                let sp = youpipe::StreamPipeline::new(config.clone());
                 b.iter(|| {
-                    let r = sp.run(data.clone(), |x: u64| bb(cpu_work(x)), false);
+                    let r = stream(data.clone())
+                        .stage(|x: u64| bb(cpu_work(x)))
+                        .run();
                     bb(r)
                 });
             },
@@ -33,37 +35,30 @@ fn bench_stream_pipeline(c: &mut Criterion) {
             BenchmarkId::new("single_stage_ordered", size),
             &data,
             |b, data| {
-                let sp = youpipe::StreamPipeline::new(config.clone());
                 b.iter(|| {
-                    let r = sp.run(data.clone(), |x: u64| bb(cpu_work(x)), true);
+                    let r = stream(data.clone()).stage(|x: u64| bb(cpu_work(x))).ordered().run();
                     bb(r)
                 });
             },
         );
 
         group.bench_with_input(BenchmarkId::new("multi_stage_2", size), &data, |b, data| {
-            let sp = youpipe::StreamPipeline::new(config.clone());
             b.iter(|| {
-                let r = sp.run_multi_stage(
-                    data.clone(),
-                    |x: u64| bb(cpu_work(x)),
-                    |x: u64| bb(x.wrapping_add(1)),
-                    false,
-                );
+                let r = stream(data.clone())
+                    .stage(|x: u64| bb(cpu_work(x)))
+                    .stage(|x: u64| bb(x.wrapping_add(1)))
+                    .run();
                 bb(r)
             });
         });
 
         group.bench_with_input(BenchmarkId::new("with_fence", size), &data, |b, data| {
-            let sp = youpipe::StreamPipeline::new(config.clone());
             b.iter(|| {
-                let r = sp.run_with_fence(
-                    data.clone(),
-                    |x: u64| bb(cpu_work(x)),
-                    |x: u64| bb(x.wrapping_add(1)),
-                    youpipe::FenceMode::Chunked(NonZeroUsize::new(500).unwrap()),
-                    false,
-                );
+                let r = stream(data.clone())
+                    .stage(|x: u64| bb(cpu_work(x)))
+                    .fence(FenceMode::Chunked(NonZeroUsize::new(500).unwrap()))
+                    .stage(|x: u64| bb(x.wrapping_add(1)))
+                    .run();
                 bb(r)
             });
         });

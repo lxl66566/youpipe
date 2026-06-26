@@ -4,16 +4,17 @@
 //! # Quick start
 //!
 //! ```
-//! use youpipe::{par_map, Pipeline, Workload};
+//! use youpipe::pipe;
 //!
-//! // One-shot parallel map
-//! let results = par_map(0..1000, |x| x * 2);
+//! // Data-first fused pipeline
+//! let results: Vec<i32> = pipe(0..1000)
+//!     .map(|x| x * 2)
+//!     .collect();
 //!
-//! // Fused pipeline (compile-time stage fusion)
-//! let results = Pipeline::new()
-//!     .map(|x: i32| x + 1)
-//!     .filter(|x: &i32| x % 2 == 0)
-//!     .collect(0..1000);
+//! // Fallible chain (short-circuits on first Err)
+//! let results: Result<Vec<i32>, &str> = pipe(0..100)
+//!     .try_map(|x| if x == 50 { Err("bad") } else { Ok(x * 2) })
+//!     .try_collect();
 //! ```
 
 #![warn(clippy::pedantic)]
@@ -33,9 +34,10 @@ pub mod state;
 pub mod sync;
 pub(crate) mod util;
 
+pub use builder::{Pipe, StreamPipe, TryPipe, pipe, stream};
 pub use builder::{
-    Pipeline, PipelineConfig, StreamPipeline, Workload, par_chunks_map, par_map,
-    par_map_with_workload, try_par_map,
+    Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, PipelineConfig,
+    StageMarker, SyncMap, TryMap, Workload,
 };
 #[cfg(feature = "tokio-runtime")]
 pub use executor::AsyncPool;
@@ -47,6 +49,6 @@ pub use handoff::{
 pub use runtime::Runtime;
 #[cfg(feature = "tokio-runtime")]
 pub use runtime::TokioRuntime;
-pub use scope::{PipelineScope, ScopedPipeline, scope};
+pub use scope::{PipelineScope, ScopedPipe, scope};
 pub use state::{FenceBarrier, FenceMode, ReorderBuffer};
 pub use sync::CancellationToken;

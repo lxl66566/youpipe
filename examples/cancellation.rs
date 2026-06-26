@@ -1,29 +1,56 @@
+//! Cooperative cancellation: stream().with_cancel(token) lets an external
+//! signal abort the pipeline mid-flight.
+//!
+//! `CancellationToken` is checked by the feeder, every stage worker, and every
+//! bridge thread on each iteration. Once cancelled, in-flight items are
+//! drained to completion but no new items are accepted.
+//!
+//! ```text
+//! cargo run --example cancellation
+//! ```
+
 use std::{thread, time::Duration};
 
-use youpipe::{CancellationToken, PipelineConfig, StreamPipeline};
+use youpipe::{CancellationToken, stream};
 
 fn main() {
     let token = CancellationToken::new();
-    let config = PipelineConfig::default().with_compute_workers(4);
-    let sp = StreamPipeline::new(config).with_cancel(token.clone());
+    let items: Vec<u32> = (0..10_000).collect();
 
-    let items: Vec<i32> = (0..10_000).collect();
+    // Simulate slow per-item work so cancellation has time to fire.
+    let slow = |x: u32| -> u32 {
+        thread::sleep(Duration::from_micros(50));
+        x * 2
+    };
 
-    let cancel_handle = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(5));
-        token.cancel();
-    });
+    // Canceller thread: signal abort after a short delay.
+    let cancel_handle = {
+        let token = token.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            token.cancel();
+        })
+    };
 
-    let result = sp.run(
-        items,
-        |x: i32| -> i32 {
-            thread::sleep(Duration::from_micros(50));
-            x * 2
-        },
-        false,
-    );
+    let start = std::time::Instant::now();
+    let result = stream(items)
+        .with_cancel(token)
+        .stage(slow)
+        .run();
+    let elapsed = start.elapsed();
 
     cancel_handle.join().unwrap();
-    println!("cancelled: {}/10000 items processed", result.len());
-    assert!(result.len() < 10_000);
+
+    // We should have processed only a fraction of the 10_000 items.
+    let n = result.len();
+    println!("cancelled: processed {n}/10000 items in {elapsed:?}");
+    assert!(n < 10_000, "expected cancellation to abort early, got {n}");
+
+    // Without cancellation the full 10_000 items would take
+    // 10000 × 50 µs ≈ 0.5 s on a single worker. With cancellation + the
+    // pool's parallelism, we finish as soon as the token fires + drain.
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "cancellation should shortcut the run"
+    );
 }

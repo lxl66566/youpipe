@@ -18,7 +18,7 @@
 use std::{hint::black_box as bb, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use youpipe::{AsyncPool, PipelineConfig, StreamPipeline};
+use youpipe::{AsyncPool, PipelineConfig, stream};
 
 /// CPU work, variable cost controlled by `iters`.
 fn cpu_work(x: u64, iters: u32) -> u64 {
@@ -94,18 +94,19 @@ fn bench_pure_io_async(c: &mut Criterion) {
         // ~ms and would otherwise dominate smaller sizes).
         {
             let pool = AsyncPool::from_global(num_cpus()).expect("async runtime");
-            let sp = StreamPipeline::new(PipelineConfig::default().with_io_concurrency(512))
-                .with_async_pool(pool);
+            let pool_handle = pool.handle().clone();
             group.bench_with_input(
                 BenchmarkId::new("youpipe_async", size),
                 &tasks,
                 |b, tasks| {
                     b.iter(|| {
-                        let r = sp.run_async(
-                            tasks.clone(),
-                            |(x, dur): (u64, Duration)| async move { async_io(x, dur).await },
-                            false,
-                        );
+                        let r = stream(tasks.clone())
+                            .with_config(PipelineConfig::default().with_io_concurrency(512))
+                            .with_async_pool(AsyncPool::new(pool_handle.clone(), num_cpus()))
+                            .stage_async(|(x, dur): (u64, Duration)| async move {
+                                async_io(x, dur).await
+                            })
+                            .run();
                         bb(r)
                     });
                 },
@@ -117,13 +118,10 @@ fn bench_pure_io_async(c: &mut Criterion) {
             BenchmarkId::new("youpipe_blocking", size),
             &tasks,
             |b, tasks| {
-                let sp = StreamPipeline::new(PipelineConfig::default());
                 b.iter(|| {
-                    let r = sp.run(
-                        tasks.clone(),
-                        |(x, dur): (u64, Duration)| bb(blocking_io(x, dur)),
-                        false,
-                    );
+                    let r = stream(tasks.clone())
+                        .stage(|(x, dur): (u64, Duration)| bb(blocking_io(x, dur)))
+                        .run();
                     bb(r)
                 });
             },
@@ -193,21 +191,22 @@ fn bench_mixed_cpu_io(c: &mut Criterion) {
         // async runtime (overlapping stages).
         {
             let pool = AsyncPool::from_global(num_cpus()).expect("async runtime");
-            let sp = StreamPipeline::new(PipelineConfig::default().with_io_concurrency(512))
-                .with_async_pool(pool);
+            let pool_handle = pool.handle().clone();
             group.bench_with_input(
                 BenchmarkId::new("youpipe_mixed_async", size),
                 &items,
                 |b, items| {
                     b.iter(|| {
-                        let r = sp.run_mixed_async(
-                            items.clone(),
-                            |((x, iters), dur): ((u64, u32), Duration)| {
+                        let r = stream(items.clone())
+                            .with_config(PipelineConfig::default().with_io_concurrency(512))
+                            .with_async_pool(AsyncPool::new(pool_handle.clone(), num_cpus()))
+                            .stage(|((x, iters), dur): ((u64, u32), Duration)| {
                                 (bb(cpu_work(x, iters)), dur)
-                            },
-                            |(val, dur): (u64, Duration)| async move { async_io(val, dur).await },
-                            false,
-                        );
+                            })
+                            .stage_async(|(val, dur): (u64, Duration)| async move {
+                                async_io(val, dur).await
+                            })
+                            .run();
                         bb(r)
                     });
                 },
@@ -217,20 +216,17 @@ fn bench_mixed_cpu_io(c: &mut Criterion) {
         // youpipe run_multi_stage: both stages blocking on the compute pool
         // (the previous all-sync baseline).
         {
-            let sp = StreamPipeline::new(PipelineConfig::default());
             group.bench_with_input(
                 BenchmarkId::new("youpipe_mixed_blocking", size),
                 &items,
                 |b, items| {
                     b.iter(|| {
-                        let r = sp.run_multi_stage(
-                            items.clone(),
-                            |((x, iters), dur): ((u64, u32), Duration)| {
+                        let r = stream(items.clone())
+                            .stage(|((x, iters), dur): ((u64, u32), Duration)| {
                                 (bb(cpu_work(x, iters)), dur)
-                            },
-                            |(val, dur): (u64, Duration)| bb(blocking_io(val, dur)),
-                            false,
-                        );
+                            })
+                            .stage(|(val, dur): (u64, Duration)| bb(blocking_io(val, dur)))
+                            .run();
                         bb(r)
                     });
                 },

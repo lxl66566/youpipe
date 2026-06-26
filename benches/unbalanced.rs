@@ -3,6 +3,8 @@ use std::hint::black_box as bb;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rayon::prelude::*;
 
+use youpipe::{Workload, pipe, stream};
+
 // ── Workload generators ──
 
 /// CPU work with variable cost. `iterations` controls how much CPU time is
@@ -88,11 +90,10 @@ fn bench_cpu_unbalanced_skewed(c: &mut Criterion) {
             &tasks,
             |b, tasks| {
                 b.iter(|| {
-                    let r = youpipe::par_map_with_workload(
-                        tasks.clone(),
-                        |(x, iters)| bb(cpu_work_variable(x, iters)),
-                        youpipe::Workload::Unbalanced,
-                    );
+                    let r = pipe(tasks.clone())
+                        .with_workload(Workload::Unbalanced)
+                        .map(|(x, iters)| bb(cpu_work_variable(x, iters)))
+                        .collect();
                     bb(r)
                 });
             },
@@ -138,11 +139,10 @@ fn bench_cpu_unbalanced_log_uniform(c: &mut Criterion) {
             &tasks,
             |b, tasks| {
                 b.iter(|| {
-                    let r = youpipe::par_map_with_workload(
-                        tasks.clone(),
-                        |(x, iters)| bb(cpu_work_variable(x, iters)),
-                        youpipe::Workload::Unbalanced,
-                    );
+                    let r = pipe(tasks.clone())
+                        .with_workload(Workload::Unbalanced)
+                        .map(|(x, iters)| bb(cpu_work_variable(x, iters)))
+                        .collect();
                     bb(r)
                 });
             },
@@ -169,7 +169,6 @@ fn bench_cpu_unbalanced_stream(c: &mut Criterion) {
     let mut group = c.benchmark_group("cpu_unbalanced_stream");
     for size in [200, 1000, 5000] {
         let tasks = generate_skewed_workload(size);
-        let config = youpipe::PipelineConfig::default();
 
         group.throughput(Throughput::Elements(size as u64));
         group.sample_size(10);
@@ -178,13 +177,10 @@ fn bench_cpu_unbalanced_stream(c: &mut Criterion) {
             BenchmarkId::new("youpipe_stream_unordered", size),
             &tasks,
             |b, tasks| {
-                let sp = youpipe::StreamPipeline::new(config.clone());
                 b.iter(|| {
-                    let r = sp.run(
-                        tasks.clone(),
-                        |(x, iters): (u64, u32)| bb(cpu_work_variable(x, iters)),
-                        false,
-                    );
+                    let r = stream(tasks.clone())
+                        .stage(|(x, iters): (u64, u32)| bb(cpu_work_variable(x, iters)))
+                        .run();
                     bb(r)
                 });
             },
@@ -194,13 +190,11 @@ fn bench_cpu_unbalanced_stream(c: &mut Criterion) {
             BenchmarkId::new("youpipe_stream_ordered", size),
             &tasks,
             |b, tasks| {
-                let sp = youpipe::StreamPipeline::new(config.clone());
                 b.iter(|| {
-                    let r = sp.run(
-                        tasks.clone(),
-                        |(x, iters): (u64, u32)| bb(cpu_work_variable(x, iters)),
-                        true,
-                    );
+                    let r = stream(tasks.clone())
+                        .stage(|(x, iters): (u64, u32)| bb(cpu_work_variable(x, iters)))
+                        .ordered()
+                        .run();
                     bb(r)
                 });
             },
@@ -244,14 +238,10 @@ fn bench_io_unbalanced(c: &mut Criterion) {
             BenchmarkId::new("youpipe_stream_unordered", size),
             &tasks,
             |b, tasks| {
-                let config = youpipe::PipelineConfig::default();
-                let sp = youpipe::StreamPipeline::new(config);
                 b.iter(|| {
-                    let r = sp.run(
-                        tasks.clone(),
-                        |(x, micros): (u64, u64)| bb(io_work_variable(x, micros)),
-                        false,
-                    );
+                    let r = stream(tasks.clone())
+                        .stage(|(x, micros): (u64, u64)| bb(io_work_variable(x, micros)))
+                        .run();
                     bb(r)
                 });
             },
@@ -261,14 +251,11 @@ fn bench_io_unbalanced(c: &mut Criterion) {
             BenchmarkId::new("youpipe_stream_ordered", size),
             &tasks,
             |b, tasks| {
-                let config = youpipe::PipelineConfig::default();
-                let sp = youpipe::StreamPipeline::new(config);
                 b.iter(|| {
-                    let r = sp.run(
-                        tasks.clone(),
-                        |(x, micros): (u64, u64)| bb(io_work_variable(x, micros)),
-                        true,
-                    );
+                    let r = stream(tasks.clone())
+                        .stage(|(x, micros): (u64, u64)| bb(io_work_variable(x, micros)))
+                        .ordered()
+                        .run();
                     bb(r)
                 });
             },
@@ -325,25 +312,19 @@ fn bench_mixed_unbalanced(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
 
         group.bench_function(BenchmarkId::new("youpipe_stream", size), |b| {
-            let config = youpipe::PipelineConfig::default();
-            let sp = youpipe::StreamPipeline::new(config);
             let cpu_tasks = cpu_tasks.clone();
             let io_tasks = io_tasks.clone();
             b.iter(|| {
-                let cpu_results = sp.run(
-                    cpu_tasks.clone(),
-                    |(x, iters): (u64, u32)| bb(cpu_work_variable(x, iters)),
-                    false,
-                );
+                let cpu_results = stream(cpu_tasks.clone())
+                    .stage(|(x, iters): (u64, u32)| bb(cpu_work_variable(x, iters)))
+                    .run();
                 let io_items: Vec<(u64, u64)> = cpu_results
                     .into_iter()
                     .zip(io_tasks.iter().map(|&(_, micros)| micros))
                     .collect();
-                let r = sp.run(
-                    io_items,
-                    |(x, micros): (u64, u64)| bb(io_work_variable(x, micros)),
-                    false,
-                );
+                let r = stream(io_items)
+                    .stage(|(x, micros): (u64, u64)| bb(io_work_variable(x, micros)))
+                    .run();
                 bb(r)
             });
         });

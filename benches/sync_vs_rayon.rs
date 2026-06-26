@@ -47,7 +47,7 @@ fn bench_par_map_vs_rayon(c: &mut Criterion) {
             |b, data| {
                 b.iter_batched(
                     || warm_clone(data),
-                    |v| black_box(youpipe::par_map(v, |x| black_box(cpu_work(x)))),
+                    |v| black_box(youpipe::pipe(v).map(|x| black_box(cpu_work(x))).collect()),
                     BatchSize::PerIteration,
                 );
             },
@@ -88,11 +88,11 @@ fn bench_pipeline_fusion(c: &mut Criterion) {
                     || warm_clone(data),
                     |v| {
                         black_box(
-                            youpipe::Pipeline::new()
+                            youpipe::pipe(v)
                                 .map(|x: u64| x + 1)
                                 .map(|x: u64| x * 3)
                                 .map(|x: u64| x - 2)
-                                .collect(black_box(v)),
+                                .collect(),
                         )
                     },
                     BatchSize::PerIteration,
@@ -145,7 +145,9 @@ fn bench_lightweight_work(c: &mut Criterion) {
             |b, data| {
                 b.iter_batched(
                     || warm_clone(data),
-                    |v| black_box(youpipe::par_map(v, |x| black_box(x.wrapping_add(1)))),
+                    |v| {
+                        black_box(youpipe::pipe(v).map(|x| black_box(x.wrapping_add(1))).collect())
+                    },
                     BatchSize::PerIteration,
                 );
             },
@@ -160,9 +162,11 @@ fn bench_lightweight_work(c: &mut Criterion) {
             &data,
             |b, data| {
                 b.iter(|| {
-                    black_box(youpipe::par_map(data.clone(), |x| {
-                        black_box(x.wrapping_add(1))
-                    }))
+                    black_box(
+                        youpipe::pipe(data.clone())
+                            .map(|x| black_box(x.wrapping_add(1)))
+                            .collect(),
+                    )
                 });
             },
         );

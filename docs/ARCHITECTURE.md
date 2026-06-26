@@ -6,27 +6,39 @@ This document is for contributors and developers who want to understand how youp
 
 ## 1. Design Philosophy
 
+### Data-First
+
+youpipe's public API is **data-first**: items enter the pipeline at the front
+(`pipe(items)` / `stream(items)` / `scope(|s| s.pipe(items))`), stages chain via
+builder methods, and a single terminal call (`.collect()` / `.run()`) executes
+the whole chain. This mirrors the mental model of `iter().map().collect()` —
+data flows left-to-right, never "define the pipeline, then feed data at the end".
+
 ### Compile-Time Pipeline Fusion
 
 youpipe uses **generic nested types** for compile-time pipeline fusion — similar to the iterator `Map<Filter<Iter, F1>, F2>` pattern. When the user chains `.map().filter().map()`, there are no intermediate `Vec`s or virtual dispatch overhead:
 
 ```rust
-Pipeline::new()
-    .map(|x: i32| x + 1)      // SyncMap<Identity, F1>
-    .filter(|x: &i32| *x > 0) // Filter<SyncMap<Identity, F1>, F2>
-    .map(|x: i32| x * 2)      // SyncMap<Filter<...>, F3>
-    .collect(items)
+pipe(0..1000)                // Pipe<Identity, i32, i32>
+    .map(|x: i32| x + 1)     // Pipe<SyncMap<Identity, F1>, i32, i32>
+    .filter(|x: &i32| *x > 0) // Pipe<Filter<SyncMap<...>, F2>, i32, i32>
+    .map(|x: i32| x * 2)     // Pipe<SyncMap<Filter<...>, F3>, i32, i32>
+    .collect()               // executes the chain → Vec<i32>
 ```
 
 The compiler monomorphizes all stages into a single concrete `FusedStage::apply()` call with zero indirection.
 
-### Data-First
+### Streaming for the cases fusion can't cover
 
-All data flows through typed channels (`crossfire` MPMC). Each stage owns its input receiver and output sender — no shared-memory consensus objects.
+The fused `Pipe` is CPU-only and `'static`. For workloads that need
+channel-connected stages, async IO, cancellation, fences, or 1-to-N expansion,
+the data-first `stream(items)` builder assembles a `StreamPipe` whose stages are
+linked by MPMC channels at `.run()` time. The two engines are deliberately
+separate (work-stealing join vs channel handoff) — see §3.6.
 
 ### Non-`'static` Lifetime Support
 
-The `scope()` API allows closures to borrow stack-local variables without `'static` bounds. The `'env` lifetime is threaded through `ScopedPipeline` and propagated to `ComputePool::join`, whose `Registry::in_worker_cold` blocks the calling thread until every spawned sub-task finishes — guaranteeing borrowed references outlive the pool's access to them.
+The `scope()` API allows closures to borrow stack-local variables without `'static` bounds. The `'env` lifetime is threaded through `ScopedPipe` and the underlying `fused_collect_scoped` drives the same `ComputePool::join` work-stealing core — whose `Registry::in_worker_cold` blocks the calling thread until every spawned sub-task finishes — guaranteeing borrowed references outlive the pool's access to them.
 
 ### Runtime Agnostic
 
@@ -38,11 +50,17 @@ Core modules (`builder/`, `handoff/`, `executor/`, `state/`, `scope/`) have zero
 
 ```
 src/
-├── builder/          # Strongly-typed Pipeline API + compile-time fusion + StreamPipeline
+├── builder/          # Strongly-typed data-first API + compile-time fusion + StreamPipe
 │   ├── mod.rs        # Public re-exports
 │   ├── config.rs     # PipelineConfig, Workload enum
-│   └── typed.rs      # Pipeline<S,T>, par_map(), StreamPipeline, FusedStage,
-│                     # Slots<T> index-based parallel map core, RangeOp
+│   └── typed/        # Pipe / TryPipe / StreamPipe builder core
+│       ├── mod.rs    # Re-exports
+│       ├── fused.rs  # pipe(), Pipe<S,I,O>, TryPipe<S,I,O,E>, par_index_* core,
+│       │             #   fused_collect_scoped (pub(crate) entry for scope)
+│       ├── stream.rs # stream(), StreamPipe<S,I,O>, StageSpawn typestate chain
+│       ├── traits.rs # FusedStage / FusedTryStage / RangeOp / stage markers
+│       │             #   (SyncMap / Filter / TryMap / MapErr / InfallibleChain)
+│       └── slots.rs  # Slots<T> index-based zero-copy buffer
 ├── executor/
 │   ├── compute/      # st3 work-stealing CPU thread pool
 │   │   ├── mod.rs    # ComputePool unit tests
@@ -63,7 +81,7 @@ src/
 │   ├── stream.rs     # run_ordered_collect helper
 │   └── mod.rs
 ├── scope/            # Non-'static lifetime support
-│   ├── pipeline_scope.rs # scope(), PipelineScope, ScopedPipeline (work-stealing, 'env closures)
+│   ├── pipeline_scope.rs # scope(), PipelineScope, ScopedPipe (work-stealing, 'env closures)
 │   └── mod.rs
 ├── sync/             # Synchronization primitives
 │   ├── cancel.rs     # CancellationToken (Arc<AtomicBool>)
@@ -132,19 +150,22 @@ already-completed sibling's output range. `MAY_FILTER = false` guarantees
 written ranges have no holes, so `drop_range` is sound without per-slot
 validity tracking. Miri (tree-borrows) passes on all paths.
 
-### 3.3 `Pipeline<S, I, O>` — Compile-Time Fused Pipeline
+### 3.3 `Pipe<S, I, O>` — Data-First Fused Pipeline
 
-`Pipeline` has three generic parameters:
+`Pipe` is the data-first fused pipeline. Built by `pipe(items)`, it carries the
+input `Vec<I>` inside the builder so the chain reads naturally left-to-right and
+`.collect()` takes no arguments. Three generic parameters:
 
-- `S`: The stage chain (nested `SyncMap` / `Filter` / `Fence` / `Ordered` / `Identity`)
-- `I`: The pipeline **input** type (fixed by the first `.map` closure)
+- `S`: The stage chain (nested `SyncMap` / `Filter` / `Identity`)
+- `I`: The pipeline **input** type (fixed by `pipe()`)
 - `O`: The **current output** type (the input to the next stage)
 
 ```rust
-pub struct Pipeline<S = Identity, I = (), O = ()> {
+pub struct Pipe<S = Identity, I = (), O = ()> {
+    items: Vec<I>,
     stages: S,
     config: PipelineConfig,
-    _marker: PhantomData<(I, O)>,
+    _marker: PhantomData<O>,
 }
 ```
 
@@ -157,17 +178,17 @@ tracks the latest transform's output, so `.map(i32 -> String)` then
 
 | Method call | Type change |
 |---|---|
-| `Pipeline::new()` | `Pipeline<Identity, I₀, I₀>` |
-| `.map(\|x\| f(x))` | `Pipeline<SyncMap<Identity, F>, I₀, O>` |
-| `.map(\|x\| g(x))` | `Pipeline<SyncMap<...>, I₀, N>` (output type changes) |
-| `.filter(\|x\| p(x))` | `Pipeline<Filter<...>, I₀, O>` (output unchanged) |
-| `.fence()` | `Pipeline<Fence<...>, I₀, O>` |
-| `.ordered()` | `Pipeline<Ordered<...>, I₀, O>` |
+| `pipe(items)` | `Pipe<Identity, I₀, I₀>` |
+| `.map(\|x\| f(x))` | `Pipe<SyncMap<Identity, F>, I₀, O>` |
+| `.map(\|x\| g(x))` | `Pipe<SyncMap<...>, I₀, N>` (output type changes) |
+| `.filter(\|x\| p(x))` | `Pipe<Filter<...>, I₀, O>` (output unchanged) |
+| `.try_map(\|x\| …)` | `TryPipe<TryMap<InfallibleChain<S, E>, F>, I₀, N, E>` (infallible → fallible) |
 
-`ScopedPipeline<'env, S, I, O>` mirrors this exactly with `'env` (non-`'static`)
-closure bounds.
+`ScopedPipe<'env, S, I, O>` mirrors this exactly with `'env` (non-`'static`)
+closure bounds; `TryPipe<S, I, O, E>` adds the fixed error type `E` and exposes
+`.try_map()` / `.map_err()` for further fallible chaining.
 
-### 3.4 `FusedStage` Trait — Zero-Dispatch Execution
+### 3.4 `FusedStage` / `FusedTryStage` Traits — Zero-Dispatch Execution
 
 ```rust
 pub trait FusedStage<T> {
@@ -175,92 +196,127 @@ pub trait FusedStage<T> {
     /// Whether the chain can drop items (contains a `Filter`).
     const MAY_FILTER: bool = false;
     fn apply(&self, item: T) -> Option<Self::Output>;
+    /// Branch-free variant used by the index-based hot path; sound only when
+    /// `MAY_FILTER == false` throughout the chain.
+    fn apply_pure(&self, item: T) -> Self::Output;
 }
 ```
 
-- `SyncMap::apply()` → `self.prev.apply(item).map(|v| (self.f)(v))`
-- `Filter::apply()` → `self.prev.apply(item).filter(|v| (self.f)(v))` (sets `MAY_FILTER = true`)
-- `Fence::apply()` → passthrough (fence semantics handled by `StreamPipeline` at runtime)
-- `Ordered::apply()` → passthrough (ordering handled by `ReorderBuffer`)
+- `SyncMap::apply()` → `self.prev.apply(item).map(|v| (self.f)(v))` (also overrides `apply_pure` to thread `prev.apply_pure`, no `Option`)
+- `Filter::apply()` → `self.prev.apply(item).filter(|v| (self.f)(v))` (sets `MAY_FILTER = true`; never on the pure path)
+- `Identity::apply()` → `Some(item)` (the `pipe()` seed)
 
-`MAY_FILTER` is propagated through `SyncMap` / `Fence` / `Ordered` from the
-preceding stage. `collect()` uses it as a compile-time switch: when `false`,
-the stage chain is driven by the index-based `Slots` fast path (output
-cardinality equals input cardinality); when `true`, it falls back to the
-per-leaf-`Vec` merge path (filters change cardinality, so fixed-index writes
-are impossible). Returning `Option` lets filter semantics integrate naturally
-into the fusion chain.
+`MAY_FILTER` is propagated through `SyncMap` from the preceding stage.
+`.collect()` uses it as a compile-time switch: when `false`, the stage chain is
+driven by the index-based `Slots` fast path via the `RangeOp` wrapper `FusedOp`
+(output cardinality equals input cardinality, branch-free leaf loop); when
+`true`, it falls back to the per-leaf-`Vec` merge path (`join_fused_collect`).
+The `apply_pure` fast path is what keeps the leaf vectorizable — it never
+constructs an `Option`.
 
-### 3.5 `par_map()` — Convenience Parallel Map
+`FusedTryStage` is the fallible counterpart (returns
+`Result<Option<Output>, Error>`): `TryMap` threads `Result` via `?`,
+`InfallibleChain` adapts an infallible `FusedStage` chain to `FusedTryStage` at
+the `.try_map()` boundary, and `MapErr` converts the error type. Driven by
+`join_fused_try_collect` (always the `Vec`-merge path, since fallible +
+filtering can't assume fixed cardinality).
+
+### 3.5 `Pipe::collect()` / `TryPipe::try_collect()` — Execution
 
 ```rust
-pub fn par_map<I, F, R>(iter: I, f: F) -> Vec<R>
-pub fn par_map_with_workload<I, F, R>(iter: I, f: F, workload: Workload) -> Vec<R>
-pub fn par_chunks_map<I, F, R>(iter: I, chunk_size: usize, f: F) -> Vec<R>
-pub fn try_par_map<I, F, R, E>(iter: I, f: F) -> Result<Vec<R>, E>
+pub fn pipe<I, It>(items: It) -> Pipe<Identity, I, I>
+impl<S, I, O> Pipe<S, I, O> {
+    pub fn map<N>(...)  -> Pipe<SyncMap<S, ...>, I, N>
+    pub fn filter(...)  -> Pipe<Filter<S, ...>, I, O>
+    pub fn try_map<N, E>(...) -> TryPipe<TryMap<InfallibleChain<S, E>, ...>, I, N, E>
+    pub fn collect(self) -> Vec<O>
+}
 ```
 
-- `par_map`: delegates to `par_map_with_workload(..., Balanced)`
-- `par_map_with_workload`: allocates input + output `Slots` once, then drives
-  the recursive index-based core (`par_index_rec`) via `FnMap` (a never-filter
-  `RangeOp`). Workload only changes the oversplit factor.
-- `par_chunks_map`: splits items into worker ranges, each subdivides into chunk_size sub-chunks. Preserves LLVM SIMD auto-vectorization.
-- `try_par_map`: still uses the recursive `Vec`-merge path (early-error return
-  with `join`); not on the hot benchmark path.
+`.collect()` dispatches on `S::MAY_FILTER`:
 
-### 3.6 `StreamPipeline` — Streaming Multi-Stage Pipeline
+- **`MAY_FILTER == false`** — the index-based fast path. Input + output `Slots`
+  are allocated once, then `par_index_rec` recursively splits the **index range**
+  `[0, n)` (not the data) via `ComputePool::join`. Each leaf receives `&[T]` /
+  `&mut [R]` slice views and runs the `RangeOp` (`FusedOp(stages)`) through
+  `apply_pure` — branch-free and vectorizable. Workload only changes the oversplit
+  factor (`Balanced` = 4×, `Unbalanced` = 8×).
+- **`MAY_FILTER == true`** — `join_fused_collect` recursively halves the `Vec`,
+  each leaf filters into a per-leaf `Vec`, results merged by `extend`.
 
-When a pipeline contains `fence`, `ordered`, or other runtime semantics, stages are connected via channels:
+`.try_collect()` always uses the `Vec`-merge path (`join_fused_try_collect`),
+short-circuiting on the first `Err` via `?` and honouring `Filter`.
 
-| Method | Description |
+### 3.6 `StreamPipe` — Streaming Multi-Stage Pipeline
+
+For workloads that need channel-connected stages, async IO, cancellation,
+fences, or 1-to-N expansion, `stream(items)` builds a `StreamPipe` whose stages
+chain via builder methods and assemble a channel topology at `.run()` time:
+
+```rust
+stream(items)                       // StreamPipe<StreamStart, I, I>
+    .stage(|x| f(x))                //   → SyncStage (compute pool workers)
+    .expand(|x| vec![...])          //   → ExpandStage (1-to-N)
+    .fence(FenceMode::Chunked(k))   //   → FenceLink (batching barrier thread)
+    .stage_async(|x| async { .. })  //   → AsyncStage (tokio tasks, M:N)
+    .ordered()                      // restore input order via ReorderBuffer
+    .with_cancel(token)             // cooperative cancellation
+    .run()                          // execute → Vec<O>
+```
+
+| Builder method | Runtime topology |
 |---|---|
-| `run()` | Single-stage streaming execution |
-| `run_async()` | Single async stage on the tokio runtime (M:N IO concurrency) |
-| `run_multi_stage()` | Two-stage pipeline (stage1 → channel → stage2) |
-| `run_mixed_async()` | Sync CPU stage (compute pool) → async IO stage (runtime), overlapping |
-| `run_with_fence()` | Configurable isolation (`FenceMode`): `Barrier` (stage1 fully drains before stage2 starts) or `Chunked(k)` (forward every k items, stages overlap) |
-| `run_nested()` | Expand mode: outer_stage 1:N expansion → inner_stage parallel processing |
+| `.stage(f)` | `parallelism` compute-pool workers pull, apply `f`, forward |
+| `.expand(f)` | like `.stage` but each input → `Vec<N>` outputs (inherits parent's `seq`) |
+| `.fence(mode)` | dedicated forwarder thread batching between adjacent stages |
+| `.stage_async(f)` | `io_concurrency` tokio tasks on the async runtime (M:N) |
+| `.ordered()` | feeder tags each item with `seq`; collector reorders via `ReorderBuffer` |
+| `.with_cancel(token)` | feeder/workers/bridges check `is_cancelled()` per iteration |
 
-All streaming methods accept `ordered: bool`, using `ReorderBuffer` to restore original order. Optional `CancellationToken` enables cooperative cancellation — feeder and workers check `is_cancelled()` per iteration.
+The stage chain is a typestate (`SyncStage<FenceLink<SyncStage<StreamStart,…>>>`)
+walked by the `StageSpawn` trait — `spawn` recurses inside-out (older stages
+first) so the data-flow direction matches. `worker_stages()` counts compute-pool
+stages so `.run()` divides `compute_workers` across sync stages, preventing the
+"stage 1 fills the pool → stage 2 starves → deadlock" failure mode.
 
-#### Async IO stages (mixed sync+async)
+#### Async IO stages
 
-`run_async` / `run_mixed_async` are gated behind the `tokio-runtime` feature. They
-run an IO stage as **`io_concurrency` async tasks** on a dedicated tokio runtime
+`.stage_async()` is gated behind the `tokio-runtime` feature. It runs an IO
+stage as **`io_concurrency` async tasks** on a tokio runtime
 ([`AsyncPool`]). The runtime's M:N scheduler multiplexes those tasks over
 `async_workers` OS threads: each task yields its thread back to the runtime while
 it awaits (e.g. `tokio::time::sleep`, real network/disk IO), so concurrency is
 bounded by `io_concurrency` — **not** by the thread count.
 
 This is the right tool when IO waits actually yield. For work that *blocks* the
-OS thread (e.g. `std::thread::sleep`), the sync [`StreamPipeline::run`] is
-preferable: a blocking call inside a task stalls a runtime worker and forfeits
-the M:N advantage (blocking concurrency is then capped at the thread count).
+OS thread (e.g. `std::thread::sleep`), a sync `.stage()` is preferable: a
+blocking call inside an async task stalls a runtime worker and forfeits the M:N
+advantage (blocking concurrency is then capped at the thread count).
 
-`run_mixed_async` keeps the CPU stage on the sync compute pool (rayon-style,
-sized to cores) and the IO stage on the async runtime; the two stages overlap via
-a dedicated sync→async bridge thread (mirrors `forward_fenced`). The pools do not
-contend: CPU uses `compute_workers` OS threads, IO uses `async_workers` OS threads
-multiplexing `io_concurrency` tasks.
+A mixed sync-CPU + async-IO chain keeps the CPU stage on the sync compute pool
+(rayon-style, sized to cores) and the IO stage on the async runtime; the two
+overlap via a sync→async bridge thread. The pools do not contend: CPU uses
+`compute_workers` OS threads, IO uses `async_workers` OS threads multiplexing
+`io_concurrency` tasks.
 
 An [`AsyncPool`] may be attached via `.with_async_pool(...)` and reused across
 runs; otherwise a transient runtime is built per call (simpler, but pays
 ~ms runtime construction each time — avoid inside tight loops).
 
-### 3.7 `ScopedPipeline` — Non-`'static` Pipeline
+### 3.7 `ScopedPipe` — Non-`'static` Pipeline
 
 ```rust
 youpipe::scope(|s| {
     let factor = 10;
-    s.pipeline()
-        .map(|x: i32| x * factor)   // borrows stack-local factor
-        .collect(items)
+    s.pipe(0..100)                 // data-first, like pipe()
+        .map(|x: i32| x * factor)  // borrows stack-local factor
+        .collect()                 // → Vec<i32>
 })
 ```
 
-Mirrors `Pipeline`'s compile-time-fused stage chain (`SyncMap` / `Filter` /
+Mirrors `Pipe`'s compile-time-fused stage chain (`SyncMap` / `Filter` /
 etc.) but with `'env` (non-`'static`) closure bounds. `.collect()` drives the
-same recursive work-stealing `par_index_collect` core as `Pipeline::collect`
+same recursive work-stealing `par_index_collect` core as `Pipe::collect`
 — exposed via the `pub(crate) fused_collect_scoped` entry point — so the
 soundness story rests on `ComputePool::join`: the calling thread blocks in
 `Registry::in_worker_cold` until every sub-task finishes, which guarantees
@@ -359,7 +415,7 @@ Counter barrier: `add(n)` increments, `done()` decrements, `wait()` blocks until
 
 ---
 
-## 7. Fence Barrier (`state/fence.rs` + `StreamPipeline::run_with_fence`)
+## 7. Fence Barrier (`state/fence.rs` + `StreamPipe::fence`)
 
 A fence lets the caller decide how strictly two adjacent stages are isolated, via `FenceMode`:
 
@@ -392,7 +448,7 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 ## 9. Performance Benchmarks
 
 > All numbers below are from a 32-core AMD (Zen) Linux machine, `criterion`
-> `--sample-size 30 --measurement-time 5`. Methodology note: `par_map` takes
+> `--sample-size 30 --measurement-time 5`. Methodology note: `pipe()` takes
 > ownership of the input, so a benchmark iteration must rebuild the input
 > (`warm_clone`). glibc's large `memcpy` uses non-temporal stores that bypass
 > the cache, so a naïve `data.clone()` arrives **cold-from-RAM** — measuring
@@ -402,7 +458,7 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 > `_cold` variant is kept for the lightweight group to document the one-shot
 > cold-memory cost.
 
-### CPU-Heavy par_map vs rayon (`sync_cpu_heavy`, 100 iters/item, warm input)
+### CPU-Heavy `pipe()` vs rayon (`sync_cpu_heavy`, 100 iters/item, warm input)
 
 | Size | youpipe | rayon | Result |
 |---|---|---|---|
@@ -421,9 +477,9 @@ The fused stage chain still trails rayon's `par_iter` because rayon's consumer
 is a highly-tuned length-splitting fold/collect; youpipe drives the index-based
 `Slots` core through a generic `RangeOp`. Closing this gap is the next
 optimization target — see `§3.2` for the current `&[T]`/`&mut [R]` leaf view
-that already closed most of the lightweight-`par_map` gap.
+that already closed most of the lightweight-`pipe()` gap.
 
-### Lightweight par_map vs rayon (`sync_lightweight`, `x+1`)
+### Lightweight `pipe()` vs rayon (`sync_lightweight`, `x+1`)
 
 | Size | youpipe (warm) | youpipe (cold) | rayon |
 |---|---|---|---|
@@ -441,7 +497,7 @@ The cold variant documents the read-compute-write sensitivity to
 cold-from-RAM input (glibc's non-temporal memcpy bypasses the cache); rayon
 on an equally-cold clone measures ~800 µs at 1M.
 
-### Mixed Load — StreamPipeline vs `tokio::spawn_blocking` (`mixed_load`)
+### Mixed Load — `stream()` vs `tokio::spawn_blocking` (`mixed_load`)
 
 | Size | youpipe stream | spawn_blocking | rayon (CPU-only) | Result |
 |---|---|---|---|---|
@@ -449,11 +505,11 @@ on an equally-cold clone measures ~800 µs at 1M.
 | 500 | ~418 µs | ~1.25 ms | ~29 µs | **youpipe ~3× faster** |
 | 1000 | ~1.0 ms | ~2.5 ms | ~37 µs | **youpipe ~2.5× faster** |
 
-StreamPipeline comfortably beats `tokio::spawn_blocking` (the design target for
+`StreamPipe` comfortably beats `tokio::spawn_blocking` (the design target for
 mixed CPU/IO). `rayon::par_iter` is fastest here because this benchmark is
 pure-CPU and rayon's direct fork-join skips channel handoff entirely.
 
-### Async IO — `run_async` / `run_mixed_async` (`io_async`, yielding IO)
+### Async IO — `.stage_async()` (`io_async`, yielding IO)
 
 Simulated IO uses `tokio::time::sleep` (90% × 1 ms, 10% × 8 ms tail) — a wait
 that *yields* the OS thread, the regime where M:N async concurrency beats the
@@ -479,7 +535,7 @@ oversubscription that only pays off for pure-sleep (no CPU) work.
 | 500 | ~10.07 ms | ~60.13 ms | ~10.60 ms |
 
 `youpipe_mixed_async` is **2.8× (200) / ~6× (500) faster than the all-blocking
-`run_multi_stage`**, and at size 500 even edges out `tokio_mixed_blocking`: the
+two-stage baseline**, and at size 500 even edges out `tokio_mixed_blocking`: the
 async path overlaps the CPU and IO stages on separate pools, whereas the
 all-blocking path splits one compute pool between two blocking stages.
 
@@ -497,8 +553,8 @@ all-blocking path splits one compute pool between two blocking stages.
 ### Adding a New Fused Stage
 
 1. Define a stage struct implementing `StageMarker<T>` and `FusedStage<T>`
-2. Add a builder method on `Pipeline<S, I, O>` returning `Pipeline<NewStage<S, ...>, I, NewO>`
-3. In `FusedStage::apply()`, compose `self.prev.apply(item)` with the new logic
+2. Add a builder method on `Pipe<S, I, O>` returning `Pipe<NewStage<S, ...>, I, NewO>`
+3. In `FusedStage::apply()` (and `apply_pure` if the stage can't filter), compose `self.prev.apply(item)` with the new logic
 
 ### Adding a New Runtime
 

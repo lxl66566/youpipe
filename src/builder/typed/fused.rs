@@ -3,7 +3,8 @@ use std::{any::Any, marker::PhantomData, panic};
 use super::{
     slots::Slots,
     traits::{
-        Fence, Filter, FnMap, FusedOp, FusedStage, Identity, Ordered, RangeOp, StageMarker, SyncMap,
+        Filter, FusedOp, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, RangeOp,
+        StageMarker, SyncMap, TryMap,
     },
 };
 use crate::{
@@ -194,7 +195,7 @@ where
 
 // ── Join-based parallel helpers ──
 
-/// Compute the number of recursive split levels. Aiming for ~`oversplit` tasks
+/// Compute the number of recursive split levels. Aiming at ~`oversplit` tasks
 /// per thread gives good work-stealing without excessive task overhead.
 fn split_depth(n: usize, num_threads: usize, oversplit: usize) -> usize {
     let desired_tasks = (num_threads * oversplit).max(1);
@@ -203,22 +204,63 @@ fn split_depth(n: usize, num_threads: usize, oversplit: usize) -> usize {
     by_threads.min(by_len).max(1)
 }
 
-/// Fallible recursive join-based map. Returns the first error encountered.
-fn join_try_map<T, R, E, F>(mut items: Vec<T>, f: &F, splits_left: usize) -> Result<Vec<R>, E>
+/// Recursive merge-based collect for fused stages that may filter. Used only as
+/// the `MAY_FILTER == true` fallback; output cardinality is unknown up front so
+/// each leaf produces its own `Vec` and results are concatenated.
+fn join_fused_collect<S, T>(mut items: Vec<T>, stages: &S, splits_left: usize) -> Vec<S::Output>
 where
+    S: FusedStage<T> + Sync,
     T: Send,
-    R: Send,
-    E: Send,
-    F: Fn(T) -> Result<R, E> + Sync,
+    S::Output: Send,
 {
     if splits_left == 0 || items.len() <= 1 {
-        return items.into_iter().map(f).collect();
+        return items
+            .into_iter()
+            .filter_map(|item| stages.apply(item))
+            .collect();
     }
     let mid = items.len() / 2;
     let right = items.split_off(mid);
     let (left_r, right_r) = ComputePool::global().join(
-        || join_try_map(items, f, splits_left - 1),
-        || join_try_map(right, f, splits_left - 1),
+        || join_fused_collect(items, stages, splits_left - 1),
+        || join_fused_collect(right, stages, splits_left - 1),
+    );
+    let mut result = left_r;
+    result.extend(right_r);
+    result
+}
+
+/// Recursive merge-based collect for fallible fused stages. Short-circuits on
+/// the first `Err`; on success honours `Filter` (drops `None` items).
+///
+/// Uses the `Vec`-merge path rather than the index-based fast path because
+/// fallible + filter pipelines cannot assume fixed output cardinality. The
+/// infallible/no-filter fast path is reserved for `Pipe::collect`.
+fn join_fused_try_collect<S, T, E>(
+    mut items: Vec<T>,
+    stages: &S,
+    splits_left: usize,
+) -> Result<Vec<S::Output>, E>
+where
+    S: FusedTryStage<T, Error = E> + Sync,
+    T: Send,
+    S::Output: Send,
+    E: Send,
+{
+    if splits_left == 0 || items.len() <= 1 {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            if let Some(o) = stages.try_apply(item)? {
+                out.push(o);
+            }
+        }
+        return Ok(out);
+    }
+    let mid = items.len() / 2;
+    let right = items.split_off(mid);
+    let (left_r, right_r) = ComputePool::global().join(
+        || join_fused_try_collect(items, stages, splits_left - 1),
+        || join_fused_try_collect(right, stages, splits_left - 1),
     );
     match (left_r, right_r) {
         (Ok(mut l), Ok(r)) => {
@@ -229,186 +271,62 @@ where
     }
 }
 
-/// Parallel map over an iterator. Uses [`Workload::Balanced`] by default.
+// ── Pipe (data-first fused pipeline) ──
+
+/// Data-first entry point. Builds a fused pipeline that consumes `items` when
+/// `.collect()` is called.
 ///
-/// Internally uses recursive `join`-based splitting (like rayon) which enables
-/// work-stealing of sub-tasks. This handles both balanced and skewed workloads
-/// well without per-item atomics.
-pub fn par_map<I, F, R>(iter: I, f: F) -> Vec<R>
+/// ```rust
+/// # use youpipe::pipe;
+/// let result: Vec<i32> = pipe(0..1000)
+///     .map(|x: i32| x + 1)
+///     .filter(|x: &i32| x % 2 == 0)
+///     .map(|x: i32| x * 10)
+///     .collect();
+/// ```
+pub fn pipe<I, It>(items: It) -> Pipe<Identity, I, I>
 where
-    I: IntoIterator,
-    I::Item: Send + 'static,
-    F: Fn(I::Item) -> R + Send + Sync + 'static,
-    R: Send + 'static,
+    It: IntoIterator<Item = I>,
+    I: Send + 'static,
 {
-    par_map_with_workload(iter, f, Workload::Balanced)
+    Pipe {
+        items: items.into_iter().collect(),
+        stages: Identity,
+        config: PipelineConfig::default(),
+        _marker: PhantomData,
+    }
 }
 
-/// Parallel map with explicit [`Workload`] hint.
+/// A type-state, data-first fused pipeline. Stages chained via `.map()` /
+/// `.filter()` are compiled into a single closure per worker — zero
+/// intermediate allocations when no `filter` is present.
 ///
-/// Uses the index-based range core (pre-allocated output, no `split_off` /
-/// `extend`) driven by recursive `join` splitting. `Unbalanced` creates more
-/// split points (finer task granularity) so that slow items spread across more
-/// leaves and can be stolen by idle workers.
-pub fn par_map_with_workload<I, F, R>(iter: I, f: F, workload: Workload) -> Vec<R>
-where
-    I: IntoIterator,
-    I::Item: Send + 'static,
-    F: Fn(I::Item) -> R + Send + Sync + 'static,
-    R: Send + 'static,
-{
-    let items: Vec<I::Item> = iter.into_iter().collect();
-    let n = items.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let num_threads = ComputePool::global().num_workers();
-    if n <= 1 || num_threads <= 1 {
-        return items.into_iter().map(f).collect();
-    }
-
-    // Oversplit: more leaves than threads so work-stealing can balance skewed
-    // loads. Unbalanced uses a higher factor for finer granularity.
-    let oversplit = match workload {
-        Workload::Balanced => 4,
-        Workload::Unbalanced => 8,
-    };
-    let splits = split_depth(n, num_threads, oversplit);
-
-    par_index_collect(items, &FnMap(f), splits)
-}
-
-/// Parallel chunked map — splits items into `chunk_size` slices and calls `f`
-/// on each slice, collecting all results.
-pub fn par_chunks_map<I, F, R>(iter: I, chunk_size: usize, f: F) -> Vec<R>
-where
-    I: IntoIterator,
-    I::Item: Send + 'static,
-    F: Fn(&[I::Item]) -> Vec<R> + Send + Sync + 'static,
-    R: Send + 'static,
-{
-    let items: Vec<I::Item> = iter.into_iter().collect();
-    let n = items.len();
-    if n == 0 || chunk_size == 0 {
-        return Vec::new();
-    }
-
-    let num_threads = ComputePool::global().num_workers();
-    let num_chunks = n.div_ceil(chunk_size);
-    if num_chunks <= 1 || num_threads <= 1 {
-        return items.chunks(chunk_size).flat_map(&f).collect();
-    }
-
-    let splits = split_depth(num_chunks, num_threads, 4);
-    join_chunks_map(items, chunk_size, &f, splits)
-}
-
-/// Recursive join-based chunked map.
-fn join_chunks_map<T, R, F>(
-    mut items: Vec<T>,
-    chunk_size: usize,
-    f: &F,
-    splits_left: usize,
-) -> Vec<R>
-where
-    T: Send,
-    R: Send,
-    F: Fn(&[T]) -> Vec<R> + Sync,
-{
-    if splits_left == 0 || items.len() <= chunk_size {
-        return items.chunks(chunk_size).flat_map(f).collect();
-    }
-    // Split at a chunk boundary.
-    let mid = ((items.len() / 2) / chunk_size) * chunk_size;
-    let mid = mid.max(chunk_size);
-    let right = items.split_off(mid);
-
-    let (left_r, right_r) = ComputePool::global().join(
-        || join_chunks_map(items, chunk_size, f, splits_left - 1),
-        || join_chunks_map(right, chunk_size, f, splits_left - 1),
-    );
-    let mut result = left_r;
-    result.extend(right_r);
-    result
-}
-
-/// Fallible parallel map. Both branches always execute (join guarantee); the
-/// first error is returned.
-pub fn try_par_map<I, F, R, E>(iter: I, f: F) -> Result<Vec<R>, E>
-where
-    I: IntoIterator,
-    I::Item: Send + 'static,
-    F: Fn(I::Item) -> Result<R, E> + Send + Sync + 'static,
-    R: Send + 'static,
-    E: Send + 'static,
-{
-    let items: Vec<I::Item> = iter.into_iter().collect();
-    let n = items.len();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let num_threads = ComputePool::global().num_workers();
-    if n <= 1 || num_threads <= 1 {
-        return items.into_iter().map(f).collect();
-    }
-
-    let splits = split_depth(n, num_threads, 4);
-    join_try_map(items, &f, splits)
-}
-
-// ── Pipeline (main user-facing type) ──
-
-/// A type-state pipeline builder. Stages are fused at compile time into a
-/// single pass over the data when possible (no `fence` / `ordered` boundaries).
+/// Three type parameters:
+/// - `S` — the stage chain (nested `SyncMap` / `Filter` / `Identity`).
+/// - `I` — the pipeline **input** type (fixed by `pipe()`).
+/// - `O` — the **current output** type (the input to the next stage).
 ///
-/// Two type parameters carry the live element type through the chain:
-/// - `I` — the pipeline **input** type (fixed by the first `.map` closure).
-/// - `O` — the **current output** type (the input to the *next* stage).
-///
-/// Separating them (previously a single `T` overloaded both roles) is what
-/// lets a type-changing `.map(i32 -> String)` compile: the input type `I`
-/// stays `i32` while `O` tracks the latest transform's output.
-///
-/// Use [`Pipeline::new`] to start, chain `.map()` / `.filter()` calls,
-/// then call `.collect(items)` to execute.
-pub struct Pipeline<S = Identity, I = (), O = ()> {
+/// Separating `I` and `O` is what lets type-changing maps like
+/// `.map(i32 -> String)` then `.map(String -> usize)` type-check end to end.
+pub struct Pipe<S = Identity, I = (), O = ()> {
+    items: Vec<I>,
     stages: S,
     config: PipelineConfig,
-    _marker: PhantomData<(I, O)>,
+    _marker: PhantomData<O>,
 }
 
-impl<T: Send + 'static> Pipeline<Identity, T, T> {
-    /// Create a new pipeline (type-state entry point).
-    ///
-    /// `T` is inferred from the first staged method (e.g. `.map(|x: i32|
-    /// ...)`), so callers do not need to spell it out — the previous
-    /// `from_vec(vec![])` entry point existed only as a type hint and
-    /// silently discarded its argument, which was both wasteful and
-    /// confusing.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            stages: Identity,
-            config: PipelineConfig::default(),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<T: Send + 'static> Default for Pipeline<Identity, T, T> {
-    /// `Pipeline: Default` lets downstream code write
-    /// `Pipeline::<T>::default()` or rely on type inference from the first
-    /// `.map` / `.filter` call.
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<S, I, O> Pipeline<S, I, O> {
+impl<S, I, O> Pipe<S, I, O> {
     /// Override the default [`PipelineConfig`].
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Tune the workload split factor. Default is [`Workload::Balanced`].
+    #[must_use]
+    pub fn with_workload(mut self, workload: Workload) -> Self {
+        self.config.workload = workload;
         self
     }
 
@@ -417,15 +335,17 @@ impl<S, I, O> Pipeline<S, I, O> {
     /// The output type changes to `N`; the pipeline input `I` is unchanged.
     /// Type-changing maps (e.g. `i32 -> String`) are supported because `I` and
     /// `O` are tracked as separate type parameters.
-    pub fn map<N: Send + 'static>(
+    pub fn map<N>(
         self,
         f: impl Fn(O) -> N + Send + Sync + 'static,
-    ) -> Pipeline<SyncMap<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N>
+    ) -> Pipe<SyncMap<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N>
     where
         S: StageMarker<I, Output = O>,
         O: Send + 'static,
+        N: Send + 'static,
     {
-        Pipeline {
+        Pipe {
+            items: self.items,
             stages: SyncMap {
                 prev: self.stages,
                 f,
@@ -439,11 +359,12 @@ impl<S, I, O> Pipeline<S, I, O> {
     pub fn filter(
         self,
         f: impl Fn(&O) -> bool + Send + Sync + 'static,
-    ) -> Pipeline<Filter<S, impl Fn(&O) -> bool + Send + Sync + 'static>, I, O>
+    ) -> Pipe<Filter<S, impl Fn(&O) -> bool + Send + Sync + 'static>, I, O>
     where
         S: StageMarker<I, Output = O>,
     {
-        Pipeline {
+        Pipe {
+            items: self.items,
             stages: Filter {
                 prev: self.stages,
                 f,
@@ -453,66 +374,53 @@ impl<S, I, O> Pipeline<S, I, O> {
         }
     }
 
-    /// Append a fence (materialization barrier).
-    pub fn fence(self) -> Pipeline<Fence<S>, I, O>
+    /// Append a fallible map stage: `Fn(O) -> Result<N, E>`. Transitions the
+    /// pipeline into a [`TryPipe`] whose `.try_collect()` returns
+    /// `Result<Vec<N>, E>`. The first `Err` short-circuits the chain.
+    ///
+    /// `Filter` is honoured even after a `try_map` boundary — items dropped by
+    /// an upstream filter are simply not passed to `f`.
+    #[allow(clippy::type_complexity)] // the return type encodes the typestate
+    // chain (`InfallibleChain` wraps the infallible prefix so it impls
+    // `FusedTryStage<Error = E>`); there is no shorter spelling that preserves
+    // the compile-time-fusion guarantee.
+    pub fn try_map<N, E>(
+        self,
+        f: impl Fn(O) -> Result<N, E> + Send + Sync + 'static,
+    ) -> TryPipe<TryMap<InfallibleChain<S, E>, impl Fn(O) -> Result<N, E> + Send + Sync + 'static>, I, N, E>
     where
         S: StageMarker<I, Output = O>,
+        O: Send + 'static,
+        N: Send + 'static,
+        E: Send + 'static,
     {
-        Pipeline {
-            stages: Fence {
-                prev: self.stages,
-                chunk_size: None,
+        TryPipe {
+            items: self.items,
+            stages: TryMap {
+                prev: InfallibleChain(self.stages, PhantomData),
+                f,
             },
-            config: self.config,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Append a chunked fence with the given chunk size.
-    pub fn fence_chunked(self, chunk_size: usize) -> Pipeline<Fence<S>, I, O>
-    where
-        S: StageMarker<I, Output = O>,
-    {
-        Pipeline {
-            stages: Fence {
-                prev: self.stages,
-                chunk_size: Some(chunk_size),
-            },
-            config: self.config,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Mark the output as order-preserving.
-    pub fn ordered(self) -> Pipeline<Ordered<S>, I, O>
-    where
-        S: StageMarker<I, Output = O>,
-    {
-        Pipeline {
-            stages: Ordered { prev: self.stages },
             config: self.config,
             _marker: PhantomData,
         }
     }
 }
 
-// ── Collect for fully-fused sync pipelines ──
-
-impl<S, I, O> Pipeline<S, I, O>
+impl<S, I, O> Pipe<S, I, O>
 where
     S: FusedStage<I, Output = O> + Send + Sync + 'static,
     I: Send + 'static,
     O: Send + 'static,
 {
-    /// Execute the fused pipeline over `items` and collect results.
+    /// Execute the fused pipeline and collect results.
     ///
     /// Uses the index-based range core (pre-allocated output, no per-level
     /// `split_off`/`extend`) when the stage chain cannot filter
     /// (`S::MAY_FILTER == false`), and falls back to the recursive merge path
     /// otherwise (filters change output cardinality, so fixed-index writes are
     /// not possible).
-    pub fn collect<It: IntoIterator<Item = I>>(self, items: It) -> Vec<O> {
-        let items: Vec<I> = items.into_iter().collect();
+    pub fn collect(self) -> Vec<O> {
+        let items = self.items;
         let n = items.len();
         if n == 0 {
             return Vec::new();
@@ -540,8 +448,162 @@ where
     }
 }
 
-/// `pub(crate)` entry point for scoped pipelines. Identical to
-/// `Pipeline::collect` but without `'static` bounds — driven by
+// ── TryPipe (fallible fused pipeline) ──
+
+/// A data-first fused pipeline whose stages may fail. Obtained from
+/// [`Pipe::try_map`]; call `.try_collect()` to execute and get a `Result`.
+///
+/// The error type `E` is fixed across the chain — every subsequent `try_map`
+/// must produce the same `E` (use `.map_err()` to convert). `map` and `filter`
+/// are also supported: their effects compose with `Result` via `?`.
+pub struct TryPipe<S = Identity, I = (), O = (), E = std::convert::Infallible> {
+    items: Vec<I>,
+    stages: S,
+    config: PipelineConfig,
+    _marker: PhantomData<(O, E)>,
+}
+
+impl<S, I, O, E> TryPipe<S, I, O, E> {
+    /// Override the default [`PipelineConfig`].
+    #[must_use]
+    pub fn with_config(mut self, config: PipelineConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Tune the workload split factor. Default is [`Workload::Balanced`].
+    #[must_use]
+    pub fn with_workload(mut self, workload: Workload) -> Self {
+        self.config.workload = workload;
+        self
+    }
+
+    /// Append an infallible map stage. The error type `E` is unchanged.
+    pub fn map<N>(
+        self,
+        f: impl Fn(O) -> N + Send + Sync + 'static,
+    ) -> TryPipe<SyncMap<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N, E>
+    where
+        S: StageMarker<I, Output = O>,
+        O: Send + 'static,
+        N: Send + 'static,
+    {
+        TryPipe {
+            items: self.items,
+            stages: SyncMap {
+                prev: self.stages,
+                f,
+            },
+            config: self.config,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Append a filter stage. Items where `f` returns `false` are dropped from
+    /// the output (no error is signalled).
+    pub fn filter(
+        self,
+        f: impl Fn(&O) -> bool + Send + Sync + 'static,
+    ) -> TryPipe<Filter<S, impl Fn(&O) -> bool + Send + Sync + 'static>, I, O, E>
+    where
+        S: StageMarker<I, Output = O>,
+    {
+        TryPipe {
+            items: self.items,
+            stages: Filter {
+                prev: self.stages,
+                f,
+            },
+            config: self.config,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Append another fallible map stage. The closure must produce the same
+    /// error type `E` (use `.map_err()` upstream if a different `E2` is
+    /// needed).
+    #[allow(clippy::type_complexity)] // typestate chain return — see `Pipe::try_map`.
+    pub fn try_map<N>(
+        self,
+        f: impl Fn(O) -> Result<N, E> + Send + Sync + 'static,
+    ) -> TryPipe<TryMap<S, impl Fn(O) -> Result<N, E> + Send + Sync + 'static>, I, N, E>
+    where
+        S: StageMarker<I, Output = O> + FusedTryStage<I, Error = E>,
+        O: Send + 'static,
+        N: Send + 'static,
+    {
+        TryPipe {
+            items: self.items,
+            stages: TryMap {
+                prev: self.stages,
+                f,
+            },
+            config: self.config,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Convert the error type from `E` to `E2`. Useful when chaining multiple
+    /// `try_map` calls whose closures return different error types.
+    pub fn map_err<E2>(
+        self,
+        f: impl Fn(E) -> E2 + Send + Sync + 'static,
+    ) -> TryPipe<MapErr<S, impl Fn(E) -> E2 + Send + Sync + 'static>, I, O, E2>
+    where
+        E: Send + 'static,
+        E2: Send + 'static,
+    {
+        TryPipe {
+            items: self.items,
+            stages: MapErr {
+                prev: self.stages,
+                f,
+            },
+            config: self.config,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<S, I, O, E> TryPipe<S, I, O, E>
+where
+    S: FusedTryStage<I, Output = O, Error = E> + Send + Sync + 'static,
+    I: Send + 'static,
+    O: Send + 'static,
+    E: Send + 'static,
+{
+    /// Execute the fused fallible pipeline, short-circuiting on the first
+    /// error. `Filter` stages drop items from the success output.
+    pub fn try_collect(self) -> Result<Vec<O>, E> {
+        let items = self.items;
+        let n = items.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let num_threads = ComputePool::global().num_workers();
+        if n <= 1 || num_threads <= 1 {
+            let mut out = Vec::with_capacity(n);
+            for item in items {
+                if let Some(o) = self.stages.try_apply(item)? {
+                    out.push(o);
+                }
+            }
+            return Ok(out);
+        }
+
+        let oversplit = match self.config.workload {
+            Workload::Balanced => 4,
+            Workload::Unbalanced => 8,
+        };
+        let splits = split_depth(n, num_threads, oversplit);
+        join_fused_try_collect(items, &self.stages, splits)
+    }
+}
+
+// ── pub(crate) scoped entry point ──
+
+/// `pub(crate)` entry point for scoped pipelines. Identical dispatch logic to
+/// `Pipe::collect` but without `'static` bounds — driven by
 /// `crate::scope::ScopedPipeline`, whose closure/stage lifetime is `'env`
 /// (the surrounding `scope` block).
 ///
@@ -582,30 +644,4 @@ where
         let op = FusedOp(stages);
         par_index_collect(items, &op, splits)
     }
-}
-
-/// Recursive merge-based collect for fused stages that may filter. Used only as
-/// the `MAY_FILTER == true` fallback; output cardinality is unknown up front so
-/// each leaf produces its own `Vec` and results are concatenated.
-fn join_fused_collect<S, T>(mut items: Vec<T>, stages: &S, splits_left: usize) -> Vec<S::Output>
-where
-    S: FusedStage<T> + Sync,
-    T: Send,
-    S::Output: Send,
-{
-    if splits_left == 0 || items.len() <= 1 {
-        return items
-            .into_iter()
-            .filter_map(|item| stages.apply(item))
-            .collect();
-    }
-    let mid = items.len() / 2;
-    let right = items.split_off(mid);
-    let (left_r, right_r) = ComputePool::global().join(
-        || join_fused_collect(items, stages, splits_left - 1),
-        || join_fused_collect(right, stages, splits_left - 1),
-    );
-    let mut result = left_r;
-    result.extend(right_r);
-    result
 }

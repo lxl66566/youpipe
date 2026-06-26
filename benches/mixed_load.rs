@@ -3,6 +3,8 @@ use std::hint::black_box as bb;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rayon::prelude::*;
 
+use youpipe::stream;
+
 fn cpu_work(x: u64) -> u64 {
     let mut r = x;
     for _ in 0..50 {
@@ -21,10 +23,8 @@ fn bench_mixed_load(c: &mut Criterion) {
             BenchmarkId::new("youpipe_stream_cpu", size),
             &data,
             |b, data| {
-                let config = youpipe::PipelineConfig::default();
-                let sp = youpipe::StreamPipeline::new(config);
                 b.iter(|| {
-                    let r = sp.run(data.clone(), |x: u64| bb(cpu_work(x)), false);
+                    let r = stream(data.clone()).stage(|x: u64| bb(cpu_work(x))).run();
                     bb(r)
                 });
             },
