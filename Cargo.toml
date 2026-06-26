@@ -1,0 +1,48 @@
+[package]
+categories   = ["concurrency", "algorithms"]
+description  = "High-performance Rust concurrent pipeline batch processing framework with compile-time fusion"
+edition      = "2024"
+exclude      = ["/benches", "/docs", "/.agent_memory"]
+keywords     = ["parallel", "pipeline", "concurrency", "map-reduce", "work-stealing"]
+license      = "MIT"
+name         = "youpipe"
+readme       = "README.md"
+repository   = "https://github.com/lxl66566/youpipe"
+rust-version = "1.85"
+version      = "0.2.0"
+
+[features]
+default       = ["tokio-runtime"]
+tokio-runtime = ["tokio"]
+
+[dependencies]
+crossbeam-deque = "0.8"
+crossfire       = "3.1"
+parking_lot     = "0.12"
+tokio           = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
+
+[dev-dependencies]
+criterion         = "0.8"
+crossbeam-channel = "0.5"
+rayon             = "1"
+tokio             = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
+
+[[bench]]
+harness = false
+name    = "sync_vs_rayon"
+
+[[bench]]
+harness = false
+name    = "async_vs_tokio"
+
+[[bench]]
+harness = false
+name    = "mixed_load"
+
+[[bench]]
+harness = false
+name    = "channel_bench"
+
+[[bench]]
+harness = false
+name    = "unbalanced"

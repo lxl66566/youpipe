@@ -1,0 +1,30 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "zai-coding-plan/glm-5.2",
+  "agent": {
+    "general": {
+      "mode": "subagent",
+      "model": "deepseek/deepseek-v4-flash", // 或者 "deepseek/deepseek-v4-flash"
+      "thinking": {
+        "type": "enabled",
+        "budgetTokens": 65536
+      }
+    },
+    "explore": {
+      "mode": "subagent",
+      "model": "deepseek/deepseek-v4-flash",
+      "thinking": {
+        "type": "enabled",
+        "budgetTokens": 65536
+      }
+    },
+    "scout": {
+      "mode": "subagent",
+      "model": "deepseek/deepseek-v4-flash",
+      "thinking": {
+        "type": "enabled",
+        "budgetTokens": 65536
+      }
+    }
+  }
+}
