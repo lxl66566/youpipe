@@ -196,6 +196,42 @@ where
     }
 }
 
+// ── Experiment record: flat leaf dispatch (2026-06, reverted) ──
+//
+// Hypothesis (from hotpath): ~60% of stolen `join` B-jobs force the origin
+// worker into `wait_until_cold`, so a *flat* dispatcher — N disjoint leaf-jobs
+// injected at once into the pool's global queue, each writing its own output
+// range, synchronized by one `CountLatch` — should win by eliminating the
+// join-wait entirely.
+//
+// Result (A/B vs this tree, 32-core): genuinely faster at small/medium N, but
+// regresses at large N — a net wash, so the code was reverted:
+//
+//   sync_cpu_heavy    10 k: −6.8 %      100 k:  ~0 % (noise)
+//   sync_lightweight  10 k: −15 %       100 k:  −8 %      1 M: +14 %  ←
+// regression
+//
+// Why it helps small/medium: no fork/join tree ⇒ no "run A inline then wait for
+// the stolen B" idle-search; the ~120 µs fixed dispatch overhead shrinks.
+//
+// Why it regresses at large N: all N leaf-jobs funnel through the *single*
+// global injector queue (`concurrent_queue`), and 32 workers contending on one
+// MPMC queue for 128+ pops is slower than the tree's distributed model (each
+// worker pushes to its own LIFO deque, peers steal — far less coherence traffic
+// on a single cache line). The bottleneck is fundamental, not tunable away.
+//
+// It also has a panic-semantics snag: a panicking flat job propagates into the
+// worker's `AbortIfPanic` (process abort) instead of the tree's
+// `halt_unwinding`/`resume_unwind` propagation, so panic-safe flat dispatch
+// needs extra plumbing (a Drop-guard that always decrements the latch + a
+// shared panic slot + per-chunk success flags to drop siblings on unwind).
+//
+// Conclusion: flat dispatch is a small/medium-N win but a large-N loss. The
+// promising unattempted direction is a *hybrid*: inject `num_threads` broad
+// top-level chunks (low injector contention, no ramp-up) and let each chunk
+// recurse via the tree (distributed deques + stealing). That needs the same
+// scoped-latch plumbing as full flat, so it is left for a follow-up.
+
 // ── Join-based parallel helpers ──
 
 /// Items-per-worker below which a batch is routed to the calling thread
@@ -500,6 +536,12 @@ where
                 .collect();
         }
 
+        // `oversplit` = tasks-per-worker for the fork/join tree. A/B-tuned
+        // (2026-06, 32-core): Balanced `1` regressed cpu_heavy ~+18 % (too few
+        // leaves ⇒ poor load balancing, longer tail), `8` regressed ~+5.5 %
+        // (too many nodes ⇒ per-node dispatch overhead). `4` (128 leaves on 32
+        // cores) is the sweet spot. Unbalanced keeps `8` for the stealing slack
+        // its expensive tail needs.
         let oversplit = match self.config.workload {
             Workload::Balanced => 4,
             Workload::Unbalanced => 8,
