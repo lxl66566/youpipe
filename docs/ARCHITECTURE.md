@@ -205,11 +205,37 @@ When a pipeline contains `fence`, `ordered`, or other runtime semantics, stages 
 | Method | Description |
 |---|---|
 | `run()` | Single-stage streaming execution |
+| `run_async()` | Single async stage on the tokio runtime (M:N IO concurrency) |
 | `run_multi_stage()` | Two-stage pipeline (stage1 → channel → stage2) |
+| `run_mixed_async()` | Sync CPU stage (compute pool) → async IO stage (runtime), overlapping |
 | `run_with_fence()` | Configurable isolation (`FenceMode`): `Barrier` (stage1 fully drains before stage2 starts) or `Chunked(k)` (forward every k items, stages overlap) |
 | `run_nested()` | Expand mode: outer_stage 1:N expansion → inner_stage parallel processing |
 
 All streaming methods accept `ordered: bool`, using `ReorderBuffer` to restore original order. Optional `CancellationToken` enables cooperative cancellation — feeder and workers check `is_cancelled()` per iteration.
+
+#### Async IO stages (mixed sync+async)
+
+`run_async` / `run_mixed_async` are gated behind the `tokio-runtime` feature. They
+run an IO stage as **`io_concurrency` async tasks** on a dedicated tokio runtime
+([`AsyncPool`]). The runtime's M:N scheduler multiplexes those tasks over
+`async_workers` OS threads: each task yields its thread back to the runtime while
+it awaits (e.g. `tokio::time::sleep`, real network/disk IO), so concurrency is
+bounded by `io_concurrency` — **not** by the thread count.
+
+This is the right tool when IO waits actually yield. For work that *blocks* the
+OS thread (e.g. `std::thread::sleep`), the sync [`StreamPipeline::run`] is
+preferable: a blocking call inside a task stalls a runtime worker and forfeits
+the M:N advantage (blocking concurrency is then capped at the thread count).
+
+`run_mixed_async` keeps the CPU stage on the sync compute pool (rayon-style,
+sized to cores) and the IO stage on the async runtime; the two stages overlap via
+a dedicated sync→async bridge thread (mirrors `forward_fenced`). The pools do not
+contend: CPU uses `compute_workers` OS threads, IO uses `async_workers` OS threads
+multiplexing `io_concurrency` tasks.
+
+An [`AsyncPool`] may be attached via `.with_async_pool(...)` and reused across
+runs; otherwise a transient runtime is built per call (simpler, but pays
+~ms runtime construction each time — avoid inside tight loops).
 
 ### 3.7 `ScopedPipeline` — Non-`'static` Pipeline
 
@@ -416,6 +442,36 @@ on an equally-cold clone measures ~800 µs at 1M.
 StreamPipeline comfortably beats `tokio::spawn_blocking` (the design target for
 mixed CPU/IO). `rayon::par_iter` is fastest here because this benchmark is
 pure-CPU and rayon's direct fork-join skips channel handoff entirely.
+
+### Async IO — `run_async` / `run_mixed_async` (`io_async`, yielding IO)
+
+Simulated IO uses `tokio::time::sleep` (90% × 1 ms, 10% × 8 ms tail) — a wait
+that *yields* the OS thread, the regime where M:N async concurrency beats the
+blocking-thread-per-core model. `io_concurrency = 512`, 32-core machine.
+
+#### Pure IO (`io_async_pure`)
+
+| Size | youpipe_async | youpipe_blocking | tokio_async_native | tokio_spawn_blocking |
+|---|---|---|---|---|
+| 200 | ~9.18 ms | ~16.71 ms | ~9.17 ms | ~8.42 ms |
+| 500 | ~9.63 ms | ~33.21 ms | ~9.40 ms | ~9.03 ms |
+
+`youpipe_async` **matches `tokio_async_native`** (the async ceiling) and is
+**1.8× (200) / 3.45× (500) faster than `youpipe_blocking`**. `tokio_spawn_blocking`
+edges it via tokio's 512-thread blocking pool — aggressive OS-thread
+oversubscription that only pays off for pure-sleep (no CPU) work.
+
+#### Mixed CPU (sync) + IO (`io_async_mixed`)
+
+| Size | youpipe_mixed_async | youpipe_mixed_blocking | tokio_mixed_blocking |
+|---|---|---|---|
+| 200 | ~9.64 ms | ~27.32 ms | ~9.08 ms |
+| 500 | ~10.07 ms | ~60.13 ms | ~10.60 ms |
+
+`youpipe_mixed_async` is **2.8× (200) / ~6× (500) faster than the all-blocking
+`run_multi_stage`**, and at size 500 even edges out `tokio_mixed_blocking`: the
+async path overlaps the CPU and IO stages on separate pools, whereas the
+all-blocking path splits one compute pool between two blocking stages.
 
 ### Channel Throughput
 

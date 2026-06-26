@@ -1,6 +1,7 @@
 use std::{
     any::Any,
     cell::UnsafeCell,
+    future::Future,
     marker::PhantomData,
     mem::MaybeUninit,
     panic,
@@ -13,6 +14,13 @@ use crate::{
     handoff::{Receiver, Sender, SharedWaitGroup, channel::channel},
     state::{FenceBarrier, FenceMode, run_ordered_collect},
     sync::CancellationToken,
+};
+
+#[cfg(feature = "tokio-runtime")]
+use crate::{
+    executor::AsyncPool,
+    handoff::{async_channel, channel::TrySendError},
+    state::ReorderBuffer,
 };
 
 // ── Slots: index-addressable buffer for zero-copy parallel map ──
@@ -981,6 +989,12 @@ where
 pub struct StreamPipeline {
     config: PipelineConfig,
     cancel: Option<CancellationToken>,
+    /// Optional externally-managed async runtime. When `None`, async methods
+    /// build a transient runtime per call (simpler, but pays runtime creation
+    /// on every invocation); when supplied via [`Self::with_async_pool`], the
+    /// runtime is reused across runs (recommended for tight loops / benches).
+    #[cfg(feature = "tokio-runtime")]
+    async_pool: Option<crate::executor::AsyncPool>,
 }
 
 // ── Streaming stage helpers (used by the fence pipeline) ──
@@ -1075,6 +1089,8 @@ impl StreamPipeline {
         Self {
             config,
             cancel: None,
+            #[cfg(feature = "tokio-runtime")]
+            async_pool: None,
         }
     }
 
@@ -1083,6 +1099,33 @@ impl StreamPipeline {
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
         self
+    }
+
+    /// Attach a managed async runtime ([`AsyncPool`]) so async methods
+    /// ([`Self::run_async`], [`Self::run_mixed_async`]) reuse it across runs
+    /// instead of building a transient runtime per call.
+    ///
+    /// Recommended inside tight loops (e.g. criterion benches): tokio runtime
+    /// construction costs ~ms, which would otherwise dominate small workloads.
+    #[cfg(feature = "tokio-runtime")]
+    #[must_use]
+    pub fn with_async_pool(mut self, pool: crate::executor::AsyncPool) -> Self {
+        self.async_pool = Some(pool);
+        self
+    }
+
+    /// Obtain an [`AsyncPool`] for this run: a handle-only wrapper around the
+    /// attached runtime (if any), otherwise a fresh owning runtime built from
+    /// `config.async_workers`.
+    #[cfg(feature = "tokio-runtime")]
+    fn acquire_async(&self) -> std::io::Result<crate::executor::AsyncPool> {
+        match &self.async_pool {
+            Some(p) => Ok(crate::executor::AsyncPool::new(
+                p.handle().clone(),
+                self.config.async_workers,
+            )),
+            None => crate::executor::AsyncPool::from_global(self.config.async_workers),
+        }
     }
 
     /// Run a single stage over `items`. If `ordered` is true, output preserves
@@ -1777,6 +1820,508 @@ impl StreamPipeline {
     }
 }
 
+// ── Async streaming stages (mixed sync+async) ──
+//
+// Unlike the pure-sync streaming methods above, these run an IO stage as
+// `async` tasks on a dedicated async runtime (`AsyncPool`). The runtime's M:N
+// scheduler multiplexes `io_concurrency` concurrent IO tasks over `async_workers`
+// OS threads: each task yields its thread back to the runtime while it awaits
+// (e.g. `tokio::time::sleep`, real network/disk IO), so concurrency is bounded
+// by `io_concurrency`, NOT by the thread count. For truly async IO this beats
+// the blocking-thread-per-core model, which can only run as many concurrent
+// waits as it has OS threads.
+//
+// Availability is gated behind `tokio-runtime` because the async stage needs a
+// reactor; the sync streaming API remains runtime-agnostic.
+
+#[cfg(feature = "tokio-runtime")]
+impl StreamPipeline {
+    /// Run a single **async** stage over `items` with high concurrency.
+    ///
+    /// `stage` returns a [`Future`]; each item becomes a task on the async
+    /// runtime. With [`PipelineConfig::io_concurrency`] ≫ cores this achieves
+    /// M:N concurrency for yielded (async) waits — the right choice for IO-bound
+    /// work whose waits actually yield (network/disk IO, `tokio::time::sleep`).
+    ///
+    /// For work that *blocks* the OS thread (e.g. `std::thread::sleep`), prefer
+    /// the sync [`Self::run`]: a blocking call inside a task stalls a runtime
+    /// worker and forfeits the M:N advantage.
+    pub fn run_async<I, O, F, Fut>(&self, items: Vec<I>, stage: F, ordered: bool) -> Vec<O>
+    where
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        F: Fn(I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        let n = items.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let pool = self.acquire_async().expect("failed to build async runtime");
+        let concurrency = self.config.io_concurrency.max(1).min(n);
+        let buffer_size = self.config.buffer_size.max(concurrency * 2);
+        if ordered {
+            self.run_async_ordered(&pool, items, stage, concurrency, buffer_size)
+        } else {
+            self.run_async_unordered(&pool, items, stage, concurrency, buffer_size)
+        }
+    }
+
+    fn run_async_unordered<I, O, F, Fut>(
+        &self,
+        pool: &AsyncPool,
+        items: Vec<I>,
+        stage: F,
+        concurrency: usize,
+        buffer_size: usize,
+    ) -> Vec<O>
+    where
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        F: Fn(I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        let n = items.len();
+        let (in_tx, in_rx) = async_channel::<I>(buffer_size);
+        let (out_tx, out_rx) = async_channel::<O>(buffer_size);
+        let cancel = self.cancel.clone();
+        let stage = Arc::new(stage);
+
+        pool.block_on(async move {
+            // Feeder: stream items in, keeping the input channel open via a
+            // cloned sender so consumers see Close only after the feeder ends.
+            let feeder_cancel = cancel.clone();
+            let feeder_tx = in_tx.clone();
+            let feeder = tokio::spawn(async move {
+                for item in items {
+                    if cancel_active(feeder_cancel.as_ref()) {
+                        break;
+                    }
+                    if feeder_tx.send(item).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            drop(in_tx);
+
+            let mut consumers = Vec::with_capacity(concurrency);
+            for _ in 0..concurrency {
+                let stage = stage.clone();
+                let rx = in_rx.clone();
+                let tx = out_tx.clone();
+                let c = cancel.clone();
+                consumers.push(tokio::spawn(async move {
+                    loop {
+                        let item = match rx.recv().await {
+                            Ok(it) => it,
+                            Err(_) => break,
+                        };
+                        if cancel_active(c.as_ref()) {
+                            break;
+                        }
+                        let out = stage(item).await;
+                        if tx.send(out).await.is_err() {
+                            break;
+                        }
+                    }
+                }));
+            }
+            drop(out_tx);
+            drop(in_rx);
+
+            // Collect CONCURRENTLY with feeder + consumers: the main future is
+            // polled on the calling thread while spawned tasks run on runtime
+            // workers. Awaiting consumers before draining would deadlock once
+            // `out` fills (consumers block on `send`, no drainer yet).
+            let mut results = Vec::with_capacity(n);
+            while let Ok(o) = out_rx.recv().await {
+                results.push(o);
+            }
+            // `out` closed ⇒ every consumer has exited; join for panic surfacing.
+            let _ = feeder.await;
+            for h in consumers {
+                let _ = h.await;
+            }
+            results
+        })
+    }
+
+    fn run_async_ordered<I, O, F, Fut>(
+        &self,
+        pool: &AsyncPool,
+        items: Vec<I>,
+        stage: F,
+        concurrency: usize,
+        buffer_size: usize,
+    ) -> Vec<O>
+    where
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        F: Fn(I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        let n = items.len();
+        let (in_tx, in_rx) = async_channel::<(u64, I)>(buffer_size);
+        let (out_tx, out_rx) = async_channel::<(u64, O)>(buffer_size);
+        let cancel = self.cancel.clone();
+        let stage = Arc::new(stage);
+
+        pool.block_on(async move {
+            let feeder_cancel = cancel.clone();
+            let feeder_tx = in_tx.clone();
+            let feeder = tokio::spawn(async move {
+                for (seq, item) in items.into_iter().enumerate() {
+                    if cancel_active(feeder_cancel.as_ref()) {
+                        break;
+                    }
+                    if feeder_tx.send((seq as u64, item)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            drop(in_tx);
+
+            let mut consumers = Vec::with_capacity(concurrency);
+            for _ in 0..concurrency {
+                let stage = stage.clone();
+                let rx = in_rx.clone();
+                let tx = out_tx.clone();
+                let c = cancel.clone();
+                consumers.push(tokio::spawn(async move {
+                    loop {
+                        let (seq, item) = match rx.recv().await {
+                            Ok(it) => it,
+                            Err(_) => break,
+                        };
+                        if cancel_active(c.as_ref()) {
+                            break;
+                        }
+                        let out = stage(item).await;
+                        if tx.send((seq, out)).await.is_err() {
+                            break;
+                        }
+                    }
+                }));
+            }
+            drop(out_tx);
+            drop(in_rx);
+
+            // Collect + reorder CONCURRENTLY with feeder + consumers (see
+            // `run_async_unordered` for the deadlock rationale).
+            let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
+            let mut buffer = ReorderBuffer::new(capacity);
+            let mut results = Vec::with_capacity(n);
+            while let Ok((seq, o)) = out_rx.recv().await {
+                results.extend(buffer.insert(seq, o));
+            }
+            results.extend(buffer.flush_remaining());
+            let _ = feeder.await;
+            for h in consumers {
+                let _ = h.await;
+            }
+            results
+        })
+    }
+
+    /// Run a **mixed sync+async** pipeline: a synchronous CPU stage on the
+    /// compute pool feeds an async IO stage on the async runtime.
+    ///
+    /// `cpu_stage` (`Fn(I) -> M`) runs on [`ComputePool`] workers; `io_stage`
+    /// (`Fn(M) -> Future<Output = O>`) runs as `io_concurrency` async tasks.
+    /// The two stages overlap — the async IO side starts consuming as soon as
+    /// the first CPU result arrives — so a CPU-bound stage and an IO-bound
+    /// stage progress in parallel rather than back-to-back.
+    pub fn run_mixed_async<I, M, O, CF, AF, Fut>(
+        &self,
+        items: Vec<I>,
+        cpu_stage: CF,
+        io_stage: AF,
+        ordered: bool,
+    ) -> Vec<O>
+    where
+        I: Send + 'static,
+        M: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        CF: Fn(I) -> M + Send + Sync + 'static,
+        AF: Fn(M) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        let n = items.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let pool = self.acquire_async().expect("failed to build async runtime");
+        let parallelism = self.config.compute_workers.min(n);
+        let io_concurrency = self.config.io_concurrency.max(1).min(n);
+        let buffer_size = self
+            .config
+            .buffer_size
+            .max(parallelism.max(io_concurrency) * 2);
+        if ordered {
+            self.run_mixed_async_ordered(&pool, items, cpu_stage, io_stage, parallelism, io_concurrency, buffer_size)
+        } else {
+            self.run_mixed_async_unordered(&pool, items, cpu_stage, io_stage, parallelism, io_concurrency, buffer_size)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // internal helper: per-stage tuning knobs
+    fn run_mixed_async_unordered<I, M, O, CF, AF, Fut>(
+        &self,
+        pool: &AsyncPool,
+        items: Vec<I>,
+        cpu_stage: CF,
+        io_stage: AF,
+        parallelism: usize,
+        io_concurrency: usize,
+        buffer_size: usize,
+    ) -> Vec<O>
+    where
+        I: Send + 'static,
+        M: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        CF: Fn(I) -> M + Send + Sync + 'static,
+        AF: Fn(M) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        let n = items.len();
+        // CPU stage (sync) channels + bridge into the async IO channels.
+        let (in_tx, in_rx) = channel::<I>(buffer_size);
+        let (mid_tx, mid_rx) = channel::<M>(buffer_size);
+        let (a_in_tx, a_in_rx) = async_channel::<M>(buffer_size);
+        let (a_out_tx, a_out_rx) = async_channel::<O>(buffer_size);
+        let compute = ComputePool::global();
+
+        let feeder_cancel = self.cancel.clone();
+        let feeder = std::thread::spawn(move || {
+            for item in items {
+                if cancel_active(feeder_cancel.as_ref()) {
+                    break;
+                }
+                if in_tx.send(item).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let cpu = Arc::new(cpu_stage);
+        let wg = SharedWaitGroup::new();
+        wg.add(parallelism);
+        for _ in 0..parallelism {
+            let cpu = cpu.clone();
+            let rx = in_rx.clone();
+            let tx = mid_tx.clone();
+            let wg = wg.clone();
+            let c = self.cancel.clone();
+            compute.submit(move || {
+                while let Ok(item) = rx.recv() {
+                    if cancel_active(c.as_ref()) {
+                        break;
+                    }
+                    let m = cpu(item);
+                    if tx.send(m).is_err() {
+                        break;
+                    }
+                }
+                wg.done();
+            });
+        }
+        drop(in_rx);
+        drop(mid_tx);
+
+        // Bridge: sync `mid_rx` → async `a_in_tx`. A dedicated thread isolates
+        // the backpressure spin (try_send on a full async channel) from the
+        // compute pool, mirroring the existing fence-forwarder thread pattern.
+        let bridge_cancel = self.cancel.clone();
+        let bridge = std::thread::spawn(move || {
+            while let Ok(mut m) = mid_rx.recv() {
+                loop {
+                    match a_in_tx.try_send(m) {
+                        Ok(()) => break,
+                        Err(TrySendError::Full(ret)) => {
+                            if cancel_active(bridge_cancel.as_ref()) {
+                                return;
+                            }
+                            m = ret;
+                            std::thread::yield_now();
+                        }
+                        Err(TrySendError::Closed(_)) => return,
+                    }
+                }
+            }
+        });
+
+        let io_cancel = self.cancel.clone();
+        let results = pool.block_on(async move {
+            let io_stage = Arc::new(io_stage);
+            let mut consumers = Vec::with_capacity(io_concurrency);
+            for _ in 0..io_concurrency {
+                let s = io_stage.clone();
+                let rx = a_in_rx.clone();
+                let tx = a_out_tx.clone();
+                let c = io_cancel.clone();
+                consumers.push(tokio::spawn(async move {
+                    loop {
+                        let m = match rx.recv().await {
+                            Ok(m) => m,
+                            Err(_) => break,
+                        };
+                        if cancel_active(c.as_ref()) {
+                            break;
+                        }
+                        let o = s(m).await;
+                        if tx.send(o).await.is_err() {
+                            break;
+                        }
+                    }
+                }));
+            }
+            drop(a_out_tx);
+            drop(a_in_rx);
+            // Drain concurrently with the IO consumers (see run_async_unordered).
+            let mut results = Vec::with_capacity(n);
+            while let Ok(o) = a_out_rx.recv().await {
+                results.push(o);
+            }
+            for h in consumers {
+                let _ = h.await;
+            }
+            results
+        });
+
+        feeder.join().unwrap();
+        bridge.join().unwrap();
+        results
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal helper
+    fn run_mixed_async_ordered<I, M, O, CF, AF, Fut>(
+        &self,
+        pool: &AsyncPool,
+        items: Vec<I>,
+        cpu_stage: CF,
+        io_stage: AF,
+        parallelism: usize,
+        io_concurrency: usize,
+        buffer_size: usize,
+    ) -> Vec<O>
+    where
+        I: Send + 'static,
+        M: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        CF: Fn(I) -> M + Send + Sync + 'static,
+        AF: Fn(M) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+    {
+        let n = items.len();
+        let (in_tx, in_rx) = channel::<(u64, I)>(buffer_size);
+        let (mid_tx, mid_rx) = channel::<(u64, M)>(buffer_size);
+        let (a_in_tx, a_in_rx) = async_channel::<(u64, M)>(buffer_size);
+        let (a_out_tx, a_out_rx) = async_channel::<(u64, O)>(buffer_size);
+        let compute = ComputePool::global();
+
+        let feeder_cancel = self.cancel.clone();
+        let feeder = std::thread::spawn(move || {
+            for (seq, item) in items.into_iter().enumerate() {
+                if cancel_active(feeder_cancel.as_ref()) {
+                    break;
+                }
+                if in_tx.send((seq as u64, item)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let cpu = Arc::new(cpu_stage);
+        let wg = SharedWaitGroup::new();
+        wg.add(parallelism);
+        for _ in 0..parallelism {
+            let cpu = cpu.clone();
+            let rx = in_rx.clone();
+            let tx = mid_tx.clone();
+            let wg = wg.clone();
+            let c = self.cancel.clone();
+            compute.submit(move || {
+                while let Ok((seq, item)) = rx.recv() {
+                    if cancel_active(c.as_ref()) {
+                        break;
+                    }
+                    let m = cpu(item);
+                    if tx.send((seq, m)).is_err() {
+                        break;
+                    }
+                }
+                wg.done();
+            });
+        }
+        drop(in_rx);
+        drop(mid_tx);
+
+        let bridge_cancel = self.cancel.clone();
+        let bridge = std::thread::spawn(move || {
+            while let Ok(mut m) = mid_rx.recv() {
+                loop {
+                    match a_in_tx.try_send(m) {
+                        Ok(()) => break,
+                        Err(TrySendError::Full(ret)) => {
+                            if cancel_active(bridge_cancel.as_ref()) {
+                                return;
+                            }
+                            m = ret;
+                            std::thread::yield_now();
+                        }
+                        Err(TrySendError::Closed(_)) => return,
+                    }
+                }
+            }
+        });
+
+        let io_cancel = self.cancel.clone();
+        let results = pool.block_on(async move {
+            let io_stage = Arc::new(io_stage);
+            let mut consumers = Vec::with_capacity(io_concurrency);
+            for _ in 0..io_concurrency {
+                let s = io_stage.clone();
+                let rx = a_in_rx.clone();
+                let tx = a_out_tx.clone();
+                let c = io_cancel.clone();
+                consumers.push(tokio::spawn(async move {
+                    loop {
+                        let (seq, m) = match rx.recv().await {
+                            Ok(it) => it,
+                            Err(_) => break,
+                        };
+                        if cancel_active(c.as_ref()) {
+                            break;
+                        }
+                        let o = s(m).await;
+                        if tx.send((seq, o)).await.is_err() {
+                            break;
+                        }
+                    }
+                }));
+            }
+            drop(a_out_tx);
+            drop(a_in_rx);
+            // Drain + reorder concurrently with the IO consumers.
+            let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
+            let mut buffer = ReorderBuffer::new(capacity);
+            let mut results = Vec::with_capacity(n);
+            while let Ok((seq, o)) = a_out_rx.recv().await {
+                results.extend(buffer.insert(seq, o));
+            }
+            results.extend(buffer.flush_remaining());
+            for h in consumers {
+                let _ = h.await;
+            }
+            results
+        });
+
+        feeder.join().unwrap();
+        bridge.join().unwrap();
+        results
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2080,5 +2625,76 @@ mod tests {
             let r = sp.run_nested(items, |x| vec![x, x + 1], sleep_map, false);
             assert!(r.len() < 2000, "nested cancel failed: {}", r.len());
         }
+    }
+
+    // ── async streaming stage tests ──
+
+    /// `run_async` correctness (unordered): an async stage over `u64 -> u64`.
+    /// Uses `tokio::time::sleep` (a yielding wait) so the test also exercises
+    /// the M:N scheduling path rather than a blocking stall.
+    #[cfg(feature = "tokio-runtime")]
+    #[test]
+    fn test_run_async_unordered() {
+        let sp = StreamPipeline::new(PipelineConfig::default().with_io_concurrency(16));
+        let items: Vec<u64> = (0..100).collect();
+        let mut r = sp.run_async(items, |x: u64| async move { x * 2 }, false);
+        r.sort_unstable();
+        assert_eq!(r, (0..100u64).map(|x| x * 2).collect::<Vec<_>>());
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    #[test]
+    fn test_run_async_ordered() {
+        let sp = StreamPipeline::new(PipelineConfig::default().with_io_concurrency(16));
+        let items: Vec<u64> = (0..100).collect();
+        let r = sp.run_async(items, |x: u64| async move { x * 2 }, true);
+        assert_eq!(r, (0..100u64).map(|x| x * 2).collect::<Vec<_>>());
+    }
+
+    /// `run_mixed_async` correctness: sync CPU stage + async IO stage, both
+    /// ordered and unordered. Verifies the sync→async bridge preserves item
+    /// count and transforms values correctly.
+    #[cfg(feature = "tokio-runtime")]
+    #[test]
+    fn test_run_mixed_async_unordered() {
+        let sp = StreamPipeline::new(PipelineConfig::default().with_io_concurrency(16));
+        let items: Vec<u64> = (0..100).collect();
+        let mut r = sp.run_mixed_async(
+            items,
+            |x: u64| x + 1,
+            |m: u64| async move { m * 10 },
+            false,
+        );
+        r.sort_unstable();
+        assert_eq!(r, (0..100u64).map(|x| (x + 1) * 10).collect::<Vec<_>>());
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    #[test]
+    fn test_run_mixed_async_ordered() {
+        let sp = StreamPipeline::new(PipelineConfig::default().with_io_concurrency(16));
+        let items: Vec<u64> = (0..100).collect();
+        let r = sp.run_mixed_async(
+            items,
+            |x: u64| x + 1,
+            |m: u64| async move { m * 10 },
+            true,
+        );
+        assert_eq!(r, (0..100u64).map(|x| (x + 1) * 10).collect::<Vec<_>>());
+    }
+
+    /// Cancellation must propagate to the async paths: a pre-cancelled token
+    /// plus per-item yielding wait must short-circuit well before the full
+    /// input is processed.
+    #[cfg(feature = "tokio-runtime")]
+    #[test]
+    fn test_run_async_cancel() {
+        let token = crate::sync::CancellationToken::new();
+        let sp = StreamPipeline::new(PipelineConfig::default().with_io_concurrency(8))
+            .with_cancel(token.clone());
+        let items: Vec<u64> = (0..1000).collect();
+        token.cancel();
+        let r = sp.run_async(items, |x: u64| async move { x * 2 }, false);
+        assert!(r.len() < 1000, "run_async cancel failed: {}", r.len());
     }
 }

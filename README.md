@@ -8,6 +8,7 @@ High-performance Rust concurrent pipeline batch processing framework with compil
 - **Workload Hints** — `Workload::Balanced` (zero-atomics) or `Workload::Unbalanced` (adaptive fetch-add)
 - **Work-Stealing Pool** — Lock-free `st3` LIFO deque scheduler with EventCount wake-up
 - **Streaming Pipelines** — Multi-stage channel pipelines with ordered/unordered output
+- **Async IO Stages** — `run_async` / `run_mixed_async` for M:N IO concurrency on a tokio runtime
 - **Fallible Parallelism** — `try_par_map` with early termination on first error
 - **Cancellation** — `CancellationToken` for cooperative StreamPipeline shutdown
 - **Scoped Execution** — `scope()` for non-`'static` closures
@@ -65,6 +66,31 @@ let sp = StreamPipeline::new(config).with_cancel(token.clone());
 let result = sp.run(vec![1, 2, 3, 4, 5], |x: i32| x * 2, true);
 ```
 
+### Async IO Pipeline (mixed sync+async)
+
+`run_async` runs an async stage as `io_concurrency` tasks on a tokio runtime
+(M:N concurrency for yielding IO — network/disk, `tokio::time::sleep`). Reuse
+the runtime across runs by attaching it via `.with_async_pool(...)`.
+
+```rust
+use youpipe::{StreamPipeline, PipelineConfig, AsyncPool};
+
+let pool = AsyncPool::from_global(8).unwrap();
+let sp = StreamPipeline::new(PipelineConfig::default().with_io_concurrency(256))
+    .with_async_pool(pool);
+
+// Pure async IO stage
+let r = sp.run_async(vec![1u64, 2, 3], |x| async move { x + 1 }, false);
+
+// Mixed: sync CPU stage → async IO stage (stages overlap)
+let r = sp.run_mixed_async(
+    vec![1u64, 2, 3],
+    |x: u64| x + 1,                       // sync CPU
+    |m: u64| async move { m * 2 },        // async IO
+    true,                                 // ordered
+);
+```
+
 ### Scoped Pipeline
 
 ```rust
@@ -89,6 +115,7 @@ let result = scope(|s| {
 | `try_par_map(iter, f)` | Fallible parallel map |
 | `Pipeline::new()` → `.map()` → `.filter()` → `.collect()` | Fused pipeline |
 | `StreamPipeline::new(config)` → `.run()` | Streaming pipeline |
+| `StreamPipeline::run_async()` / `run_mixed_async()` | Async IO stage (tokio M:N) |
 | `CancellationToken` | Cooperative cancellation |
 | `scope(\|s\| ...)` | Non-`'static` scoped execution |
 | `ComputePool` | Work-stealing thread pool |
@@ -100,7 +127,8 @@ let result = scope(|s| {
 cargo bench --bench channel_bench    # Channel throughput
 cargo bench --bench sync_vs_rayon    # CPU-heavy, fusion, lightweight
 cargo bench --bench unbalanced       # Unbalanced workloads
-cargo bench --bench mixed_load       # Mixed CPU/IO
+cargo bench --bench mixed_load       # Mixed CPU/IO (blocking)
+cargo bench --bench io_async         # Async IO (pure + mixed sync+async)
 cargo bench --bench async_vs_tokio   # Stream vs tokio spawn_blocking
 ```
 
