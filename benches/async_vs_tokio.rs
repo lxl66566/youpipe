@@ -1,7 +1,6 @@
 use std::{hint::black_box as bb, num::NonZeroUsize};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-
 use youpipe::{FenceMode, stream};
 
 fn cpu_work(x: u64) -> u64 {
@@ -23,9 +22,7 @@ fn bench_stream_pipeline(c: &mut Criterion) {
             &data,
             |b, data| {
                 b.iter(|| {
-                    let r = stream(data.clone())
-                        .stage(|x: u64| bb(cpu_work(x)))
-                        .run();
+                    let r = stream(data.clone()).stage(|x: u64| bb(cpu_work(x))).run();
                     bb(r)
                 });
             },
@@ -36,7 +33,10 @@ fn bench_stream_pipeline(c: &mut Criterion) {
             &data,
             |b, data| {
                 b.iter(|| {
-                    let r = stream(data.clone()).stage(|x: u64| bb(cpu_work(x))).ordered().run();
+                    let r = stream(data.clone())
+                        .stage(|x: u64| bb(cpu_work(x)))
+                        .ordered()
+                        .run();
                     bb(r)
                 });
             },

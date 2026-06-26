@@ -10,6 +10,7 @@ use crate::{handoff::Receiver, state::ReorderBuffer};
 ///
 /// Used by `StreamPipeline`'s ordered run paths; kept here so the reorder
 /// logic lives next to its dependencies rather than inside the builder.
+#[must_use]
 pub fn run_ordered_collect<O: Send + 'static>(
     input_rx: &Receiver<(u64, O)>,
     expected_items: usize,

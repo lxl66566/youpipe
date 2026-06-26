@@ -16,7 +16,6 @@
 use std::time::Instant;
 
 use rayon::prelude::*;
-
 use youpipe::scope;
 
 const TABLE_SIZE: usize = 200_000;
@@ -73,9 +72,7 @@ fn main() {
     assert_eq!(yp_total, seq_total);
     let checksum = yp_total;
 
-    println!(
-        "Parallel lookup against {TABLE_SIZE}-row stack-local table, {LOOKUPS} lookups"
-    );
+    println!("Parallel lookup against {TABLE_SIZE}-row stack-local table, {LOOKUPS} lookups");
     println!("  checksum (all agree): {checksum}");
     println!(
         "  youpipe scope():  {:>10.3?}   (borrows &table, no clone)",

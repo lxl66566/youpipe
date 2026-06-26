@@ -2,7 +2,6 @@ use std::hint::black_box as bb;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rayon::prelude::*;
-
 use youpipe::{Workload, pipe, stream};
 
 // ── Workload generators ──

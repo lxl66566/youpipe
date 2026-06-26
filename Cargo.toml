@@ -14,10 +14,23 @@ version      = "0.2.0"
 [features]
 default       = ["tokio-runtime"]
 tokio-runtime = ["tokio"]
+# ── Optional permanent instrumentation (zero-cost when off) ──
+# `hotpath` is an optional dependency; when none of these features are enabled
+# the `#[cfg_attr(feature = "hotpath", hotpath::measure)]` probes are stripped at
+# parse time and the crate is not compiled into the build at all — production
+# builds pay nothing. Flip the feature on to turn the probes into real
+# per-function timing/alloc/CPU profiling without re-running `perf`.
+#
+# NOTE: youpipe's `hotpath` feature must forward to `hotpath/hotpath`, otherwise
+# the hotpath crate stays in its `lib_off` mode where every macro is a no-op.
+hotpath       = ["dep:hotpath", "hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
 concurrent-queue = "2.5"
 crossfire        = "3.1"
+hotpath          = { version = "0.18", optional = true }
 parking_lot      = "0.12"
 st3              = "0.4"
 tokio            = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
@@ -51,3 +64,10 @@ name    = "unbalanced"
 [[bench]]
 harness = false
 name    = "io_async"
+
+# One-shot profiling driver: builds only with `--features hotpath`. Sets up the
+# HotpathGuard, runs a representative `pipe().map().collect()` workload, and
+# dumps a structured report. See docs/PERF_NOTES.md (#1).
+[[example]]
+name              = "hotpath_profile"
+required-features = ["hotpath"]

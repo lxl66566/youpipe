@@ -73,7 +73,8 @@ impl<'env> PipelineScope<'env> {
 /// `Arc<Vec<Mutex<Vec<T>>>>`), this version:
 ///
 /// - has no `'static` bound on `T` or the closure,
-/// - is **data-first** (items are passed to `pipe(items)`, not to `.collect()`),
+/// - is **data-first** (items are passed to `pipe(items)`, not to
+///   `.collect()`),
 /// - fuses `.map`/`.filter`/ at compile time (lazy chain),
 /// - drives `.collect()` through the same recursive work-stealing
 ///   `par_index_collect` core as the top-level [`crate::Pipe`].
@@ -165,7 +166,9 @@ mod tests {
     fn test_scope_basic() {
         let multiplier = 3i32;
         let result = scope(|s| {
-            s.pipe([1, 2, 3, 4, 5]).map(|x: i32| x * multiplier).collect()
+            s.pipe([1, 2, 3, 4, 5])
+                .map(|x: i32| x * multiplier)
+                .collect()
         });
         assert_eq!(result, vec![3, 6, 9, 12, 15]);
     }
@@ -175,11 +178,7 @@ mod tests {
         // ScopedPipe::collect now drives the recursive work-stealing core,
         // so large inputs parallelise automatically.
         let offset = 100i32;
-        let result = scope(|s| {
-            s.pipe(0..1000)
-                .map(|x: i32| x + offset)
-                .collect()
-        });
+        let result = scope(|s| s.pipe(0..1000).map(|x: i32| x + offset).collect());
         let expected: Vec<i32> = (100..1100).collect();
         assert_eq!(result, expected);
     }
@@ -251,7 +250,9 @@ mod tests {
     /// `Arc` it or `clone()` per pipeline.
     #[test]
     fn test_scope_shared_lookup_across_pipelines() {
-        let table: Vec<u64> = (0..1000u64).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+        let table: Vec<u64> = (0..1000u64)
+            .map(|i| i.wrapping_mul(2_654_435_761))
+            .collect();
         let total = scope(|s| {
             let lookup_hits: usize = s
                 .pipe(0..table.len())

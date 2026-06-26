@@ -2,6 +2,8 @@
 use std::future::Future;
 use std::{marker::PhantomData, sync::Arc};
 
+#[cfg(feature = "tokio-runtime")]
+use crate::handoff::{AsyncReceiver, async_channel, channel::TrySendError};
 use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
@@ -9,20 +11,20 @@ use crate::{
     state::{FenceBarrier, FenceMode, ReorderBuffer, run_ordered_collect},
     sync::CancellationToken,
 };
-#[cfg(feature = "tokio-runtime")]
-use crate::handoff::{AsyncReceiver, async_channel, channel::TrySendError};
 
 // ── Streaming pipeline (chainable, data-first) ──
 //
 // Each stage wraps the previous stage's chain (`prev`), so the typestate nests
 // as the user adds stages: `SyncStage<FenceLink<SyncStage<StreamStart, F1>>>`
-// for `.stage(f1).fence(mode).stage(f2)`. The newest stage sits at the OUTERMOST
-// level and executes LAST; the recursion in `StageSpawn::spawn` recurses into
-// `prev` first (spawning earlier stages), then spawns this stage's workers.
+// for `.stage(f1).fence(mode).stage(f2)`. The newest stage sits at the
+// OUTERMOST level and executes LAST; the recursion in `StageSpawn::spawn`
+// recurses into `prev` first (spawning earlier stages), then spawns this
+// stage's workers.
 //
 // Channel topology is assembled at `.run()` time by walking the typestate:
 //
-//   feeder → [stage 1 workers] → mid₁ → [stage 2 workers] → mid₂ → … → collector
+//   feeder → [stage 1 workers] → mid₁ → [stage 2 workers] → mid₂ → … →
+// collector
 //
 // Stages may be sync (run on `ComputePool`), async (run on `AsyncPool` via
 // tokio tasks), or a fence (forward-fence thread between adjacent stages).
@@ -141,8 +143,8 @@ where
 /// fix for the previous wait-before-drain deadlock.
 #[allow(clippy::needless_pass_by_value)] // runs inside a `thread::spawn(move …)`:
 // owning `mid_rx` / `fenced_tx` by value lets them drop (and close the channel)
-// when the forwarder returns, which is how the downstream stage detects "no more
-// items" — taking them by reference would keep the channel open forever.
+// when the forwarder returns, which is how the downstream stage detects "no
+// more items" — taking them by reference would keep the channel open forever.
 fn forward_fenced<M>(mid_rx: Receiver<(u64, M)>, fenced_tx: Sender<(u64, M)>, mode: FenceMode)
 where
     M: Send + Unpin + 'static,
@@ -573,7 +575,9 @@ where
             let c = cancel.clone();
             consumers.push(tokio::spawn(async move {
                 loop {
-                    let Ok((seq, item)) = rx.recv().await else { break };
+                    let Ok((seq, item)) = rx.recv().await else {
+                        break;
+                    };
                     if cancel_active(c.as_ref()) {
                         break;
                     }
@@ -821,8 +825,9 @@ where
 /// [`ReorderBuffer`] to restore input order.
 #[allow(clippy::needless_pass_by_value)] // `rx` is the terminal drain of the
 // pipeline: `run` passes the sole receiver by value to express "consume fully".
-// The drain loop uses `recv()` by ref, but owning the receiver keeps its lifetime
-// bounded to this call so the caller can't accidentally reuse it after the run.
+// The drain loop uses `recv()` by ref, but owning the receiver keeps its
+// lifetime bounded to this call so the caller can't accidentally reuse it after
+// the run.
 fn collect_sync<T: Send + Unpin + 'static>(
     rx: Receiver<(u64, T)>,
     ordered: bool,

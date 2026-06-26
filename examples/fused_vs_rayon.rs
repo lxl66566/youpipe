@@ -11,7 +11,6 @@
 //! ```
 
 use rayon::prelude::*;
-
 use youpipe::pipe;
 
 const SIZE: usize = 1_000_000;
@@ -49,10 +48,7 @@ fn main() {
 
     // ── sequential iterator: the lower bound (no parallelism overhead) ──
     let seq_start = std::time::Instant::now();
-    let seq_result: Vec<u64> = data
-        .iter()
-        .map(|&x| cpu_chain(x))
-        .collect();
+    let seq_result: Vec<u64> = data.iter().map(|&x| cpu_chain(x)).collect();
     let seq_elapsed = seq_start.elapsed();
 
     // Correctness: all three must agree.
@@ -61,7 +57,8 @@ fn main() {
 
     println!(
         "3-stage CPU chain over {SIZE} items (all results agree, first={} last={})",
-        yp_result[0], yp_result[SIZE - 1]
+        yp_result[0],
+        yp_result[SIZE - 1]
     );
     println!(
         "  youpipe  pipe():  {:>10.3?}   (fused, single closure per worker)",

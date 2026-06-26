@@ -8,7 +8,7 @@ pub use self::{
     fused::{Pipe, TryPipe, pipe},
     stream::{StreamPipe, stream},
     traits::{
-        FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, StageMarker, SyncMap, TryMap,
-        Filter,
+        Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, StageMarker, SyncMap,
+        TryMap,
     },
 };

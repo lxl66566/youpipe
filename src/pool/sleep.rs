@@ -220,6 +220,7 @@ impl Sleep {
 
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn work_found(&self) {
         let threads_to_wake = self.counters.sub_inactive_thread();
         // `sub_inactive_thread` returns at most 2, safe to truncate
@@ -227,6 +228,7 @@ impl Sleep {
     }
 
     #[inline]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn no_work_found(
         &self,
         idle: &mut IdleState,
@@ -249,6 +251,7 @@ impl Sleep {
     }
 
     #[cold]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn announce_sleepy(&self) -> JobsEventCounter {
         self.counters
             .increment_jobs_event_counter_if(JobsEventCounter::is_active)
@@ -256,6 +259,7 @@ impl Sleep {
     }
 
     #[cold]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn sleep(
         &self,
         idle: &mut IdleState,
@@ -313,6 +317,7 @@ impl Sleep {
 
     /// New jobs were injected from outside the pool.
     #[inline]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn new_injected_jobs(&self, num_jobs: u32, queue_was_empty: bool) {
         // Fence guarantees sleepy/sleeping threads observe injected work.
         std::sync::atomic::fence(Ordering::SeqCst);
@@ -321,12 +326,14 @@ impl Sleep {
 
     /// New jobs were pushed onto a thread's local deque.
     #[inline]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn new_internal_jobs(&self, num_jobs: u32, queue_was_empty: bool) {
         self.new_jobs(num_jobs, queue_was_empty);
     }
 
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn new_jobs(&self, num_jobs: u32, queue_was_empty: bool) {
         let counters = self
             .counters
@@ -349,6 +356,7 @@ impl Sleep {
     }
 
     #[cold]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn wake_any_threads(&self, mut num_to_wake: u32) {
         if num_to_wake > 0 {
             for i in 0..self.worker_sleep_states.len() {
@@ -362,6 +370,7 @@ impl Sleep {
         }
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn wake_specific_thread(&self, index: usize) -> bool {
         let sleep_state = &self.worker_sleep_states[index];
         let mut is_blocked = sleep_state.is_blocked.lock();

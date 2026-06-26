@@ -34,10 +34,9 @@ pub mod state;
 pub mod sync;
 pub(crate) mod util;
 
-pub use builder::{Pipe, StreamPipe, TryPipe, pipe, stream};
 pub use builder::{
-    Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, PipelineConfig,
-    StageMarker, SyncMap, TryMap, Workload,
+    Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, Pipe, PipelineConfig,
+    StageMarker, StreamPipe, SyncMap, TryMap, TryPipe, Workload, pipe, stream,
 };
 #[cfg(feature = "tokio-runtime")]
 pub use executor::AsyncPool;

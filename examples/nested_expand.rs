@@ -13,7 +13,6 @@
 use std::time::Instant;
 
 use rayon::prelude::*;
-
 use youpipe::stream;
 
 const N_INPUTS: usize = 1000;
@@ -55,7 +54,11 @@ fn main() {
 
     // ── std sequential ──
     let seq_start = Instant::now();
-    let seq_result: Vec<i32> = inputs.iter().flat_map(|&i| expand(i)).map(postprocess).collect();
+    let seq_result: Vec<i32> = inputs
+        .iter()
+        .flat_map(|&i| expand(i))
+        .map(postprocess)
+        .collect();
     let seq_elapsed = seq_start.elapsed();
 
     // Correctness: rayon and std produce the same ordered output. youpipe's

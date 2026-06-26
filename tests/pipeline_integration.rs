@@ -83,13 +83,15 @@ fn test_try_map_ok() {
 
 #[test]
 fn test_try_map_err_short_circuits() {
-    let result = pipe(0..100).try_map(|x: i32| -> Result<i32, String> {
-        if x == 50 {
-            Err(format!("bad: {x}"))
-        } else {
-            Ok(x * 2)
-        }
-    }).try_collect();
+    let result = pipe(0..100)
+        .try_map(|x: i32| -> Result<i32, String> {
+            if x == 50 {
+                Err(format!("bad: {x}"))
+            } else {
+                Ok(x * 2)
+            }
+        })
+        .try_collect();
     assert!(result.is_err());
     assert_eq!(result.unwrap_err(), "bad: 50");
 }
@@ -107,10 +109,7 @@ fn test_try_map_then_map() {
 #[test]
 fn test_stream_single_ordered() {
     let items: Vec<i32> = (0..100).collect();
-    let result = stream(items)
-        .stage(|x: i32| x * 2 + 1)
-        .ordered()
-        .run();
+    let result = stream(items).stage(|x: i32| x * 2 + 1).ordered().run();
     let expected: Vec<i32> = (0..100).map(|x| x * 2 + 1).collect();
     assert_eq!(result, expected);
 }
@@ -217,9 +216,7 @@ fn test_stream_expand() {
 #[test]
 fn test_scope_non_static() {
     let factor = 7i32;
-    let result = youpipe::scope(|s| {
-        s.pipe(0..20).map(|x: i32| x * factor).collect()
-    });
+    let result = youpipe::scope(|s| s.pipe(0..20).map(|x: i32| x * factor).collect());
     let expected: Vec<i32> = (0..20).map(|x| x * 7).collect();
     assert_eq!(result, expected);
 }
@@ -227,9 +224,7 @@ fn test_scope_non_static() {
 #[test]
 fn test_scope_par_map() {
     let offset = 100i32;
-    let result = youpipe::scope(|s| {
-        s.pipe(0..50).map(|x: i32| x + offset).collect()
-    });
+    let result = youpipe::scope(|s| s.pipe(0..50).map(|x: i32| x + offset).collect());
     assert_eq!(result, (100..150).collect::<Vec<_>>());
 }
 

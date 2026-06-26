@@ -66,9 +66,7 @@ fn main() {
     let pool = AsyncPool::from_global(num_cpus()).expect("async runtime");
     let yp_start = Instant::now();
     let yp_result = stream(items.clone())
-        .with_config(
-            PipelineConfig::default().with_io_concurrency(512),
-        )
+        .with_config(PipelineConfig::default().with_io_concurrency(512))
         .with_async_pool(pool)
         .stage(|((x, iters), dur): ((u64, u32), Duration)| {
             // Sync CPU stage on the work-stealing compute pool.

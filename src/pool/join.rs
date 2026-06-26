@@ -43,6 +43,7 @@ where
 /// # Safety
 ///
 /// `worker_thread` must be the current thread's `WorkerThread`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) unsafe fn join_on<A, B, RA, RB>(
     worker_thread: &WorkerThread,
     injected: bool,
@@ -97,6 +98,7 @@ where
 /// If A panics, we still must wait for B to complete (it may hold references
 /// into our stack frame).
 #[cold]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 unsafe fn join_recover_from_panic(
     worker_thread: &WorkerThread,
     job_b_latch: &SpinLatch<'_>,

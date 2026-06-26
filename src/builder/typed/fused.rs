@@ -24,6 +24,7 @@ type PanicPayload = Box<dyn Any + Send>;
 /// already-completed sibling's output range. On return, the whole `[start,
 /// end)` range is fully resolved: every output slot is either init (success
 /// path) or dropped, and every input slot is consumed.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn par_index_rec<T, R, OP>(
     input: &Slots<T>,
     output: &Slots<R>,
@@ -90,6 +91,7 @@ where
 /// warm `par_map` path. Slice references carry Rust's noalias guarantees into
 /// LLVM, which is what unlocks the same per-item throughput rayon's
 /// `par_iter().collect()` achieves.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn par_index_leaf<T, R, OP>(input: &[T], output: &mut [R], op: &OP)
 where
     T: Send,
@@ -166,6 +168,7 @@ where
 /// # Panics
 ///
 /// Propagates any panic raised by `op`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn par_index_collect<T, R, OP>(items: Vec<T>, op: &OP, splits: usize) -> Vec<R>
 where
     T: Send,
@@ -195,6 +198,37 @@ where
 
 // ── Join-based parallel helpers ──
 
+/// Items-per-worker below which a batch is routed to the calling thread
+/// instead of the work-stealing pool.
+///
+/// The fork/join path pays a **per-call** fixed cost (external-thread job
+/// injection, latch handoff, worker spin/park rounds, condvar wakeups) that is
+/// independent of `n`. For small `n` that fixed cost dwarfs the per-item
+/// compute, and a plain sequential loop is faster — including faster than the
+/// pathological case where the scheduler's park/wake heuristic thrashes.
+///
+/// See `docs/PERF_NOTES.md` (#1): on a 32-core box with `cpu_heavy` work (100
+/// iterations/item), the measured serial↔parallel crossover is ~3 k items
+/// (1 k: parallel 137 µs vs serial 46 µs; 10 k: parallel 152 µs vs serial
+/// ~460 µs). `64` items/thread lands at ~2 k on 32 cores — below the
+/// crossover, so the 1 k regression is recovered while 100 k–1 M batches
+/// (50–500× above the threshold) are completely unaffected.
+///
+/// This is a heuristic, not a cliff: it only redirects *small* batches to the
+/// cheap serial path. It cannot starve the pool because sub-threshold batches
+/// submit zero jobs, and it is monotonic in the per-item cost (a more
+/// expensive item lowers the real crossover, so serializing even fewer
+/// batches would be safe — the constant is deliberately conservative).
+const SERIAL_ITEMS_PER_THREAD: usize = 64;
+
+/// Whether a batch of `n` items should run sequentially on the calling thread
+/// instead of being split across the pool. `num_threads` is read once by the
+/// caller and passed in to avoid a second `ComputePool::global()` TLS hit.
+#[inline]
+fn prefers_serial(n: usize, num_threads: usize) -> bool {
+    n <= 1 || num_threads <= 1 || n <= num_threads * SERIAL_ITEMS_PER_THREAD
+}
+
 /// Compute the number of recursive split levels. Aiming at ~`oversplit` tasks
 /// per thread gives good work-stealing without excessive task overhead.
 fn split_depth(n: usize, num_threads: usize, oversplit: usize) -> usize {
@@ -207,6 +241,7 @@ fn split_depth(n: usize, num_threads: usize, oversplit: usize) -> usize {
 /// Recursive merge-based collect for fused stages that may filter. Used only as
 /// the `MAY_FILTER == true` fallback; output cardinality is unknown up front so
 /// each leaf produces its own `Vec` and results are concatenated.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn join_fused_collect<S, T>(mut items: Vec<T>, stages: &S, splits_left: usize) -> Vec<S::Output>
 where
     S: FusedStage<T> + Sync,
@@ -236,6 +271,7 @@ where
 /// Uses the `Vec`-merge path rather than the index-based fast path because
 /// fallible + filter pipelines cannot assume fixed output cardinality. The
 /// infallible/no-filter fast path is reserved for `Pipe::collect`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn join_fused_try_collect<S, T, E>(
     mut items: Vec<T>,
     stages: &S,
@@ -387,7 +423,12 @@ impl<S, I, O> Pipe<S, I, O> {
     pub fn try_map<N, E>(
         self,
         f: impl Fn(O) -> Result<N, E> + Send + Sync + 'static,
-    ) -> TryPipe<TryMap<InfallibleChain<S, E>, impl Fn(O) -> Result<N, E> + Send + Sync + 'static>, I, N, E>
+    ) -> TryPipe<
+        TryMap<InfallibleChain<S, E>, impl Fn(O) -> Result<N, E> + Send + Sync + 'static>,
+        I,
+        N,
+        E,
+    >
     where
         S: StageMarker<I, Output = O>,
         O: Send + 'static,
@@ -419,6 +460,11 @@ where
     /// (`S::MAY_FILTER == false`), and falls back to the recursive merge path
     /// otherwise (filters change output cardinality, so fixed-index writes are
     /// not possible).
+    ///
+    /// Small batches (≤ `num_workers * SERIAL_ITEMS_PER_THREAD`) run
+    /// sequentially on the calling thread — see [`prefers_serial`] and
+    /// `docs/PERF_NOTES.md` (#1).
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn collect(self) -> Vec<O> {
         let items = self.items;
         let n = items.len();
@@ -426,7 +472,7 @@ where
             return Vec::new();
         }
         let num_threads = ComputePool::global().num_workers();
-        if n <= 1 || num_threads <= 1 {
+        if prefers_serial(n, num_threads) {
             return items
                 .into_iter()
                 .filter_map(|item| self.stages.apply(item))
@@ -574,6 +620,7 @@ where
 {
     /// Execute the fused fallible pipeline, short-circuiting on the first
     /// error. `Filter` stages drop items from the success output.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn try_collect(self) -> Result<Vec<O>, E> {
         let items = self.items;
         let n = items.len();
@@ -581,7 +628,7 @@ where
             return Ok(Vec::new());
         }
         let num_threads = ComputePool::global().num_workers();
-        if n <= 1 || num_threads <= 1 {
+        if prefers_serial(n, num_threads) {
             let mut out = Vec::with_capacity(n);
             for item in items {
                 if let Some(o) = self.stages.try_apply(item)? {
@@ -612,6 +659,7 @@ where
 /// `Registry::in_worker_cold` until every recursively spawned sub-task
 /// finishes, so every `'env` reference captured by `stages` outlives the
 /// pool's access to them.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn fused_collect_scoped<S, T>(
     items: Vec<T>,
     stages: S,
@@ -627,7 +675,7 @@ where
         return Vec::new();
     }
     let num_threads = ComputePool::global().num_workers();
-    if n <= 1 || num_threads <= 1 {
+    if prefers_serial(n, num_threads) {
         return items
             .into_iter()
             .filter_map(|item| stages.apply(item))

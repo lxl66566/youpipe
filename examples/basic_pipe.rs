@@ -10,9 +10,7 @@ fn main() {
     // `pipe` consumes any `IntoIterator` and returns a fused, chainable
     // pipeline. `.collect()` executes the chain on the work-stealing compute
     // pool and returns a `Vec`.
-    let result: Vec<i32> = pipe(0..10_000)
-        .map(|x| x * 2)
-        .collect();
+    let result: Vec<i32> = pipe(0..10_000).map(|x| x * 2).collect();
 
     assert_eq!(result.len(), 10_000);
     assert_eq!(result[0], 0);

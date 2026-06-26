@@ -124,6 +124,7 @@ impl Registry {
 
     /// Push from a worker thread's local deque, or inject from outside. Checks
     /// TLS to determine whether the caller is a pool worker.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn inject_or_push(&self, job_ref: JobRef) {
         let wt = WorkerThread::current();
         if !wt.is_null() && unsafe { (*wt).registry_id() } == self.id() {
@@ -135,6 +136,7 @@ impl Registry {
     }
 
     /// Inject a job from outside the pool.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn inject(&self, job_ref: JobRef) {
         // `was_empty` drives the wake heuristic; read before the push. A
         // concurrent consumer draining the queue makes it racy, but it is only
@@ -147,6 +149,7 @@ impl Registry {
     }
 
     /// Inject multiple jobs from outside the pool, notifying sleepers once.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn inject_batch(&self, job_refs: impl ExactSizeIterator<Item = JobRef>) {
         let queue_was_empty = self.injected_jobs.is_empty();
         let mut count = 0u32;
@@ -203,6 +206,7 @@ impl Registry {
     }
 
     #[cold]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn in_worker_cold<OP, R>(&self, op: OP) -> R
     where
         OP: FnOnce(&WorkerThread, bool) -> R + Send,
@@ -330,6 +334,7 @@ impl WorkerThread {
     }
 
     #[inline]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) unsafe fn push(&self, job: JobRef) {
         let queue_was_empty = self.worker.is_empty();
         match self.worker.push(job) {
@@ -373,6 +378,7 @@ impl WorkerThread {
     }
 
     #[cold]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     unsafe fn wait_until_cold(&self, latch: &CoreLatch) {
         let abort_guard = unwind::AbortIfPanic;
 
@@ -416,6 +422,7 @@ impl WorkerThread {
         unsafe { Latch::set(&raw const registry.thread_infos[index].stopped) };
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn find_work(&self) -> Option<JobRef> {
         // Preference: local deque → injected jobs → steal from peers.
         //
@@ -437,6 +444,7 @@ impl WorkerThread {
 
     /// Steal a single job from another worker. Only called when the local
     /// deque is empty.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn steal(&self) -> Option<JobRef> {
         let thread_infos = self.registry.thread_infos.as_slice();
         let num_threads = thread_infos.len();

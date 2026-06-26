@@ -146,7 +146,11 @@ fn bench_lightweight_work(c: &mut Criterion) {
                 b.iter_batched(
                     || warm_clone(data),
                     |v| {
-                        black_box(youpipe::pipe(v).map(|x| black_box(x.wrapping_add(1))).collect())
+                        black_box(
+                            youpipe::pipe(v)
+                                .map(|x| black_box(x.wrapping_add(1)))
+                                .collect(),
+                        )
                     },
                     BatchSize::PerIteration,
                 );

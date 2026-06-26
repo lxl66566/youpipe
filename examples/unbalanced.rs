@@ -17,7 +17,6 @@
 use std::time::Instant;
 
 use rayon::prelude::*;
-
 use youpipe::{Workload, pipe};
 
 const SIZE: usize = 5_000;
@@ -69,10 +68,7 @@ fn main() {
 
     // ── sequential iterator: the baseline ──
     let seq_start = Instant::now();
-    let seq: Vec<u64> = items
-        .iter()
-        .map(|&(x, iters)| cpu_work(x, iters))
-        .collect();
+    let seq: Vec<u64> = items.iter().map(|&(x, iters)| cpu_work(x, iters)).collect();
     let seq_elapsed = seq_start.elapsed();
 
     // Correctness.
@@ -88,10 +84,12 @@ fn main() {
     assert_eq!(yp_b, rn_s);
     assert_eq!(yp_b, seq_s);
 
+    println!("Unbalanced CPU workload, {SIZE} items (~10% slow, 1000× cost spread)");
     println!(
-        "Unbalanced CPU workload, {SIZE} items (~10% slow, 1000× cost spread)"
+        "  all sorted outputs agree, first={}, last={}",
+        yp_b[0],
+        yp_b[SIZE - 1]
     );
-    println!("  all sorted outputs agree, first={}, last={}", yp_b[0], yp_b[SIZE - 1]);
     println!(
         "  youpipe pipe() Balanced:    {:>10.3?}   (4× oversplit)",
         yp_balanced_elapsed
