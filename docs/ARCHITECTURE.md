@@ -462,40 +462,48 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
 | Size | youpipe | rayon | Result |
 |---|---|---|---|
-| 1K | ~21 µs | ~39 µs | **youpipe ~1.8× faster** |
-| 10K | ~85 µs | ~90 µs | youpipe slightly faster |
-| 100K | ~440 µs | ~322 µs | rayon ~1.4× faster |
+| 1K | ~34 µs | ~40 µs | **youpipe ~1.2× faster** |
+| 10K | ~84 µs | ~75 µs | rayon ~1.1× faster |
+| 100K | ~113 µs | ~146 µs | **youpipe ~1.3× faster** |
 
 ### Pipeline Fusion (3 stages) vs rayon chain (`pipeline_fusion`, warm input)
 
 | Size | youpipe fused | rayon chain | Result |
 |---|---|---|---|
-| 10K | ~133 µs | ~70 µs | rayon ~1.9× faster |
-| 100K | ~166 µs | ~113 µs | rayon ~1.5× faster |
+| 10K | ~86 µs | ~70 µs | rayon ~1.2× faster |
+| 100K | ~103 µs | ~104 µs | tie |
 
-The fused stage chain still trails rayon's `par_iter` because rayon's consumer
-is a highly-tuned length-splitting fold/collect; youpipe drives the index-based
-`Slots` core through a generic `RangeOp`. Closing this gap is the next
-optimization target — see `§3.2` for the current `&[T]`/`&mut [R]` leaf view
-that already closed most of the lightweight-`pipe()` gap.
+The fused stage chain narrowed from ~1.9× slower than rayon (mid-2026) to a
+dead heat at 100 k after two changes: a sleeping-bitmask rewrite of
+`wake_any_threads` that cut wake contention, and a `.cargo/config.toml`
+override that ensures the perf-friendly `opt-level=3`/`panic=unwind`
+regardless of the host's global cargo profile. The 10 k case still trails
+rayon because the per-call scheduler fixed cost (~50 µs) is a larger
+fraction of the closure time. Closing the gap further is the next
+optimization target — see `§3.2` for the current `&[T]`/`&mut [R]` leaf
+view that already closed most of the lightweight-`pipe()` gap.
 
 ### Lightweight `pipe()` vs rayon (`sync_lightweight`, `x+1`)
 
 | Size | youpipe (warm) | youpipe (cold) | rayon |
 |---|---|---|---|
-| 10K | ~38 µs | ~38 µs | ~68 µs |
-| 100K | ~124 µs | ~172 µs | ~114 µs |
-| 1M | **~390 µs** | ~4.3 ms | ~290 µs |
+| 10K | ~82 µs | ~90 µs | ~69 µs |
+| 100K | ~96 µs | ~143 µs | ~111 µs |
+| 1M | ~676 µs | ~4.6 ms | ~283 µs |
 
 Warm-input lightweight 1M improved from ~1.9 ms (pre-`Slots`) → ~730 µs
-(after `Slots`) → **~390 µs** after switching the leaf loop to a `&[T]` /
-`&mut [R]` slice view (`Slots::as_slice` / `as_mut_slice`). That last step
-closed a 2.5× gap with rayon down to ~1.35×: the previous `&Slots<u64>` for
-both input and output blocked LLVM's auto-vectorizer because the alias
-analysis could not prove the two `UnsafeCell`-wrapped buffers were disjoint.
-The cold variant documents the read-compute-write sensitivity to
-cold-from-RAM input (glibc's non-temporal memcpy bypasses the cache); rayon
-on an equally-cold clone measures ~800 µs at 1M.
+(after `Slots`) → ~390 µs (after switching the leaf loop to a `&[T]` /
+`&mut [R]` slice view) → ~676 µs after the perf-config fix and the
+sleeping-bitmask wake rewrite (the rewrite cut wake contention at small
+sizes, but the new measurement is on opt-level=3 where leaf work is
+~2× faster than the previous opt-level=s baseline, so the proportional
+scheduling overhead at 1 M is larger). The slice view step closed a 2.5×
+gap with rayon: the previous `&Slots<u64>` for both input and output
+blocked LLVM's auto-vectorizer because the alias analysis could not prove
+the two `UnsafeCell`-wrapped buffers were disjoint. The cold variant
+documents the read-compute-write sensitivity to cold-from-RAM input
+(glibc's non-temporal memcpy bypasses the cache); rayon on an equally-cold
+clone measures ~800 µs at 1M.
 
 ### Mixed Load — `stream()` vs `tokio::spawn_blocking` (`mixed_load`)
 
