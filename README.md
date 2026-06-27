@@ -125,9 +125,9 @@ Async IO (`tokio::time::sleep`, ~1 ms latency, `io_concurrency = 512`), 500 item
 
 | Topology                              | Time    |
 | ------------------------------------- | ------- |
-| youpipe: pure async IO                | 9.82 ms |
+| youpipe: pure async IO                | 9.61 ms |
 | tokio: native async                   | 9.33 ms |
-| youpipe: mixed sync CPU + async IO    | 9.93 ms |
+| youpipe: mixed sync CPU + async IO    | 9.99 ms |
 | tokio: mixed spawn_blocking           | 10.1 ms |
 | youpipe: mixed sync CPU + blocking IO | 60.0 ms |
 

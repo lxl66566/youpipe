@@ -299,6 +299,16 @@ overlap via a sync→async bridge thread. The pools do not contend: CPU uses
 `compute_workers` OS threads, IO uses `async_workers` OS threads multiplexing
 `io_concurrency` tasks.
 
+For the pure-async shape `stream(..).stage_async(..)` the bridge thread is
+skipped entirely: `StageSpawn::first_consumer_is_async()` reports that the
+innermost real consumer is async, so `.run()` builds a mixed-mode feeder
+channel (`SyncSender` + `AsyncReceiver` sharing one `mpmc::Array` —
+crossfire's `bounded_blocking_async`) and the AsyncStage's
+`spawn_async_feeder` consumes the `AsyncReceiver` directly. The feeder pushes
+via the blocking `SyncSender::send` (backpressure parks it on `Full`); the
+async consumers `recv().await` from the *same* queue. One fewer OS thread,
+one fewer bounded channel, one fewer send/recv round-trip per item.
+
 An [`AsyncPool`] may be attached via `.with_async_pool(...)` and reused across
 runs; otherwise a transient runtime is built per call (simpler, but pays
 ~ms runtime construction each time — avoid inside tight loops).
@@ -529,25 +539,35 @@ blocking-thread-per-core model. `io_concurrency = 512`, 32-core machine.
 
 | Size | youpipe_async | youpipe_blocking | tokio_async_native | tokio_spawn_blocking |
 |---|---|---|---|---|
-| 200 | ~9.18 ms | ~16.71 ms | ~9.17 ms | ~8.42 ms |
-| 500 | ~9.63 ms | ~33.21 ms | ~9.40 ms | ~9.03 ms |
+| 200 | ~9.27 ms | ~16.58 ms | ~9.15 ms | ~8.40 ms |
+| 500 | ~9.61 ms | ~33.08 ms | ~9.33 ms | ~8.85 ms |
 
-`youpipe_async` **matches `tokio_async_native`** (the async ceiling) and is
-**1.8× (200) / 3.45× (500) faster than `youpipe_blocking`**. `tokio_spawn_blocking`
-edges it via tokio's 512-thread blocking pool — aggressive OS-thread
-oversubscription that only pays off for pure-sleep (no CPU) work.
+`youpipe_async` **matches `tokio_async_native`** (the async ceiling) within
+~3% and is **1.8× (200) / 3.45× (500) faster than `youpipe_blocking`**.
+`tokio_spawn_blocking` edges it via tokio's 512-thread blocking pool —
+aggressive OS-thread oversubscription that only pays off for pure-sleep
+(no CPU) work. The gap to the async ceiling shrank after three changes:
+eliminating the sync→async bridge thread for `stream(..).stage_async(..)`
+(the feeder pushes into a mixed-mode `SyncSender` + `AsyncReceiver`
+channel that the AsyncStage consumes directly — see §3.6), and replacing
+the collector's per-item `recv().await` with a `try_recv` burst-drain that
+absorbs tokio's timer-tick completion bursts without per-item waker
+overhead.
 
 #### Mixed CPU (sync) + IO (`io_async_mixed`)
 
 | Size | youpipe_mixed_async | youpipe_mixed_blocking | tokio_mixed_blocking |
 |---|---|---|---|
-| 200 | ~9.64 ms | ~27.32 ms | ~9.08 ms |
-| 500 | ~10.07 ms | ~60.13 ms | ~10.60 ms |
+| 200 | ~9.55 ms | ~27.14 ms | ~8.99 ms |
+| 500 | ~9.99 ms | ~59.96 ms | ~10.14 ms |
 
 `youpipe_mixed_async` is **2.8× (200) / ~6× (500) faster than the all-blocking
-two-stage baseline**, and at size 500 even edges out `tokio_mixed_blocking`: the
-async path overlaps the CPU and IO stages on separate pools, whereas the
-all-blocking path splits one compute pool between two blocking stages.
+two-stage baseline**, and at size 500 edges out `tokio_mixed_blocking` by
+~150 µs: the async path overlaps the CPU and IO stages on separate pools,
+whereas the all-blocking path splits one compute pool between two blocking
+stages. At size 200 the fixed per-run setup cost (feeder thread, channel
+allocation, runtime entry) is a larger fraction of the ~9 ms total, so
+tokio's simpler spawn-per-item model still leads there.
 
 ### Channel Throughput
 
