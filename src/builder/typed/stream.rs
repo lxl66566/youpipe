@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 use std::{marker::PhantomData, sync::Arc};
 
 #[cfg(feature = "tokio-runtime")]
-use crate::handoff::{AsyncReceiver, async_channel, sync_async_channel};
+use crate::handoff::{
+    AsyncReceiver, TryRecvError, async_channel, sync_async_channel,
+};
 use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
@@ -1147,6 +1149,26 @@ fn collect_sync<T: Send + Unpin + 'static>(
 
 /// Async collector: drains `rx` into a `Vec` via the async runtime. If
 /// `ordered`, uses a [`ReorderBuffer`].
+///
+/// # Burst-drain strategy (unordered path)
+///
+/// When multiple items land in the channel before the collector loops back
+/// (the common case once the first wave of async consumers wakes from their
+/// sleeps — tokio's coarse timer wheel batches same-duration timeouts into
+/// the same tick), a pure `while let Ok(..) = rx.recv().await` pays one
+/// waker-register / waker-wake round-trip per item even though every item
+/// after the first is already queued. The unordered path therefore drains
+/// in two phases per burst:
+///
+///   1. Spin `try_recv` until `Empty` — no `await`, no waker registration,
+///      just non-blocking pops at ~atomic-op cost.
+///   2. When the queue is drained but the channel is still open, `recv().await`
+///      exactly once to register a waker and yield until the next item lands.
+///      Then loop back to step 1.
+///
+/// This converts the per-item `await` cost into a per-burst `await` cost.
+/// For `io_async_pure` at size 500 (~450 items completing in the same ~1 ms
+/// timer tick) the savings is measurable.
 #[cfg(feature = "tokio-runtime")]
 async fn collect_async<T: Send + Unpin + 'static>(
     rx: AsyncReceiver<(u64, T)>,
@@ -1164,9 +1186,24 @@ async fn collect_async<T: Send + Unpin + 'static>(
         results
     } else {
         let mut results = Vec::with_capacity(n);
-        while let Ok((_, item)) = rx.recv().await {
-            results.push(item);
+        loop {
+            // Burst-drain: pop everything already queued without awaiting.
+            // `try_recv` is a non-blocking pop; on `Empty` we fall through
+            // to the awaited `recv` below.
+            loop {
+                match rx.try_recv() {
+                    Ok((_, item)) => results.push(item),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Closed) => return results,
+                }
+            }
+            // Queue is drained but channel may still be open. Await exactly
+            // one item to register a waker; the next iteration's burst-drain
+            // picks up anything that arrived in the meantime.
+            match rx.recv().await {
+                Ok((_, item)) => results.push(item),
+                Err(_) => return results,
+            }
         }
-        results
     }
 }
