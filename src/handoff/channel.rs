@@ -83,6 +83,24 @@ pub fn async_channel<T: Send + Unpin + 'static>(
     (AsyncSender { tx }, AsyncReceiver { rx })
 }
 
+/// Create a bounded *mixed-mode* MPMC channel: a blocking sync sender paired
+/// with an async receiver over the same underlying queue.
+///
+/// This is the right primitive for a sync→async bridge: the producer side can
+/// call the naturally blocking [`SyncSender::send`] (letting crossfire's
+/// internal waker park the producer thread until the async consumer drains an
+/// item), instead of `try_send` + `yield_now` busy-spinning on `Full`. The
+/// consumer side stays fully async (`AsyncReceiver::recv`). Both endpoints
+/// share one `mpmc::Array`, so there is no extra hop relative to
+/// [`async_channel`].
+#[must_use]
+pub fn sync_async_channel<T: Send + Unpin + 'static>(
+    capacity: usize,
+) -> (SyncSender<T>, AsyncReceiver<T>) {
+    let (tx, rx) = mpmc::bounded_blocking_async::<T>(capacity);
+    (SyncSender { tx }, AsyncReceiver { rx })
+}
+
 impl<T: Send + Unpin + 'static> AsyncSender<T> {
     pub async fn send(&self, item: T) -> Result<(), ChannelError> {
         self.tx.send(item).await.map_err(|_| ChannelError::Closed)

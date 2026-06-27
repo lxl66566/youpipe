@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use std::{marker::PhantomData, sync::Arc};
 
 #[cfg(feature = "tokio-runtime")]
-use crate::handoff::{AsyncReceiver, async_channel, channel::TrySendError};
+use crate::handoff::{AsyncReceiver, async_channel, sync_async_channel};
 use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
@@ -557,35 +557,44 @@ where
         let prev_rx = self.prev.spawn(rx, ctx);
 
         // Bridge prev's output (sync or async) into our async input channel.
+        //
+        // The bridge type depends on whether the upstream stage is sync or
+        // async; both produce the same `AsyncReceiver<(u64, Prev::Out)>` for
+        // the consumer loop below, so the bridge-type choice is local to this
+        // `match`.
+        //
+        //   sync → async: dedicated OS thread + blocking `send` over a
+        //                 mixed-mode channel (`SyncSender` + `AsyncReceiver`
+        //                 sharing one `mpmc::Array`). Backpressure parks the
+        //                 bridge thread via crossfire's internal waker — no
+        //                 `try_send` + `yield_now` busy-spin.
+        //
+        //   async → async: tokio task + async `send().await` over a fully
+        //                 async channel. Blocking on the runtime worker thread
+        //                 would stall the executor, so this side stays async.
         let concurrency = ctx.config.io_concurrency.max(1).min(ctx.n.max(1));
         let buffer = ctx.buffer_size(concurrency);
-        let (a_in_tx, a_in_rx) = async_channel::<(u64, Prev::Out)>(buffer);
         let bridge_cancel = ctx.cancel.clone();
-        match prev_rx {
+        let a_in_rx: AsyncReceiver<(u64, Prev::Out)> = match prev_rx {
             FinalRx::Sync(mid_rx) => {
-                // sync → async: dedicated thread spin-sends into the async
-                // channel (mirrors the existing bridge pattern).
+                let (a_in_tx, a_in_rx) = sync_async_channel::<(u64, Prev::Out)>(buffer);
                 std::thread::spawn(move || {
-                    while let Ok(mut item) = mid_rx.recv() {
-                        loop {
-                            match a_in_tx.try_send(item) {
-                                Ok(()) => break,
-                                Err(TrySendError::Full(ret)) => {
-                                    if cancel_active(bridge_cancel.as_ref()) {
-                                        return;
-                                    }
-                                    item = ret;
-                                    std::thread::yield_now();
-                                }
-                                Err(TrySendError::Closed(_)) => return,
-                            }
+                    while let Ok(item) = mid_rx.recv() {
+                        if cancel_active(bridge_cancel.as_ref()) {
+                            return;
+                        }
+                        if a_in_tx.send(item).is_err() {
+                            return;
                         }
                     }
                 });
+                a_in_rx
             }
             FinalRx::Async(prev_async_rx) => {
-                // async → async: spawn a task that pipes prev's output through.
-                let pool = ctx.acquire_async().expect("failed to build async runtime");
+                let (a_in_tx, a_in_rx) = async_channel::<(u64, Prev::Out)>(buffer);
+                let pool = ctx
+                    .acquire_async()
+                    .expect("failed to build async runtime");
                 let _enter = pool.handle().enter();
                 tokio::spawn(async move {
                     while let Ok(item) = prev_async_rx.recv().await {
@@ -597,8 +606,9 @@ where
                         }
                     }
                 });
+                a_in_rx
             }
-        }
+        };
 
         let (a_out_tx, a_out_rx) = async_channel::<(u64, M)>(buffer);
         let pool = ctx.acquire_async().expect("failed to build async runtime");
