@@ -181,13 +181,25 @@ pub(crate) struct Sleep {
     /// Per-worker sleep state.
     worker_sleep_states: Vec<crate::util::CachePadded<WorkerSleepState>>,
     counters: AtomicCounters,
-    /// Rotating start index for `wake_any_threads`' linear scan. Without this
-    /// every wake scan begins at worker 0, making worker 0's `is_blocked` mutex
-    /// a hot lock under churn (measured: ~200 k wake attempts per 100 k-item
-    /// run, most finding the target awake). A monotonic cursor spreads the
-    /// remaining lock acquisitions across workers; exact rotation is irrelevant
-    /// to correctness.
-    wake_cursor: AtomicUsize,
+    /// Bitmask of currently-sleeping workers (bit `i` set iff worker `i` is
+    /// parked in `condvar.wait`). Lets `wake_any_threads` jump directly to
+    /// sleeping workers instead of doing a rotating linear scan that locks
+    /// every awake worker's `is_blocked` mutex along the way.
+    ///
+    /// Under the fork/join `join` pattern, when most workers are awake and
+    /// scanning, each `work_found`/`new_internal_jobs` wake attempt used to
+    /// scan several awake workers (each lock is ~70 ns L3 hit uncontended),
+    /// and under contention the p99 `work_found` reached ~100 µs as 32
+    /// workers piled on the same victim mutex. The mask collapses the scan
+    /// to exactly the set bits, so awake workers are never touched.
+    ///
+    /// The mask is racy by design (set in `sleep()` under the worker's own
+    /// mutex, cleared in `wake_specific_thread` under the same mutex); a
+    /// stale set bit just causes one redundant lock attempt that returns
+    /// `false`. A stale clear bit just causes a missed wake, which is
+    /// recovered by the existing JEC/`increment_jobs_event_counter_if`
+    /// retry loop (sleepers re-check `jobs_counter` before parking).
+    sleeping_mask: CachePadded<AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -231,7 +243,7 @@ impl Sleep {
         Sleep {
             worker_sleep_states: (0..n_threads).map(|_| CachePadded::default()).collect(),
             counters: AtomicCounters::new(),
-            wake_cursor: AtomicUsize::new(0),
+            sleeping_mask: CachePadded::new(AtomicUsize::new(0)),
         }
     }
 
@@ -309,11 +321,28 @@ impl Sleep {
             return;
         }
 
+        // Pre-publish our sleeping bit *before* the counter commit. A waker
+        // that observes our `sleeping_threads` increment also observes the bit
+        // (the bit's `Release` is ordered before the counter's `SeqCst`
+        // exchange in program order; the waker reads counter with `SeqCst`
+        // then mask with `Acquire`, so the synchronizes-with pair carries the
+        // bit write into the waker's observation). Setting the bit after the
+        // commit instead opens a race where the waker sees the counter but
+        // not the bit, skips us, and leaves us parked with no notifier.
+        //
+        // We hold `is_blocked`'s mutex throughout the commit, so any concurrent
+        // `wake_specific_thread` blocks here until our `condvar.wait` releases
+        // the mutex (by which point `*is_blocked == true`, so the waker finds
+        // us rather than missing the wake).
+        let bit = 1usize << worker_index;
+        self.sleeping_mask.fetch_or(bit, Ordering::Release);
+
         loop {
             let counters = self.counters.load(Ordering::SeqCst);
 
             // JEC changed since we got sleepy — new work was posted. Search again.
             if counters.jobs_counter() != idle.jobs_counter {
+                self.sleeping_mask.fetch_and(!bit, Ordering::Release);
                 idle.wake_partly();
                 latch.wake_up();
                 return;
@@ -328,11 +357,16 @@ impl Sleep {
         std::sync::atomic::fence(Ordering::SeqCst);
         if has_injected_jobs() {
             self.counters.sub_sleeping_thread();
+            // We never reached `condvar.wait`, so no waker cleared our bit.
+            self.sleeping_mask.fetch_and(!bit, Ordering::Release);
         } else {
+            // If we don't see an injected job (the normal case), then flag
+            // ourselves as asleep and wait till we are notified.
             *is_blocked = true;
             while *is_blocked {
                 sleep_state.condvar.wait(&mut is_blocked);
             }
+            // Woken by `wake_specific_thread`, which already cleared our bit.
         }
 
         idle.wake_fully();
@@ -387,19 +421,24 @@ impl Sleep {
     #[cold]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn wake_any_threads(&self, mut num_to_wake: u32) {
-        if num_to_wake > 0 {
-            let n = self.worker_sleep_states.len();
-            // Rotate the scan start so worker 0's `is_blocked` mutex isn't a
-            // hot lock under churn (see `wake_cursor`). n ≥ 1 (a pool always
-            // has at least one worker), so the modulo is sound.
-            let start = self.wake_cursor.fetch_add(1, Ordering::Relaxed) % n;
-            for i in 0..n {
-                if self.wake_specific_thread((start + i) % n) {
-                    num_to_wake -= 1;
-                    if num_to_wake == 0 {
-                        return;
-                    }
-                }
+        if num_to_wake == 0 {
+            return;
+        }
+        // Snapshot the sleeping mask and walk only set bits. Each bit is
+        // racing with the worker's own sleep/wake transitions, so the mask
+        // may be stale — `wake_specific_thread` re-checks `is_blocked` under
+        // the worker's mutex and returns `false` for any bit we no longer
+        // own. Reload the mask after a failed wake to pick up bits the
+        // racing sleeper just published.
+        let mut mask = self.sleeping_mask.load(Ordering::Acquire);
+        while num_to_wake > 0 && mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= !(1usize << i);
+            if self.wake_specific_thread(i) {
+                num_to_wake -= 1;
+            } else {
+                // Bit was stale; reload in case a fresh sleeper published.
+                mask = self.sleeping_mask.load(Ordering::Acquire);
             }
         }
     }
@@ -410,6 +449,10 @@ impl Sleep {
         let mut is_blocked = sleep_state.is_blocked.lock();
         if *is_blocked {
             *is_blocked = false;
+            // Clear the sleeping bit before notifying so concurrent
+            // `wake_any_threads` scanners don't pile onto this worker.
+            self.sleeping_mask
+                .fetch_and(!(1 << index), Ordering::Release);
             sleep_state.condvar.notify_one();
             // Decrement sleeping counter here (not in the woken thread) so other
             // posters see the updated count sooner.
