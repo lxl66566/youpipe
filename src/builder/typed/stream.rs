@@ -731,6 +731,33 @@ where
             a_in_rx
         }
         FinalRx::Async(prev_async_rx) => {
+            // NOTE(perf): this bridge task is NOT redundant — do not try to
+            // remove it by having consumers clone `prev_async_rx` directly.
+            //
+            // Attempted in the `try(perfopt)` recorded below: replace this
+            // arm with `prev_async_rx` (consumers clone it N ways and pull
+            // directly, eliminating one tokio task + one bounded channel per
+            // item). Measured result on `io_async_pure` (sample-size 30,
+            // measurement-time 5, vs the readme_20260627_v3 baseline):
+            //
+            //   youpipe_async/200  +0.50%  (p = 0.04, flagged noise threshold)
+            //   youpipe_async/500  +0.82%  (p = 0.03, flagged noise threshold)
+            //
+            // Both point estimates were *positive* (regression) — the
+            // simplification is consistently slower, not faster. The
+            // hypothesis: with the bridge in place the bridge task is the
+            // sole registered waker on `prev_async_rx`, so each item the
+            // upstream produces wakes exactly one task. Without the bridge,
+            // all `concurrency` consumer clones register wakers on the same
+            // `MAsyncRx` (`crossfire::mpmc` uses `RegistryMulti`), so a
+            // single produced item can spuriously wake several consumers —
+            // all but one then poll an empty queue, re-register, and return
+            // `Pending`. That extra scheduler churn outweighs the saved
+            // channel hop at `io_concurrency ≥ 64`.
+            //
+            // The bridge is therefore load-bearing: it's a 1-task funnel
+            // that converts the MPMC upstream into a single-waker source for
+            // the consumer fan-out. Keep it.
             let (a_in_tx, a_in_rx) = async_channel::<(u64, Prev::Out)>(buffer);
             let pool = ctx
                 .acquire_async()
