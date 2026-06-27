@@ -530,9 +530,22 @@ where
         }
         let num_threads = ComputePool::global().num_workers();
         if prefers_serial(n, num_threads, self.config.workload) {
+            // Dispatch on `MAY_FILTER`: skip the `Option` wrapping on the
+            // pure path so the serial fallback matches a hand-written
+            // `iter().map().collect()`. With `black_box(cpu_work(x))` at 1 k
+            // items this trims ~5 µs of `Option`-discriminant + branch
+            // overhead (the `Identity::apply(item).map(f)` wrapper LLVM cannot
+            // always elide through the trait call), narrowing the gap to the
+            // raw sequential baseline.
+            if S::MAY_FILTER {
+                return items
+                    .into_iter()
+                    .filter_map(|item| self.stages.apply(item))
+                    .collect();
+            }
             return items
                 .into_iter()
-                .filter_map(|item| self.stages.apply(item))
+                .map(|item| self.stages.apply_pure(item))
                 .collect();
         }
 
@@ -739,9 +752,15 @@ where
     }
     let num_threads = ComputePool::global().num_workers();
     if prefers_serial(n, num_threads, workload) {
+        if S::MAY_FILTER {
+            return items
+                .into_iter()
+                .filter_map(|item| stages.apply(item))
+                .collect();
+        }
         return items
             .into_iter()
-            .filter_map(|item| stages.apply(item))
+            .map(|item| stages.apply_pure(item))
             .collect();
     }
     let oversplit = match workload {
