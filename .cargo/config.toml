@@ -14,3 +14,25 @@
 # `force = false` (the default) keeps any caller-supplied `MIRIFLAGS`.
 [env]
 MIRIFLAGS = { value = "-Zmiri-ignore-leaks", force = false }
+
+# ── Performance overrides ──
+#
+# The host's `~/.cargo/config.toml` sets `[profile.release] panic = "abort"
+# opt-level = "s"`. That combination is catastrophic for youpipe:
+#
+#   * `panic = "abort"` makes every `catch_unwind` in the pool/join machinery
+#     a no-op (panics tear the process down instead of unwinding), so the
+#     `LeafGuard` panic-safety path in `par_index_leaf` is never exercised and
+#     the index-spill it works around still happens.
+#   * `opt-level = "s"` (size) disables the loop unrolling/vectorization
+#     heuristics that the leaf auto-vectorizer depends on — measured: ~2×
+#     regression on the lightweight 1 M warm path vs `opt-level = 3`.
+#
+# `~/.cargo/config.toml`'s `[profile]` table takes precedence over the
+# `[profile]` table in `Cargo.toml`, so a local override there does nothing.
+# `[build] rustflags` *is* applied after profile flags, and rustc takes the
+# last `-C` flag for each setting, so we use this to force the perf-friendly
+# configuration regardless of the host's defaults. Override or disable by
+# setting `RUSTFLAGS` in the environment (Cargo appends those after these).
+[build]
+rustflags = ["-C", "opt-level=3", "-C", "panic=unwind"]

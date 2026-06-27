@@ -101,32 +101,37 @@ where
     /// RAII guard that drops the partial slot state on unwind. `Drop` only
     /// fires if the loop panics; the success path calls `mem::forget`.
     ///
-    /// `consumed` = count of input items already moved out (logically uninit).
-    /// `written`  = count of output items already initialized.
-    /// At the panic point in `op.apply(item)`: `consumed == i + 1` (item `i`
-    /// moved into `op`), `written == i` (output[i] still uninit).
+    /// `written` tracks the count of fully completed iterations (read +
+    /// applied + written). At the panic point in `op.apply(item)` for iter
+    /// `i = written`, item `i` has been moved into `op` (so `input[i+1..]` is
+    /// still init and must be dropped) and `output[..i]` is init (must be
+    /// dropped); `output[i..]` is uninit and item `i` is gone with the panic.
+    /// `consumed` is therefore always `written + 1` at the panic point, so we
+    /// don't track it separately — one less store per iteration on the hot
+    /// path (helps the vectorizer keep the index in a register).
     struct LeafGuard<'a, T, R> {
         input: &'a [T],
         output: &'a mut [R],
-        consumed: usize,
         written: usize,
     }
 
     impl<T, R> Drop for LeafGuard<'_, T, R> {
         fn drop(&mut self) {
-            // SAFETY: `consumed`/`written` reflect the actual init state at
-            // the unwind point. `RangeOp` never filters, so output[..written)
+            // SAFETY: `written` reflects the actual completed-iteration count
+            // at the unwind point. `RangeOp` never filters, so output[..written)
             // has no holes — every slot there is init and must be dropped.
-            // input[consumed..] is still init (untouched), must be dropped.
-            // We use `ptr::read` to consume each live slot exactly once.
+            // input[written+1..] is still init (untouched), must be dropped.
+            // Item `written` itself was moved into `op` and is gone with the
+            // panic, so we don't drop input[written].
             unsafe {
+                let i = self.written;
                 let out_live = self.output.as_mut_ptr();
-                for i in 0..self.written {
-                    std::ptr::drop_in_place(out_live.add(i));
+                for j in 0..i {
+                    std::ptr::drop_in_place(out_live.add(j));
                 }
                 let in_live = self.input.as_ptr();
-                for i in self.consumed..self.input.len() {
-                    std::ptr::drop_in_place(in_live.add(i).cast_mut());
+                for j in (i + 1)..self.input.len() {
+                    std::ptr::drop_in_place(in_live.add(j).cast_mut());
                 }
             }
         }
@@ -134,8 +139,8 @@ where
 
     debug_assert_eq!(input.len(), output.len());
 
-    // Capture raw pointers up front so the loop can mutate `g.written` /
-    // `g.consumed` (which borrow `&mut g`) without re-borrowing `input` /
+    // Capture raw pointers up front so the loop can mutate `g.written`
+    // (which borrows `&mut g`) without re-borrowing `input` /
     // `output` (already borrowed by `g`).
     let in_ptr = input.as_ptr();
     let out_ptr = output.as_mut_ptr();
@@ -144,7 +149,6 @@ where
     let mut g = LeafGuard {
         input,
         output,
-        consumed: 0,
         written: 0,
     };
 
@@ -152,7 +156,6 @@ where
         let i = g.written;
         // SAFETY: disjoint index; slot i is init (input) / uninit (output).
         let item = unsafe { std::ptr::read(in_ptr.add(i)) };
-        g.consumed = i + 1;
         let out = op.apply(item);
         unsafe { std::ptr::write(out_ptr.add(i), out) };
         g.written = i + 1;
