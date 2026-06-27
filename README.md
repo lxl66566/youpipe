@@ -95,24 +95,24 @@ fused `pipe()` — CPU-heavy (100 iters/item):
 
 | Size | youpipe | rayon  |
 | ---- | ------- | ------ |
-| 1K   | 34 µs   | 39 µs  |
-| 10K  | 84 µs   | 75 µs  |
-| 100K | 113 µs  | 146 µs |
+| 1K   | 34 µs   | 38 µs  |
+| 10K  | 73 µs   | 73 µs  |
+| 100K | 108 µs  | 148 µs |
 
 fused `pipe()` — lightweight `x+1`:
 
 | Size | youpipe | rayon  |
 | ---- | ------- | ------ |
-| 10K  | 82 µs   | 69 µs  |
-| 100K | 96 µs   | 111 µs |
-| 1M   | 676 µs  | 283 µs |
+| 10K  | 74 µs   | 68 µs  |
+| 100K | 86 µs   | 109 µs |
+| 1M   | 585 µs  | 277 µs |
 
 fused `pipe()` — 3-stage chain (`x+1`, `x*3`, `x-2`):
 
 | Size | youpipe | rayon  |
 | ---- | ------- | ------ |
-| 10K  | 86 µs   | 70 µs  |
-| 100K | 103 µs  | 104 µs |
+| 10K  | 72 µs   | 69 µs  |
+| 100K | 89 µs   | 103 µs |
 
 streaming `stream()` — single sync stage (`cpu_work`, 100 iters/item):
 
