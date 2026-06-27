@@ -230,11 +230,25 @@ pub(crate) struct IdleState {
 /// youpipe `pipe().map().collect()` improved −14 % @ 10 k, −18 % @ 100 k;
 /// `pipeline_fusion` and `sync_lightweight` improved −5…−13 %. The 1 k batch is
 /// unchanged because it hits the serial short-circuit and never reaches here.
+///
+/// Widening the spin window further (A/B tried 128 in 2026-06) regressed
+/// everything by +20-36 %: 32 workers all spinning burn enough coherence
+/// traffic on the deque / counter cache lines to throttle the cores, and the
+/// longer pause window delays the first round of `find_work` after a stolen
+/// job arrives. 32 stays the sweet spot.
 const ROUNDS_SPIN: u32 = 32;
 /// Idle rounds spent in `sched_yield` (cooperate but stay runnable) after the
 /// busy-spin phase. At this round the worker announces "sleepy" (bumps the JEC
 /// so a later poster can detect it), yields once more, and then the next idle
 /// round falls through to the actual `condvar` park in `sleep()`.
+///
+/// Widening the yield window (A/B tried 64 and 96 in 2026-06) lifted the
+/// 10 k and 1 M `sync_lightweight` cases by 5-30 % — workers stay runnable
+/// across `criterion`'s ~30-100 µs `iter_batched` gap and skip the next iter's
+/// `condvar.notify_one` wake cascade — but consistently regressed the 100 k
+/// variants (especially `_cold`) by 4-12 % because the longer yield window
+/// keeps workers in syscall overhead during the closure's intra-iter idle
+/// rounds. 32 (matching rayon) stays the global sweet spot.
 const ROUNDS_UNTIL_SLEEPY: u32 = ROUNDS_SPIN + 32;
 
 impl Sleep {
