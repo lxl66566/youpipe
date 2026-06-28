@@ -5,11 +5,11 @@ use std::sync::OnceLock;
 use std::{marker::PhantomData, sync::Arc};
 
 #[cfg(feature = "tokio-runtime")]
-use crate::handoff::{AsyncReceiver, TryRecvError, async_channel, sync_async_channel};
+use crate::handoff::{AsyncReceiver, async_channel, sync_async_channel};
 use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
-    handoff::{Receiver, Sender, SyncSender, SharedWaitGroup, channel::channel},
+    handoff::{Receiver, Sender, SyncSender, SharedWaitGroup, TryRecvError, channel::channel},
     state::{FenceBarrier, FenceMode, ReorderBuffer, run_ordered_collect},
     sync::CancellationToken,
 };
@@ -1150,11 +1150,15 @@ where
 
 /// Sync collector: drains `rx` into a `Vec`. If `ordered`, uses a
 /// [`ReorderBuffer`] to restore input order.
+///
+/// # Burst-drain strategy (unordered path)
+///
+/// Mirrors the async collector's burst-drain: when multiple items land in the
+/// channel before the collector loops back (common with parallel workers),
+/// `try_recv` absorbs the burst without per-item condvar overhead. Only the
+/// first item of each burst goes through the blocking `recv()`.
 #[allow(clippy::needless_pass_by_value)] // `rx` is the terminal drain of the
 // pipeline: `run` passes the sole receiver by value to express "consume fully".
-// The drain loop uses `recv()` by ref, but owning the receiver keeps its
-// lifetime bounded to this call so the caller can't accidentally reuse it after
-// the run.
 fn collect_sync<T: Send + Unpin + 'static>(
     rx: Receiver<(u64, T)>,
     ordered: bool,
@@ -1164,10 +1168,21 @@ fn collect_sync<T: Send + Unpin + 'static>(
         run_ordered_collect(&rx, n)
     } else {
         let mut results = Vec::with_capacity(n);
-        while let Ok((_, item)) = rx.recv() {
-            results.push(item);
+        loop {
+            // Burst-drain: pop everything already queued without blocking.
+            loop {
+                match rx.try_recv() {
+                    Ok((_, item)) => results.push(item),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Closed) => return results,
+                }
+            }
+            // Queue drained but channel may still be open — block for one.
+            match rx.recv() {
+                Ok((_, item)) => results.push(item),
+                Err(_) => return results,
+            }
         }
-        results
     }
 }
 
