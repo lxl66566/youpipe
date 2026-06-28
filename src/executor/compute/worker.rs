@@ -99,6 +99,11 @@ impl ComputePool {
 
 impl Drop for ComputePool {
     fn drop(&mut self) {
+        // Decrement the ref-count started by Clone (or Registry::new for the
+        // original). Only the last Drop (counter 1→0) signals workers to stop;
+        // earlier Drops are no-ops. This mirrors the Arc ref-counting pattern
+        // but uses the registry's own terminate_count so worker shutdown is
+        // coordinated with the sleep/latch machinery.
         self.registry.terminate();
     }
 }

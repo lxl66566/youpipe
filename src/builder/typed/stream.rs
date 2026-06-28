@@ -1100,6 +1100,14 @@ where
     /// Feeds `items` through the stage chain (channels between each stage),
     /// optionally reorders by sequence tag if `.ordered()` was called, and
     /// drains the final receiver into a `Vec`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `.ordered()` is combined with `.expand()` (see
+    /// [`FenceMode`] docs), or if the tokio runtime cannot be constructed
+    /// (e.g. OS thread/resource limits). To handle runtime construction
+    /// failure gracefully, pass a pre-built [`AsyncPool`] via
+    /// [`with_async_pool`](Self::with_async_pool).
     pub fn run(self) -> Vec<O> {
         let n = self.items.len();
         if n == 0 {
@@ -1202,7 +1210,9 @@ where
             FinalRx::Sync(rx) => collect_sync(rx, ordered, n),
             #[cfg(feature = "tokio-runtime")]
             FinalRx::Async(rx) => {
-                let pool = ctx.acquire_async().expect("failed to build async runtime");
+    let pool = ctx
+        .acquire_async()
+        .expect("failed to build tokio runtime (OS resource limit? pass a custom AsyncPool via with_async_pool to handle this)");
                 pool.block_on(collect_async(rx, ordered, n))
             }
         };
