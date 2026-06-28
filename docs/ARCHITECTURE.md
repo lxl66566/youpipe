@@ -540,10 +540,10 @@ blocking-thread-per-core model. `io_concurrency = 512`, 32-core machine.
 
 #### Pure IO (`io_async_pure`)
 
-| Size | youpipe_async | youpipe_blocking | tokio_async_native | tokio_spawn_blocking |
-|---|---|---|---|---|
-| 200 | ~9.27 ms | ~16.58 ms | ~9.15 ms | ~8.40 ms |
-| 500 | ~9.61 ms | ~33.08 ms | ~9.33 ms | ~8.85 ms |
+| Size | youpipe_async | youpipe_blocking | youpipe_blocking_oversub | tokio_async_native | tokio_spawn_blocking |
+|---|---|---|---|---|---|
+| 200 | ~9.30 ms | ~16.57 ms | ~11.32 ms | ~9.13 ms | ~8.42 ms |
+| 500 | ~9.65 ms | ~33.07 ms | ~19.46 ms | ~9.33 ms | ~8.81 ms |
 
 `youpipe_async` **matches `tokio_async_native`** (the async ceiling) within
 ~3% and is **1.8× (200) / 3.45× (500) faster than `youpipe_blocking`**.
@@ -556,6 +556,13 @@ channel that the AsyncStage consumes directly — see §3.6), and replacing
 the collector's per-item `recv().await` with a `try_recv` burst-drain that
 absorbs tokio's timer-tick completion bursts without per-item waker
 overhead.
+
+`youpipe_blocking_oversub` uses `.with_compute_pool(ComputePool::new(512))`
+to match tokio's 512-thread blocking pool, narrowing the gap from ~2× to
+~35%. The remaining gap is streaming infrastructure overhead (channel
+handoff, injector scheduling) — the tradeoff for backpressure, ordering,
+and multi-stage composition that raw `spawn_blocking` doesn't provide.
+For blocking IO, `.stage_async()` remains the recommended tool.
 
 #### Mixed CPU (sync) + IO (`io_async_mixed`)
 
