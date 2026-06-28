@@ -213,6 +213,20 @@ fn test_stream_expand() {
     assert_eq!(result, expected);
 }
 
+#[test]
+#[should_panic(expected = "incompatible with `.expand()`")]
+fn test_stream_expand_ordered_rejected() {
+    // expand + ordered() is rejected: expand fan-out shares the parent seq,
+    // which the single-item-per-seq ReorderBuffer cannot handle. See the
+    // `StageSpawn::has_expand` doc and the panic message in `run`.
+    let items: Vec<i32> = (0..10).collect();
+    let _ = stream(items)
+        .expand(|x: i32| vec![x, x * 10])
+        .stage(|x: i32| x + 1)
+        .ordered()
+        .run();
+}
+
 // ── Async stage regression coverage (gated by tokio-runtime) ──
 //
 // These exercise the lazy-pool path: no `with_async_pool` is attached, so

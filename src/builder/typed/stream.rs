@@ -360,6 +360,17 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     /// Used by `StreamPipe::run` to divide the pool across stages.
     fn worker_stages(&self) -> usize;
 
+    /// Returns `true` if this chain contains at least one `ExpandStage`.
+    ///
+    /// Expand is a 1-to-N fan-out: one input seq produces multiple outputs
+    /// that **share** the parent's sequence number. The [`ReorderBuffer`] used
+    /// by `.ordered()` is single-item-per-seq, so `expand` + `ordered()` would
+    /// silently drop colliding items. [`StreamPipe::run`] checks this flag and
+    /// rejects the combination with a clear panic instead of corrupting output.
+    fn has_expand(&self) -> bool {
+        false
+    }
+
     /// Returns `Some(true)` if the innermost *real* stage in this chain — the
     /// first non-`StreamStart` stage that consumes the feeder channel — is
     /// async, `Some(false)` if it's sync, or `None` if there are no real
@@ -590,9 +601,11 @@ where
         // consumer — and we're sync.
         self.prev.first_consumer_is_async().or(Some(false))
     }
-}
 
-// ExpandStage<Prev, F>: recurse into prev, then spawn expand workers.
+    fn has_expand(&self) -> bool {
+        self.prev.has_expand()
+    }
+}
 impl<Prev, F, In, N> StageSpawn<In> for ExpandStage<Prev, F>
 where
     Prev: StageSpawn<In>,
@@ -651,9 +664,11 @@ where
         // Expand stages are sync — claim "first consumer" only if prev didn't.
         self.prev.first_consumer_is_async().or(Some(false))
     }
-}
 
-// FenceLink<Prev>: recurse into prev, then insert a fence forwarder thread.
+    fn has_expand(&self) -> bool {
+        true
+    }
+}
 impl<Prev, In> StageSpawn<In> for FenceLink<Prev>
 where
     Prev: StageSpawn<In>,
@@ -704,6 +719,10 @@ where
         // Fence is transparent — defer to prev.
         self.prev.first_consumer_is_async()
     }
+
+    fn has_expand(&self) -> bool {
+        self.prev.has_expand()
+    }
 }
 
 // AsyncStage<Prev, F>: recurse into prev (likely sync), bridge sync→async,
@@ -734,6 +753,10 @@ where
         // Defer to prev's opinion; if prev had none, *we* are the first real
         // consumer — and we're async.
         self.prev.first_consumer_is_async().or(Some(true))
+    }
+
+    fn has_expand(&self) -> bool {
+        self.prev.has_expand()
     }
 
     fn spawn_async_feeder(self, rx: AsyncReceiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<M> {
@@ -1109,6 +1132,16 @@ where
         if n == 0 {
             return Vec::new();
         }
+        // `expand` produces multiple outputs sharing one parent seq, but the
+        // `ReorderBuffer` (`.ordered()`) is single-item-per-seq — the collision
+        // silently drops data. Reject the combination loudly instead.
+        assert!(
+            !(self.ordered && self.stages.has_expand()),
+            "`.ordered()` is incompatible with `.expand()`: expand fan-out \
+             shares the parent sequence number, which the ReorderBuffer \
+             cannot re-sequence. Drop `.ordered()` (completion order is still \
+             correct) or replace `expand` with a 1:1 `stage`."
+        );
         let Self {
             items,
             stages,

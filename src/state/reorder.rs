@@ -6,6 +6,22 @@ struct Slot<T> {
     item: MaybeUninit<T>,
 }
 
+/// A sequence-numbered re-sequencing buffer.
+///
+/// Items arrive tagged with a `u64` sequence number; `insert` returns any
+/// items whose sequence numbers form a contiguous run starting from the last
+/// flushed position. Out-of-order arrivals are buffered until their
+/// predecessors arrive.
+///
+/// # Capacity precondition
+///
+/// The buffer uses power-of-two masking, so sequence numbers are mapped to
+/// slots via `seq & mask`. If the number of *simultaneously outstanding*
+/// (un-flushed) items ever exceeds `capacity`, two distinct sequence numbers
+/// alias the same slot and the older item is **silently dropped**. Callers
+/// must size the buffer to at least the maximum out-of-order window. The
+/// streaming collectors clamp the window to `[1 Ki, 1 Mi]` slots, which is
+/// ample for realistic worker counts.
 pub struct ReorderBuffer<T> {
     slots: Vec<Slot<T>>,
     next_expected: u64,
@@ -33,9 +49,21 @@ impl<T> ReorderBuffer<T> {
     }
 
     pub fn insert(&mut self, seq: u64, item: T) -> Vec<T> {
-        let idx = usize::try_from(seq).unwrap() & self.mask;
+        // `seq as usize` is safe across all pointer widths: the subsequent
+        // `& self.mask` only keeps the low log2(capacity) bits, so truncation
+        // on 32-bit targets is harmless (capacity is always < 2³²).
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = (seq as usize) & self.mask;
         let slot = &mut self.slots[idx];
         if slot.occupied {
+            // Capacity precondition violated: a different seq aliases this
+            // slot. The old item is dropped to avoid a leak. See the type-level
+            // doc for the capacity contract.
+            debug_assert_ne!(
+                slot.seq, seq,
+                "duplicate seq {seq} — ReorderBuffer is single-item-per-seq; \
+                 use without `expand`"
+            );
             unsafe { slot.item.assume_init_drop() };
             self.len -= 1;
         }
@@ -49,7 +77,9 @@ impl<T> ReorderBuffer<T> {
     fn flush_ready(&mut self) -> Vec<T> {
         let mut ready = Vec::new();
         loop {
-            let idx = usize::try_from(self.next_expected).unwrap() & self.mask;
+            // See `insert` for why truncation is harmless.
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = (self.next_expected as usize) & self.mask;
             if !self.slots[idx].occupied || self.slots[idx].seq != self.next_expected {
                 break;
             }
