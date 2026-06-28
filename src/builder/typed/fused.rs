@@ -3,8 +3,8 @@ use std::{any::Any, marker::PhantomData, panic};
 use super::{
     slots::Slots,
     traits::{
-        Filter, FusedOp, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, RangeOp,
-        StageMarker, SyncMap, TryMap,
+        Filter, FusedOp, FusedStage, FusedTryOp, FusedTryStage, Identity, InfallibleChain, MapErr,
+        RangeOp, RangeTryOp, StageMarker, SyncMap, TryMap,
     },
 };
 use crate::{
@@ -199,7 +199,189 @@ where
     }
 }
 
-// ── Experiment record: flat leaf dispatch (2026-06, reverted) ──
+// ── Index-based fast path for fallible (`try_collect`) pipelines ──
+//
+// When `FusedTryStage::MAY_FILTER == false`, output cardinality equals input
+// cardinality (every item either succeeds or aborts the whole pipeline with an
+// error). This lets us pre-allocate the output `Slots<R>` and write results at
+// known indices — the same zero-allocation strategy `par_index_collect` uses
+// for infallible pipelines. The `Vec`-merge path (`join_fused_try_collect`)
+// remains the fallback for chains containing `Filter`.
+
+/// Recursive divide-and-conquer for fallible stages. Returns `Err(e)` on the
+/// first error; on error, all init output slots in the error branch are
+/// cleaned up by the leaf, and sibling ranges are dropped by this function.
+///
+/// Panics propagate naturally through `join`'s `halt_unwinding`/`resume_unwind`
+/// (re-raised past the match). The leaf's `TryLeafGuard` handles panic cleanup
+/// of the leaf's own partial range, identical to `LeafGuard` in
+/// `par_index_leaf`.
+fn par_index_try_rec<T, R, E, OP>(
+    input: &Slots<T>,
+    output: &Slots<R>,
+    start: usize,
+    end: usize,
+    op: &OP,
+    splits_left: usize,
+) -> Result<(), E>
+where
+    T: Send,
+    R: Send,
+    E: Send,
+    OP: RangeTryOp<T, Out = R, Error = E>,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: disjoint range — this leaf owns `[start, end)` exclusively.
+        let in_slice = unsafe { input.as_slice(start, end) };
+        let out_slice = unsafe { output.as_mut_slice(start, end) };
+        par_index_try_leaf(in_slice, out_slice, op)?;
+        return Ok(());
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = ComputePool::global().join(
+        || par_index_try_rec(input, output, start, mid, op, splits_left - 1),
+        || par_index_try_rec(input, output, mid, end, op, splits_left - 1),
+    );
+    match (l, r) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) => {
+            // SAFETY: right sibling completed without filter (RangeTryOp never
+            // filters), so [mid, end) is fully init and safe to drop.
+            unsafe { output.drop_range(mid, end) };
+            Err(e)
+        }
+        (Ok(()), Err(e)) => {
+            unsafe { output.drop_range(start, mid) };
+            Err(e)
+        }
+        (Err(e), Err(_)) => {
+            unsafe {
+                output.drop_range(start, mid);
+                output.drop_range(mid, end);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Process `[start, end)` sequentially, short-circuiting on the first `Err`.
+///
+/// On error: drops `output[..written]` (init from prior iterations) and
+/// `input[written+1..]` (still init — untouched), then returns `Err`. Item
+/// `written` was consumed by `try_apply` and is gone.
+///
+/// A `TryLeafGuard` runs the same cleanup on **panic** (unwind), disarmed by
+/// `mem::forget` on both the `Ok` and `Err` return paths — identical structure
+/// to `LeafGuard` in `par_index_leaf`.
+fn par_index_try_leaf<T, R, E, OP>(input: &[T], output: &mut [R], op: &OP) -> Result<(), E>
+where
+    T: Send,
+    R: Send,
+    E: Send,
+    OP: RangeTryOp<T, Out = R, Error = E>,
+{
+    /// RAII guard mirroring `LeafGuard`: drops the partial slot state on
+    /// unwind. `Drop` only fires on panic; both success and error paths call
+    /// `mem::forget`.
+    struct TryLeafGuard<'a, T, R> {
+        input: &'a [T],
+        output: &'a mut [R],
+        written: usize,
+    }
+
+    impl<T, R> Drop for TryLeafGuard<'_, T, R> {
+        fn drop(&mut self) {
+            // SAFETY: same reasoning as `LeafGuard::drop` — `written` reflects
+            // completed iterations at the unwind point.
+            unsafe {
+                let i = self.written;
+                let out_live = self.output.as_mut_ptr();
+                for j in 0..i {
+                    std::ptr::drop_in_place(out_live.add(j));
+                }
+                let in_live = self.input.as_ptr();
+                for j in (i + 1)..self.input.len() {
+                    std::ptr::drop_in_place(in_live.add(j).cast_mut());
+                }
+            }
+        }
+    }
+
+    debug_assert_eq!(input.len(), output.len());
+
+    let in_ptr = input.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+    let n = input.len();
+
+    let mut g = TryLeafGuard {
+        input,
+        output,
+        written: 0,
+    };
+
+    while g.written < n {
+        let i = g.written;
+        // SAFETY: disjoint index; slot i is init (input) / uninit (output).
+        let item = unsafe { std::ptr::read(in_ptr.add(i)) };
+        match op.try_apply(item) {
+            Ok(out) => {
+                unsafe { std::ptr::write(out_ptr.add(i), out) };
+                g.written = i + 1;
+            }
+            Err(e) => {
+                // Error path: run the same cleanup the guard would do on
+                // panic, then disarm (forget) so Drop doesn't double-clean.
+                // Item `i` was consumed by `try_apply` and is gone.
+                unsafe {
+                    for j in 0..i {
+                        std::ptr::drop_in_place(out_ptr.add(j));
+                    }
+                    for j in (i + 1)..n {
+                        std::ptr::drop_in_place(in_ptr.add(j).cast_mut());
+                    }
+                }
+                std::mem::forget(g);
+                return Err(e);
+            }
+        }
+    }
+
+    // Success: disarm the cleanup Drop.
+    std::mem::forget(g);
+    Ok(())
+}
+
+/// Drive `par_index_try_rec` over `[0, n)` and convert the output buffer into
+/// a `Vec<R>`. On error, the recursion has already dropped all init output
+/// slots; on panic, the panic propagates (and the output buffer's init slots
+/// may leak, same as `par_index_collect`).
+fn par_index_try_collect<T, R, E, OP>(items: Vec<T>, op: &OP, splits: usize) -> Result<Vec<R>, E>
+where
+    T: Send,
+    R: Send,
+    E: Send,
+    OP: RangeTryOp<T, Out = R, Error = E>,
+{
+    let n = items.len();
+    debug_assert!(n > 0);
+    let input = Slots::from_vec(items);
+    let output = Slots::<R>::uninit(n);
+    let result = par_index_try_rec(&input, &output, 0, n, op, splits);
+    match result {
+        Ok(()) => {
+            drop(input);
+            Ok(output.into_vec())
+        }
+        Err(e) => {
+            // Recursion already dropped every live output slot.
+            drop(input);
+            drop(output);
+            Err(e)
+        }
+    }
+}
+
+
 //
 // Hypothesis (from hotpath): ~60% of stolen `join` B-jobs force the origin
 // worker into `wait_until_cold`, so a *flat* dispatcher — N disjoint leaf-jobs
@@ -722,7 +904,16 @@ where
             Workload::Unbalanced => 8,
         };
         let splits = split_depth(n, num_threads, oversplit);
-        join_fused_try_collect(items, &self.stages, splits)
+        if S::MAY_FILTER {
+            join_fused_try_collect(items, &self.stages, splits)
+        } else {
+            // Fast path: no filter → output cardinality == input cardinality.
+            // Pre-allocate the output buffer and write at known indices,
+            // avoiding the per-split `Vec::split_off` allocations of the
+            // merge path.
+            let op = FusedTryOp(self.stages);
+            par_index_try_collect(items, &op, splits)
+        }
     }
 }
 

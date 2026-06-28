@@ -189,10 +189,57 @@ fn bench_lightweight_work(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_try_collect(c: &mut Criterion) {
+    let mut group = c.benchmark_group("try_collect");
+    for size in [10_000, 100_000] {
+        let data: Vec<u64> = (0..size).collect();
+
+        group.throughput(Throughput::Elements(size));
+        // youpipe try_collect (success path — index-based fast path, MAY_FILTER == false)
+        group.bench_with_input(
+            BenchmarkId::new("youpipe_try_map_warm", size),
+            &data,
+            |b, data| {
+                b.iter_batched(
+                    || warm_clone(data),
+                    |v| {
+                        black_box(
+                            youpipe::pipe(v)
+                                .try_map(|x: u64| -> Result<u64, &'static str> { Ok(x + 1) })
+                                .map(|x| x * 3)
+                                .try_collect()
+                                .unwrap(),
+                        )
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+
+        // rayon equivalent: try for each + collect
+        group.bench_with_input(
+            BenchmarkId::new("rayon_try_map", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let r: Vec<u64> = data
+                        .par_iter()
+                        .map(|&x| x + 1)
+                        .map(|x| x * 3)
+                        .collect();
+                    black_box(r)
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_par_map_vs_rayon,
     bench_pipeline_fusion,
-    bench_lightweight_work
+    bench_lightweight_work,
+    bench_try_collect
 );
 criterion_main!(benches);

@@ -187,6 +187,46 @@ where
     }
 }
 
+// ── RangeTryOp: fallible variant for the try-index fast path ──
+
+/// Fallible transform applied to every item by the try-index-based core.
+///
+/// Like [`RangeOp`] but returns `Result<R, E>`. Used by `par_index_try_leaf`
+/// for `TryPipe::try_collect` when the chain has `MAY_FILTER == false`. The
+/// `Result` lets the leaf short-circuit on the first error without
+/// constructing an `Option` per item.
+pub(super) trait RangeTryOp<T>: Sync {
+    type Out: Send;
+    type Error: Send;
+    fn try_apply(&self, item: T) -> Result<Self::Out, Self::Error>;
+}
+
+/// `RangeTryOp` wrapper around a `FusedTryStage` chain. Only constructable
+/// when `S::MAY_FILTER == false` — the impl unwraps the `Option` from
+/// `FusedTryStage::try_apply` via `unreachable_unchecked`, keeping the leaf
+/// branch-free.
+pub(super) struct FusedTryOp<S>(pub(super) S);
+
+impl<S, T> RangeTryOp<T> for FusedTryOp<S>
+where
+    S: FusedTryStage<T> + Sync,
+    S::Output: Send,
+    S::Error: Send,
+{
+    type Out = S::Output;
+    type Error = S::Error;
+    #[inline]
+    fn try_apply(&self, item: T) -> Result<S::Output, S::Error> {
+        // SAFETY: `FusedTryOp` is only constructed when `MAY_FILTER == false`,
+        // so `try_apply` always returns `Ok(Some(_))` on success.
+        match S::try_apply(&self.0, item) {
+            Ok(Some(o)) => Ok(o),
+            Ok(None) => unsafe { hint::unreachable_unchecked() },
+            Err(e) => Err(e),
+        }
+    }
+}
+
 // ── FusedTryStage trait (fallible chain) ──
 
 /// Compile-time fused stage for a fallible pipeline. The chain threads
@@ -204,6 +244,13 @@ where
 pub trait FusedTryStage<T> {
     type Output;
     type Error;
+
+    /// Whether `try_apply` may return `Ok(None)` (i.e. the chain contains a
+    /// `Filter`). When `false`, every `Ok` result carries a value and the
+    /// output cardinality equals the input cardinality — the index-based fast
+    /// path (`par_index_try_collect`) can pre-allocate the output buffer and
+    /// write results at known indices, avoiding the `Vec`-merge overhead.
+    const MAY_FILTER: bool = false;
 
     /// Apply the chain.
     ///
@@ -230,6 +277,7 @@ where
 {
     type Output = O;
     type Error = E;
+    const MAY_FILTER: bool = Prev::MAY_FILTER;
 
     #[inline]
     fn try_apply(&self, item: I) -> Result<Option<O>, E> {
@@ -247,6 +295,7 @@ where
 {
     type Output = Prev::Output;
     type Error = E;
+    const MAY_FILTER: bool = true;
 
     #[inline]
     fn try_apply(&self, item: I) -> Result<Option<Prev::Output>, E> {
@@ -270,6 +319,7 @@ where
 {
     type Output = O;
     type Error = E;
+    const MAY_FILTER: bool = Prev::MAY_FILTER;
 
     #[inline]
     fn try_apply(&self, item: I) -> Result<Option<O>, E> {
@@ -307,6 +357,7 @@ where
 {
     type Output = S::Output;
     type Error = E;
+    const MAY_FILTER: bool = S::MAY_FILTER;
 
     #[inline]
     fn try_apply(&self, item: T) -> Result<Option<S::Output>, E> {
@@ -339,6 +390,7 @@ where
 {
     type Output = Prev::Output;
     type Error = E2;
+    const MAY_FILTER: bool = Prev::MAY_FILTER;
 
     #[inline]
     fn try_apply(&self, item: I) -> Result<Option<Prev::Output>, E2> {

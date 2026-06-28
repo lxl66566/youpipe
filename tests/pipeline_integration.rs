@@ -98,12 +98,44 @@ fn test_try_map_err_short_circuits() {
 
 #[test]
 fn test_try_map_then_map() {
-    // Chain an infallible map after a try_map: error type stays the same.
+    // Chain an inffallible map after a try_map: error type stays the same.
     let r: Result<Vec<String>, &str> = pipe(0..5)
         .try_map(|x: i32| -> Result<i32, &str> { Ok(x * 2) })
         .map(|x: i32| x.to_string())
         .try_collect();
     assert_eq!(r.unwrap(), vec!["0", "2", "4", "6", "8"]);
+}
+
+#[test]
+fn test_try_map_parallel_large() {
+    // Large enough to exceed the serial threshold (num_threads * 64) and
+    // exercise the index-based parallel fast path (MAY_FILTER == false).
+    let n = 50_000;
+    let result = pipe(0..n)
+        .try_map(|x: i32| -> Result<i32, &str> { Ok(x.wrapping_mul(3)) })
+        .map(|x: i32| x + 1)
+        .try_collect()
+        .unwrap();
+    assert_eq!(result.len(), n as usize);
+    assert_eq!(result[0], 1);
+    assert_eq!(result[n as usize - 1], (n - 1) * 3 + 1);
+}
+
+#[test]
+fn test_try_map_parallel_error_short_circuits() {
+    // Error in the parallel path (index-based fast path) must propagate.
+    let n = 50_000;
+    let result = pipe(0..n)
+        .try_map(|x: i32| -> Result<i32, String> {
+            if x == 30_000 {
+                Err("mid-batch error".into())
+            } else {
+                Ok(x * 2)
+            }
+        })
+        .try_collect();
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), "mid-batch error");
 }
 
 #[test]
