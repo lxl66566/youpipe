@@ -460,15 +460,15 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 | Size | youpipe | rayon | Result |
 |---|---|---|---|
 | 1K | ~34 µs | ~38 µs | **youpipe ~1.1× faster** |
-| 10K | ~73 µs | ~73 µs | tie |
-| 100K | ~108 µs | ~148 µs | **youpipe ~1.4× faster** |
+| 10K | ~74 µs | ~73 µs | tie |
+| 100K | ~109 µs | ~163 µs | **youpipe ~1.5× faster** |
 
 ### Pipeline Fusion (3 stages) vs rayon chain (`pipeline_fusion`, warm input)
 
 | Size | youpipe fused | rayon chain | Result |
 |---|---|---|---|
-| 10K | ~72 µs | ~69 µs | tie |
-| 100K | ~89 µs | ~103 µs | **youpipe ~1.15× faster** |
+| 10K | ~75 µs | ~68 µs | rayon ~1.1× faster (scheduler fixed cost) |
+| 100K | ~93 µs | ~102 µs | **youpipe ~1.1× faster** |
 
 The fused stage chain went from ~1.9× slower than rayon (mid-2026) to a
 dead heat or win at every size after three changes: a sleeping-bitmask
@@ -486,13 +486,13 @@ for the current `&[T]`/`&mut [R]` leaf view.
 
 | Size | youpipe (warm) | youpipe (cold) | rayon |
 |---|---|---|---|
-| 10K | ~74 µs | ~83 µs | ~68 µs |
-| 100K | ~86 µs | ~131 µs | ~109 µs |
-| 1M | ~585 µs | ~4.3 ms | ~277 µs |
+| 10K | ~75 µs | ~83 µs | ~66 µs |
+| 100K | ~86 µs | ~135 µs | ~108 µs |
+| 1M | ~574 µs | ~4.27 ms | ~280 µs |
 
 Warm-input lightweight 1M improved from ~1.9 ms (pre-`Slots`) → ~730 µs
 (after `Slots`) → ~390 µs (after switching the leaf loop to a `&[T]` /
-`&mut [R]` slice view) → ~585 µs after the perf-config fix + the
+`&mut [R]` slice view) → ~574 µs after the perf-config fix + the
 sleeping-bitmask wake rewrite + the notify-outside-lock fix. The slice
 view step closed a 2.5× gap with rayon: the previous `&Slots<u64>` for
 both input and output blocked LLVM's auto-vectorizer because the alias
@@ -504,20 +504,33 @@ The cold variant documents the read-compute-write sensitivity to
 cold-from-RAM input (glibc's non-temporal memcpy bypasses the cache);
 rayon on an equally-cold clone measures ~800 µs at 1M.
 
+### Fallible `try_map().try_collect()` vs rayon (`try_collect`, warm input)
+
+When the chain has `MAY_FILTER == false`, `try_collect` uses the same
+zero-allocation index-based fast path as `collect` — pre-allocating the output
+buffer and writing at known indices instead of the `Vec`-merge fallback.
+
+| Size | youpipe try_map | rayon | Result |
+|---|---|---|---|
+| 10K | ~75 µs | ~67 µs | rayon ~1.1× faster (Result branch overhead) |
+| 100K | ~95 µs | ~98 µs | **youpipe ~1.03× faster** |
+
 ### Mixed Load — `stream()` vs `tokio::spawn_blocking` (`mixed_load`)
 
 | Size | youpipe stream | spawn_blocking | rayon (CPU-only) | Result |
 |---|---|---|---|---|
-| 1K | ~1.09 ms | ~2.53 ms | ~36 µs | **youpipe ~2.3× faster** than tokio |
-| 10K | ~10.6 ms | ~24.8 ms | ~64 µs | **youpipe ~2.3× faster** |
-| 100K | ~107 ms | ~241 ms | ~103 µs | **youpipe ~2.3× faster** |
+| 1K | ~832 µs | ~2.92 ms | ~38 µs | **youpipe ~3.5× faster** than tokio |
+| 10K | ~9.5 ms | ~27.4 ms | ~68 µs | **youpipe ~2.9× faster** |
+| 100K | ~95.9 ms | ~239 ms | ~111 µs | **youpipe ~2.5× faster** |
 
 `StreamPipe` comfortably and **stably** beats `tokio::spawn_blocking` (the
-design target for mixed CPU/IO) by ~2.3× at every size — the ratio holds
-from 1K to 100K because both frameworks amortise per-item overhead at the
-same rate, so the constant-factor channel/spawn advantage is preserved.
-`rayon::par_iter` is fastest here because this benchmark is pure-CPU and
-rayon's direct fork-join skips channel handoff entirely.
+design target for mixed CPU/IO) by ~2.5–3.5× at every size. The ratio
+improves at smaller sizes (3.5× at 1K) where per-task spawn overhead
+dominates tokio's cost, and narrows slightly at larger sizes (2.5× at 100K)
+where channel bandwidth becomes the bottleneck. `rayon::par_iter` is fastest
+here because this benchmark is pure-CPU and rayon's direct fork-join skips
+channel handoff entirely. All youpipe variants use `warm_clone` (cache-warmed
+input) for fair comparison against rayon's warm borrow.
 
 ### Async IO — `.stage_async()` (`io_async`, yielding IO)
 
@@ -529,8 +542,8 @@ blocking-thread-per-core model. `io_concurrency = 512`, 32-core machine.
 
 | Size | youpipe_async | youpipe_blocking | youpipe_blocking_oversub | tokio_async_native | tokio_spawn_blocking |
 |---|---|---|---|---|---|
-| 200 | ~9.30 ms | ~16.57 ms | ~11.32 ms | ~9.13 ms | ~8.42 ms |
-| 500 | ~9.65 ms | ~33.07 ms | ~19.46 ms | ~9.33 ms | ~8.81 ms |
+| 200 | ~9.32 ms | ~16.56 ms | ~11.31 ms | ~9.16 ms | ~8.38 ms |
+| 500 | ~9.65 ms | ~33.08 ms | ~19.46 ms | ~9.30 ms | ~8.83 ms |
 
 `youpipe_async` **matches `tokio_async_native`** (the async ceiling) within
 ~3% and is **1.8× (200) / 3.45× (500) faster than `youpipe_blocking`**.
@@ -555,8 +568,8 @@ For blocking IO, `.stage_async()` remains the recommended tool.
 
 | Size | youpipe_mixed_async | youpipe_mixed_blocking | tokio_mixed_blocking |
 |---|---|---|---|
-| 200 | ~9.55 ms | ~27.14 ms | ~8.99 ms |
-| 500 | ~9.99 ms | ~59.96 ms | ~10.14 ms |
+| 200 | ~9.48 ms | ~27.3 ms | ~8.93 ms |
+| 500 | ~9.97 ms | ~60.0 ms | ~10.1 ms |
 
 `youpipe_mixed_async` is **2.8× (200) / ~6× (500) faster than the all-blocking
 two-stage baseline**, and at size 500 edges out `tokio_mixed_blocking` by
@@ -570,8 +583,8 @@ tokio's simpler spawn-per-item model still leads there.
 
 | Size | crossfire | crossbeam-channel | std_mpsc | Result |
 |---|---|---|---|---|
-| 10K | 45.5 Melem/s | 46.5 Melem/s | 62.4 Melem/s | Tie (MPMC) |
-| 100K | 76.6 Melem/s | 74.8 Melem/s | 125.5 Melem/s | **crossfire 1.02× vs crossbeam** |
+| 10K | 27.1 Melem/s | 20.2 Melem/s | 37.0 Melem/s | **crossfire 1.34× vs crossbeam** |
+| 100K | 34.7 Melem/s | 17.3 Melem/s | 44.6 Melem/s | **crossfire 2.0× vs crossbeam** |
 
 ---
 

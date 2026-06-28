@@ -96,47 +96,54 @@ fused `pipe()` — CPU-heavy (100 iters/item, warm input):
 | Size | youpipe | rayon  |
 | ---- | ------- | ------ |
 | 1K   | 34 µs   | 38 µs  |
-| 10K  | 73 µs   | 73 µs  |
-| 100K | 108 µs  | 148 µs |
+| 10K  | 74 µs   | 73 µs  |
+| 100K | 109 µs  | 163 µs |
 
 fused `pipe()` — lightweight `x+1` (warm input):
 
 | Size | youpipe | rayon  |
 | ---- | ------- | ------ |
-| 10K  | 74 µs   | 68 µs  |
-| 100K | 86 µs   | 109 µs |
-| 1M   | 585 µs  | 277 µs |
+| 10K  | 75 µs   | 66 µs  |
+| 100K | 86 µs   | 108 µs |
+| 1M   | 574 µs  | 280 µs |
 
 fused `pipe()` — 3-stage chain (`x+1`, `x*3`, `x-2`):
 
 | Size | youpipe | rayon  |
 | ---- | ------- | ------ |
-| 10K  | 72 µs   | 69 µs  |
-| 100K | 89 µs   | 103 µs |
+| 10K  | 75 µs   | 68 µs  |
+| 100K | 93 µs   | 102 µs |
+
+fused `try_map().try_collect()` — fallible `Result` chain (warm input):
+
+| Size | youpipe | rayon  |
+| ---- | ------- | ------ |
+| 10K  | 75 µs   | 67 µs  |
+| 100K | 95 µs   | 98 µs  |
 
 streaming `stream()` — single sync stage (`cpu_work`, 100 iters/item):
 
 | Size | youpipe | tokio spawn_blocking |
 | ---- | ------- | -------------------- |
-| 1K   | 1.05 ms | 2.43 ms              |
-| 10K  | 10.4 ms | 24.4 ms              |
-| 100K | 98.8 ms | 225 ms               |
+| 1K   | 0.72 ms | 2.46 ms              |
+| 10K  | 8.8 ms  | 23.5 ms              |
+| 100K | 88.6 ms | 236 ms               |
 
 Pure async IO (`tokio::time::sleep`, ~1 ms latency, 90/10 tail, 500 items):
 
 | Topology                               | Time    |
 | -------------------------------------- | ------- |
 | youpipe: async IO (`.stage_async`)     | 9.65 ms |
-| tokio: native async                    | 9.33 ms |
+| tokio: native async                    | 9.30 ms |
 | youpipe: blocking IO (`.stage`)        | 33.1 ms |
 | youpipe: blocking IO (oversub 512 thr) | 19.5 ms |
-| tokio: spawn_blocking                  | 8.81 ms |
+| tokio: spawn_blocking                  | 8.83 ms |
 
 Mixed CPU + IO (two stages, 500 items):
 
 | Topology                              | Time    |
 | ------------------------------------- | ------- |
-| youpipe: sync CPU + async IO          | 9.99 ms |
+| youpipe: sync CPU + async IO          | 9.97 ms |
 | tokio: mixed spawn_blocking           | 10.1 ms |
 | youpipe: sync CPU + blocking IO       | 60.0 ms |
 
