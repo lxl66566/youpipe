@@ -7,8 +7,24 @@ use crate::pool::{self, Registry};
 /// Workers pull jobs from a shared injector queue and steal from each other's
 /// local deques. The fast path for posting work is pure atomics — no
 /// Mutex/Condvar unless threads are actually sleeping.
+///
+/// `ComputePool` is cheap to clone (one `Arc` clone + one atomic increment).
+/// Each clone holds a reference to the underlying [`Registry`]; the pool's
+/// worker threads stay alive until the last clone is dropped.
 pub struct ComputePool {
     registry: Arc<Registry>,
+}
+
+impl Clone for ComputePool {
+    fn clone(&self) -> Self {
+        // Keep the registry alive until the last clone drops. Without this
+        // increment, dropping any clone would decrement terminate_count to 0
+        // and tear down worker threads while other clones still reference them.
+        self.registry.increment_terminate_count();
+        Self {
+            registry: Arc::clone(&self.registry),
+        }
+    }
 }
 
 impl ComputePool {

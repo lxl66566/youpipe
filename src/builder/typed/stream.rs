@@ -261,6 +261,11 @@ pub struct StreamPipe<S = StreamStart, I = (), O = ()> {
     stages: S,
     config: PipelineConfig,
     cancel: Option<CancellationToken>,
+    /// Custom compute pool. When `None`, stages use [`ComputePool::global`]
+    /// (sized to `num_cpus`). When `Some`, stages run on the user-supplied
+    /// pool — useful for oversubscribing threads for blocking-IO sync stages
+    /// (e.g. `ComputePool::new(512)` to match tokio's `spawn_blocking` pool).
+    compute_pool: Option<ComputePool>,
     #[cfg(feature = "tokio-runtime")]
     async_pool: Option<crate::executor::AsyncPool>,
     ordered: bool,
@@ -286,6 +291,7 @@ where
         stages: StreamStart,
         config: PipelineConfig::default(),
         cancel: None,
+        compute_pool: None,
         #[cfg(feature = "tokio-runtime")]
         async_pool: None,
         ordered: false,
@@ -426,6 +432,9 @@ pub struct StreamCtx<'a> {
     /// inside the pool — preventing the "stage 1 fills the pool, stage 2
     /// starves, deadlock" failure mode.
     pub per_stage_parallelism: usize,
+    /// Custom compute pool (cloned from the builder's `with_compute_pool`).
+    /// When `None`, sync stages use [`ComputePool::global`].
+    pub compute_pool: Option<ComputePool>,
     #[cfg(feature = "tokio-runtime")]
     pub async_pool: Option<crate::executor::AsyncPool>,
     /// Lazily-constructed runtime for this single `run()` call, used when the
@@ -449,6 +458,15 @@ pub struct StreamCtx<'a> {
 impl StreamCtx<'_> {
     pub fn buffer_size(&self, parallelism: usize) -> usize {
         self.config.buffer_size.max(parallelism * 4)
+    }
+
+    /// Returns the compute pool for this run: the user-supplied pool from
+    /// `with_compute_pool`, or the global pool as default.
+    pub fn compute_pool(&self) -> &ComputePool {
+        match &self.compute_pool {
+            Some(p) => p,
+            None => ComputePool::global(),
+        }
     }
 
     /// Acquire an async runtime for this run.
@@ -552,7 +570,7 @@ where
         let buffer = ctx.buffer_size(parallelism);
         let (out_tx, out_rx) = channel::<(u64, M)>(buffer);
         let _wg = spawn_stage(
-            ComputePool::global(),
+            ctx.compute_pool(),
             mid_rx,
             out_tx,
             parallelism,
@@ -615,7 +633,7 @@ where
         let buffer = ctx.buffer_size(parallelism);
         let (out_tx, out_rx) = channel::<(u64, N)>(buffer);
         let _wg = spawn_expand_stage(
-            ComputePool::global(),
+            ctx.compute_pool(),
             mid_rx,
             out_tx,
             parallelism,
@@ -907,6 +925,40 @@ impl<S, I, O> StreamPipe<S, I, O> {
         self
     }
 
+    /// Attach a custom [`ComputePool`] for sync stages. When omitted, sync
+    /// stages run on the global pool (sized to `num_cpus`).
+    ///
+    /// The primary use case is **oversubscribing threads for blocking-IO sync
+    /// stages**: the global pool has one thread per core, which caps blocking
+    /// concurrency at `num_cpus`. For workloads that mix blocking IO into a
+    /// sync `.stage()` (rather than using `.stage_async()`), a larger pool
+    /// (e.g. `ComputePool::new(512)`) matches tokio's `spawn_blocking`
+    /// behaviour.
+    ///
+    /// `ComputePool` is cheap to clone (`Arc` + one atomic), so the pool can
+    /// be created once and reused across many `run()` calls — important for
+    /// tight loops where per-call pool construction (~ms) would dominate.
+    ///
+    /// ```rust
+    /// use youpipe::{stream, ComputePool};
+    ///
+    /// let pool = ComputePool::new(128);
+    /// let result = stream(0..100)
+    ///     .with_compute_pool(pool)
+    ///     .stage(|x: u64| x + 1)
+    ///     .run();
+    /// ```
+    #[must_use]
+    pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
+        // Sync config.compute_workers to the pool's actual thread count so
+        // per_stage_parallelism (computed in run() as compute_workers /
+        // worker_stages) matches the available parallelism. Without this,
+        // a 512-thread pool would still only get num_cpus worker jobs.
+        self.config.compute_workers = pool.num_workers();
+        self.compute_pool = Some(pool);
+        self
+    }
+
     /// Append a synchronous CPU stage: `Fn(O) -> N`. Runs on the work-stealing
     /// [`ComputePool`]; the output type changes to `N`.
     pub fn stage<N>(
@@ -924,6 +976,7 @@ impl<S, I, O> StreamPipe<S, I, O> {
             },
             config: self.config,
             cancel: self.cancel,
+            compute_pool: self.compute_pool,
             #[cfg(feature = "tokio-runtime")]
             async_pool: self.async_pool,
             ordered: self.ordered,
@@ -949,6 +1002,7 @@ impl<S, I, O> StreamPipe<S, I, O> {
             },
             config: self.config,
             cancel: self.cancel,
+            compute_pool: self.compute_pool,
             #[cfg(feature = "tokio-runtime")]
             async_pool: self.async_pool,
             ordered: self.ordered,
@@ -996,6 +1050,7 @@ impl<S, I, O> StreamPipe<S, I, O> {
             },
             config: self.config,
             cancel: self.cancel,
+            compute_pool: self.compute_pool,
             #[cfg(feature = "tokio-runtime")]
             async_pool: self.async_pool,
             ordered: self.ordered,
@@ -1028,6 +1083,7 @@ impl<S, I, O> StreamPipe<S, I, O> {
             },
             config: self.config,
             cancel: self.cancel,
+            compute_pool: self.compute_pool,
             async_pool: self.async_pool,
             ordered: self.ordered,
             _marker: PhantomData,
@@ -1058,6 +1114,7 @@ where
             stages,
             config,
             cancel,
+            compute_pool,
             #[cfg(feature = "tokio-runtime")]
             async_pool,
             ordered,
@@ -1077,6 +1134,7 @@ where
             cancel,
             n,
             per_stage_parallelism,
+            compute_pool,
             #[cfg(feature = "tokio-runtime")]
             async_pool,
             #[cfg(feature = "tokio-runtime")]

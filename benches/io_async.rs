@@ -127,6 +127,28 @@ fn bench_pure_io_async(c: &mut Criterion) {
             },
         );
 
+        // youpipe sync stream with oversubscribed pool (512 threads). This
+        // matches tokio's spawn_blocking pool size, giving a fair comparison
+        // for the "blocking IO on sync stages" use case. It demonstrates
+        // `with_compute_pool` — the fix for the `youpipe_blocking` gap.
+        {
+            use youpipe::ComputePool;
+            let pool = ComputePool::new(512);
+            group.bench_with_input(
+                BenchmarkId::new("youpipe_blocking_oversub", size),
+                &tasks,
+                |b, tasks| {
+                    b.iter(|| {
+                        let r = stream(tasks.clone())
+                            .with_compute_pool(pool.clone())
+                            .stage(|(x, dur): (u64, Duration)| bb(blocking_io(x, dur)))
+                            .run();
+                        bb(r)
+                    });
+                },
+            );
+        }
+
         // tokio-native async: spawn one task per item (async sleep). This is
         // the async ceiling — unbounded concurrency with no channel handoff.
         let rt = tokio::runtime::Runtime::new().unwrap();
