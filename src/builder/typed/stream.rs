@@ -64,25 +64,33 @@ where
     let stage = Arc::new(stage);
     let wg = SharedWaitGroup::new();
     wg.add(parallelism);
-    for _ in 0..parallelism {
-        let stage = stage.clone();
-        let rx = rx.clone();
-        let tx = tx.clone();
-        let wg = wg.clone();
-        let worker_cancel = cancel.clone();
-        pool.submit(move || {
-            while let Ok((seq, item)) = rx.recv() {
-                if cancel_active(worker_cancel.as_ref()) {
-                    break;
+    // Collect all worker closures and submit as a single batch. This reduces
+    // injector-queue notification overhead from N SeqCst fences + N JEC
+    // increments (one per `submit`) down to 1 (one `submit_batch`), which
+    // measurably helps the small-workload case where per-run fixed cost
+    // dominates.
+    let jobs: Vec<_> = (0..parallelism)
+        .map(|_| {
+            let stage = stage.clone();
+            let rx = rx.clone();
+            let tx = tx.clone();
+            let wg = wg.clone();
+            let worker_cancel = cancel.clone();
+            move || {
+                while let Ok((seq, item)) = rx.recv() {
+                    if cancel_active(worker_cancel.as_ref()) {
+                        break;
+                    }
+                    let output = stage(item);
+                    if tx.send((seq, output)).is_err() {
+                        break;
+                    }
                 }
-                let output = stage(item);
-                if tx.send((seq, output)).is_err() {
-                    break;
-                }
+                wg.done();
             }
-            wg.done();
-        });
-    }
+        })
+        .collect();
+    pool.submit_batch(jobs);
     drop(rx);
     drop(tx);
     wg
@@ -107,26 +115,29 @@ where
     let expand = Arc::new(expand);
     let wg = SharedWaitGroup::new();
     wg.add(parallelism);
-    for _ in 0..parallelism {
-        let expand = expand.clone();
-        let rx = rx.clone();
-        let tx = tx.clone();
-        let wg = wg.clone();
-        let worker_cancel = cancel.clone();
-        pool.submit(move || {
-            while let Ok((seq, item)) = rx.recv() {
-                if cancel_active(worker_cancel.as_ref()) {
-                    break;
-                }
-                for n in expand(item) {
-                    if tx.send((seq, n)).is_err() {
+    let jobs: Vec<_> = (0..parallelism)
+        .map(|_| {
+            let expand = expand.clone();
+            let rx = rx.clone();
+            let tx = tx.clone();
+            let wg = wg.clone();
+            let worker_cancel = cancel.clone();
+            move || {
+                while let Ok((seq, item)) = rx.recv() {
+                    if cancel_active(worker_cancel.as_ref()) {
                         break;
                     }
+                    for n in expand(item) {
+                        if tx.send((seq, n)).is_err() {
+                            break;
+                        }
+                    }
                 }
+                wg.done();
             }
-            wg.done();
-        });
-    }
+        })
+        .collect();
+    pool.submit_batch(jobs);
     drop(rx);
     drop(tx);
     wg
