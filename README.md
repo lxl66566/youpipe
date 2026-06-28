@@ -122,15 +122,23 @@ streaming `stream()` — single sync stage (`cpu_work`, 100 iters/item):
 | 10K  | 10.4 ms | 24.4 ms              |
 | 100K | 98.8 ms | 225 ms               |
 
-Async IO (`tokio::time::sleep`, ~1 ms latency, 90/10 tail, `io_concurrency = 512`), 500 items:
+Pure async IO (`tokio::time::sleep`, ~1 ms latency, 90/10 tail, 500 items):
+
+| Topology                               | Time    |
+| -------------------------------------- | ------- |
+| youpipe: async IO (`.stage_async`)     | 9.65 ms |
+| tokio: native async                    | 9.33 ms |
+| youpipe: blocking IO (`.stage`)        | 33.1 ms |
+| youpipe: blocking IO (oversub 512 thr) | 19.5 ms |
+| tokio: spawn_blocking                  | 8.81 ms |
+
+Mixed CPU + IO (two stages, 500 items):
 
 | Topology                              | Time    |
 | ------------------------------------- | ------- |
-| youpipe: pure async IO                | 9.61 ms |
-| tokio: native async                   | 9.33 ms |
-| youpipe: mixed sync CPU + async IO    | 9.99 ms |
+| youpipe: sync CPU + async IO          | 9.99 ms |
 | tokio: mixed spawn_blocking           | 10.1 ms |
-| youpipe: mixed sync CPU + blocking IO | 60.0 ms |
+| youpipe: sync CPU + blocking IO       | 60.0 ms |
 
 ## Advanced usage
 
@@ -166,6 +174,13 @@ let token = CancellationToken::new();
 let r = (0..10_000).stream()
     .with_cancel(token.clone())
     .stage(|x| expensive(x))
+    .run();
+
+// Oversubscribed compute pool for blocking-IO sync stages
+let pool = ComputePool::new(512);
+let r = (0..1000).stream()
+    .with_compute_pool(pool)
+    .stage(|x| blocking_io(x))
     .run();
 ```
 

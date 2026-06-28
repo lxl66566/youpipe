@@ -9,7 +9,7 @@ use crate::handoff::{AsyncReceiver, async_channel, sync_async_channel};
 use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
-    handoff::{Receiver, Sender, SyncSender, SharedWaitGroup, TryRecvError, channel::channel},
+    handoff::{Receiver, Sender, SharedWaitGroup, SyncSender, TryRecvError, channel::channel},
     state::{FenceBarrier, FenceMode, ReorderBuffer, run_ordered_collect},
     sync::CancellationToken,
 };

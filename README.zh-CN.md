@@ -116,15 +116,23 @@ fused `pipe()` —— 3 轮轻量操作 (`x+1`, `x*3`, `x-2`)：
 | 10K  | 10.4 ms | 24.4 ms              |
 | 100K | 98.8 ms | 225 ms               |
 
-异步 IO（`tokio::time::sleep`，~1 ms 延迟，90/10 尾部，`io_concurrency = 512`），500 项：
+纯异步 IO（`tokio::time::sleep`，~1 ms 延迟，90/10 尾部，500 项）：
 
-| 拓扑                                      | 耗时    |
-| ----------------------------------------- | ------- |
-| youpipe：纯异步 IO                        | 9.61 ms |
-| tokio：原生异步                           | 9.33 ms |
-| youpipe：同步 CPU + 异步 IO 混合          | 9.99 ms |
-| tokio：混合 spawn_blocking                | 10.1 ms |
-| youpipe：同步 CPU + 阻塞 IO（计算线程池） | 60.0 ms |
+| 拓扑                                  | 耗时    |
+| ------------------------------------- | ------- |
+| youpipe：异步 IO（`.stage_async`）    | 9.65 ms |
+| tokio：原生异步                       | 9.33 ms |
+| youpipe：阻塞 IO（`.stage`）          | 33.1 ms |
+| youpipe：阻塞 IO（过订阅 512 线程）   | 19.5 ms |
+| tokio：spawn_blocking                 | 8.81 ms |
+
+CPU + IO 混合（两阶段，500 项）：
+
+| 拓扑                                  | 耗时    |
+| ------------------------------------- | ------- |
+| youpipe：同步 CPU + 异步 IO           | 9.99 ms |
+| tokio：混合 spawn_blocking            | 10.1 ms |
+| youpipe：同步 CPU + 阻塞 IO           | 60.0 ms |
 
 ## 深入用法
 
@@ -159,6 +167,13 @@ let token = CancellationToken::new();
 let r = (0..10_000).stream()
     .with_cancel(token.clone())
     .stage(|x| expensive(x))
+    .run();
+
+// 为阻塞 IO 同步阶段过订阅计算线程池
+let pool = ComputePool::new(512);
+let r = (0..1000).stream()
+    .with_compute_pool(pool)
+    .stage(|x| blocking_io(x))
     .run();
 ```
 
