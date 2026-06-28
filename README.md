@@ -12,8 +12,8 @@ whole chain. Two pipeline engines cover different regimes:
 - `StreamPipe` — channel-backed streaming for cases fusion cannot cover:
   async IO, cancellation, fences, 1-to-N expansion, and more.
 
-A rayon-style work-stealing scheduler (`st3` LIFO deque + `EventCount`)
-handles balanced and unbalanced loads. `scope()` supports non-`'static`
+A rayon-style work-stealing scheduler (`st3` LIFO deque + packed atomic
+sleep counters) handles balanced and unbalanced loads. `scope()` supports non-`'static`
 closures that borrow stack-local data.
 
 Usage: `cargo add youpipe`.

@@ -64,16 +64,14 @@ src/
 ├── executor/
 │   ├── compute/      # st3 work-stealing CPU thread pool
 │   │   ├── mod.rs    # ComputePool unit tests
-│   │   └── worker.rs # ComputePool: Injector/Stealer/EventCount wake/graceful shutdown/join
+│   │   └── worker.rs # ComputePool: Injector/Stealer/sleep counters wake/graceful shutdown/join
 │   ├── async_pool/   # Tokio async task pool (feature-gated)
 │   │   ├── mod.rs
 │   │   └── driver.rs # AsyncPool (tokio::runtime::Handle wrapper)
 │   └── mod.rs
 ├── handoff/          # Data transfer layer
 │   ├── channel.rs    # MPMC channels (crossfire wrapper: sync + async)
-│   ├── ring_buffer.rs # Lock-free SPSC ring buffer (power-of-2, cache-line padded)
-│   ├── batcher.rs    # Auto-batching layer (SharedRingBuffer + BatchConfig)
-│   ├── notify.rs     # EventCount (condvar notify), WaitGroup (counter barrier)
+│   ├── notify.rs     # WaitGroup (counter barrier for stage synchronization)
 │   └── mod.rs
 ├── state/            # Ordered output & streaming execution
 │   ├── reorder.rs    # ReorderBuffer<T> (min-heap for restoring ordered output)
@@ -351,7 +349,7 @@ Worker₃ ←→ Stealer₃
 
 - Built on `st3` (bounded lock-free LIFO deque): each worker has a local LIFO deque (FIFO stealing); other workers steal via `Stealer`
 - Global injector (mutex-protected `VecDeque`) accepts externally submitted tasks and local-queue overflow
-- `EventCount` (condvar) wakes idle workers
+- `EventCount`-style packed atomic counters (`pool/sleep.rs`) wake idle workers
 
 ### Task Submission Flow
 
@@ -391,26 +389,9 @@ Wraps `crossfire` with a unified API:
 
 An additional `closed: Arc<AtomicBool>` flag provides early termination without racing with crossfire's internal disconnect detection.
 
-### 5.2 SPSC Ring Buffer (`ring_buffer.rs`)
+### 5.2 WaitGroup (`notify.rs`)
 
-Lock-free SPSC ring buffer features:
-
-- Capacity must be a power of 2 (masking instead of modulo)
-- `CachePadded<AtomicUsize>` separates head/tail to different cache lines — avoids false sharing
-- `push_batch()` / `pop_batch()` for bulk operations
-- `Drop` impl correctly drops unconsumed elements
-
-### 5.3 EventCount (`notify.rs`)
-
-Condvar wrapper for ComputePool worker wake-up:
-
-- `notify()` / `notify_one()` → increment state + condvar wake
-- `wait()` → remember current state key, condvar wait until key changes
-- Uses `parking_lot::{Condvar, Mutex}` directly (the `cfg(miri)` mutex switch lives in `pool/sys`, used by the injector)
-
-### 5.4 WaitGroup (`notify.rs`)
-
-Counter barrier: `add(n)` increments, `done()` decrements, `wait()` blocks until zero. When count transitions 1→0, condvar broadcasts.
+Counter barrier: `add(n)` increments, `done()` decrements, `wait()` blocks until zero. When count transitions 1→0, condvar broadcasts. Used internally by streaming stages to track worker completion.
 
 ---
 

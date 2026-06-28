@@ -43,8 +43,7 @@ pub use builder::{
 pub use executor::AsyncPool;
 pub use executor::ComputePool;
 pub use handoff::{
-    AsyncReceiver, AsyncSender, BatchConfig, Receiver, Sender, SharedBatcher, SharedRingBuffer,
-    SharedWaitGroup, async_channel, channel,
+    AsyncReceiver, AsyncSender, Receiver, Sender, SharedWaitGroup, async_channel, channel,
 };
 pub use runtime::Runtime;
 #[cfg(feature = "tokio-runtime")]
