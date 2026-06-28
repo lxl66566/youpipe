@@ -246,9 +246,9 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crossfire"
-version = "3.1.17"
+version = "3.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec878ae2b1a7e54a960b05f55ab80579e00ffa2064e0b45613ac396a8c57991c"
+checksum = "df981decccf9b846c396ae513b3d2c6a1770d9593c8e47853d8fdb336c7bcb46"
 dependencies = [
  "crossbeam-utils",
  "embed-collections",
@@ -1289,7 +1289,7 @@ checksum = "ed94fce61571a4006852b7389a063ab983c02eb1bb37b47f8272ce92d06d9538"
 
 [[package]]
 name = "youpipe"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "concurrent-queue",
  "criterion",

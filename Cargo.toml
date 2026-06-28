@@ -9,7 +9,7 @@ name         = "youpipe"
 readme       = "README.md"
 repository   = "https://github.com/lxl66566/youpipe"
 rust-version = "1.85"
-version      = "0.2.0"
+version      = "0.3.0"
 
 [features]
 default       = ["tokio-runtime"]
@@ -52,10 +52,6 @@ name    = "async_vs_tokio"
 [[bench]]
 harness = false
 name    = "mixed_load"
-
-[[bench]]
-harness = false
-name    = "channel_bench"
 
 [[bench]]
 harness = false
