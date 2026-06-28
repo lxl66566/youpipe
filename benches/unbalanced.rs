@@ -1,8 +1,30 @@
 use std::hint::black_box as bb;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rayon::prelude::*;
 use youpipe::{Workload, pipe, stream};
+
+/// Clone `src` and warm it into cache so the measured time reflects framework
+/// overhead, not allocator/page-fault latency. See `sync_vs_rayon.rs`.
+fn warm_clone_tasks(src: &[(u64, u32)]) -> Vec<(u64, u32)> {
+    let v: Vec<(u64, u32)> = src.to_vec();
+    let mut acc = 0u64;
+    for &(x, _) in &v {
+        acc = acc.wrapping_add(x);
+    }
+    bb(acc);
+    v
+}
+
+fn warm_clone_io_tasks(src: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let v: Vec<(u64, u64)> = src.to_vec();
+    let mut acc = 0u64;
+    for &(x, _) in &v {
+        acc = acc.wrapping_add(x);
+    }
+    bb(acc);
+    v
+}
 
 // ── Workload generators ──
 
@@ -16,11 +38,13 @@ fn cpu_work_variable(x: u64, iterations: u32) -> u64 {
     r
 }
 
-/// Simulated IO work: spin-wait for approximately `micros` microseconds.
-/// Uses a calibration loop to avoid actual sleep (which would be unfair
-/// due to scheduler differences). We use `thread::sleep` with microsecond
-/// granularity to simulate IO latency — this is fair because all frameworks
-/// face the same OS scheduling behavior.
+/// Simulated IO work: blocks for approximately `micros` microseconds.
+///
+/// Note: `thread::sleep` has a granularity of ~50 µs on Linux (CFS timer tick),
+/// so `Duration::from_micros(1)` actually sleeps ~50 µs. This is **consistent**
+/// across all frameworks (they all call the same `thread::sleep`), so relative
+/// comparisons remain fair — but the absolute latency is higher than the
+/// argument suggests.
 fn io_work_variable(x: u64, micros: u64) -> u64 {
     if micros > 0 {
         std::thread::sleep(std::time::Duration::from_micros(micros));
@@ -88,13 +112,17 @@ fn bench_cpu_unbalanced_skewed(c: &mut Criterion) {
             BenchmarkId::new("youpipe_par_map", size),
             &tasks,
             |b, tasks| {
-                b.iter(|| {
-                    let r = pipe(tasks.clone())
-                        .with_workload(Workload::Unbalanced)
-                        .map(|(x, iters)| bb(cpu_work_variable(x, iters)))
-                        .collect();
-                    bb(r)
-                });
+                b.iter_batched(
+                    || warm_clone_tasks(tasks),
+                    |v| {
+                        let r = pipe(v)
+                            .with_workload(Workload::Unbalanced)
+                            .map(|(x, iters)| bb(cpu_work_variable(x, iters)))
+                            .collect();
+                        bb(r)
+                    },
+                    BatchSize::PerIteration,
+                );
             },
         );
 
@@ -137,13 +165,17 @@ fn bench_cpu_unbalanced_log_uniform(c: &mut Criterion) {
             BenchmarkId::new("youpipe_par_map", size),
             &tasks,
             |b, tasks| {
-                b.iter(|| {
-                    let r = pipe(tasks.clone())
-                        .with_workload(Workload::Unbalanced)
-                        .map(|(x, iters)| bb(cpu_work_variable(x, iters)))
-                        .collect();
-                    bb(r)
-                });
+                b.iter_batched(
+                    || warm_clone_tasks(tasks),
+                    |v| {
+                        let r = pipe(v)
+                            .with_workload(Workload::Unbalanced)
+                            .map(|(x, iters)| bb(cpu_work_variable(x, iters)))
+                            .collect();
+                        bb(r)
+                    },
+                    BatchSize::PerIteration,
+                );
             },
         );
 
@@ -176,12 +208,16 @@ fn bench_cpu_unbalanced_stream(c: &mut Criterion) {
             BenchmarkId::new("youpipe_stream_unordered", size),
             &tasks,
             |b, tasks| {
-                b.iter(|| {
-                    let r = stream(tasks.clone())
-                        .stage(|(x, iters): (u64, u32)| bb(cpu_work_variable(x, iters)))
-                        .run();
-                    bb(r)
-                });
+                b.iter_batched(
+                    || warm_clone_tasks(tasks),
+                    |v| {
+                        let r = stream(v)
+                            .stage(|(x, iters): (u64, u32)| bb(cpu_work_variable(x, iters)))
+                            .run();
+                        bb(r)
+                    },
+                    BatchSize::PerIteration,
+                );
             },
         );
 
@@ -189,13 +225,17 @@ fn bench_cpu_unbalanced_stream(c: &mut Criterion) {
             BenchmarkId::new("youpipe_stream_ordered", size),
             &tasks,
             |b, tasks| {
-                b.iter(|| {
-                    let r = stream(tasks.clone())
-                        .stage(|(x, iters): (u64, u32)| bb(cpu_work_variable(x, iters)))
-                        .ordered()
-                        .run();
-                    bb(r)
-                });
+                b.iter_batched(
+                    || warm_clone_tasks(tasks),
+                    |v| {
+                        let r = stream(v)
+                            .stage(|(x, iters): (u64, u32)| bb(cpu_work_variable(x, iters)))
+                            .ordered()
+                            .run();
+                        bb(r)
+                    },
+                    BatchSize::PerIteration,
+                );
             },
         );
 
@@ -237,12 +277,16 @@ fn bench_io_unbalanced(c: &mut Criterion) {
             BenchmarkId::new("youpipe_stream_unordered", size),
             &tasks,
             |b, tasks| {
-                b.iter(|| {
-                    let r = stream(tasks.clone())
-                        .stage(|(x, micros): (u64, u64)| bb(io_work_variable(x, micros)))
-                        .run();
-                    bb(r)
-                });
+                b.iter_batched(
+                    || warm_clone_io_tasks(tasks),
+                    |v| {
+                        let r = stream(v)
+                            .stage(|(x, micros): (u64, u64)| bb(io_work_variable(x, micros)))
+                            .run();
+                        bb(r)
+                    },
+                    BatchSize::PerIteration,
+                );
             },
         );
 
@@ -250,13 +294,17 @@ fn bench_io_unbalanced(c: &mut Criterion) {
             BenchmarkId::new("youpipe_stream_ordered", size),
             &tasks,
             |b, tasks| {
-                b.iter(|| {
-                    let r = stream(tasks.clone())
-                        .stage(|(x, micros): (u64, u64)| bb(io_work_variable(x, micros)))
-                        .ordered()
-                        .run();
-                    bb(r)
-                });
+                b.iter_batched(
+                    || warm_clone_io_tasks(tasks),
+                    |v| {
+                        let r = stream(v)
+                            .stage(|(x, micros): (u64, u64)| bb(io_work_variable(x, micros)))
+                            .ordered()
+                            .run();
+                        bb(r)
+                    },
+                    BatchSize::PerIteration,
+                );
             },
         );
 

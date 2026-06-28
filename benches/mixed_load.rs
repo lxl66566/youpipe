@@ -1,6 +1,6 @@
 use std::hint::black_box as bb;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rayon::prelude::*;
 use youpipe::stream;
 
@@ -10,6 +10,20 @@ fn cpu_work(x: u64) -> u64 {
         r = r.wrapping_mul(7).wrapping_add(13);
     }
     r
+}
+
+/// Clone `src` and warm it into cache. See `sync_vs_rayon.rs` for rationale:
+/// `stream()` takes ownership (needs a fresh Vec per iteration) whereas rayon
+/// borrows warm data — without warming, the fresh clone arrives cold-from-RAM
+/// and the measured time is dominated by allocator/page-fault latency.
+fn warm_clone(src: &[u64]) -> Vec<u64> {
+    let v: Vec<u64> = src.to_vec();
+    let mut acc = 0u64;
+    for x in &v {
+        acc = acc.wrapping_add(*x);
+    }
+    bb(acc);
+    v
 }
 
 fn bench_mixed_load(c: &mut Criterion) {
@@ -24,10 +38,14 @@ fn bench_mixed_load(c: &mut Criterion) {
             BenchmarkId::new("youpipe_stream_cpu", size),
             &data,
             |b, data| {
-                b.iter(|| {
-                    let r = stream(data.clone()).stage(|x: u64| bb(cpu_work(x))).run();
-                    bb(r)
-                });
+                b.iter_batched(
+                    || warm_clone(data),
+                    |v| {
+                        let r = stream(v).stage(|x: u64| bb(cpu_work(x))).run();
+                        bb(r)
+                    },
+                    BatchSize::PerIteration,
+                );
             },
         );
 
