@@ -85,7 +85,7 @@ let r: Vec<usize> = scope(|s| {
 
 7945HX 32-Core Linux，详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#9-performance-benchmarks)。
 
-fused `pipe()` —— CPU 密集型操作（每元素 100 次迭代）：
+fused `pipe()` —— CPU 密集型操作（每元素 100 次迭代，热输入）：
 
 | 规模 | youpipe | rayon  |
 | ---- | ------- | ------ |
@@ -93,7 +93,7 @@ fused `pipe()` —— CPU 密集型操作（每元素 100 次迭代）：
 | 10K  | 73 µs   | 73 µs  |
 | 100K | 108 µs  | 148 µs |
 
-fused `pipe()` —— 轻量操作 `x+1`：
+fused `pipe()` —— 轻量操作 `x+1`（热输入）：
 
 | 规模 | youpipe | rayon  |
 | ---- | ------- | ------ |
@@ -112,10 +112,11 @@ fused `pipe()` —— 3 轮轻量操作 (`x+1`, `x*3`, `x-2`)：
 
 | 规模 | youpipe | tokio spawn_blocking |
 | ---- | ------- | -------------------- |
-| 1K   | 801 µs  | 2.45 ms              |
-| 10K  | 7.73 ms | 23.2 ms              |
+| 1K   | 1.05 ms | 2.43 ms              |
+| 10K  | 10.4 ms | 24.4 ms              |
+| 100K | 98.8 ms | 225 ms               |
 
-异步 IO（`tokio::time::sleep`，~1 ms 延迟，`io_concurrency = 512`），500 项：
+异步 IO（`tokio::time::sleep`，~1 ms 延迟，90/10 尾部，`io_concurrency = 512`），500 项：
 
 | 拓扑                                      | 耗时    |
 | ----------------------------------------- | ------- |

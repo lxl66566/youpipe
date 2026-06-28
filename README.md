@@ -91,7 +91,7 @@ let r: Vec<usize> = scope(|s| {
 
 7945HX 32-core Linux. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#9-performance-benchmarks).
 
-fused `pipe()` — CPU-heavy (100 iters/item):
+fused `pipe()` — CPU-heavy (100 iters/item, warm input):
 
 | Size | youpipe | rayon  |
 | ---- | ------- | ------ |
@@ -99,7 +99,7 @@ fused `pipe()` — CPU-heavy (100 iters/item):
 | 10K  | 73 µs   | 73 µs  |
 | 100K | 108 µs  | 148 µs |
 
-fused `pipe()` — lightweight `x+1`:
+fused `pipe()` — lightweight `x+1` (warm input):
 
 | Size | youpipe | rayon  |
 | ---- | ------- | ------ |
@@ -118,10 +118,11 @@ streaming `stream()` — single sync stage (`cpu_work`, 100 iters/item):
 
 | Size | youpipe | tokio spawn_blocking |
 | ---- | ------- | -------------------- |
-| 1K   | 801 µs  | 2.45 ms              |
-| 10K  | 7.73 ms | 23.2 ms              |
+| 1K   | 1.05 ms | 2.43 ms              |
+| 10K  | 10.4 ms | 24.4 ms              |
+| 100K | 98.8 ms | 225 ms               |
 
-Async IO (`tokio::time::sleep`, ~1 ms latency, `io_concurrency = 512`), 500 items:
+Async IO (`tokio::time::sleep`, ~1 ms latency, 90/10 tail, `io_concurrency = 512`), 500 items:
 
 | Topology                              | Time    |
 | ------------------------------------- | ------- |

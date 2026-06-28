@@ -5,9 +5,7 @@ use std::sync::OnceLock;
 use std::{marker::PhantomData, sync::Arc};
 
 #[cfg(feature = "tokio-runtime")]
-use crate::handoff::{
-    AsyncReceiver, TryRecvError, async_channel, sync_async_channel,
-};
+use crate::handoff::{AsyncReceiver, TryRecvError, async_channel, sync_async_channel};
 use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
@@ -310,11 +308,7 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     /// tokio task) and delegates to [`Self::spawn`]. Stages whose immediate
     /// consumer is async should override to skip the bridge.
     #[cfg(feature = "tokio-runtime")]
-    fn spawn_async_feeder(
-        self,
-        rx: AsyncReceiver<(u64, In)>,
-        ctx: &StreamCtx,
-    ) -> FinalRx<Self::Out>
+    fn spawn_async_feeder(self, rx: AsyncReceiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<Self::Out>
     where
         Self: Sized,
     {
@@ -324,9 +318,7 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (s_tx, s_rx) = channel::<(u64, In)>(buffer);
         let cancel = ctx.cancel.clone();
-        let pool = ctx
-            .acquire_async()
-            .expect("failed to build async runtime");
+        let pool = ctx.acquire_async().expect("failed to build async runtime");
         let _enter = pool.handle().enter();
         tokio::spawn(async move {
             while let Ok(item) = rx.recv().await {
@@ -436,11 +428,7 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
         None
     }
     #[cfg(feature = "tokio-runtime")]
-    fn spawn_async_feeder(
-        self,
-        rx: AsyncReceiver<(u64, I)>,
-        _ctx: &StreamCtx,
-    ) -> FinalRx<I> {
+    fn spawn_async_feeder(self, rx: AsyncReceiver<(u64, I)>, _ctx: &StreamCtx) -> FinalRx<I> {
         // Identity — pass the async feeder rx through unchanged so the
         // wrapping AsyncStage can consume it directly. This is the key
         // hop-elimination: when the chain is `stream(..).stage_async(..)`,
@@ -659,11 +647,7 @@ where
         self.prev.first_consumer_is_async().or(Some(true))
     }
 
-    fn spawn_async_feeder(
-        self,
-        rx: AsyncReceiver<(u64, In)>,
-        ctx: &StreamCtx,
-    ) -> FinalRx<M> {
+    fn spawn_async_feeder(self, rx: AsyncReceiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<M> {
         // Recurse via `spawn_async_feeder`. When prev is `StreamStart`, this
         // returns the feeder rx unchanged as `FinalRx::Async` — letting us
         // consume it directly and skip the sync→async bridge entirely. Other
@@ -761,9 +745,7 @@ where
             // that converts the MPMC upstream into a single-waker source for
             // the consumer fan-out. Keep it.
             let (a_in_tx, a_in_rx) = async_channel::<(u64, Prev::Out)>(buffer);
-            let pool = ctx
-                .acquire_async()
-                .expect("failed to build async runtime");
+            let pool = ctx.acquire_async().expect("failed to build async runtime");
             let _enter = pool.handle().enter();
             tokio::spawn(async move {
                 while let Ok(item) = prev_async_rx.recv().await {
@@ -1160,8 +1142,8 @@ fn collect_sync<T: Send + Unpin + 'static>(
 /// after the first is already queued. The unordered path therefore drains
 /// in two phases per burst:
 ///
-///   1. Spin `try_recv` until `Empty` — no `await`, no waker registration,
-///      just non-blocking pops at ~atomic-op cost.
+///   1. Spin `try_recv` until `Empty` — no `await`, no waker registration, just
+///      non-blocking pops at ~atomic-op cost.
 ///   2. When the queue is drained but the channel is still open, `recv().await`
 ///      exactly once to register a waker and yield until the next item lands.
 ///      Then loop back to step 1.

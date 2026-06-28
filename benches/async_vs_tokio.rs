@@ -13,7 +13,10 @@ fn cpu_work(x: u64) -> u64 {
 
 fn bench_stream_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("stream_pipeline");
-    for size in [1_000, 10_000] {
+    // 1K → 10K → 100K: spans the setup-dominated to channel-bandwidth-bound
+    // regime. Above 100K the channel handoff cost is fully amortised and the
+    // numbers stop surfacing new information, so 100K is the upper anchor.
+    for size in [1_000, 10_000, 100_000] {
         let data: Vec<u64> = (0..size).collect();
 
         group.throughput(Throughput::Elements(size));
@@ -70,7 +73,7 @@ fn bench_tokio_spawn_blocking(c: &mut Criterion) {
     let mut group = c.benchmark_group("tokio_spawn_blocking");
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    for size in [1_000, 10_000] {
+    for size in [1_000, 10_000, 100_000] {
         group.throughput(Throughput::Elements(size as u64));
         group.bench_function(BenchmarkId::new("spawn_blocking_cpu", size), |b| {
             b.iter(|| {

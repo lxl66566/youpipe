@@ -14,7 +14,9 @@ fn cpu_work(x: u64) -> u64 {
 
 fn bench_mixed_load(c: &mut Criterion) {
     let mut group = c.benchmark_group("mixed_load");
-    for size in [100usize, 500, 1000] {
+    // 1K → 10K → 100K: aligned with `async_vs_tokio` so the streaming-CPU
+    // story reads off one consistent size axis across both benches.
+    for size in [1_000usize, 10_000, 100_000] {
         let data: Vec<u64> = (0..size as u64).collect();
 
         group.throughput(Throughput::Elements(size as u64));

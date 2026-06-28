@@ -521,13 +521,16 @@ rayon on an equally-cold clone measures ~800 µs at 1M.
 
 | Size | youpipe stream | spawn_blocking | rayon (CPU-only) | Result |
 |---|---|---|---|---|
-| 100 | ~129 µs | ~229 µs | ~19 µs | **youpipe ~1.8× faster** than tokio |
-| 500 | ~418 µs | ~1.25 ms | ~29 µs | **youpipe ~3× faster** |
-| 1000 | ~1.0 ms | ~2.5 ms | ~37 µs | **youpipe ~2.5× faster** |
+| 1K | ~1.09 ms | ~2.53 ms | ~36 µs | **youpipe ~2.3× faster** than tokio |
+| 10K | ~10.6 ms | ~24.8 ms | ~64 µs | **youpipe ~2.3× faster** |
+| 100K | ~107 ms | ~241 ms | ~103 µs | **youpipe ~2.3× faster** |
 
-`StreamPipe` comfortably beats `tokio::spawn_blocking` (the design target for
-mixed CPU/IO). `rayon::par_iter` is fastest here because this benchmark is
-pure-CPU and rayon's direct fork-join skips channel handoff entirely.
+`StreamPipe` comfortably and **stably** beats `tokio::spawn_blocking` (the
+design target for mixed CPU/IO) by ~2.3× at every size — the ratio holds
+from 1K to 100K because both frameworks amortise per-item overhead at the
+same rate, so the constant-factor channel/spawn advantage is preserved.
+`rayon::par_iter` is fastest here because this benchmark is pure-CPU and
+rayon's direct fork-join skips channel handoff entirely.
 
 ### Async IO — `.stage_async()` (`io_async`, yielding IO)
 
