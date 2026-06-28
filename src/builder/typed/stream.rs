@@ -37,6 +37,35 @@ fn cancel_active(cancel: Option<&CancellationToken>) -> bool {
     cancel.is_some_and(CancellationToken::is_cancelled)
 }
 
+/// Bridge an [`AsyncReceiver`] to a sync [`Receiver`] via a dedicated OS
+/// thread that runs `block_on` and forwards items. Used when a sync stage
+/// (sync / expand / fence) follows an async stage in the chain — the previous
+/// stage's output arrives on an async channel but this stage's workers expect a
+/// sync one.
+#[cfg(feature = "tokio-runtime")]
+fn bridge_async_to_sync<T: Send + Unpin + 'static>(
+    rx: AsyncReceiver<(u64, T)>,
+    ctx: &StreamCtx,
+) -> Receiver<(u64, T)> {
+    let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
+    let (s_tx, s_rx) = channel::<(u64, T)>(buffer);
+    let cancel = ctx.cancel.clone();
+    let pool = ctx.acquire_async().expect("failed to build async runtime");
+    std::thread::spawn(move || {
+        pool.block_on(async move {
+            while let Ok(item) = rx.recv().await {
+                if cancel_active(cancel.as_ref()) {
+                    return;
+                }
+                if s_tx.send(item).is_err() {
+                    return;
+                }
+            }
+        });
+    });
+    s_rx
+}
+
 /// Handle returned by [`feed_items`]: either an inline push (already done,
 /// nothing to join) or a spawned feeder thread.
 enum Feeder {
@@ -554,27 +583,7 @@ where
         let mid_rx = match prev_rx {
             FinalRx::Sync(r) => r,
             #[cfg(feature = "tokio-runtime")]
-            FinalRx::Async(r) => {
-                // async → sync bridge: dedicated thread runs `block_on` on the
-                // async receiver and forwards to a sync sender.
-                let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
-                let (s_tx, s_rx) = channel::<(u64, Prev::Out)>(buffer);
-                let cancel = ctx.cancel.clone();
-                let pool = ctx.acquire_async().expect("failed to build async runtime");
-                std::thread::spawn(move || {
-                    pool.block_on(async move {
-                        while let Ok(item) = r.recv().await {
-                            if cancel_active(cancel.as_ref()) {
-                                return;
-                            }
-                            if s_tx.send(item).is_err() {
-                                return;
-                            }
-                        }
-                    });
-                });
-                s_rx
-            }
+            FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
         };
 
         let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
@@ -621,25 +630,7 @@ where
         let mid_rx = match prev_rx {
             FinalRx::Sync(r) => r,
             #[cfg(feature = "tokio-runtime")]
-            FinalRx::Async(r) => {
-                let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
-                let (s_tx, s_rx) = channel::<(u64, Prev::Out)>(buffer);
-                let cancel = ctx.cancel.clone();
-                let pool = ctx.acquire_async().expect("failed to build async runtime");
-                std::thread::spawn(move || {
-                    pool.block_on(async move {
-                        while let Ok(item) = r.recv().await {
-                            if cancel_active(cancel.as_ref()) {
-                                return;
-                            }
-                            if s_tx.send(item).is_err() {
-                                return;
-                            }
-                        }
-                    });
-                });
-                s_rx
-            }
+            FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
         };
 
         let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
@@ -682,25 +673,7 @@ where
         let mid_rx = match prev_rx {
             FinalRx::Sync(r) => r,
             #[cfg(feature = "tokio-runtime")]
-            FinalRx::Async(r) => {
-                let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
-                let (s_tx, s_rx) = channel::<(u64, Prev::Out)>(buffer);
-                let cancel = ctx.cancel.clone();
-                let pool = ctx.acquire_async().expect("failed to build async runtime");
-                std::thread::spawn(move || {
-                    pool.block_on(async move {
-                        while let Ok(item) = r.recv().await {
-                            if cancel_active(cancel.as_ref()) {
-                                return;
-                            }
-                            if s_tx.send(item).is_err() {
-                                return;
-                            }
-                        }
-                    });
-                });
-                s_rx
-            }
+            FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
         };
 
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
