@@ -9,7 +9,7 @@ use crate::handoff::{AsyncReceiver, TryRecvError, async_channel, sync_async_chan
 use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
-    handoff::{Receiver, Sender, SharedWaitGroup, channel::channel},
+    handoff::{Receiver, Sender, SyncSender, SharedWaitGroup, channel::channel},
     state::{FenceBarrier, FenceMode, ReorderBuffer, run_ordered_collect},
     sync::CancellationToken,
 };
@@ -35,6 +35,66 @@ use crate::{
 #[inline]
 fn cancel_active(cancel: Option<&CancellationToken>) -> bool {
     cancel.is_some_and(CancellationToken::is_cancelled)
+}
+
+/// Handle returned by [`feed_items`]: either an inline push (already done,
+/// nothing to join) or a spawned feeder thread.
+enum Feeder {
+    Thread(std::thread::JoinHandle<()>),
+    Inline,
+}
+
+impl Feeder {
+    fn join(self) {
+        if let Self::Thread(h) = self {
+            h.join().expect("feeder thread panicked");
+        }
+    }
+}
+
+/// Push `items` into the feeder channel.
+///
+/// When all items fit in the channel buffer (`items.len() ≤ buffer`), push
+/// inline from the calling thread — saving ~20-50 µs of thread-spawn/join
+/// overhead per `run()` call, which is a measurable fraction of small
+/// workloads (e.g. mixed_cpu_io_unbalanced/200 ≈ 680 µs total).
+///
+/// # Deadlock safety
+///
+/// The inline path is safe because `items.len() ≤ buffer` guarantees the
+/// sender never blocks on `Full`: even if every downstream worker is blocked
+/// on the *output* channel, the calling thread finishes pushing, drops the
+/// sender, and proceeds to collect — draining the output and unblocking
+/// workers. With the thread path, the feeder and collector run concurrently
+/// so neither can starve the other.
+fn feed_items<I: Send + 'static>(
+    items: Vec<I>,
+    feeder_tx: SyncSender<(u64, I)>,
+    cancel: Option<CancellationToken>,
+    buffer: usize,
+) -> Feeder {
+    if items.len() <= buffer {
+        for (seq, item) in items.into_iter().enumerate() {
+            if cancel_active(cancel.as_ref()) {
+                break;
+            }
+            if feeder_tx.send((seq as u64, item)).is_err() {
+                break;
+            }
+        }
+        Feeder::Inline
+    } else {
+        Feeder::Thread(std::thread::spawn(move || {
+            for (seq, item) in items.into_iter().enumerate() {
+                if cancel_active(cancel.as_ref()) {
+                    break;
+                }
+                if feeder_tx.send((seq as u64, item)).is_err() {
+                    break;
+                }
+            }
+        }))
+    }
 }
 
 /// Spawn `parallelism` workers on `pool` that pull from `rx`, apply `stage`,
@@ -1039,16 +1099,14 @@ where
         // Both feeder branches share an identical push loop — the only
         // difference is whether the *receiver* end is sync (-> `spawn`) or
         // async (-> `spawn_async_feeder`). The sender side (`SyncSender`) is
-        // the same type either way, so the feeder body is duplicated verbatim
-        // rather than factored into a generic helper that would need a trait
-        // abstraction over the sender (a lot of plumbing for a 5-line loop).
+        // the same type either way, so [`feed_items`] handles both.
         //
         // Without `tokio-runtime`, `AsyncStage` doesn't exist, so
         // `first_consumer_is_async` can never return `Some(true)` and the
         // async branch is unreachable; the `cfg_not` block keeps the function
         // compilable in that configuration.
-        let feeder_cancel = ctx.cancel.clone();
         let async_feeder = stages.first_consumer_is_async() == Some(true);
+        let feeder_cancel = ctx.cancel.clone();
         debug_assert!(
             cfg!(feature = "tokio-runtime") || !async_feeder,
             "first_consumer_is_async == Some(true) requires the tokio-runtime feature"
@@ -1057,22 +1115,24 @@ where
         #[cfg(feature = "tokio-runtime")]
         let (final_rx, feeder) = if async_feeder {
             let (feeder_tx, feeder_rx) = sync_async_channel::<(u64, I)>(buffer);
-            let feeder = std::thread::spawn(move || {
-                for (seq, item) in items.into_iter().enumerate() {
-                    if cancel_active(feeder_cancel.as_ref()) {
-                        break;
-                    }
-                    if feeder_tx.send((seq as u64, item)).is_err() {
-                        break;
-                    }
-                }
-            });
+            // Feed items BEFORE spawning stages: preserves the pre-inline
+            // ordering where the feeder starts while stages are being
+            // submitted. For the inline path, items are already queued when
+            // workers start (no wakeup round-trip). For the thread path, the
+            // feeder pushes concurrently with stage startup.
+            let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
             (stages.spawn_async_feeder(feeder_rx, &ctx), feeder)
         } else {
-            sync_feeder_path(items, feeder_cancel, buffer, stages, &ctx)
+            let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
+            let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
+            (stages.spawn(feeder_rx, &ctx), feeder)
         };
         #[cfg(not(feature = "tokio-runtime"))]
-        let (final_rx, feeder) = sync_feeder_path(items, feeder_cancel, buffer, stages, &ctx);
+        let (final_rx, feeder) = {
+            let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
+            let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
+            (stages.spawn(feeder_rx, &ctx), feeder)
+        };
 
         let results = match final_rx {
             FinalRx::Sync(rx) => collect_sync(rx, ordered, n),
@@ -1083,38 +1143,9 @@ where
             }
         };
 
-        feeder.join().unwrap();
+        feeder.join();
         results
     }
-}
-
-/// Sync-feeder path: build a sync MPMC channel, push `items` from a dedicated
-/// feeder thread, and call `stages.spawn`. Factored out so the
-/// `tokio-runtime` and non-`tokio-runtime` builds of `run` share one source
-/// copy of the body.
-fn sync_feeder_path<S, I>(
-    items: Vec<I>,
-    feeder_cancel: Option<CancellationToken>,
-    buffer: usize,
-    stages: S,
-    ctx: &StreamCtx,
-) -> (FinalRx<S::Out>, std::thread::JoinHandle<()>)
-where
-    S: StageSpawn<I>,
-    I: Send + Unpin + 'static,
-{
-    let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
-    let feeder = std::thread::spawn(move || {
-        for (seq, item) in items.into_iter().enumerate() {
-            if cancel_active(feeder_cancel.as_ref()) {
-                break;
-            }
-            if feeder_tx.send((seq as u64, item)).is_err() {
-                break;
-            }
-        }
-    });
-    (stages.spawn(feeder_rx, ctx), feeder)
 }
 
 /// Sync collector: drains `rx` into a `Vec`. If `ordered`, uses a
