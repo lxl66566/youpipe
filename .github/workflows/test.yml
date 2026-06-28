@@ -23,3 +23,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo nextest run --all-features --no-tests pass && cargo test --doc && cargo check --examples
       - run: cargo clippy --all-features -- -D warnings
+
+  miri:
+    name: cargo miri test
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      # Miri is slow (~minutes per test); run only the unsafe-heavy subset
+      # (pool, slots, handoff, state) to keep CI under ~10 min. The
+      # `.cargo/config.toml` MIRIFLAGS (-Zmiri-ignore-leaks) is applied
+      # automatically for the global pool's intentionally-leaked threads.
+      - run: cargo miri test --lib -- --skip tests_that_need_many_threads

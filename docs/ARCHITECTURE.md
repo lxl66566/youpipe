@@ -242,8 +242,14 @@ impl<S, I, O> Pipe<S, I, O> {
 - **`MAY_FILTER == true`** — `join_fused_collect` recursively halves the `Vec`,
   each leaf filters into a per-leaf `Vec`, results merged by `extend`.
 
-`.try_collect()` always uses the `Vec`-merge path (`join_fused_try_collect`),
-short-circuiting on the first `Err` via `?` and honouring `Filter`.
+`.try_collect()` dispatches on `S::MAY_FILTER`:
+
+- **`MAY_FILTER == false`** — the index-based fast path (`par_index_try_collect`),
+  mirroring `collect()`'s zero-allocation strategy but with `RangeTryOp` /
+  `FusedTryOp` wrappers that short-circuit on `Err`. Each leaf's `TryLeafGuard`
+  cleans up partial output on both panic (unwind) and error (explicit) paths.
+- **`MAY_FILTER == true`** — `join_fused_try_collect` (Vec-merge fallback),
+  short-circuiting on the first `Err` via `?` and honouring `Filter`.
 
 ### 3.6 `StreamPipe` — Streaming Multi-Stage Pipeline
 

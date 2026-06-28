@@ -424,3 +424,61 @@ fn test_prelude_iterext_on_various_sources() {
     let r: Vec<i32> = vec![1, 2, 3].stream().stage(|x: i32| x - 1).ordered().run();
     assert_eq!(r, vec![0, 1, 2]);
 }
+
+// ── Panic propagation ──
+
+#[test]
+fn test_pipe_panic_propagates_parallel() {
+    // Large enough to hit the parallel index-based path (n > serial threshold).
+    // A panicking closure must propagate through the join tree and LeafGuard
+    // cleanup, surfacing as a real panic on the collecting thread.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Vec<i32> = pipe(0..50_000i32)
+            .map(|x| {
+                if x == 25_000 {
+                    panic!("boom at {x}");
+                }
+                x + 1
+            })
+            .collect();
+    }));
+    assert!(result.is_err());
+    let payload = result.unwrap_err();
+    let msg = payload.downcast_ref::<String>().expect("panic payload is String");
+    assert_eq!(msg, "boom at 25000");
+}
+
+#[test]
+fn test_pipe_panic_propagates_serial() {
+    // Small batch: hits the serial fallback loop inside collect().
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Vec<i32> = pipe(0..100i32)
+            .map(|x| {
+                if x == 50 {
+                    panic!("serial boom");
+                }
+                x + 1
+            })
+            .collect();
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_try_collect_panic_propagates() {
+    // Panic inside try_collect's fast path (index-based): the TryLeafGuard
+    // must clean up partial output slots before the panic propagates.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<Vec<i32>, &'static str> = pipe(0..50_000i32)
+            .try_map(|x| -> Result<i32, &'static str> {
+                if x == 25_000 {
+                    panic!("try boom");
+                }
+                Ok(x + 1)
+            })
+            .try_collect();
+    }));
+    assert!(result.is_err());
+    let payload = result.unwrap_err();
+    assert_eq!(*payload.downcast_ref::<&'static str>().unwrap(), "try boom");
+}
