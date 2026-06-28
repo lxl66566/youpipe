@@ -1210,7 +1210,7 @@ where
             FinalRx::Sync(rx) => collect_sync(rx, ordered, n),
             #[cfg(feature = "tokio-runtime")]
             FinalRx::Async(rx) => {
-    let pool = ctx
+                let pool = ctx
         .acquire_async()
         .expect("failed to build tokio runtime (OS resource limit? pass a custom AsyncPool via with_async_pool to handle this)");
                 pool.block_on(collect_async(rx, ordered, n))

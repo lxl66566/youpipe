@@ -195,7 +195,8 @@ fn bench_try_collect(c: &mut Criterion) {
         let data: Vec<u64> = (0..size).collect();
 
         group.throughput(Throughput::Elements(size));
-        // youpipe try_collect (success path — index-based fast path, MAY_FILTER == false)
+        // youpipe try_collect (success path — index-based fast path, MAY_FILTER ==
+        // false)
         group.bench_with_input(
             BenchmarkId::new("youpipe_try_map_warm", size),
             &data,
@@ -217,20 +218,12 @@ fn bench_try_collect(c: &mut Criterion) {
         );
 
         // rayon equivalent: try for each + collect
-        group.bench_with_input(
-            BenchmarkId::new("rayon_try_map", size),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    let r: Vec<u64> = data
-                        .par_iter()
-                        .map(|&x| x + 1)
-                        .map(|x| x * 3)
-                        .collect();
-                    black_box(r)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("rayon_try_map", size), &data, |b, data| {
+            b.iter(|| {
+                let r: Vec<u64> = data.par_iter().map(|&x| x + 1).map(|x| x * 3).collect();
+                black_box(r)
+            });
+        });
     }
     group.finish();
 }

@@ -381,7 +381,6 @@ where
     }
 }
 
-
 //
 // Hypothesis (from hotpath): ~60% of stolen `join` B-jobs force the origin
 // worker into `wait_until_cold`, so a *flat* dispatcher — N disjoint leaf-jobs

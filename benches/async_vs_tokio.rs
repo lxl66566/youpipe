@@ -54,10 +54,7 @@ fn bench_stream_pipeline(c: &mut Criterion) {
                 b.iter_batched(
                     || warm_clone(data),
                     |v| {
-                        let r = stream(v)
-                            .stage(|x: u64| bb(cpu_work(x)))
-                            .ordered()
-                            .run();
+                        let r = stream(v).stage(|x: u64| bb(cpu_work(x))).ordered().run();
                         bb(r)
                     },
                     BatchSize::PerIteration,

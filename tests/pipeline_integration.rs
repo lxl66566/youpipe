@@ -444,7 +444,9 @@ fn test_pipe_panic_propagates_parallel() {
     }));
     assert!(result.is_err());
     let payload = result.unwrap_err();
-    let msg = payload.downcast_ref::<String>().expect("panic payload is String");
+    let msg = payload
+        .downcast_ref::<String>()
+        .expect("panic payload is String");
     assert_eq!(msg, "boom at 25000");
 }
 
