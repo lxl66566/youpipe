@@ -479,6 +479,50 @@ fn split_depth(n: usize, num_threads: usize, oversplit: usize) -> usize {
     by_threads.min(by_len).max(1)
 }
 
+/// Items-per-worker (at oversplit = 1) below which the fork/join tree is built
+/// with `oversplit = 1` instead of [`BALANCED_OVERSPLIT`].
+///
+/// Each internal node of the tree costs ~60-100 ns of dispatch overhead
+/// (StackJob/Latch creation, deque push, `catch_unwind`, probe loop). With
+/// `oversplit = 4` a 32-core pool builds 127 internal nodes — that fixed cost
+/// dominates batches whose own leaf work is sub-microsecond.
+///
+/// When `n / num_threads` is small the per-leaf wall time is short enough that
+/// tail latency from a single slow leaf is negligible, so the extra
+/// stealing slack from `oversplit = 4` is pure overhead. Dropping to
+/// `oversplit = 1` (32 leaves on 32 cores) trims ~95 nodes and measured
+/// −8…−14 % on 10 k batches across `sync_cpu_heavy`, `sync_lightweight`, and
+/// `pipeline_fusion`.
+///
+/// Above this threshold the leaves become long enough (measured cpu_heavy
+/// crossover ~3 k items ⇒ ~150 µs/leaf) that scheduling jitter on the last
+/// finishing worker stretches the tail; reverting to `oversplit = 1` at 100 k
+/// cpu_heavy regressed +12.6 %.
+const LOW_OVERSPLIT_ITEMS_PER_THREAD: usize = 1024;
+
+/// Default oversplit factor for `Workload::Balanced`. A/B-tuned (2026-06,
+/// 32-core): `1` regressed cpu_heavy ~+18 % (too few leaves ⇒ poor load
+/// balancing, longer tail), `8` regressed ~+5.5 % (too many nodes ⇒ per-node
+/// dispatch overhead). `4` (128 leaves on 32 cores) is the sweet spot.
+const BALANCED_OVERSPLIT: usize = 4;
+
+/// Oversplit factor for the fork/join tree, adapting to batch size.
+///
+/// See [`LOW_OVERSPLIT_ITEMS_PER_THREAD`] for the rationale. `Unbalanced`
+/// always uses `8` for the stealing slack its expensive tail needs.
+fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize {
+    match workload {
+        Workload::Balanced => {
+            if n / num_threads.max(1) <= LOW_OVERSPLIT_ITEMS_PER_THREAD {
+                1
+            } else {
+                BALANCED_OVERSPLIT
+            }
+        }
+        Workload::Unbalanced => 8,
+    }
+}
+
 /// Recursive merge-based collect for fused stages that may filter. Used only as
 /// the `MAY_FILTER == true` fallback; output cardinality is unknown up front so
 /// each leaf produces its own `Vec` and results are concatenated.
@@ -733,16 +777,11 @@ where
                 .collect();
         }
 
-        // `oversplit` = tasks-per-worker for the fork/join tree. A/B-tuned
-        // (2026-06, 32-core): Balanced `1` regressed cpu_heavy ~+18 % (too few
-        // leaves ⇒ poor load balancing, longer tail), `8` regressed ~+5.5 %
-        // (too many nodes ⇒ per-node dispatch overhead). `4` (128 leaves on 32
-        // cores) is the sweet spot. Unbalanced keeps `8` for the stealing slack
-        // its expensive tail needs.
-        let oversplit = match self.config.workload {
-            Workload::Balanced => 4,
-            Workload::Unbalanced => 8,
-        };
+        // `oversplit` = tasks-per-worker for the fork/join tree. Adaptive:
+        // small batches (≤ `LOW_OVERSPLIT_ITEMS_PER_THREAD` per worker) use
+        // `1` to minimise join-dispatch overhead; larger batches use
+        // `BALANCED_OVERSPLIT` for stealing slack. See `workload_oversplit`.
+        let oversplit = workload_oversplit(n, num_threads, self.config.workload);
         let splits = split_depth(n, num_threads, oversplit);
 
         if S::MAY_FILTER {
@@ -898,10 +937,7 @@ where
             return Ok(out);
         }
 
-        let oversplit = match self.config.workload {
-            Workload::Balanced => 4,
-            Workload::Unbalanced => 8,
-        };
+        let oversplit = workload_oversplit(n, num_threads, self.config.workload);
         let splits = split_depth(n, num_threads, oversplit);
         if S::MAY_FILTER {
             join_fused_try_collect(items, &self.stages, splits)
@@ -956,10 +992,7 @@ where
             .map(|item| stages.apply_pure(item))
             .collect();
     }
-    let oversplit = match workload {
-        Workload::Balanced => 4,
-        Workload::Unbalanced => 8,
-    };
+    let oversplit = workload_oversplit(n, num_threads, workload);
     let splits = split_depth(n, num_threads, oversplit);
     if S::MAY_FILTER {
         join_fused_collect(items, &stages, splits)

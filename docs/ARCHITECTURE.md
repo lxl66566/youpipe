@@ -1,4 +1,4 @@
-# youpipe v0.2.0 — Internal Architecture
+# youpipe internal
 
 This document is for contributors and developers who want to understand how youpipe works internally, why certain design decisions were made, and how to extend the system.
 
@@ -174,13 +174,13 @@ tracks the latest transform's output, so `.map(i32 -> String)` then
 
 **Type transition chain** (`I₀` = initial input):
 
-| Method call | Type change |
-|---|---|
-| `pipe(items)` | `Pipe<Identity, I₀, I₀>` |
-| `.map(\|x\| f(x))` | `Pipe<SyncMap<Identity, F>, I₀, O>` |
-| `.map(\|x\| g(x))` | `Pipe<SyncMap<...>, I₀, N>` (output type changes) |
-| `.filter(\|x\| p(x))` | `Pipe<Filter<...>, I₀, O>` (output unchanged) |
-| `.try_map(\|x\| …)` | `TryPipe<TryMap<InfallibleChain<S, E>, F>, I₀, N, E>` (infallible → fallible) |
+| Method call           | Type change                                                                   |
+| --------------------- | ----------------------------------------------------------------------------- |
+| `pipe(items)`         | `Pipe<Identity, I₀, I₀>`                                                      |
+| `.map(\|x\| f(x))`    | `Pipe<SyncMap<Identity, F>, I₀, O>`                                           |
+| `.map(\|x\| g(x))`    | `Pipe<SyncMap<...>, I₀, N>` (output type changes)                             |
+| `.filter(\|x\| p(x))` | `Pipe<Filter<...>, I₀, O>` (output unchanged)                                 |
+| `.try_map(\|x\| …)`   | `TryPipe<TryMap<InfallibleChain<S, E>, F>, I₀, N, E>` (infallible → fallible) |
 
 `ScopedPipe<'env, S, I, O>` mirrors this exactly with `'env` (non-`'static`)
 closure bounds; `TryPipe<S, I, O, E>` adds the fixed error type `E` and exposes
@@ -268,14 +268,14 @@ stream(items)                       // StreamPipe<StreamStart, I, I>
     .run()                          // execute → Vec<O>
 ```
 
-| Builder method | Runtime topology |
-|---|---|
-| `.stage(f)` | `parallelism` compute-pool workers pull, apply `f`, forward |
-| `.expand(f)` | like `.stage` but each input → `Vec<N>` outputs (inherits parent's `seq`) |
-| `.fence(mode)` | dedicated forwarder thread batching between adjacent stages |
-| `.stage_async(f)` | `io_concurrency` tokio tasks on the async runtime (M:N) |
-| `.ordered()` | feeder tags each item with `seq`; collector reorders via `ReorderBuffer` |
-| `.with_cancel(token)` | feeder/workers/bridges check `is_cancelled()` per iteration |
+| Builder method        | Runtime topology                                                          |
+| --------------------- | ------------------------------------------------------------------------- |
+| `.stage(f)`           | `parallelism` compute-pool workers pull, apply `f`, forward               |
+| `.expand(f)`          | like `.stage` but each input → `Vec<N>` outputs (inherits parent's `seq`) |
+| `.fence(mode)`        | dedicated forwarder thread batching between adjacent stages               |
+| `.stage_async(f)`     | `io_concurrency` tokio tasks on the async runtime (M:N)                   |
+| `.ordered()`          | feeder tags each item with `seq`; collector reorders via `ReorderBuffer`  |
+| `.with_cancel(token)` | feeder/workers/bridges check `is_cancelled()` per iteration               |
 
 The stage chain is a typestate (`SyncStage<FenceLink<SyncStage<StreamStart,…>>>`)
 walked by the `StageSpawn` trait — `spawn` recurses inside-out (older stages
@@ -292,7 +292,7 @@ stage as **`io_concurrency` async tasks** on a tokio runtime
 it awaits (e.g. `tokio::time::sleep`, real network/disk IO), so concurrency is
 bounded by `io_concurrency` — **not** by the thread count.
 
-This is the right tool when IO waits actually yield. For work that *blocks* the
+This is the right tool when IO waits actually yield. For work that _blocks_ the
 OS thread (e.g. `std::thread::sleep`), a sync `.stage()` is preferable: a
 blocking call inside an async task stalls a runtime worker and forfeits the M:N
 advantage (blocking concurrency is then capped at the thread count).
@@ -310,7 +310,7 @@ channel (`SyncSender` + `AsyncReceiver` sharing one `mpmc::Array` —
 crossfire's `bounded_blocking_async`) and the AsyncStage's
 `spawn_async_feeder` consumes the `AsyncReceiver` directly. The feeder pushes
 via the blocking `SyncSender::send` (backpressure parks it on `Full`); the
-async consumers `recv().await` from the *same* queue. One fewer OS thread,
+async consumers `recv().await` from the _same_ queue. One fewer OS thread,
 one fewer bounded channel, one fewer send/recv round-trip per item.
 
 An [`AsyncPool`] may be attached via `.with_async_pool(...)` and reused across
@@ -388,10 +388,10 @@ find_work():
 
 Wraps `crossfire` with a unified API:
 
-| Type | Implementation |
-|---|---|
-| `SyncSender<T>` / `SyncReceiver<T>` | `crossfire::mpmc::bounded_blocking` |
-| `AsyncSender<T>` / `AsyncReceiver<T>` | `crossfire::mpmc::bounded_async` |
+| Type                                  | Implementation                      |
+| ------------------------------------- | ----------------------------------- |
+| `SyncSender<T>` / `SyncReceiver<T>`   | `crossfire::mpmc::bounded_blocking` |
+| `AsyncSender<T>` / `AsyncReceiver<T>` | `crossfire::mpmc::bounded_async`    |
 
 An additional `closed: Arc<AtomicBool>` flag provides early termination without racing with crossfire's internal disconnect detection.
 
@@ -433,10 +433,10 @@ Stage completion is signalled purely by channel disconnect (all sender clones dr
 
 The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
-| Environment | Injector mutex |
-|---|---|
-| Production | `parking_lot::Mutex` (zero-cost re-export — fairer, no poisoning) |
-| Miri | `std::sync::Mutex` wrapped in a newtype exposing the same infallible `lock()` |
+| Environment | Injector mutex                                                                |
+| ----------- | ----------------------------------------------------------------------------- |
+| Production  | `parking_lot::Mutex` (zero-cost re-export — fairer, no poisoning)             |
+| Miri        | `std::sync::Mutex` wrapped in a newtype exposing the same infallible `lock()` |
 
 `parking_lot_core` resolves `WaitOnAddress` through `GetModuleHandleA`, a Windows foreign function Miri cannot emulate, whereas the std mutex/condvar are natively supported. The unified API lets callers write `mutex.lock()` once and stay transparent to which backend is active.
 
@@ -457,18 +457,18 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
 ### CPU-Heavy `pipe()` vs rayon (`sync_cpu_heavy`, 100 iters/item, warm input)
 
-| Size | youpipe | rayon | Result |
-|---|---|---|---|
-| 1K | ~34 µs | ~38 µs | **youpipe ~1.1× faster** |
-| 10K | ~74 µs | ~73 µs | tie |
-| 100K | ~109 µs | ~163 µs | **youpipe ~1.5× faster** |
+| Size | youpipe | rayon   | Result                   |
+| ---- | ------- | ------- | ------------------------ |
+| 1K   | ~34 µs  | ~40 µs  | **youpipe ~1.2× faster** |
+| 10K  | ~66 µs  | ~73 µs  | **youpipe ~1.1× faster** |
+| 100K | ~106 µs | ~147 µs | **youpipe ~1.4× faster** |
 
 ### Pipeline Fusion (3 stages) vs rayon chain (`pipeline_fusion`, warm input)
 
-| Size | youpipe fused | rayon chain | Result |
-|---|---|---|---|
-| 10K | ~75 µs | ~68 µs | rayon ~1.1× faster (scheduler fixed cost) |
-| 100K | ~93 µs | ~102 µs | **youpipe ~1.1× faster** |
+| Size | youpipe fused | rayon chain | Result                    |
+| ---- | ------------- | ----------- | ------------------------- |
+| 10K  | ~65 µs        | ~70 µs      | **youpipe ~1.08× faster** |
+| 100K | ~90 µs        | ~104 µs     | **youpipe ~1.15× faster** |
 
 The fused stage chain went from ~1.9× slower than rayon (mid-2026) to a
 dead heat or win at every size after three changes: a sleeping-bitmask
@@ -477,18 +477,20 @@ workers, moving the `condvar.notify_one` outside the `is_blocked` mutex
 (which had been serialising every woken thread's re-acquire), and a
 `.cargo/config.toml` override that ensures the perf-friendly
 `opt-level=3`/`panic=unwind` regardless of the host's global cargo
-profile. The 10 k case still trails slightly because the per-call
-scheduler fixed cost (~50 µs) is a larger fraction of the closure time;
-closing that gap further is the next optimization target — see `§3.2`
-for the current `&[T]`/`&mut [R]` leaf view.
+profile. A fourth change — adaptive oversplit (`workload_oversplit`)
+that drops to `oversplit = 1` for small batches (≤ 1024 items/worker) —
+trimmed ~95 fork/join internal nodes from 10 k batches, flipping the
+10 k case from trailing rayon to beating it. The remaining per-call
+scheduler fixed cost (~50 µs) is now only visible on batches far below
+the serial short-circuit threshold.
 
 ### Lightweight `pipe()` vs rayon (`sync_lightweight`, `x+1`)
 
-| Size | youpipe (warm) | youpipe (cold) | rayon |
-|---|---|---|---|
-| 10K | ~75 µs | ~83 µs | ~66 µs |
-| 100K | ~86 µs | ~135 µs | ~108 µs |
-| 1M | ~574 µs | ~4.27 ms | ~280 µs |
+| Size | youpipe (warm) | youpipe (cold) | rayon   |
+| ---- | -------------- | -------------- | ------- |
+| 10K  | ~64 µs         | ~71 µs         | ~69 µs  |
+| 100K | ~85 µs         | ~131 µs        | ~110 µs |
+| 1M   | ~606 µs        | ~4.15 ms       | ~272 µs |
 
 Warm-input lightweight 1M improved from ~1.9 ms (pre-`Slots`) → ~730 µs
 (after `Slots`) → ~390 µs (after switching the leaf loop to a `&[T]` /
@@ -498,11 +500,11 @@ view step closed a 2.5× gap with rayon: the previous `&Slots<u64>` for
 both input and output blocked LLVM's auto-vectorizer because the alias
 analysis could not prove the two `UnsafeCell`-wrapped buffers were
 disjoint. The 1 M case still trails rayon because the leaf work itself
-is so cheap (~1 ns/item) that scheduling overhead dominates; at 100 k
-youpipe now beats rayon because the leaf amortises the overhead better.
-The cold variant documents the read-compute-write sensitivity to
-cold-from-RAM input (glibc's non-temporal memcpy bypasses the cache);
-rayon on an equally-cold clone measures ~800 µs at 1M.
+is so cheap (~0.12 ns/item) that scheduling overhead dominates; at 10 k
+and 100 k youpipe now beats rayon because the leaf amortises the
+overhead better. The cold variant documents the read-compute-write
+sensitivity to cold-from-RAM input (glibc's non-temporal memcpy bypasses
+the cache); rayon on an equally-cold clone measures ~800 µs at 1M.
 
 ### Fallible `try_map().try_collect()` vs rayon (`try_collect`, warm input)
 
@@ -510,18 +512,18 @@ When the chain has `MAY_FILTER == false`, `try_collect` uses the same
 zero-allocation index-based fast path as `collect` — pre-allocating the output
 buffer and writing at known indices instead of the `Vec`-merge fallback.
 
-| Size | youpipe try_map | rayon | Result |
-|---|---|---|---|
-| 10K | ~75 µs | ~67 µs | rayon ~1.1× faster (Result branch overhead) |
-| 100K | ~95 µs | ~98 µs | **youpipe ~1.03× faster** |
+| Size | youpipe try_map | rayon   | Result                    |
+| ---- | --------------- | ------- | ------------------------- |
+| 10K  | ~64 µs          | ~68 µs  | **youpipe ~1.06× faster** |
+| 100K | ~88 µs          | ~101 µs | **youpipe ~1.15× faster** |
 
 ### Mixed Load — `stream()` vs `tokio::spawn_blocking` (`mixed_load`)
 
-| Size | youpipe stream | spawn_blocking | rayon (CPU-only) | Result |
-|---|---|---|---|---|
-| 1K | ~832 µs | ~2.92 ms | ~38 µs | **youpipe ~3.5× faster** than tokio |
-| 10K | ~9.5 ms | ~27.4 ms | ~68 µs | **youpipe ~2.9× faster** |
-| 100K | ~95.9 ms | ~239 ms | ~111 µs | **youpipe ~2.5× faster** |
+| Size | youpipe stream | spawn_blocking | rayon (CPU-only) | Result                              |
+| ---- | -------------- | -------------- | ---------------- | ----------------------------------- |
+| 1K   | ~832 µs        | ~2.92 ms       | ~38 µs           | **youpipe ~3.5× faster** than tokio |
+| 10K  | ~9.5 ms        | ~27.4 ms       | ~68 µs           | **youpipe ~2.9× faster**            |
+| 100K | ~95.9 ms       | ~239 ms        | ~111 µs          | **youpipe ~2.5× faster**            |
 
 `StreamPipe` comfortably and **stably** beats `tokio::spawn_blocking` (the
 design target for mixed CPU/IO) by ~2.5–3.5× at every size. The ratio
@@ -535,15 +537,15 @@ input) for fair comparison against rayon's warm borrow.
 ### Async IO — `.stage_async()` (`io_async`, yielding IO)
 
 Simulated IO uses `tokio::time::sleep` (90% × 1 ms, 10% × 8 ms tail) — a wait
-that *yields* the OS thread, the regime where M:N async concurrency beats the
+that _yields_ the OS thread, the regime where M:N async concurrency beats the
 blocking-thread-per-core model. `io_concurrency = 512`, 32-core machine.
 
 #### Pure IO (`io_async_pure`)
 
 | Size | youpipe_async | youpipe_blocking | youpipe_blocking_oversub | tokio_async_native | tokio_spawn_blocking |
-|---|---|---|---|---|---|
-| 200 | ~9.32 ms | ~16.56 ms | ~11.31 ms | ~9.16 ms | ~8.38 ms |
-| 500 | ~9.65 ms | ~33.08 ms | ~19.46 ms | ~9.30 ms | ~8.83 ms |
+| ---- | ------------- | ---------------- | ------------------------ | ------------------ | -------------------- |
+| 200  | ~9.32 ms      | ~16.56 ms        | ~11.31 ms                | ~9.16 ms           | ~8.38 ms             |
+| 500  | ~9.65 ms      | ~33.08 ms        | ~19.46 ms                | ~9.30 ms           | ~8.83 ms             |
 
 `youpipe_async` **matches `tokio_async_native`** (the async ceiling) within
 ~3% and is **1.8× (200) / 3.45× (500) faster than `youpipe_blocking`**.
@@ -567,9 +569,9 @@ For blocking IO, `.stage_async()` remains the recommended tool.
 #### Mixed CPU (sync) + IO (`io_async_mixed`)
 
 | Size | youpipe_mixed_async | youpipe_mixed_blocking | tokio_mixed_blocking |
-|---|---|---|---|
-| 200 | ~9.48 ms | ~27.3 ms | ~8.93 ms |
-| 500 | ~9.97 ms | ~60.0 ms | ~10.1 ms |
+| ---- | ------------------- | ---------------------- | -------------------- |
+| 200  | ~9.48 ms            | ~27.3 ms               | ~8.93 ms             |
+| 500  | ~9.97 ms            | ~60.0 ms               | ~10.1 ms             |
 
 `youpipe_mixed_async` is **2.8× (200) / ~6× (500) faster than the all-blocking
 two-stage baseline**, and at size 500 edges out `tokio_mixed_blocking` by
@@ -581,10 +583,10 @@ tokio's simpler spawn-per-item model still leads there.
 
 ### Channel Throughput
 
-| Size | crossfire | crossbeam-channel | std_mpsc | Result |
-|---|---|---|---|---|
-| 10K | 27.1 Melem/s | 20.2 Melem/s | 37.0 Melem/s | **crossfire 1.34× vs crossbeam** |
-| 100K | 34.7 Melem/s | 17.3 Melem/s | 44.6 Melem/s | **crossfire 2.0× vs crossbeam** |
+| Size | crossfire    | crossbeam-channel | std_mpsc     | Result                           |
+| ---- | ------------ | ----------------- | ------------ | -------------------------------- |
+| 10K  | 27.1 Melem/s | 20.2 Melem/s      | 37.0 Melem/s | **crossfire 1.34× vs crossbeam** |
+| 100K | 34.7 Melem/s | 17.3 Melem/s      | 44.6 Melem/s | **crossfire 2.0× vs crossbeam**  |
 
 ---
 
