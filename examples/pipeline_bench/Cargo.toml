@@ -1,0 +1,12 @@
+[package]
+description  = "Mixed CPU/IO pipeline benchmark: youpipe vs rayon vs tokio vs sequential on a heavy-tailed document processing workload"
+edition      = "2024"
+name         = "pipeline-bench"
+publish      = false
+rust-version = "1.85"
+version      = "0.1.0"
+
+[dependencies]
+rayon   = "1"
+tokio   = { version = "1", features = ["rt-multi-thread", "time"] }
+youpipe = { path = "../..", default-features = true }

@@ -1,10 +1,17 @@
 # Examples
 
 Each example is a self-contained, runnable program demonstrating one feature of
-youpipe. Run any of them with:
+youpipe. Most are single files under `examples/` and can be run with:
 
 ```bash
 cargo run --release --example <name>
+```
+
+Standalone packages (with their own `Cargo.toml`) live under `examples/<name>/`;
+run them from their own directory:
+
+```bash
+cd examples/<name> && cargo run --release
 ```
 
 > Always use `--release` — debug builds don't exercise the work-stealing
@@ -51,6 +58,7 @@ form for explicitness; user code typically uses the prelude form.
 | Build a multi-stage streaming CPU chain | [`stream_chain`](stream_chain.rs) | `stream().stage().stage()` vs tokio `spawn_blocking` |
 | Cancel a pipeline mid-flight | [`cancellation`](cancellation.rs) | `with_cancel(token)` aborts feeder + workers + bridges |
 | Profile internal hot paths | [`hotpath_profile`](hotpath_profile.rs) | `--features hotpath` only — per-function timing without `perf` |
+| Compare 5 strategies on a mixed CPU/IO pipeline | [`pipeline_bench`](pipeline-bench) | youpipe mixed/sync vs rayon vs tokio vs sequential |
 
 ## Detailed notes
 
@@ -168,6 +176,29 @@ can re-run this whenever the scheduler changes to see — without `perf` and
 without reading disassembly — exactly how many times each worker parked, how
 long each `join`/`steal`/`inject` took, and where the per-call fixed overhead
 is actually spent.
+
+### `pipeline_bench`
+
+A standalone benchmarking package that compares five strategies on the same
+heavy-tailed document processing pipeline (IO read → CPU analysis → IO write):
+
+1. **Sequential** — single-threaded baseline
+2. **Rayon** `par_iter` — batch parallel, IO blocks the thread pool
+3. **Tokio** — async IO + `spawn_blocking` for CPU (oversubscribes cores)
+4. **Youpipe all-sync** — three stages on the work-stealing compute pool
+5. **Youpipe mixed** — async IO on tokio (M:N), CPU on compute pool (← fastest)
+
+Document sizes follow a log-normal distribution (~8 KB median, 260 KB P99),
+creating realistic workload imbalance. No actual disk IO — latencies are
+simulated with `thread::sleep` / `tokio::time::sleep`. The output includes a
+profiled sequential breakdown, a ranked results table, and analysis of the
+observed differences.
+
+```bash
+cd examples/pipeline-bench && cargo run --release
+```
+
+Environment variable: `N_DOCS=2000` (change the number of documents).
 
 ## Related benchmarks
 
