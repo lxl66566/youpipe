@@ -2,14 +2,14 @@
 categories   = ["concurrency"]
 description  = "High-performance data-first pipelines with fused CPU stages and streaming async IO"
 edition      = "2024"
-exclude      = ["/docs", "/.github", "/AGENTS.md", ".opencode", ".vscode"]
+exclude      = ["/docs", "/.github", "/AGENTS.md", "/.opencode", "/.vscode", "/examples"]
 keywords     = ["parallel", "pipeline", "concurrency", "map-reduce", "work-stealing"]
 license      = "Apache-2.0"
 name         = "youpipe"
 readme       = "README.md"
 repository   = "https://github.com/lxl66566/youpipe"
 rust-version = "1.85"
-version      = "0.3.0"
+version      = "0.3.1"
 
 [features]
 default       = ["tokio-runtime"]
@@ -30,7 +30,7 @@ hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
 [dependencies]
 concurrent-queue = "2.5"
 crossfire        = "3.1"
-hotpath          = { version = "0.18", optional = true }
+hotpath          = { version = "0.19", optional = true }
 parking_lot      = "0.12"
 st3              = "0.4"
 tokio            = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
