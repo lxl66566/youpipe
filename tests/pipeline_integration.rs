@@ -316,6 +316,73 @@ fn test_two_async_stages_share_lazy_pool() {
     assert_eq!(result, expected);
 }
 
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_async_then_sync_via_bridge() {
+    // async-first → sync stage. Exercises the default `spawn_async_feeder`
+    // path: the feeder uses a mixed-mode channel, the AsyncStage's
+    // `spawn_async_feeder` recurses into StreamStart (identity), and the
+    // SyncStage's default impl bridges async→sync on a dedicated OS thread.
+    // This is the topology that previously did a blocking `send` inside a
+    // `tokio::spawn` task (parking a tokio worker on backpressure).
+    let items: Vec<u64> = (0..100).collect();
+    let result: Vec<u64> = stream(items)
+        .stage_async(|x: u64| async move { x + 1 })
+        .stage(|x: u64| x * 2)
+        .ordered()
+        .run();
+    let expected: Vec<u64> = (0..100).map(|x| (x + 1) * 2).collect();
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn test_fence_cancellation_aborts_early() {
+    // The fence forwarder checks the cancellation token. In Barrier mode it
+    // buffers all upstream items before forwarding any — without the cancel
+    // check it would ignore the token and keep draining until upstream
+    // finished, defeating the purpose of cancellation.
+    use std::{thread, time::Duration};
+
+    use youpipe::CancellationToken;
+
+    let token = CancellationToken::new();
+    let items: Vec<u32> = (0..10_000).collect();
+    let slow = |x: u32| -> u32 {
+        thread::sleep(Duration::from_micros(20));
+        x + 1
+    };
+
+    let cancel_handle = {
+        let token = token.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            token.cancel();
+        })
+    };
+
+    let start = std::time::Instant::now();
+    let result = stream(items)
+        .with_cancel(token)
+        .stage(slow)
+        .fence(FenceMode::Barrier)
+        .stage(|x: u32| x * 2)
+        .run();
+    let elapsed = start.elapsed();
+
+    cancel_handle.join().unwrap();
+
+    // Cancellation should abort well before processing all 10 000 items.
+    assert!(
+        result.len() < 10_000,
+        "expected early abort, got {}",
+        result.len()
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "fence cancellation should shortcut the run, took {elapsed:?}"
+    );
+}
+
 #[test]
 fn test_scope_non_static() {
     let factor = 7i32;

@@ -247,12 +247,19 @@ where
 // owning `mid_rx` / `fenced_tx` by value lets them drop (and close the channel)
 // when the forwarder returns, which is how the downstream stage detects "no
 // more items" — taking them by reference would keep the channel open forever.
-fn forward_fenced<M>(mid_rx: Receiver<(u64, M)>, fenced_tx: Sender<(u64, M)>, mode: FenceMode)
-where
+fn forward_fenced<M>(
+    mid_rx: Receiver<(u64, M)>,
+    fenced_tx: Sender<(u64, M)>,
+    mode: FenceMode,
+    cancel: Option<&CancellationToken>,
+) where
     M: Send + Unpin + 'static,
 {
     let mut fence = FenceBarrier::<(u64, M)>::new(mode);
     while let Ok(item) = mid_rx.recv() {
+        if cancel_active(cancel) {
+            return;
+        }
         if let Some(batch) = fence.push(item) {
             for it in batch {
                 if fenced_tx.send(it).is_err() {
@@ -261,6 +268,9 @@ where
             }
         }
     }
+    // Normal drain (mid_rx closed): flush remaining buffered items. This path
+    // is only reached on completion — the cancel path returns early above
+    // without flushing, dropping in-progress items as expected on abort.
     if let Some(remaining) = fence.flush() {
         for it in remaining {
             if fenced_tx.send(it).is_err() {
@@ -429,24 +439,15 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     where
         Self: Sized,
     {
-        // Default: bridge async → sync (one tokio task on the runtime), then
-        // delegate to the sync `spawn` path. Async-first stages override this
-        // to consume the async rx directly and skip the extra hop.
-        let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
-        let (s_tx, s_rx) = channel::<(u64, In)>(buffer);
-        let cancel = ctx.cancel.clone();
-        let pool = ctx.acquire_async().expect("failed to build async runtime");
-        let _enter = pool.handle().enter();
-        tokio::spawn(async move {
-            while let Ok(item) = rx.recv().await {
-                if cancel_active(cancel.as_ref()) {
-                    return;
-                }
-                if s_tx.send(item).is_err() {
-                    return;
-                }
-            }
-        });
+        // Bridge async→sync on a dedicated OS thread, then delegate to the
+        // sync `spawn` path. The bridge MUST run on an OS thread (via
+        // `bridge_async_to_sync`), not a `tokio::spawn` task:
+        // `SyncSender::send` is blocking, and running it inside a tokio task
+        // would park the tokio worker thread whenever the downstream sync
+        // stage exerts backpressure — the "one thread is both async driver
+        // and blocking worker" anti-pattern that stalls every other task on
+        // that worker.
+        let s_rx = bridge_async_to_sync(rx, ctx);
         self.spawn(s_rx, ctx)
     }
 }
@@ -679,7 +680,8 @@ where
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = channel::<(u64, Prev::Out)>(buffer);
         let mode = self.mode;
-        std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode));
+        let cancel = ctx.cancel.clone();
+        std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode, cancel.as_ref()));
         FinalRx::Sync(fenced_rx)
     }
 
