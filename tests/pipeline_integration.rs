@@ -335,6 +335,98 @@ fn test_async_then_sync_via_bridge() {
     assert_eq!(result, expected);
 }
 
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_sync_to_async_does_not_stall_tokio_driver() {
+    // Regression guard for the "async driver + blocking worker" anti-pattern.
+    //
+    // The sync→async handoff parks producers on `SyncSender::send` when the
+    // mixed-mode channel fills under backpressure. That blocking call MUST
+    // live on a ComputePool OS thread — never on a tokio worker. If it ran
+    // inside a `tokio::spawn` task, it would park the tokio worker thread and
+    // stall *every* other task on it (or, with one worker, deadlock).
+    //
+    // This test amplifies the effect with a single-worker runtime: any
+    // blocking op on that one worker freezes the whole async side. We run a
+    // sync→async pipeline under deliberate backpressure (fast sync producer,
+    // slow async consumer) while a heartbeat task measures its own scheduling
+    // gaps on the same runtime. A healthy gap stays near the sleep duration;
+    // a stalled driver (blocking `send` on the tokio worker) spikes it.
+    use std::time::{Duration, Instant};
+
+    use youpipe::{AsyncPool, PipelineConfig};
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("build single-worker runtime");
+
+    // Heartbeat: 30 sleeps of 5 ms, tracking the worst observed gap between
+    // successive wake-ups. Spawned onto the same single-worker runtime as the
+    // pipeline's async consumers, so it shares the fate of the tokio worker.
+    let (hb_tx, hb_rx) = std::sync::mpsc::channel::<Duration>();
+    {
+        let _enter = rt.handle().enter();
+        tokio::spawn(async move {
+            let mut max_gap = Duration::ZERO;
+            let mut prev = Instant::now();
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let now = Instant::now();
+                max_gap = max_gap.max(now - prev);
+                prev = now;
+            }
+            let _ = hb_tx.send(max_gap);
+        });
+    }
+
+    // Pipeline runs on a dedicated OS thread so a stalled runtime can't hang
+    // the test thread — we observe completion via a channel with a timeout.
+    // Fast sync stage floods the channel; slow async stage (1 ms sleep each,
+    // only 4 consumers) drains it slowly, so the mixed-mode channel fills and
+    // sync workers park on `send`. This is precisely the regime where a
+    // tokio-hosted producer would freeze the runtime.
+    let n: u64 = 3000;
+    let (res_tx, res_rx) = std::sync::mpsc::channel::<Vec<u64>>();
+    let pipe = stream(0..n)
+        .with_config(PipelineConfig::default().with_io_concurrency(4))
+        .with_async_pool(AsyncPool::new(rt.handle().clone(), 1))
+        .stage(|x: u64| x + 1)
+        .stage_async(|x: u64| async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            x * 2
+        });
+    std::thread::spawn(move || {
+        let _ = res_tx.send(pipe.run());
+    });
+
+    // Strong guarantee: the single tokio worker was never parked by a blocking
+    // send. Heartbeat gaps stay near 5 ms even while sync workers are parked
+    // on `send` under backpressure. 40 ms leaves headroom for single-worker
+    // scheduling jitter; a stalled driver either never finishes the heartbeat
+    // (timeout below) or spikes past this.
+    let max_gap = hb_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("heartbeat never finished — tokio worker stalled by a blocking op");
+    assert!(
+        max_gap < Duration::from_millis(40),
+        "tokio driver stalled under sync→async backpressure: max heartbeat gap \
+         {max_gap:?} (expected ~5 ms) — a blocking send is likely running on \
+         the tokio worker"
+    );
+
+    // Weak guarantee: the pipeline completed at all — no deadlock from a
+    // stalled runtime starving its own consumers.
+    let result = res_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("pipeline deadlocked — tokio worker stalled by a blocking op");
+    assert_eq!(result.len(), n as usize);
+
+    // Keep the runtime alive until both observations land.
+    drop(rt);
+}
+
 #[test]
 fn test_fence_cancellation_aborts_early() {
     // The fence forwarder checks the cancellation token. In Barrier mode it

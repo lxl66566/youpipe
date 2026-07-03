@@ -299,19 +299,30 @@ advantage (blocking concurrency is then capped at the thread count).
 
 A mixed sync-CPU + async-IO chain keeps the CPU stage on the sync compute pool
 (rayon-style, sized to cores) and the IO stage on the async runtime; the two
-overlap via a sync→async bridge thread. The pools do not contend: CPU uses
+overlap with the CPU stage's workers writing **directly** into the IO stage's
+input channel — no bridge thread. The pools do not contend: CPU uses
 `compute_workers` OS threads, IO uses `async_workers` OS threads multiplexing
 `io_concurrency` tasks.
 
-For the pure-async shape `stream(..).stage_async(..)` the bridge thread is
-skipped entirely: `StageSpawn::first_consumer_is_async()` reports that the
-innermost real consumer is async, so `.run()` builds a mixed-mode feeder
-channel (`SyncSender` + `AsyncReceiver` sharing one `mpmc::Array` —
-crossfire's `bounded_blocking_async`) and the AsyncStage's
-`spawn_async_feeder` consumes the `AsyncReceiver` directly. The feeder pushes
-via the blocking `SyncSender::send` (backpressure parks it on `Full`); the
-async consumers `recv().await` from the _same_ queue. One fewer OS thread,
-one fewer bounded channel, one fewer send/recv round-trip per item.
+Every sync→async edge uses crossfire's mixed-mode channel (`SyncSender` +
+`AsyncReceiver` sharing one `mpmc::Array` — `bounded_blocking_async`).
+`StageSpawn::spawn_for_async` lets each stage pick the channel kind that lets
+its producers run with least friction: sync stages (sync / expand / fence)
+override it so their ComputePool workers write the `SyncSender` directly
+(backpressure parks the worker on `Full` — correct, since they're OS threads),
+while the async consumers `recv().await` from the _same_ queue. One channel,
+zero forwarding threads — for `stream(..).stage_async(..)` *and*
+`stream(..).stage(cpu).stage_async(io)` alike.
+
+A bridge thread survives only on the `spawn_async_feeder` path — chains whose
+*first* stage is async (e.g. `..stage_async(f1).stage(f2).stage_async(f3)`),
+where a sync stage reached through an async→sync conversion feeds a trailing
+async stage. Keeping the blocking `send` off the tokio worker avoids the
+"one thread is both async driver and blocking worker" anti-pattern: a
+`SyncSender::send` inside a `tokio::spawn` task would park the runtime worker
+under backpressure, stalling every other task on it (or deadlocking a
+single-worker runtime — covered by the
+`test_sync_to_async_does_not_stall_tokio_driver` regression test).
 
 An [`AsyncPool`] may be attached via `.with_async_pool(...)` and reused across
 runs; otherwise a transient runtime is built per call (simpler, but pays

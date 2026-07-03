@@ -450,6 +450,84 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
         let s_rx = bridge_async_to_sync(rx, ctx);
         self.spawn(s_rx, ctx)
     }
+
+    /// Spawn this stage to feed a downstream **async** consumer, returning the
+    /// [`AsyncReceiver`] the consumer should read from.
+    ///
+    /// This is the sync→async handoff primitive. The default implementation
+    /// spawns the stage normally (via [`Self::spawn`]) and then bridges its
+    /// output into a mixed-mode channel — i.e. it still pays for a forwarder
+    /// thread. **Sync stages override this** to write the mixed-mode
+    /// [`SyncSender`] directly from their ComputePool workers, eliminating the
+    /// dedicated bridge thread entirely: the workers are already OS threads,
+    /// so blocking on `SyncSender::send` under backpressure is the natural
+    /// (and correct) behaviour — not the "async driver + blocking worker"
+    /// anti-pattern that mandates a bridge when a tokio task would be the
+    /// producer.
+    ///
+    /// `AsyncStage` calls this on its `prev` to obtain its input channel
+    /// regardless of whether the preceding stage is sync or async: each stage
+    /// picks the channel kind that lets its producers run with the least
+    /// friction (mixed-mode for sync producers, fully-async for async ones).
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_for_async(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx,
+    ) -> AsyncReceiver<(u64, Self::Out)>
+    where
+        Self: Sized,
+    {
+        // Default: spawn normally, then bridge the output (sync or async) into
+        // a mixed-mode channel. Sync stages override this to skip the bridge
+        // — see `SyncStage::spawn_for_async`.
+        let fr = self.spawn(rx, ctx);
+        let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
+        let (tx, a_rx) = sync_async_channel::<(u64, Self::Out)>(buffer);
+        let cancel = ctx.cancel.clone();
+        match fr {
+            FinalRx::Sync(r) => {
+                // sync output → mixed-mode: a plain forward thread. Both the
+                // source `recv` and the sink `send` are blocking, so this is
+                // just a data-copying thread — the same shape as the old
+                // sync→async bridge that used to live in `spawn_async_consumers`.
+                std::thread::spawn(move || {
+                    while let Ok(item) = r.recv() {
+                        if cancel_active(cancel.as_ref()) {
+                            return;
+                        }
+                        if tx.send(item).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            FinalRx::Async(r) => {
+                // async output → mixed-mode: `block_on` the async receiver on
+                // a dedicated OS thread (mirrors `bridge_async_to_sync`, but
+                // emits into a mixed-mode sender so the consumer side stays
+                // async). Only reached when an async stage feeds another async
+                // stage through the default impl — `AsyncStage` overrides this
+                // to return its already-async output directly.
+                let pool = ctx
+                    .acquire_async()
+                    .expect("failed to build async runtime");
+                std::thread::spawn(move || {
+                    pool.block_on(async move {
+                        while let Ok(item) = r.recv().await {
+                            if cancel_active(cancel.as_ref()) {
+                                return;
+                            }
+                            if tx.send(item).is_err() {
+                                return;
+                            }
+                        }
+                    });
+                });
+            }
+        }
+        a_rx
+    }
 }
 
 /// Final receiver handed back by [`StageSpawn::spawn`]. Drained by the
@@ -601,6 +679,42 @@ where
         FinalRx::Sync(out_rx)
     }
 
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_for_async(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx,
+    ) -> AsyncReceiver<(u64, M)> {
+        // Direct sync→async handoff: ComputePool workers write the mixed-mode
+        // `SyncSender` directly — no bridge thread. The workers are OS threads,
+        // so blocking on `send` under backpressure simply parks the worker
+        // (correct), and crossfire's internal waker hands off to the async
+        // consumer draining the same `mpmc::Array`. One channel, zero
+        // forwarding hops vs the default impl's spawn-then-bridge.
+        //
+        // This is the load-bearing optimisation: a chain like
+        // `stream(..).stage(cpu).stage_async(io)` previously paid for a
+        // dedicated OS thread forwarding each item sync→mixed-mode; now the
+        // CPU stage's workers ARE the mixed-mode producers.
+        let prev_rx = self.prev.spawn(rx, ctx);
+        let mid_rx = match prev_rx {
+            FinalRx::Sync(r) => r,
+            FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
+        };
+        let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
+        let buffer = ctx.buffer_size(parallelism);
+        let (out_tx, out_rx) = sync_async_channel::<(u64, M)>(buffer);
+        let _wg = spawn_stage(
+            ctx.compute_pool(),
+            mid_rx,
+            out_tx,
+            parallelism,
+            ctx.cancel.clone(),
+            self.f,
+        );
+        out_rx
+    }
+
     fn worker_stages(&self) -> usize {
         // This stage consumes a pool slot; recurse to count earlier stages.
         1 + self.prev.worker_stages()
@@ -648,6 +762,33 @@ where
         FinalRx::Sync(out_rx)
     }
 
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_for_async(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx,
+    ) -> AsyncReceiver<(u64, N)> {
+        // Same direct-handoff optimisation as `SyncStage::spawn_for_async`:
+        // expansion workers write the mixed-mode sender directly.
+        let prev_rx = self.prev.spawn(rx, ctx);
+        let mid_rx = match prev_rx {
+            FinalRx::Sync(r) => r,
+            FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
+        };
+        let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
+        let buffer = ctx.buffer_size(parallelism);
+        let (out_tx, out_rx) = sync_async_channel::<(u64, N)>(buffer);
+        let _wg = spawn_expand_stage(
+            ctx.compute_pool(),
+            mid_rx,
+            out_tx,
+            parallelism,
+            ctx.cancel.clone(),
+            self.f,
+        );
+        out_rx
+    }
+
     fn worker_stages(&self) -> usize {
         1 + self.prev.worker_stages()
     }
@@ -685,6 +826,29 @@ where
         FinalRx::Sync(fenced_rx)
     }
 
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_for_async(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx,
+    ) -> AsyncReceiver<(u64, Prev::Out)> {
+        // Direct handoff: the fence forwarder writes the mixed-mode sender
+        // directly. It already runs on a dedicated OS thread, so blocking on
+        // `send` under backpressure is its natural behaviour — no extra bridge
+        // needed between the fence and a downstream async stage.
+        let prev_rx = self.prev.spawn(rx, ctx);
+        let mid_rx = match prev_rx {
+            FinalRx::Sync(r) => r,
+            FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
+        };
+        let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
+        let (fenced_tx, fenced_rx) = sync_async_channel::<(u64, Prev::Out)>(buffer);
+        let mode = self.mode;
+        let cancel = ctx.cancel.clone();
+        std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode, cancel.as_ref()));
+        fenced_rx
+    }
+
     fn worker_stages(&self) -> usize {
         // Fence runs on a dedicated thread, doesn't consume a pool slot.
         self.prev.worker_stages()
@@ -715,8 +879,21 @@ where
     type Out = M;
 
     fn spawn(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<M> {
-        let prev_rx = self.prev.spawn(rx, ctx);
-        spawn_async_consumers::<Prev, F, In, M, Fut>(self.f, prev_rx, ctx)
+        FinalRx::Async(self.spawn_for_async(rx, ctx))
+    }
+
+    fn spawn_for_async(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx,
+    ) -> AsyncReceiver<(u64, M)> {
+        // async → async: recurse via prev's `spawn_for_async` to obtain our
+        // input channel — mixed-mode when prev is sync (ComputePool workers
+        // write the sender directly, **no bridge thread**), fully-async when
+        // prev is async (tokio-task funnel). Then run the consumer fan-out.
+        // The output is already a fully-async channel, handed back directly.
+        let a_in_rx = self.prev.spawn_for_async(rx, ctx);
+        spawn_async_consumers_body::<F, Prev::Out, M, Fut>(self.f, a_in_rx, ctx)
     }
 
     fn worker_stages(&self) -> usize {
@@ -745,25 +922,78 @@ where
     }
 }
 
-/// Shared body of [`StageSpawn::spawn`] and [`StageSpawn::spawn_async_feeder`]
-/// for `AsyncStage`: bridge prev's output (sync or async) into our async input
-/// channel, then spawn `io_concurrency` async consumer tasks on the runtime.
+/// Spawn `io_concurrency` async consumer tasks that read `a_in_rx`, apply `f`,
+/// and forward to a fresh async output channel; returns that output channel.
 ///
-/// Factored out as a free function (rather than a method on `AsyncStage<Prev,
-/// F>`) because Rust's `impl` blocks can only constrain type parameters that
-/// appear in the `Self` type — `In`, `M`, `Fut` only show up in the bounds, so
-/// they have to live on the function itself. The two entry points (`spawn`,
-/// `spawn_async_feeder`) differ only in how `prev_rx` is obtained — sync
-/// `Receiver` via `spawn`, or async `AsyncReceiver` via `spawn_async_feeder`.
-/// Once the upstream `FinalRx` is in hand, the consumer setup is identical.
+/// This is the consumer fan-out half of an async stage, shared by both entry
+/// points: `AsyncStage::spawn_for_async` (the `spawn` path — `a_in_rx` arrives
+/// directly from `prev.spawn_for_async`) and `spawn_async_consumers` (the
+/// `spawn_async_feeder` path — `a_in_rx` is bridged from a `FinalRx` first).
+#[cfg(feature = "tokio-runtime")]
+#[allow(clippy::needless_pass_by_value)] // ownership transfer is intentional:
+// `f` is moved into the `Arc` shared across consumer tasks; taking it by value
+// expresses "this is the last stop for the closure".
+fn spawn_async_consumers_body<F, In, M, Fut>(
+    f: F,
+    a_in_rx: AsyncReceiver<(u64, In)>,
+    ctx: &StreamCtx,
+) -> AsyncReceiver<(u64, M)>
+where
+    F: Fn(In) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = M> + Send + 'static,
+    In: Send + Unpin + 'static,
+    M: Send + Unpin + 'static,
+{
+    let concurrency = ctx.config.io_concurrency.max(1).min(ctx.n.max(1));
+    let buffer = ctx.buffer_size(concurrency);
+    let (a_out_tx, a_out_rx) = async_channel::<(u64, M)>(buffer);
+    let pool = ctx.acquire_async().expect("failed to build async runtime");
+    let _enter = pool.handle().enter();
+    let f = Arc::new(f);
+    let cancel = ctx.cancel.clone();
+    let mut consumers = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let f = f.clone();
+        let rx = a_in_rx.clone();
+        let tx = a_out_tx.clone();
+        let c = cancel.clone();
+        consumers.push(tokio::spawn(async move {
+            loop {
+                let Ok((seq, item)) = rx.recv().await else {
+                    break;
+                };
+                if cancel_active(c.as_ref()) {
+                    break;
+                }
+                let out = f(item).await;
+                if tx.send((seq, out)).await.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+    drop(a_out_tx);
+    drop(a_in_rx);
+    // Detach: tasks complete as channels close; we don't need the JoinHandles
+    // (output is observed via the channel).
+    drop(consumers);
+    a_out_rx
+}
+
+/// Bridge prev's output (sync or async) into an async input channel, then run
+/// the consumer fan-out via [`spawn_async_consumers_body`].
 ///
-/// # Bridge topology
+/// This now serves **only the `spawn_async_feeder` path** (chains whose first
+/// stage is async). The regular `spawn` path no longer reaches here: sync
+/// stages override `spawn_for_async` to write the mixed-mode sender directly,
+/// so `AsyncStage::spawn_for_async` obtains its input channel with no bridge.
+///
+/// # Bridge topology (this path only)
 ///
 ///   sync → async: dedicated OS thread + blocking `send` over a mixed-mode
-///                 channel (`SyncSender` + `AsyncReceiver` sharing one
-///                 `mpmc::Array`). Backpressure parks the bridge thread via
-///                 crossfire's internal waker — no `try_send` + `yield_now`
-///                 busy-spin.
+///                 channel. Reached only when a sync stage feeds this
+///                 AsyncStage *and* the feeder itself is async (so the sync
+///                 stage arrived via the default `spawn_async_feeder` bridge).
 ///
 ///   async → async: tokio task + async `send().await` over a fully async
 ///                 channel. Blocking on the runtime worker thread would stall
@@ -785,11 +1015,14 @@ where
     Prev::Out: Send + Unpin + 'static,
     M: Send + Unpin + 'static,
 {
-    let concurrency = ctx.config.io_concurrency.max(1).min(ctx.n.max(1));
-    let buffer = ctx.buffer_size(concurrency);
+    let buffer = ctx.buffer_size(ctx.config.io_concurrency.max(1).min(ctx.n.max(1)));
     let bridge_cancel = ctx.cancel.clone();
     let a_in_rx: AsyncReceiver<(u64, Prev::Out)> = match prev_rx {
         FinalRx::Sync(mid_rx) => {
+            // sync → async bridge. The `spawn` path no longer reaches here —
+            // sync stages override `spawn_for_async` to write the mixed-mode
+            // sender directly. This arm serves only `spawn_async_feeder`
+            // (first-stage-async chains where a later sync stage feeds us).
             let (a_in_tx, a_in_rx) = sync_async_channel::<(u64, Prev::Out)>(buffer);
             std::thread::spawn(move || {
                 while let Ok(item) = mid_rx.recv() {
@@ -847,40 +1080,9 @@ where
             a_in_rx
         }
     };
-
-    let (a_out_tx, a_out_rx) = async_channel::<(u64, M)>(buffer);
-    let pool = ctx.acquire_async().expect("failed to build async runtime");
-    let _enter = pool.handle().enter();
-    let f = Arc::new(f);
-    let cancel = ctx.cancel.clone();
-    let mut consumers = Vec::with_capacity(concurrency);
-    for _ in 0..concurrency {
-        let f = f.clone();
-        let rx = a_in_rx.clone();
-        let tx = a_out_tx.clone();
-        let c = cancel.clone();
-        consumers.push(tokio::spawn(async move {
-            loop {
-                let Ok((seq, item)) = rx.recv().await else {
-                    break;
-                };
-                if cancel_active(c.as_ref()) {
-                    break;
-                }
-                let out = f(item).await;
-                if tx.send((seq, out)).await.is_err() {
-                    break;
-                }
-            }
-        }));
-    }
-    drop(a_out_tx);
-    drop(a_in_rx);
-    // Detach: tasks complete as channels close; we don't need the JoinHandles
-    // (output is observed via the channel).
-    drop(consumers);
-
-    FinalRx::Async(a_out_rx)
+    FinalRx::Async(spawn_async_consumers_body::<F, Prev::Out, M, Fut>(
+        f, a_in_rx, ctx,
+    ))
 }
 
 // ── StreamPipe builder methods ──
