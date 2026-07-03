@@ -28,10 +28,10 @@ temperature: 0
 
 ### 具体实现
 
+详情请参考 docs/ARCHITECTURE.md。
+
 - CPU 负载任务：rayon 架构在各种 balanced/unbalanced 负载下的综合表现都很好，这里直接采用 rayon 的调度器核心，详见 `src/pool/`。
   - 不希望引入 crossbeam_deque 库，因为 crossbeam_epoch 不兼容 miri。目前使用 st3 + concurrent-queue 实现工作窃取和 injector 队列。
-- 支持创建 scope，scope 闭包内可捕获外部的非 'static 引用
-- stream 的不同阶段之间支持添加 fence，允许一批数据/全部数据均执行完上一阶段后，再进入下一阶段。默认不进行阻拦。
 
 ### 开发提示
 

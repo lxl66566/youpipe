@@ -125,21 +125,21 @@ fused `try_map().try_collect()` —— fallible `Result` 链（热输入）：
 
 纯异步 IO（`tokio::time::sleep`，~1 ms 延迟，90/10 尾部，500 项）：
 
-| 拓扑                                  | 耗时    |
-| ------------------------------------- | ------- |
-| youpipe：异步 IO（`.stage_async`）    | 9.65 ms |
-| tokio：原生异步                       | 9.30 ms |
-| youpipe：阻塞 IO（`.stage`）          | 33.1 ms |
-| youpipe：阻塞 IO（过订阅 512 线程）   | 19.5 ms |
-| tokio：spawn_blocking                 | 8.83 ms |
+| 拓扑                                | 耗时    |
+| ----------------------------------- | ------- |
+| youpipe：异步 IO（`.stage_async`）  | 9.65 ms |
+| tokio：原生异步                     | 9.30 ms |
+| youpipe：阻塞 IO（`.stage`）        | 33.1 ms |
+| youpipe：阻塞 IO（过订阅 512 线程） | 19.5 ms |
+| tokio：spawn_blocking               | 8.83 ms |
 
 CPU + IO 混合（两阶段，500 项）：
 
-| 拓扑                                  | 耗时    |
-| ------------------------------------- | ------- |
-| youpipe：同步 CPU + 异步 IO           | 9.97 ms |
-| tokio：混合 spawn_blocking            | 10.1 ms |
-| youpipe：同步 CPU + 阻塞 IO           | 60.0 ms |
+| 拓扑                        | 耗时    |
+| --------------------------- | ------- |
+| youpipe：同步 CPU + 异步 IO | 9.97 ms |
+| tokio：混合 spawn_blocking  | 10.1 ms |
+| youpipe：同步 CPU + 阻塞 IO | 60.0 ms |
 
 ## 深入用法
 
@@ -194,11 +194,9 @@ let r = (0..1000).stream()
 
 ## 工作原理
 
-`Pipe` 组合一条编译期类型状态链，编译器将其单态化为每个工作线程上的单一闭包——无
-`dyn`、无阶段级 `Vec`。融合热路径一次性分配输入/输出缓冲区，并在索引范围 `[0, n)`
-上递归，每个叶子接收 `&[T]` / `&mut [R]` 切片视图，使叶子循环保持无分支、可向量化。
+见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
-`StreamPipe` 在 `.run()` 时遍历链，通过通道为每个阶段生成工作线程。同步阶段运行在
-`ComputePool` 上；异步阶段在 `async_workers` 个 OS 线程上复用 `io_concurrency` 个
-tokio 任务。完整设计原理、模块详解与 panic 安全性讨论见
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+## 第三方声明
+
+`src/pool/` 中的工作窃取调度器改编自
+[rayon-core](https://github.com/rayon-rs/rayon)。

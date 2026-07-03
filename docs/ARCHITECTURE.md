@@ -74,7 +74,7 @@ src/
 │   ├── notify.rs     # WaitGroup (counter barrier for stage synchronization)
 │   └── mod.rs
 ├── state/            # Ordered output & streaming execution
-│   ├── reorder.rs    # ReorderBuffer<T> (min-heap for restoring ordered output)
+│   ├── reorder.rs    # ReorderBuffer<T> (bitmask slot array for restoring ordered output)
 │   ├── fence.rs      # FenceBarrier<T> (configurable chunk_size barrier)
 │   ├── stream.rs     # run_ordered_collect helper
 │   └── mod.rs
@@ -108,15 +108,21 @@ src/
 
 ```rust
 pub enum Workload {
-    Balanced,    // 4× oversplit via recursive join
+    Balanced,    // up to 4× oversplit via recursive join (adaptive, see below)
     Unbalanced,  // 8× oversplit for finer-grained stealing
 }
 ```
 
 Both variants use the same recursive `join`-based index splitting (see 3.2).
-The oversplit factor controls how many leaf tasks the recursion produces:
+The oversplit factor controls how many leaf tasks the recursion produces;
 `Unbalanced` creates more, smaller leaves so that a thread blocked on a slow
 item can have its remaining leaves stolen by idle workers.
+
+`Balanced` is adaptive: when the batch is small enough that per-leaf work is
+sub-microsecond (`n / num_threads ≤ 1024`), it drops to `oversplit = 1` to
+avoid paying fork/join dispatch overhead for stealing slack it does not need;
+above that threshold it uses 4×. `Unbalanced` always uses 8× because its tail
+latency needs the stealing slack regardless of batch size.
 
 ### 3.2 `Slots<T>` — Index-Based Zero-Copy Buffers
 
@@ -129,11 +135,17 @@ pub(crate) struct Slots<T> {
 The parallel map/collect core never copies data between recursive levels. Two
 `Slots` buffers are allocated once:
 
-- **input** (`from_vec`): reinterprets the user's `Vec<T>` in place — items are
-  not moved, only the allocation's type is reinterpreted. `read(i)` does a
-  `ptr::read`, leaving slot `i` uninit.
-- **output** (`uninit(n)`): a `with_capacity(n) + set_len(n)` box of
-  uninitialized slots (no O(n) init loop). `write(i, val)` marks slot `i` init.
+- input (`from_vec`): reinterprets the user's `Vec<T>` in place — items are
+  not moved, only the allocation's type is reinterpreted.
+- output (`uninit(n)`): a `with_capacity(n) + set_len(n)` box of
+  uninitialized slots (no O(n) init loop).
+
+`Slots` exposes `as_slice(start, end)` / `as_mut_slice(start, end)` to borrow a
+range as a plain `&[T]` / `&mut [T]`, plus `drop_range` for panic cleanup. The
+leaf loop pulls these slice views and runs `ptr::read` / `ptr::write` over them;
+handing LLVM a normal slice reference (rather than `&Slots` with `UnsafeCell`
+interior mutability) is what lets the auto-vectorizer prove the input and
+output buffers are disjoint.
 
 Recursive `join` splits the **index range** `[0, n)`, not the data. Each leaf
 reads `input[i]`, applies the transform, writes `output[i]`. No `split_off`,
@@ -155,8 +167,8 @@ input `Vec<I>` inside the builder so the chain reads naturally left-to-right and
 `.collect()` takes no arguments. Three generic parameters:
 
 - `S`: The stage chain (nested `SyncMap` / `Filter` / `Identity`)
-- `I`: The pipeline **input** type (fixed by `pipe()`)
-- `O`: The **current output** type (the input to the next stage)
+- `I`: The pipeline input type (fixed by `pipe()`)
+- `O`: The current output type (the input to the next stage)
 
 ```rust
 pub struct Pipe<S = Identity, I = (), O = ()> {
@@ -167,12 +179,11 @@ pub struct Pipe<S = Identity, I = (), O = ()> {
 }
 ```
 
-Separating `I` and `O` (previously a single `T` overloaded both roles) is what
-makes type-changing maps compile: the input type `I` stays fixed while `O`
-tracks the latest transform's output, so `.map(i32 -> String)` then
-`.map(String -> usize)` type-checks end to end.
+`I` and `O` are separate type parameters so type-changing maps compile: the
+input type `I` stays fixed while `O` tracks the latest transform's output, so
+`.map(i32 -> String)` then `.map(String -> usize)` type-checks end to end.
 
-**Type transition chain** (`I₀` = initial input):
+Type transition chain (`I₀` = initial input):
 
 | Method call           | Type change                                                                   |
 | --------------------- | ----------------------------------------------------------------------------- |
@@ -237,8 +248,8 @@ impl<S, I, O> Pipe<S, I, O> {
   are allocated once, then `par_index_rec` recursively splits the **index range**
   `[0, n)` (not the data) via `ComputePool::join`. Each leaf receives `&[T]` /
   `&mut [R]` slice views and runs the `RangeOp` (`FusedOp(stages)`) through
-  `apply_pure` — branch-free and vectorizable. Workload only changes the oversplit
-  factor (`Balanced` = 4×, `Unbalanced` = 8×).
+  `apply_pure` — branch-free and vectorizable. Workload selects the oversplit
+  factor per §3.1.
 - **`MAY_FILTER == true`** — `join_fused_collect` recursively halves the `Vec`,
   each leaf filters into a per-leaf `Vec`, results merged by `extend`.
 
@@ -346,8 +357,7 @@ same recursive work-stealing `par_index_collect` core as `Pipe::collect`
 soundness story rests on `ComputePool::join`: the calling thread blocks in
 `Registry::in_worker_cold` until every sub-task finishes, which guarantees
 every `'env` reference captured by a scoped closure outlives the pool's
-access to it. (No `std::thread::scope` or per-chunk `Mutex<Vec<T>>` is
-involved — the previous design paid for both.)
+access to it.
 
 ---
 
@@ -365,31 +375,35 @@ Worker₃ ←→ Stealer₃
 ```
 
 - Built on `st3` (bounded lock-free LIFO deque): each worker has a local LIFO deque (FIFO stealing); other workers steal via `Stealer`
-- Global injector (mutex-protected `VecDeque`) accepts externally submitted tasks and local-queue overflow
+- Global injector is a lock-free `concurrent_queue::ConcurrentQueue` (unbounded) that accepts externally submitted tasks and local-queue overflow
 - `EventCount`-style packed atomic counters (`pool/sleep.rs`) wake idle workers
 
 ### Task Submission Flow
 
-1. `pool.submit(job)` → `injector.push(Box::new(job))`
-2. If `idle_count > 0` → `event.notify_one()` wakes a worker
+1. `pool.submit(job)` boxes the closure in a `HeapJob`, type-erases it to a `JobRef`, and calls `inject_or_push` — external callers go to the global injector, an on-pool caller pushes its own local deque
+2. `Sleep::new_injected_jobs` bumps the packed atomic counters and wakes parked workers via `wake_any_threads`
 3. Worker wakes → `find_work()` searches by priority
 
 ### Work Search Strategy
 
-```
-find_work():
-    1. local.pop()           → return if hit
-    2. injector.steal()      → return if hit
-    3. peer stealers         → return if hit
-    4. cpu_since_yield++
-       if > MAX_SPINS(64):
-           yield_now()
-           reset counter
-```
+`find_work()` tries sources in priority order:
+
+1. `local.pop()` — own LIFO deque
+2. `injector.steal()` — global queue (cheap CAS-free dequeue, checked before peers since external submits arrive here)
+3. peer stealers — randomized full scan with `steal_and_pop`
+
+The yield/spin/sleep backoff is **not** in `find_work()`; it lives in the idle
+loop of `wait_until_cold`; each round that finds no work calls
+`Sleep::no_work_found`, which ramps from `spin_loop` → `thread::yield_now` →
+parking on the `EventCount`-style counters.
 
 ### Graceful Shutdown
 
-`Drop` impl: set `shutdown` flag → `event.notify()` wake all workers → `drain_remaining()` processes leftover tasks → join all threads.
+`ComputePool::Drop` calls `Registry::terminate()`, which decrements a ref-count
+(`terminate_count`); when the last clone drops (count 1→0) it sets each worker's
+`terminate` OnceLatch and tickles it awake. Each worker's `wait_until_out_of_work`
+then drains its remaining local-deque work, sets its `stopped` latch, and exits;
+`Registry::Drop` blocks on every worker's `stopped` before returning.
 
 ---
 
@@ -404,7 +418,9 @@ Wraps `crossfire` with a unified API:
 | `SyncSender<T>` / `SyncReceiver<T>`   | `crossfire::mpmc::bounded_blocking` |
 | `AsyncSender<T>` / `AsyncReceiver<T>` | `crossfire::mpmc::bounded_async`    |
 
-An additional `closed: Arc<AtomicBool>` flag provides early termination without racing with crossfire's internal disconnect detection.
+Closure detection is delegated entirely to crossfire: `send`/`recv` return
+`Closed` once crossfire's internal disconnect logic observes that all peers
+have been dropped. No extra flag is maintained.
 
 ### 5.2 WaitGroup (`notify.rs`)
 
@@ -414,12 +430,14 @@ Counter barrier: `add(n)` increments, `done()` decrements, `wait()` blocks until
 
 ## 6. Ordered Output (`state/reorder.rs`)
 
-`ReorderBuffer<T>` uses a min-heap to restore original element order after parallel processing:
+`ReorderBuffer<T>` restores original element order after parallel processing. It is a fixed-size array of `2^k` slots addressed by bitmask: `seq & mask` maps a sequence number to its slot.
 
 1. Each element is sent with a sequence number `(seq, item)`
-2. `insert(seq, item)` pushes onto the min-heap
-3. `flush_ready()` pops contiguous elements from the top starting at `next_expected`
-4. `flush_remaining()` handles tail remainder (sorted return)
+2. `insert(seq, item)` writes the item directly into slot `seq & mask` (constant time, no comparison)
+3. `flush_ready()` walks contiguous slots starting at `next_expected`, draining any prefix that has arrived in order; returns the drained items
+4. `flush_remaining()` collects whatever is still outstanding (e.g. on disconnect) and returns it sorted by `seq` — the only path that pays for a comparison sort
+
+Capacity contract: because of the bitmask mapping, the number of simultaneously outstanding (un-flushed) items must stay below the slot count or two distinct `seq`s alias the same slot and the older item is dropped. Callers size the buffer to at least the maximum out-of-order window; the streaming collectors clamp it to `[1 Ki, 1 Mi]` slots.
 
 ---
 
@@ -468,32 +486,30 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
 ### CPU-Heavy `pipe()` vs rayon (`sync_cpu_heavy`, 100 iters/item, warm input)
 
-| Size | youpipe | rayon   | Result                   |
-| ---- | ------- | ------- | ------------------------ |
-| 1K   | ~34 µs  | ~40 µs  | **youpipe ~1.2× faster** |
-| 10K  | ~66 µs  | ~73 µs  | **youpipe ~1.1× faster** |
-| 100K | ~106 µs | ~147 µs | **youpipe ~1.4× faster** |
+| Size | youpipe | rayon   |
+| ---- | ------- | ------- |
+| 1K   | ~34 µs  | ~40 µs  |
+| 10K  | ~66 µs  | ~73 µs  |
+| 100K | ~106 µs | ~147 µs |
 
 ### Pipeline Fusion (3 stages) vs rayon chain (`pipeline_fusion`, warm input)
 
-| Size | youpipe fused | rayon chain | Result                    |
-| ---- | ------------- | ----------- | ------------------------- |
-| 10K  | ~65 µs        | ~70 µs      | **youpipe ~1.08× faster** |
-| 100K | ~90 µs        | ~104 µs     | **youpipe ~1.15× faster** |
+| Size | youpipe fused | rayon chain |
+| ---- | ------------- | ----------- |
+| 10K  | ~65 µs        | ~70 µs      |
+| 100K | ~90 µs        | ~104 µs     |
 
-The fused stage chain went from ~1.9× slower than rayon (mid-2026) to a
-dead heat or win at every size after three changes: a sleeping-bitmask
-rewrite of `wake_any_threads` that directed wakes only at parked
-workers, moving the `condvar.notify_one` outside the `is_blocked` mutex
-(which had been serialising every woken thread's re-acquire), and a
-`.cargo/config.toml` override that ensures the perf-friendly
-`opt-level=3`/`panic=unwind` regardless of the host's global cargo
-profile. A fourth change — adaptive oversplit (`workload_oversplit`)
-that drops to `oversplit = 1` for small batches (≤ 1024 items/worker) —
-trimmed ~95 fork/join internal nodes from 10 k batches, flipping the
-10 k case from trailing rayon to beating it. The remaining per-call
-scheduler fixed cost (~50 µs) is now only visible on batches far below
-the serial short-circuit threshold.
+The fused stage chain trailed rayon at every size in mid-2026 and now wins or
+draws at every size after four changes: a sleeping-bitmask rewrite of
+`wake_any_threads` that directed wakes only at parked workers, moving the
+`condvar.notify_one` outside the `is_blocked` mutex (which had been serialising
+every woken thread's re-acquire), a `.cargo/config.toml` override that ensures
+the perf-friendly `opt-level=3`/`panic=unwind` regardless of the host's global
+cargo profile, and adaptive oversplit (`workload_oversplit`) that drops to
+`oversplit = 1` for small batches (≤ 1024 items/worker) — trimming ~95 fork/join
+internal nodes from 10 k batches and flipping the 10 k case from trailing rayon
+to beating it. The remaining per-call scheduler fixed cost (~50 µs) is now only
+visible on batches far below the serial short-circuit threshold.
 
 ### Lightweight `pipe()` vs rayon (`sync_lightweight`, `x+1`)
 
@@ -506,16 +522,16 @@ the serial short-circuit threshold.
 Warm-input lightweight 1M improved from ~1.9 ms (pre-`Slots`) → ~730 µs
 (after `Slots`) → ~390 µs (after switching the leaf loop to a `&[T]` /
 `&mut [R]` slice view) → ~574 µs after the perf-config fix + the
-sleeping-bitmask wake rewrite + the notify-outside-lock fix. The slice
-view step closed a 2.5× gap with rayon: the previous `&Slots<u64>` for
-both input and output blocked LLVM's auto-vectorizer because the alias
-analysis could not prove the two `UnsafeCell`-wrapped buffers were
-disjoint. The 1 M case still trails rayon because the leaf work itself
-is so cheap (~0.12 ns/item) that scheduling overhead dominates; at 10 k
-and 100 k youpipe now beats rayon because the leaf amortises the
-overhead better. The cold variant documents the read-compute-write
-sensitivity to cold-from-RAM input (glibc's non-temporal memcpy bypasses
-the cache); rayon on an equally-cold clone measures ~800 µs at 1M.
+sleeping-bitmask wake rewrite + the notify-outside-lock fix. The slice view
+step closed the gap with rayon: the previous `&Slots<u64>` for both input and
+output blocked LLVM's auto-vectorizer because the alias analysis could not
+prove the two `UnsafeCell`-wrapped buffers were disjoint. The 1 M case still
+trails rayon because the leaf work itself is so cheap (~0.12 ns/item) that
+scheduling overhead dominates; at 10 k and 100 k youpipe now beats rayon
+because the leaf amortises the overhead better. The cold variant documents the
+read-compute-write sensitivity to cold-from-RAM input (glibc's non-temporal
+memcpy bypasses the cache); rayon on an equally-cold clone measures ~800 µs
+at 1M.
 
 ### Fallible `try_map().try_collect()` vs rayon (`try_collect`, warm input)
 
@@ -523,27 +539,26 @@ When the chain has `MAY_FILTER == false`, `try_collect` uses the same
 zero-allocation index-based fast path as `collect` — pre-allocating the output
 buffer and writing at known indices instead of the `Vec`-merge fallback.
 
-| Size | youpipe try_map | rayon   | Result                    |
-| ---- | --------------- | ------- | ------------------------- |
-| 10K  | ~64 µs          | ~68 µs  | **youpipe ~1.06× faster** |
-| 100K | ~88 µs          | ~101 µs | **youpipe ~1.15× faster** |
+| Size | youpipe try_map | rayon   |
+| ---- | --------------- | ------- |
+| 10K  | ~64 µs          | ~68 µs  |
+| 100K | ~88 µs          | ~101 µs |
 
 ### Mixed Load — `stream()` vs `tokio::spawn_blocking` (`mixed_load`)
 
-| Size | youpipe stream | spawn_blocking | rayon (CPU-only) | Result                              |
-| ---- | -------------- | -------------- | ---------------- | ----------------------------------- |
-| 1K   | ~832 µs        | ~2.92 ms       | ~38 µs           | **youpipe ~3.5× faster** than tokio |
-| 10K  | ~9.5 ms        | ~27.4 ms       | ~68 µs           | **youpipe ~2.9× faster**            |
-| 100K | ~95.9 ms       | ~239 ms        | ~111 µs          | **youpipe ~2.5× faster**            |
+| Size | youpipe stream | spawn_blocking | rayon (CPU-only) |
+| ---- | -------------- | -------------- | ---------------- |
+| 1K   | ~832 µs        | ~2.92 ms       | ~38 µs           |
+| 10K  | ~9.5 ms        | ~27.4 ms       | ~68 µs           |
+| 100K | ~95.9 ms       | ~239 ms        | ~111 µs          |
 
-`StreamPipe` comfortably and **stably** beats `tokio::spawn_blocking` (the
-design target for mixed CPU/IO) by ~2.5–3.5× at every size. The ratio
-improves at smaller sizes (3.5× at 1K) where per-task spawn overhead
-dominates tokio's cost, and narrows slightly at larger sizes (2.5× at 100K)
-where channel bandwidth becomes the bottleneck. `rayon::par_iter` is fastest
-here because this benchmark is pure-CPU and rayon's direct fork-join skips
-channel handoff entirely. All youpipe variants use `warm_clone` (cache-warmed
-input) for fair comparison against rayon's warm borrow.
+`StreamPipe` beats `tokio::spawn_blocking` (the design target for mixed CPU/IO)
+at every size, with the margin widest at smaller sizes where per-task spawn
+overhead dominates tokio's cost, and narrowing at larger sizes where channel
+bandwidth becomes the bottleneck. `rayon::par_iter` is fastest here because
+this benchmark is pure-CPU and rayon's direct fork-join skips channel handoff
+entirely. All youpipe variants use `warm_clone` (cache-warmed input) for fair
+comparison against rayon's warm borrow.
 
 ### Async IO — `.stage_async()` (`io_async`, yielding IO)
 
@@ -558,24 +573,23 @@ blocking-thread-per-core model. `io_concurrency = 512`, 32-core machine.
 | 200  | ~9.32 ms      | ~16.56 ms        | ~11.31 ms                | ~9.16 ms           | ~8.38 ms             |
 | 500  | ~9.65 ms      | ~33.08 ms        | ~19.46 ms                | ~9.30 ms           | ~8.83 ms             |
 
-`youpipe_async` **matches `tokio_async_native`** (the async ceiling) within
-~3% and is **1.8× (200) / 3.45× (500) faster than `youpipe_blocking`**.
-`tokio_spawn_blocking` edges it via tokio's 512-thread blocking pool —
-aggressive OS-thread oversubscription that only pays off for pure-sleep
-(no CPU) work. The gap to the async ceiling shrank after three changes:
-eliminating the sync→async bridge thread for `stream(..).stage_async(..)`
-(the feeder pushes into a mixed-mode `SyncSender` + `AsyncReceiver`
-channel that the AsyncStage consumes directly — see §3.6), and replacing
-the collector's per-item `recv().await` with a `try_recv` burst-drain that
-absorbs tokio's timer-tick completion bursts without per-item waker
-overhead.
+`youpipe_async` matches `tokio_async_native` (the async ceiling) within ~3% and
+stays well ahead of `youpipe_blocking`. `tokio_spawn_blocking` edges it via
+tokio's 512-thread blocking pool — aggressive OS-thread oversubscription that
+only pays off for pure-sleep (no CPU) work. The gap to the async ceiling shrank
+after three changes: eliminating the sync→async bridge thread for
+`stream(..).stage_async(..)` (the feeder pushes into a mixed-mode `SyncSender`
++ `AsyncReceiver` channel that the AsyncStage consumes directly — see §3.6),
+and replacing the collector's per-item `recv().await` with a `try_recv`
+burst-drain that absorbs tokio's timer-tick completion bursts without per-item
+waker overhead.
 
 `youpipe_blocking_oversub` uses `.with_compute_pool(ComputePool::new(512))`
-to match tokio's 512-thread blocking pool, narrowing the gap from ~2× to
-~35%. The remaining gap is streaming infrastructure overhead (channel
-handoff, injector scheduling) — the tradeoff for backpressure, ordering,
-and multi-stage composition that raw `spawn_blocking` doesn't provide.
-For blocking IO, `.stage_async()` remains the recommended tool.
+to match tokio's 512-thread blocking pool, narrowing the gap substantially.
+The remaining gap is streaming infrastructure overhead (channel handoff,
+injector scheduling) — the tradeoff for backpressure, ordering, and
+multi-stage composition that raw `spawn_blocking` doesn't provide. For
+blocking IO, `.stage_async()` remains the recommended tool.
 
 #### Mixed CPU (sync) + IO (`io_async_mixed`)
 
@@ -584,20 +598,20 @@ For blocking IO, `.stage_async()` remains the recommended tool.
 | 200  | ~9.48 ms            | ~27.3 ms               | ~8.93 ms             |
 | 500  | ~9.97 ms            | ~60.0 ms               | ~10.1 ms             |
 
-`youpipe_mixed_async` is **2.8× (200) / ~6× (500) faster than the all-blocking
-two-stage baseline**, and at size 500 edges out `tokio_mixed_blocking` by
-~150 µs: the async path overlaps the CPU and IO stages on separate pools,
-whereas the all-blocking path splits one compute pool between two blocking
-stages. At size 200 the fixed per-run setup cost (feeder thread, channel
-allocation, runtime entry) is a larger fraction of the ~9 ms total, so
-tokio's simpler spawn-per-item model still leads there.
+`youpipe_mixed_async` stays well ahead of the all-blocking two-stage baseline,
+and at size 500 edges out `tokio_mixed_blocking` by ~150 µs: the async path
+overlaps the CPU and IO stages on separate pools, whereas the all-blocking path
+splits one compute pool between two blocking stages. At size 200 the fixed
+per-run setup cost (feeder thread, channel allocation, runtime entry) is a
+larger fraction of the ~9 ms total, so tokio's simpler spawn-per-item model
+still leads there.
 
 ### Channel Throughput
 
-| Size | crossfire    | crossbeam-channel | std_mpsc     | Result                           |
-| ---- | ------------ | ----------------- | ------------ | -------------------------------- |
-| 10K  | 27.1 Melem/s | 20.2 Melem/s      | 37.0 Melem/s | **crossfire 1.34× vs crossbeam** |
-| 100K | 34.7 Melem/s | 17.3 Melem/s      | 44.6 Melem/s | **crossfire 2.0× vs crossbeam**  |
+| Size | crossfire    | crossbeam-channel | std_mpsc     |
+| ---- | ------------ | ----------------- | ------------ |
+| 10K  | 27.1 Melem/s | 20.2 Melem/s      | 37.0 Melem/s |
+| 100K | 34.7 Melem/s | 17.3 Melem/s      | 44.6 Melem/s |
 
 ---
 

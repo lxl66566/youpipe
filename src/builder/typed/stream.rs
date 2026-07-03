@@ -509,9 +509,7 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
                 // async). Only reached when an async stage feeds another async
                 // stage through the default impl — `AsyncStage` overrides this
                 // to return its already-async output directly.
-                let pool = ctx
-                    .acquire_async()
-                    .expect("failed to build async runtime");
+                let pool = ctx.acquire_async().expect("failed to build async runtime");
                 std::thread::spawn(move || {
                     pool.block_on(async move {
                         while let Ok(item) = r.recv().await {
@@ -680,11 +678,7 @@ where
     }
 
     #[cfg(feature = "tokio-runtime")]
-    fn spawn_for_async(
-        self,
-        rx: Receiver<(u64, In)>,
-        ctx: &StreamCtx,
-    ) -> AsyncReceiver<(u64, M)> {
+    fn spawn_for_async(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> AsyncReceiver<(u64, M)> {
         // Direct sync→async handoff: ComputePool workers write the mixed-mode
         // `SyncSender` directly — no bridge thread. The workers are OS threads,
         // so blocking on `send` under backpressure simply parks the worker
@@ -763,11 +757,7 @@ where
     }
 
     #[cfg(feature = "tokio-runtime")]
-    fn spawn_for_async(
-        self,
-        rx: Receiver<(u64, In)>,
-        ctx: &StreamCtx,
-    ) -> AsyncReceiver<(u64, N)> {
+    fn spawn_for_async(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> AsyncReceiver<(u64, N)> {
         // Same direct-handoff optimisation as `SyncStage::spawn_for_async`:
         // expansion workers write the mixed-mode sender directly.
         let prev_rx = self.prev.spawn(rx, ctx);
@@ -882,11 +872,7 @@ where
         FinalRx::Async(self.spawn_for_async(rx, ctx))
     }
 
-    fn spawn_for_async(
-        self,
-        rx: Receiver<(u64, In)>,
-        ctx: &StreamCtx,
-    ) -> AsyncReceiver<(u64, M)> {
+    fn spawn_for_async(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> AsyncReceiver<(u64, M)> {
         // async → async: recurse via prev's `spawn_for_async` to obtain our
         // input channel — mixed-mode when prev is sync (ComputePool workers
         // write the sender directly, **no bridge thread**), fully-async when

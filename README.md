@@ -141,11 +141,11 @@ Pure async IO (`tokio::time::sleep`, ~1 ms latency, 90/10 tail, 500 items):
 
 Mixed CPU + IO (two stages, 500 items):
 
-| Topology                              | Time    |
-| ------------------------------------- | ------- |
-| youpipe: sync CPU + async IO          | 9.97 ms |
-| tokio: mixed spawn_blocking           | 10.1 ms |
-| youpipe: sync CPU + blocking IO       | 60.0 ms |
+| Topology                        | Time    |
+| ------------------------------- | ------- |
+| youpipe: sync CPU + async IO    | 9.97 ms |
+| tokio: mixed spawn_blocking     | 10.1 ms |
+| youpipe: sync CPU + blocking IO | 60.0 ms |
 
 ## Advanced usage
 
@@ -203,14 +203,9 @@ input order via a `ReorderBuffer`.
 
 ## How it works
 
-`Pipe` composes a compile-time typestate chain that monomorphises into a
-single closure per worker — no `dyn`, no per-stage `Vec`. The fused hot path
-allocates input/output buffers once and recurses on the index range `[0, n)`,
-handing each leaf a `&[T]` / `&mut [R]` slice view so the leaf loop stays
-branch-free and vectorisable.
+see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-`StreamPipe` walks the chain at `.run()` time, spawning workers per stage
-over channels. Sync stages run on the `ComputePool`; async stages multiplex
-`io_concurrency` tokio tasks on `async_workers` OS threads. Full design
-rationale, module walkthrough and panic-safety discussion in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+## Attribution
+
+The work-stealing scheduler in `src/pool/` is adapted from
+[rayon-core](https://github.com/rayon-rs/rayon).
