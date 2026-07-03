@@ -821,3 +821,38 @@ fn test_for_each_unbalanced_workload() {
         });
     assert_eq!(counter.load(Ordering::Relaxed), 10_000);
 }
+
+#[test]
+fn test_hybrid_dispatch_spin_wait_stress() {
+    // Regression guard for `CountLatch::wait_spin` (off-pool hybrid driver).
+    //
+    // An earlier version returned directly from the spin on observing
+    // `counter == 0`, racing the latch's stack-frame free against the last
+    // chunk's still-in-flight `LockLatch::set` — surfacing as a SIGSEGV under
+    // the `sync_cpu_heavy` benchmark. The fix mandates that the spin end in
+    // the mutex acquire (`LockLatch::wait`); this test hammers the path from
+    // multiple external threads to catch any re-introduction of that
+    // use-after-free.
+    //
+    // `cpu_heavy` per item keeps each batch's parallel work inside the spin
+    // envelope (~tens of µs), so this exercises the spin fast path, not the
+    // condvar fallback.
+    const ITERS: usize = 20_000;
+    const N: usize = 1_000;
+    let data: Vec<u64> = (0..N as u64).collect();
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            let data = data.clone();
+            s.spawn(move || {
+                for _ in 0..ITERS {
+                    let v = data.clone();
+                    let r: Vec<u64> = pipe(v).map(|x: u64| cpu_heavy(x)).collect();
+                    assert_eq!(r.len(), N);
+                    // Spot-check first/last to ensure indices map correctly.
+                    assert_eq!(r[0], cpu_heavy(0));
+                    assert_eq!(r[N - 1], cpu_heavy((N - 1) as u64));
+                }
+            });
+        }
+    });
+}

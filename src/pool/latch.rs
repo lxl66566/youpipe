@@ -307,7 +307,91 @@ impl CountLatch {
             CountLatchKind::Blocking { latch } => latch.wait(),
         }
     }
+
+    /// Spin-then-park wait for the off-pool (`Blocking`) variant.
+    ///
+    /// Tight-spins on `counter` for a bounded budget first, so that by the time
+    /// we acquire the latch's mutex (below) the last chunk has — in the common
+    /// short-wait case — already finished `LockLatch::set`, meaning `*guard` is
+    /// `true` and we return without a condvar park syscall. That syscall
+    /// (`futex`/`pthread_cond_signal`) is ~10–20 µs of fixed overhead per batch
+    /// and was the bulk of the remaining gap to rayon on the 1 K `cpu_heavy`
+    /// case. For long waits we exhaust the spin budget and the mutex path
+    /// transparently parks on the condvar, releasing the core.
+    ///
+    /// # Why the mutex acquire is load-bearing (not just the spin)
+    ///
+    /// The spin may *not* return directly. The last chunk, after
+    /// `counter.fetch_sub` brings it to 0, still has to run `LockLatch::set`
+    /// (lock → store → notify → unlock) — which dereferences the latch via the
+    /// raw pointer the chunk holds. If the driver observed `counter == 0` and
+    /// freed the latch (by returning), the chunk's in-flight `LockLatch::set`
+    /// would touch freed memory (observed as SIGSEGV). Going through the mutex
+    /// fixes this: `LockLatch::set` holds the very same mutex while touching
+    /// the latch, so our `lock()` cannot return until the setter has released
+    /// it (finished touching the latch). Once we see `*guard == true` and
+    /// return, the setter is provably done — no use-after-free. The mutex
+    /// lock/unlock on an uncontended `parking_lot` mutex is ~10–30 ns
+    /// (adaptive spin, no syscall) — ~1000× cheaper than the condvar park it
+    /// replaces.
+    ///
+    /// # Synchronization
+    ///
+    /// `Latch::set` does `counter.fetch_sub(SeqCst)`; the last decrement (1→0)
+    /// additionally runs `LockLatch::set`. An `Acquire` load that reads `0`
+    /// synchronizes with that final `SeqCst` decrement, and the mutex
+    /// acquire/release pairs every prior chunk write (e.g. the hybrid driver's
+    /// `succeeded` flags) into the driver's view — the same guarantee the
+    /// condvar path relies on.
+    ///
+    /// No-stealing note: the caller is an off-pool thread with no worker deque,
+    /// so unlike the `Stealing` variant it cannot help by stealing while it
+    /// waits — a bounded spin is strictly better than parking for short waits.
+    /// The `Stealing` variant keeps its work-stealing `wait()`.
+    pub(crate) fn wait_spin(&self) {
+        match &self.kind {
+            CountLatchKind::Stealing {
+                latch,
+                registry,
+                worker_index,
+            } => {
+                // On-pool: keep the work-stealing wait — the worker can steal
+                // while it waits, which is strictly better than spinning.
+                debug_assert!(registry.num_threads() > *worker_index);
+                Registry::wait_until_worker(latch);
+            }
+            CountLatchKind::Blocking { latch } => {
+                // Tier 1: tight spin (PAUSE on x86). Each iteration is ~10–40 ns;
+                // this budget covers ~100–150 µs, enough to catch any batch whose
+                // parallel time fits inside the small/medium dispatch envelope.
+                // We only `break` (not `return`): see the method doc on why the
+                // mutex acquire below is mandatory for soundness.
+                for _ in 0..OFF_POOL_SPIN_ITERS {
+                    if self.counter.load(Ordering::Acquire) == 0 {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                // Tier 2: condvar park. In the common case the spin above let
+                // the setter finish `LockLatch::set`, so `*guard == true` here
+                // and we return without parking (no syscall). If the budget ran
+                // out (genuinely long wait), this parks until the setter's
+                // notify — releasing the core. Either way the mutex serializes
+                // us against the setter's in-flight latch access.
+                latch.wait();
+            }
+        }
+    }
 }
+
+/// Tight-spin iteration budget for [`CountLatch::wait_spin`]'s tier 1.
+///
+/// Tuned for the off-pool hybrid-dispatch driver: large enough to absorb the
+/// full small/medium-batch dispatch envelope (~100–150 µs of parallel work +
+/// wake latency) without falling through to the condvar, small enough that a
+/// truly long wait (ms+) only burns ~100 µs of one calling-thread core before
+/// parking. See the `par_index_collect_hybrid` comment in `fused.rs`.
+const OFF_POOL_SPIN_ITERS: usize = 4096;
 
 impl Latch for CountLatch {
     #[inline]

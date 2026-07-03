@@ -407,7 +407,16 @@ where
     // with no owner uses a `LockLatch` (parking-lot condvar) — correct for an
     // off-pool caller (a pool worker must NOT take this path; see the guard in
     // `par_index_collect`).
-    latch.wait();
+    //
+    // `wait_spin` instead of `wait`: spin-then-park. The condvar park/notify
+    // handshake is ~10–20 µs of fixed overhead per batch (two syscalls + a wake
+    // cascade); for small/medium batches whose own parallel work is only tens
+    // of µs that handshake dominated the wall time (the 1 K `cpu_heavy` case
+    // trailed rayon almost entirely on this). Spinning on the SeqCst counter
+    // for a bounded budget lets the last chunk's decrement land inside the spin
+    // window and skips the syscall; long waits still fall through to the
+    // condvar. See `CountLatch::wait_spin` for the synchronization argument.
+    latch.wait_spin();
 
     // After `wait` returns every chunk's `execute` has run `CountLatch::set`;
     // the SeqCst fence there carries the `succeeded` Release store into our
@@ -802,10 +811,16 @@ where
 // `num_threads`-item inject never hits the single-injector MPMC contention
 // that sank pure flat. The small/medium-N win is smaller than pure flat's
 // (−15 % at 10 k) because each chunk still builds a mini-tree (some ramp-up
-// inside the chunk), but avoiding the large-N cliff is the decisive win. The
-// remaining ~120 µs fixed cost on tiny batches (1 k cpu_heavy still trails
-// rayon) is now dominated by the off-pool `CountLatch`/condvar handoff, not
-// ramp-up — a separate problem.
+// inside the chunk), but avoiding the large-N cliff is the decisive win.
+//
+// The off-pool wait that hybrid introduces was originally a condvar park
+// (`CountLatch`/`LockLatch`), costing ~10–20 µs of fixed overhead per batch on
+// the driver thread — the dominant remaining cost on the 1 K `cpu_heavy` case.
+// It is now a spin-then-park (`CountLatch::wait_spin`): a bounded tight spin on
+// the SeqCst `counter` covers the small/medium-batch envelope without a syscall,
+// falling through to the condvar only for genuinely long waits. See the
+// `CountLatch::wait_spin` doc in `src/pool/latch.rs` for why the spin must
+// still end in the mutex acquire (use-after-free avoidance).
 
 // ── Join-based parallel helpers ──
 
@@ -820,9 +835,9 @@ where
 /// # Why this no longer guesses based on batch size
 ///
 /// An earlier version routed small batches (`n ≤ num_threads × k`) to a serial
-/// loop to avoid the pool's ~120 µs fixed dispatch overhead (external-thread
-/// job injection + `LockLatch` handoff + worker wake). That was tuned against
-/// the `cpu_heavy` benchmark (~30 ns/item), whose serial↔parallel crossover is
+/// loop to avoid the pool's fixed dispatch overhead (external-thread job
+/// injection + off-pool wait + worker wake). That was tuned against the
+/// `cpu_heavy` benchmark (~30 ns/item), whose serial↔parallel crossover is
 /// ~3 k items.
 ///
 /// The heuristic was **deceptive**: `.collect()` / `.for_each()` advertise
@@ -833,13 +848,15 @@ where
 /// serialized — turning a 4 s parallel run into a 100 s serial one.
 ///
 /// The asymmetry is decisive: wrongly parallelizing a cheap small batch costs
-/// ~120 µs (imperceptible); wrongly serializing an expensive small batch costs
-/// the entire batch wall-time. If a user wants serial execution, that is their
-/// decision to make explicitly — the framework's job is to parallelize, not to
-/// second-guess the workload. The ~120 µs overhead on cheap small batches is
-/// accepted as the price of honesty; the right long-term fix is to lower the
-/// cold-inject cost itself (hybrid dispatch — see the flat-dispatch comment
-/// above), not to silently downgrade to serial.
+/// only the dispatch envelope (now ~20–30 µs after hybrid dispatch +
+/// `CountLatch::wait_spin`, was ~120 µs — imperceptible); wrongly serializing
+/// an expensive small batch costs the entire batch wall-time. If a user wants
+/// serial execution, that is their decision to make explicitly — the
+/// framework's job is to parallelize, not to second-guess the workload. The
+/// dispatch overhead on cheap small batches is accepted as the price of
+/// honesty; the right long-term fix is to lower the cold-inject cost itself
+/// (hybrid dispatch + spin-then-park — see the flat-dispatch comment above),
+/// not to silently downgrade to serial.
 fn prefers_serial(n: usize, num_threads: usize, _workload: Workload) -> bool {
     n <= 1 || num_threads <= 1
 }

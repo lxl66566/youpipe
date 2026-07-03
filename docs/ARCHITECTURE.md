@@ -104,25 +104,35 @@ src/
 
 ## 3. Core Types
 
-### 3.1 `Workload` — Scheduling Strategy Hint
+### 3.1 `Workload` — Per-Item Cost Distribution Hint
 
 ```rust
 pub enum Workload {
-    Balanced,    // up to 4× oversplit via recursive join (adaptive, see below)
-    Unbalanced,  // 8× oversplit for finer-grained stealing
+    Balanced,    // default; adaptive oversplit (1× for small batches, 4× for large)
+    Unbalanced,  // 8× oversplit for finer-grained stealing of skewed tails
 }
 ```
 
-Both variants use the same recursive `join`-based index splitting (see 3.2).
-The oversplit factor controls how many leaf tasks the recursion produces;
-`Unbalanced` creates more, smaller leaves so that a thread blocked on a slow
-item can have its remaining leaves stolen by idle workers.
+A hint about how skewed each item's wall-clock cost is **within a single
+`pipe(..).collect()` / `for_each()` run** (not how items are spread across
+streaming stages). It selects the fork/join oversplit factor
+(`workload_oversplit`):
 
-`Balanced` is adaptive: when the batch is small enough that per-leaf work is
-sub-microsecond (`n / num_threads ≤ 1024`), it drops to `oversplit = 1` to
-avoid paying fork/join dispatch overhead for stealing slack it does not need;
-above that threshold it uses 4×. `Unbalanced` always uses 8× because its tail
-latency needs the stealing slack regardless of batch size.
+- `Balanced` (the default) — items cost roughly the same. Adaptive: when the
+  batch is small enough that per-leaf work is sub-microsecond
+  (`n / num_threads ≤ 1024`), it drops to `oversplit = 1` to avoid paying
+  fork/join dispatch overhead for stealing slack it does not need; above that
+  threshold it uses 4×.
+- `Unbalanced` — a few items are far slower than the rest (skewed tail). Always
+  uses 8× oversplit so an idle worker can steal a slow sibling's remaining
+  leaves, shrinking tail latency. Opt in only when the tail is genuinely uneven.
+
+**Scope.** Only the fused path (`pipe` / `scope` / `try_map`) consults this.
+The streaming path (`stream(..)`) ignores it: streaming already load-balances
+per-item skew through its MPMC channel + `per_stage_parallelism` workers (a
+stalled worker simply stops draining while peers keep consuming), and there is
+no fork/join oversplit decision to tune. To control streaming tail latency,
+raise `compute_workers` / `per_stage_parallelism`.
 
 ### 3.2 `Slots<T>` — Index-Based Zero-Copy Buffers
 
@@ -539,26 +549,47 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
 | Size | youpipe | rayon   |
 | ---- | ------- | ------- |
-| 1K   | ~62 µs  | ~37 µs  |
-| 10K  | ~64 µs  | ~70 µs  |
-| 100K | ~105 µs | ~145 µs |
+| 1K   | ~59 µs  | ~38 µs  |
+| 10K  | ~61 µs  | ~69 µs  |
+| 100K | ~102 µs | ~137 µs |
 
-The 1K case trails rayon because the ~120 µs fixed dispatch overhead (off-pool
-`CountLatch`/condvar handoff + worker wake) dominates a batch whose own work is
-only ~30 µs. Hybrid flat/tree dispatch (`par_index_collect_hybrid`) eliminated
-the fork/join ramp-up but the remaining fixed cost is now the off-pool park
-itself — a separate problem. An earlier version silently routed such small
-batches to a serial loop to win this benchmark, but that was deceptive (the API
-promises parallelism) and catastrophic for expensive per-item work (file IO,
-crypto) whose small batches would be wrongly serialized. The heuristic was
-removed — see `prefers_serial` in `src/builder/typed/fused.rs`.
+The 1K case still trails rayon but the gap narrowed from ~33 µs to ~21 µs after
+two changes that together removed ~11 µs of fixed overhead:
+
+1. **`Workload::Balanced` is now the default** (was `Unbalanced` → oversplit 8).
+   For 1K/10K batches `n / num_threads ≤ 1024`, so the adaptive path picks
+   `oversplit = 1` (32 leaves) instead of 8 (256 leaves) — far fewer internal
+   nodes to dispatch.
+2. **Spin-then-park for the off-pool wait** (`CountLatch::wait_spin`): the
+   hybrid driver tight-spins on the `counter` atomic for a bounded budget
+   (4096 PAUSE iters ≈ 100–150 µs) before acquiring the latch's mutex. In the
+   short-wait regime the last chunk's `fetch_sub` lands inside the spin window,
+   so the condvar park/notify syscall (~10–20 µs of fixed overhead) is skipped
+   entirely; long waits still fall through to the condvar. The mutex acquire is
+   load-bearing for soundness — it serializes against the last chunk's
+   in-flight `LockLatch::set`, preventing a use-after-free (spinning on the
+   counter and returning directly would race the latch free against that
+   access; observed as SIGSEGV).
+
+The residual ~21 µs is no longer the condvar handshake — it is the inject+
+wake cascade (pushing `num_threads` JobRefs through the injector + waking the
+workers) plus the fact that the off-pool driver blocks instead of participating
+in the work the way rayon's calling thread does (rayon's `par_iter` runs inline
+on the caller). Closing it further would need the driver to run one chunk
+inline, which is a separate change.
+
+An earlier version silently routed small batches to a serial loop to win this
+benchmark, but that was deceptive (the API promises parallelism) and
+catastrophic for expensive per-item work (file IO, crypto) whose small batches
+would be wrongly serialized. The heuristic was removed — see `prefers_serial`
+in `src/builder/typed/fused.rs`.
 
 ### Pipeline Fusion (3 stages) vs rayon chain (`pipeline_fusion`, warm input)
 
 | Size | youpipe fused | rayon chain |
 | ---- | ------------- | ----------- |
-| 10K  | ~61 µs        | ~67 µs      |
-| 100K | ~82 µs        | ~101 µs     |
+| 10K  | ~59 µs        | ~66 µs      |
+| 100K | ~79 µs        | ~100 µs     |
 
 The fused stage chain now beats rayon at every size after five changes: the
 sleeping-bitmask rewrite of `wake_any_threads`, moving the `condvar.notify_one`
@@ -574,18 +605,17 @@ stealing. The hybrid alone measured −6.5 % @ 10 k and −6.7 % @ 100 k.
 
 | Size | youpipe (warm) | youpipe (cold) | rayon   |
 | ---- | -------------- | -------------- | ------- |
-| 10K  | ~63 µs         | ~71 µs         | ~67 µs  |
-| 100K | ~79 µs         | ~122 µs        | ~104 µs |
-| 1M   | ~516 µs        | ~4.03 ms       | ~265 µs |
+| 10K  | ~59 µs         | ~67 µs         | ~64 µs  |
+| 100K | ~77 µs         | ~120 µs        | ~105 µs |
+| 1M   | ~540 µs        | ~4.23 ms       | ~273 µs |
 
 Warm-input lightweight improved ~1.9 ms (pre-`Slots`) → ~730 µs (after `Slots`)
 → ~390 µs (slice view) → ~570 µs (after perf-config + sleeping-bitmask wake +
 notify-outside-lock) → **~516 µs after hybrid flat/tree dispatch** (which alone
 shaved −9.6 % / −55 µs by eliminating fork/join ramp-up). The 1 M case still
 trails rayon because the leaf work itself is so cheap (~0.12 ns/item) that the
-off-pool `CountLatch`/condvar handoff + per-chunk tree fixed cost dominate; at
-10 k and 100 k youpipe beats rayon because the leaf amortises the overhead
-better.
+off-pool spin/mutex wait + per-chunk tree fixed cost dominate; at 10 k and
+100 k youpipe beats rayon because the leaf amortises the overhead better.
 
 ### Fallible `try_map().try_collect()` vs rayon (`try_collect`, warm input)
 

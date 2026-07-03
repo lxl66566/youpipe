@@ -1,10 +1,35 @@
-/// Describes how work is distributed across stages.
+/// Hint about the per-item **cost distribution** of a fused pipeline, used to
+/// pick the fork/join oversplit factor (see `workload_oversplit`).
+///
+/// This is *not* about how many items each stage receives (streaming handles
+/// that via per-stage parallelism + MPMC channels). It is about how much
+/// **wall-clock time** each item takes relative to its siblings within a single
+/// `pipe(..).collect()` / `for_each()` run:
+///
+/// - `Balanced` — items cost roughly the same. The fork/join tree needs little
+///   stealing slack, so oversplit is adaptive (`1` for small batches, `4` for
+///   large). This is the right default for the vast majority of workloads.
+/// - `Unbalanced` — a few items are far slower than the rest (skewed tail). The
+///   tree always uses `8×` oversplit so an idle worker can steal a slow
+///   sibling's remaining leaves, shrinking tail latency.
+///
+/// # Scope
+///
+/// Only the **fused** path (`pipe` / `scope` / `try_map`) consults this. The
+/// streaming path (`stream(..)`) ignores it: streaming already load-balances
+/// per-item skew through its MPMC channel + `per_stage_parallelism` workers (a
+/// stalled worker simply stops draining while peers keep consuming), and there
+/// is no fork/join oversplit decision to tune. To control streaming tail
+/// latency, raise `compute_workers` / `per_stage_parallelism`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Workload {
-    /// Items are roughly evenly distributed across stages.
-    Balanced,
-    /// Items may be heavily concentrated in a subset of stages.
+    /// Per-item cost is roughly uniform. Adaptive oversplit (`1` for small
+    /// batches, `4` for large). The right choice for most workloads.
     #[default]
+    Balanced,
+    /// Per-item cost is skewed (expensive tail). Always `8×` oversplit for
+    /// finer-grained work stealing. Costs more dispatch overhead per batch, so
+    /// only opt in when the tail is genuinely uneven.
     Unbalanced,
 }
 
@@ -42,7 +67,7 @@ impl Default for PipelineConfig {
             async_workers: cpus,
             buffer_size: 256,
             io_concurrency: 128,
-            workload: Workload::Unbalanced,
+            workload: Workload::Balanced,
         }
     }
 }
