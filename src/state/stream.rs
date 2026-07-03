@@ -24,8 +24,9 @@ pub fn run_ordered_collect<O: Send + 'static>(
     let mut buffer = ReorderBuffer::new(capacity);
     let mut results = Vec::with_capacity(expected_items);
     while let Ok((seq, item)) = input_rx.recv() {
-        let ready = buffer.insert(seq, item);
-        results.extend(ready);
+        // Write directly into `results` — no per-item `Vec` allocation. See
+        // `ReorderBuffer::insert_into` for the rationale.
+        buffer.insert_into(seq, item, &mut results);
     }
     results.extend(buffer.flush_remaining());
     results

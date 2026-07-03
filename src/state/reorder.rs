@@ -48,7 +48,18 @@ impl<T> ReorderBuffer<T> {
         }
     }
 
-    pub fn insert(&mut self, seq: u64, item: T) -> Vec<T> {
+    /// Insert `item` tagged with `seq`, writing any newly-contiguous run of
+    /// items directly into `sink` without allocating a temporary `Vec`.
+    ///
+    /// This is the zero-allocation hot path used by the streaming ordered
+    /// collectors: each item arriving in order produces exactly one
+    /// `sink.push(item)` with no per-item heap traffic. Contrast with
+    /// [`insert`](Self::insert), which returns a fresh `Vec<T>` per call — in
+    /// the in-order steady state that returned `Vec` has length 1, so the
+    /// collector pays a `malloc` + `free` per item purely to move a single
+    /// value. At 100 k+ items that allocation churn dominated the ordered
+    /// collector's cost; this sink variant eliminates it.
+    pub fn insert_into(&mut self, seq: u64, item: T, sink: &mut Vec<T>) {
         // `seq as usize` is safe across all pointer widths: the subsequent
         // `& self.mask` only keeps the low log2(capacity) bits, so truncation
         // on 32-bit targets is harmless (capacity is always < 2³²).
@@ -71,26 +82,36 @@ impl<T> ReorderBuffer<T> {
         slot.seq = seq;
         slot.item.write(item);
         self.len += 1;
-        self.flush_ready()
+        self.flush_ready_into(sink);
     }
 
-    fn flush_ready(&mut self) -> Vec<T> {
+    /// Insert `item` and return any newly-contiguous run as a `Vec`.
+    ///
+    /// Convenience wrapper around [`insert_into`](Self::insert_into) for callers
+    /// that prefer a returned `Vec` over an out-parameter (e.g. tests). Prefer
+    /// `insert_into` on hot paths to avoid the per-call allocation.
+    pub fn insert(&mut self, seq: u64, item: T) -> Vec<T> {
         let mut ready = Vec::new();
+        self.insert_into(seq, item, &mut ready);
+        ready
+    }
+
+    fn flush_ready_into(&mut self, sink: &mut Vec<T>) {
         loop {
-            // See `insert` for why truncation is harmless.
+            // See `insert_into` for why truncation is harmless.
             #[allow(clippy::cast_possible_truncation)]
             let idx = (self.next_expected as usize) & self.mask;
             if !self.slots[idx].occupied || self.slots[idx].seq != self.next_expected {
                 break;
             }
             let slot = &mut self.slots[idx];
+            // SAFETY: slot is occupied and init (checked above).
             let item = unsafe { slot.item.assume_init_read() };
             slot.occupied = false;
             self.len -= 1;
             self.next_expected += 1;
-            ready.push(item);
+            sink.push(item);
         }
-        ready
     }
 
     pub fn flush_remaining(&mut self) -> Vec<T> {

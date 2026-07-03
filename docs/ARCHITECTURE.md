@@ -470,9 +470,15 @@ Counter barrier: `add(n)` increments, `done()` decrements, `wait()` blocks until
 `ReorderBuffer<T>` restores original element order after parallel processing. It is a fixed-size array of `2^k` slots addressed by bitmask: `seq & mask` maps a sequence number to its slot.
 
 1. Each element is sent with a sequence number `(seq, item)`
-2. `insert(seq, item)` writes the item directly into slot `seq & mask` (constant time, no comparison)
-3. `flush_ready()` walks contiguous slots starting at `next_expected`, draining any prefix that has arrived in order; returns the drained items
-4. `flush_remaining()` collects whatever is still outstanding (e.g. on disconnect) and returns it sorted by `seq` — the only path that pays for a comparison sort
+2. `insert_into(seq, item, &mut Vec<T>)` writes the item directly into slot
+   `seq & mask` (constant time, no comparison), then drains any contiguous run
+   ready at the tail **straight into the caller's sink** — zero per-item
+   allocation. (The older `insert` returned a fresh `Vec<T>` per call; in the
+   in-order steady state that returned `Vec` had length 1, so the ordered
+   collector paid a `malloc` + `free` per item purely to move a single value.
+   `insert_into` is the hot-path variant; `insert` remains as a thin wrapper
+   for tests / ergonomic callers.)
+3. `flush_remaining()` collects whatever is still outstanding (e.g. on disconnect) and returns it sorted by `seq` — the only path that pays for a comparison sort
 
 Capacity contract: because of the bitmask mapping, the number of simultaneously outstanding (un-flushed) items must stay below the slot count or two distinct `seq`s alias the same slot and the older item is dropped. Callers size the buffer to at least the maximum out-of-order window; the streaming collectors clamp it to `[1 Ki, 1 Mi]` slots.
 

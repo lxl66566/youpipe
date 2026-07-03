@@ -1485,7 +1485,9 @@ async fn collect_async<T: Send + Unpin + 'static>(
         let mut buffer = ReorderBuffer::new(capacity);
         let mut results = Vec::with_capacity(n);
         while let Ok((seq, o)) = rx.recv().await {
-            results.extend(buffer.insert(seq, o));
+            // Write directly into `results` — no per-item `Vec` allocation.
+            // See `ReorderBuffer::insert_into` for the rationale.
+            buffer.insert_into(seq, o, &mut results);
         }
         results.extend(buffer.flush_remaining());
         results
