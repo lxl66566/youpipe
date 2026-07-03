@@ -1,4 +1,13 @@
-use std::{any::Any, marker::PhantomData, panic};
+use std::{
+    any::Any,
+    marker::PhantomData,
+    panic,
+    ptr,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use super::{
     slots::Slots,
@@ -10,9 +19,18 @@ use super::{
 use crate::{
     builder::config::{PipelineConfig, Workload},
     executor::compute::ComputePool,
+    pool::{
+        job::{Job, JobRef},
+        latch::{CountLatch, Latch},
+        registry::WorkerThread,
+        unwind,
+    },
 };
 
 type PanicPayload = Box<dyn Any + Send>;
+/// Shared first-panic slot for hybrid dispatch. `halt_unwinding` catches each
+/// chunk's panic before it reaches the lock, so the mutex is never poisoned.
+type PanicSlot = Mutex<Option<PanicPayload>>;
 
 /// Recursive index-based parallel fill. Each leaf claims a disjoint index range
 /// `[start, end)` and writes outputs into `output[start..end)` by index — no
@@ -180,9 +198,28 @@ where
 {
     let n = items.len();
     debug_assert!(n > 0);
+    let num_threads = ComputePool::global().num_workers();
     let input = Slots::from_vec(items);
     let output = Slots::<R>::uninit(n);
-    let result = par_index_rec(&input, &output, 0, n, op, splits);
+
+    // Hybrid dispatch when called from outside the pool (the common
+    // `.collect()` case): inject `num_threads` broad top-level chunks into the
+    // global injector so every worker grabs one immediately — no fork/join
+    // ramp-up. Each chunk then recurses via the tree (distributed deques +
+    // stealing). See the "flat dispatch" post-mortem above for why pure flat
+    // was a wash; hybrid keeps its small/medium-N win (parallel ramp-up) while
+    // avoiding its large-N regression (only `num_threads` items through the
+    // injector, not `N`).
+    //
+    // Fall back to the single-tree path when already on a pool worker: the
+    // hybrid path blocks the caller on a `CountLatch`/`LockLatch`, which would
+    // deadlock a pool worker (it must steal while waiting, not park).
+    let on_pool = !WorkerThread::current().is_null();
+    let result = if on_pool {
+        par_index_rec(&input, &output, 0, n, op, splits)
+    } else {
+        par_index_collect_hybrid(&input, &output, n, op, splits, num_threads)
+    };
     match result {
         Ok(()) => {
             // Input fully consumed (all uninit): dropping the box just frees
@@ -197,6 +234,196 @@ where
             panic::resume_unwind(p);
         }
     }
+}
+
+// ── Hybrid flat/tree top-level dispatch ──
+//
+// Hypothesis: the single-tree `par_index_rec` grows parallelism one level at a
+// time — the externally-injected top job runs on ONE worker, which runs its A
+// inline and pushes B; only after B is stolen does a second worker join, and so
+// on. That ramp-up costs ~log2(num_threads) join levels before every worker is
+// busy, and is the bulk of the ~120 µs fixed dispatch overhead that dominates
+// small/medium batches (notably the 1 K `cpu_heavy` case trailing rayon).
+//
+// Hybrid injects `num_threads` disjoint top-level chunks into the injector in
+// one `inject_batch` (one JEC bump, one wake cascade). Every worker pops a
+// chunk on its first `find_work`, so all workers are busy from t≈0. Each chunk
+// then builds its own mini-tree via `par_index_rec`, so within-chunk stealing
+// still uses the distributed local deques (no single-queue contention at large
+// N, which is what sank pure flat dispatch).
+//
+// Panic plumbing: injected jobs must NOT let a panic reach the worker's
+// `AbortIfPanic`. Each chunk's body is wrapped in `halt_unwinding`; the first
+// panic is funnelled into a shared `PanicSlot`, every chunk (success or panic)
+// decrements the `CountLatch`, and the driver — after `wait()` — drops the
+// output ranges of successful chunks (failed chunks already cleaned their own
+// ranges inside `par_index_rec`) and resumes the captured panic.
+
+/// One top-level chunk of a hybrid-dispatch parallel index collect. Heap-
+/// allocated (stable address); referenced by the injected `JobRef`. Carries
+/// raw pointers to the shared `Slots`/`op`/`latch`/`panic_slot`, which all
+/// live on the driver's stack frame — sound because the driver blocks on the
+/// `CountLatch` until every chunk has executed.
+struct ChunkJob<T, R, OP> {
+    input: *const Slots<T>,
+    output: *const Slots<R>,
+    op: *const OP,
+    start: usize,
+    end: usize,
+    splits: usize,
+    /// Shared count latch; decremented on completion (success or panic).
+    latch: *const CountLatch,
+    /// Shared first-panic slot.
+    panic_slot: *const PanicSlot,
+    /// Set `true` on success. On panic, stays `false` (the range is already
+    /// cleaned up by `par_index_rec`, so the driver skips it during the
+    /// Err-path output teardown). Written before `latch.set`; the driver reads
+    /// it after `latch.wait` returns (the latch's SeqCst provides the
+    /// happens-before edge).
+    succeeded: AtomicBool,
+}
+
+// SAFETY: the raw pointers reference data owned by the driver's stack frame;
+// the driver blocks on the CountLatch until every chunk finishes, so the
+// pointed-to data outlives every `execute` call. The shared `Slots`/`op`/
+// `latch`/`panic_slot` are accessed from distinct workers but over disjoint
+// index ranges (`Slots`) or through `Sync` types (`OP: Sync`, `CountLatch`,
+// `Mutex`); each `ChunkJob` itself is touched by exactly one worker (the one
+// that pops its `JobRef`).
+unsafe impl<T: Send, R: Send, OP: Sync> Send for ChunkJob<T, R, OP> {}
+
+impl<T, R, OP> Job for ChunkJob<T, R, OP>
+where
+    T: Send,
+    R: Send,
+    OP: RangeOp<T, Out = R>,
+{
+    unsafe fn execute(this: *const ()) {
+        unsafe {
+            let this = &*this.cast::<Self>();
+            // Catch any panic so it never reaches the worker's `AbortIfPanic`.
+            // `par_index_rec` returns `Result<(), PanicPayload>` AND `join` may
+            // resume-unwrap a deeper panic through it — so `halt_unwinding`
+            // yields a nested Result that we flatten: both the propagated
+            // (outer Err) and returned (inner Err) panic payloads land in the
+            // shared slot.
+            let r = unwind::halt_unwinding(|| {
+                par_index_rec(&*this.input, &*this.output, this.start, this.end, &*this.op, this.splits)
+            });
+            match r {
+                Ok(Ok(())) => this.succeeded.store(true, Ordering::Release),
+                Ok(Err(p)) | Err(p) => {
+                    // First writer wins; `halt_unwinding` caught any panic
+                    // before we touched the lock, so the mutex is never
+                    // poisoned. `unwrap_or_else(into_inner)` keeps us robust
+                    // even if a future change violates that invariant.
+                    let mut slot = (*this.panic_slot)
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if slot.is_none() {
+                        *slot = Some(p);
+                    }
+                }
+            }
+            // Always signal completion so the driver wakes exactly once the
+            // last chunk finishes, regardless of success/panic mix.
+            CountLatch::set(this.latch);
+        }
+    }
+}
+
+/// Hybrid top-level dispatcher. Splits `[0, n)` into `num_chunks` contiguous
+/// ranges, injects one `ChunkJob` per range, and blocks until all complete.
+/// Returns `Err(first_panic)` if any chunk panicked (after dropping the
+/// successful chunks' output ranges so the caller can free the buffers without
+/// double-drop).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_index_collect_hybrid<T, R, OP>(
+    input: &Slots<T>,
+    output: &Slots<R>,
+    n: usize,
+    op: &OP,
+    splits: usize,
+    num_threads: usize,
+) -> Result<(), PanicPayload>
+where
+    T: Send,
+    R: Send,
+    OP: RangeOp<T, Out = R>,
+{
+    // One chunk per worker → instant parallel ramp-up. Round up the split
+    // depth reduction so the per-chunk tree is shallower: total leaf count
+    // stays ≈ num_threads * oversplit (matching the single-tree path), just
+    // distributed across the chunks instead of grown from one root.
+    let num_chunks = Ord::min(num_threads, n).max(1);
+    let chunk_log2 = num_chunks.next_power_of_two().trailing_zeros() as usize;
+    let chunk_splits = splits.saturating_sub(chunk_log2);
+
+    let panic_slot: PanicSlot = Mutex::new(None);
+    let latch = CountLatch::with_count(num_chunks, None);
+
+    // Build contiguous ranges as evenly as possible (first `rem` chunks get one
+    // extra item). ChunkJobs are boxed so their addresses stay pinned
+    // regardless of the Vec reallocating its backing buffer.
+    let chunk = n / num_chunks;
+    let rem = n % num_chunks;
+    let mut jobs: Vec<Box<ChunkJob<T, R, OP>>> = Vec::with_capacity(num_chunks);
+    let mut start = 0;
+    for i in 0..num_chunks {
+        let size = chunk + usize::from(i < rem);
+        let end = start + size;
+        jobs.push(Box::new(ChunkJob {
+            input: ptr::from_ref(input),
+            output: ptr::from_ref(output),
+            op: ptr::from_ref(op),
+            start,
+            end,
+            splits: chunk_splits,
+            latch: ptr::from_ref(&latch),
+            panic_slot: ptr::from_ref(&panic_slot),
+            succeeded: AtomicBool::new(false),
+        }));
+        start = end;
+    }
+    debug_assert_eq!(start, n);
+
+    // One batched inject: a single JEC increment + a single wake cascade,
+    // regardless of `num_chunks`. Every idle worker pops a chunk on its next
+    // `find_work` → all workers busy from t≈0.
+    let registry = ComputePool::global().registry();
+    let job_refs: Vec<JobRef> = jobs
+        .iter()
+        .map(|j| unsafe { JobRef::new(std::ptr::from_ref(&**j)) })
+        .collect();
+    registry.inject_batch(job_refs.into_iter());
+
+    // Block the external thread until every chunk has signalled. `CountLatch`
+    // with no owner uses a `LockLatch` (parking-lot condvar) — correct for an
+    // off-pool caller (a pool worker must NOT take this path; see the guard in
+    // `par_index_collect`).
+    latch.wait();
+
+    // After `wait` returns every chunk's `execute` has run `CountLatch::set`;
+    // the SeqCst fence there carries the `succeeded` Release store into our
+    // Acquire load below.
+    let panic_payload = panic_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(p) = panic_payload {
+        // Drop output ranges of successful chunks (failed chunks already
+        // cleaned their own ranges inside `par_index_rec`'s internal-node /
+        // leaf-guard cleanup). After this, every output slot is either init
+        // (no — we just dropped them) or uninit, so the caller can free the
+        // buffers safely.
+        for j in &jobs {
+            if j.succeeded.load(Ordering::Acquire) {
+                unsafe { output.drop_range(j.start, j.end) };
+            }
+        }
+        return Err(p);
+    }
+    Ok(())
 }
 
 // ── Index-based parallel sink (`for_each`) — no output buffer ──
@@ -550,10 +777,28 @@ where
 // shared panic slot + per-chunk success flags to drop siblings on unwind).
 //
 // Conclusion: flat dispatch is a small/medium-N win but a large-N loss. The
-// promising unattempted direction is a *hybrid*: inject `num_threads` broad
-// top-level chunks (low injector contention, no ramp-up) and let each chunk
-// recurse via the tree (distributed deques + stealing). That needs the same
-// scoped-latch plumbing as full flat, so it is left for a follow-up.
+// promising direction was a *hybrid*: inject `num_threads` broad top-level
+// chunks (low injector contention, no ramp-up) and let each chunk recurse via
+// the tree (distributed deques + stealing).
+//
+// ✅ DONE (2026-07): `par_index_collect_hybrid` below implements exactly this.
+// A/B vs the single-tree baseline (32-core, sample-size 30, measurement-time 5):
+//
+//   sync_cpu_heavy       1 k: −2.8 %     10 k: −3.6 %     100 k: −1.1 %
+//   pipeline_fusion     10 k: −6.5 %     100 k: −6.7 %
+//   sync_lightweight    10 k: −4.0 %     100 k: −9.2 %      1 M: −9.6 % ←
+//   sync_lightweight_cold 100 k: −5.9 %   1 M: −5.1 %
+//   try_collect         100 k: −5.7 %
+//
+// Every size improved or held; the 1 M lightweight case that pure flat
+// regressed by +14 % now *improves* by −9.6 % — the hybrid's
+// `num_threads`-item inject never hits the single-injector MPMC contention
+// that sank pure flat. The small/medium-N win is smaller than pure flat's
+// (−15 % at 10 k) because each chunk still builds a mini-tree (some ramp-up
+// inside the chunk), but avoiding the large-N cliff is the decisive win. The
+// remaining ~120 µs fixed cost on tiny batches (1 k cpu_heavy still trails
+// rayon) is now dominated by the off-pool `CountLatch`/condvar handoff, not
+// ramp-up — a separate problem.
 
 // ── Join-based parallel helpers ──
 

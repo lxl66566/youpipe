@@ -245,11 +245,19 @@ impl<S, I, O> Pipe<S, I, O> {
 `.collect()` dispatches on `S::MAY_FILTER`:
 
 - **`MAY_FILTER == false`** — the index-based fast path. Input + output `Slots`
-  are allocated once, then `par_index_rec` recursively splits the **index range**
-  `[0, n)` (not the data) via `ComputePool::join`. Each leaf receives `&[T]` /
-  `&mut [R]` slice views and runs the `RangeOp` (`FusedOp(stages)`) through
-  `apply_pure` — branch-free and vectorizable. Workload selects the oversplit
-  factor per §3.1.
+  are allocated once, then the top-level dispatcher splits `[0, n)` into
+  **`num_threads` contiguous chunks** and injects them in a single
+  `inject_batch` (hybrid flat/tree dispatch — see `par_index_collect_hybrid`).
+  Every pool worker pops a chunk on its first `find_work`, so all workers are
+  busy from t≈0 — no fork/join ramp-up. Each chunk then recurses via
+  `ComputePool::join` (the per-chunk tree uses distributed local deques +
+  stealing, avoiding the single-injector MPMC contention that sank pure flat
+  dispatch). Each leaf receives `&[T]` / `&mut [R]` slice views and runs the
+  `RangeOp` (`FusedOp(stages)`) through `apply_pure` — branch-free and
+  vectorizable. Workload selects the oversplit factor per §3.1. The hybrid
+  path is skipped when `.collect()` is reached from inside a pool worker
+  (e.g. nested `scope`), where the `CountLatch` park would deadlock — the
+  single-tree `par_index_rec` runs instead.
 - **`MAY_FILTER == true`** — `join_fused_collect` recursively halves the `Vec`,
   each leaf filters into a per-leaf `Vec`, results merged by `extend`.
 
@@ -531,63 +539,53 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
 | Size | youpipe | rayon   |
 | ---- | ------- | ------- |
-| 1K   | ~65 µs  | ~39 µs  |
-| 10K  | ~66 µs  | ~72 µs  |
-| 100K | ~106 µs | ~145 µs |
+| 1K   | ~62 µs  | ~37 µs  |
+| 10K  | ~64 µs  | ~70 µs  |
+| 100K | ~105 µs | ~145 µs |
 
-The 1K case trails rayon because the fork/join tree's ~120 µs fixed dispatch
-overhead (external-thread job injection + `LockLatch` handoff) dominates a
-batch whose own work is only ~30 µs. An earlier version silently routed such
-small batches to a serial loop to win this benchmark, but that was deceptive
-(the API promises parallelism) and catastrophic for expensive per-item work
-(file IO, crypto) whose small batches would be wrongly serialized. The
-heuristic was removed — see `prefers_serial` in `src/builder/typed/fused.rs`.
-The principled fix is to lower the cold-inject cost itself, not to
-second-guess the user's per-item cost.
+The 1K case trails rayon because the ~120 µs fixed dispatch overhead (off-pool
+`CountLatch`/condvar handoff + worker wake) dominates a batch whose own work is
+only ~30 µs. Hybrid flat/tree dispatch (`par_index_collect_hybrid`) eliminated
+the fork/join ramp-up but the remaining fixed cost is now the off-pool park
+itself — a separate problem. An earlier version silently routed such small
+batches to a serial loop to win this benchmark, but that was deceptive (the API
+promises parallelism) and catastrophic for expensive per-item work (file IO,
+crypto) whose small batches would be wrongly serialized. The heuristic was
+removed — see `prefers_serial` in `src/builder/typed/fused.rs`.
 
 ### Pipeline Fusion (3 stages) vs rayon chain (`pipeline_fusion`, warm input)
 
 | Size | youpipe fused | rayon chain |
 | ---- | ------------- | ----------- |
-| 10K  | ~65 µs        | ~70 µs      |
-| 100K | ~90 µs        | ~104 µs     |
+| 10K  | ~61 µs        | ~67 µs      |
+| 100K | ~82 µs        | ~101 µs     |
 
-The fused stage chain trailed rayon at every size in mid-2026 and now wins or
-draws at every size after four changes: a sleeping-bitmask rewrite of
-`wake_any_threads` that directed wakes only at parked workers, moving the
-`condvar.notify_one` outside the `is_blocked` mutex (which had been serialising
-every woken thread's re-acquire), a `.cargo/config.toml` override that ensures
-the perf-friendly `opt-level=3`/`panic=unwind` regardless of the host's global
-cargo profile, and adaptive oversplit (`workload_oversplit`) that drops to
-`oversplit = 1` for small batches (≤ 1024 items/worker) — trimming ~95 fork/join
-internal nodes from 10 k batches and flipping the 10 k case from trailing rayon
-to beating it. The remaining per-call scheduler fixed cost (~50 µs) is now only
-visible on small batches that can no longer amortise it — the serial
-short-circuit that used to hide this cost was removed (see
-`prefers_serial` in `src/builder/typed/fused.rs`), so small cheap batches pay
-the full dispatch overhead rather than being silently downgraded to serial.
+The fused stage chain now beats rayon at every size after five changes: the
+sleeping-bitmask rewrite of `wake_any_threads`, moving the `condvar.notify_one`
+outside the `is_blocked` mutex, the `.cargo/config.toml` perf-friendly
+`opt-level=3`/`panic=unwind` override, adaptive oversplit (`workload_oversplit`,
+which drops to `oversplit = 1` for small batches ≤ 1024 items/worker), and
+**hybrid flat/tree dispatch** (`par_index_collect_hybrid`) — injecting
+`num_threads` broad top-level chunks so every worker starts busy at t≈0 with no
+fork/join ramp-up, while each chunk recurses via the tree for distributed
+stealing. The hybrid alone measured −6.5 % @ 10 k and −6.7 % @ 100 k.
 
 ### Lightweight `pipe()` vs rayon (`sync_lightweight`, `x+1`)
 
 | Size | youpipe (warm) | youpipe (cold) | rayon   |
 | ---- | -------------- | -------------- | ------- |
-| 10K  | ~64 µs         | ~71 µs         | ~69 µs  |
-| 100K | ~85 µs         | ~131 µs        | ~110 µs |
-| 1M   | ~606 µs        | ~4.15 ms       | ~272 µs |
+| 10K  | ~63 µs         | ~71 µs         | ~67 µs  |
+| 100K | ~79 µs         | ~122 µs        | ~104 µs |
+| 1M   | ~516 µs        | ~4.03 ms       | ~265 µs |
 
-Warm-input lightweight 1M improved from ~1.9 ms (pre-`Slots`) → ~730 µs
-(after `Slots`) → ~390 µs (after switching the leaf loop to a `&[T]` /
-`&mut [R]` slice view) → ~574 µs after the perf-config fix + the
-sleeping-bitmask wake rewrite + the notify-outside-lock fix. The slice view
-step closed the gap with rayon: the previous `&Slots<u64>` for both input and
-output blocked LLVM's auto-vectorizer because the alias analysis could not
-prove the two `UnsafeCell`-wrapped buffers were disjoint. The 1 M case still
-trails rayon because the leaf work itself is so cheap (~0.12 ns/item) that
-scheduling overhead dominates; at 10 k and 100 k youpipe now beats rayon
-because the leaf amortises the overhead better. The cold variant documents the
-read-compute-write sensitivity to cold-from-RAM input (glibc's non-temporal
-memcpy bypasses the cache); rayon on an equally-cold clone measures ~800 µs
-at 1M.
+Warm-input lightweight improved ~1.9 ms (pre-`Slots`) → ~730 µs (after `Slots`)
+→ ~390 µs (slice view) → ~570 µs (after perf-config + sleeping-bitmask wake +
+notify-outside-lock) → **~516 µs after hybrid flat/tree dispatch** (which alone
+shaved −9.6 % / −55 µs by eliminating fork/join ramp-up). The 1 M case still
+trails rayon because the leaf work itself is so cheap (~0.12 ns/item) that the
+off-pool `CountLatch`/condvar handoff + per-chunk tree fixed cost dominate; at
+10 k and 100 k youpipe beats rayon because the leaf amortises the overhead
+better.
 
 ### Fallible `try_map().try_collect()` vs rayon (`try_collect`, warm input)
 
@@ -597,8 +595,8 @@ buffer and writing at known indices instead of the `Vec`-merge fallback.
 
 | Size | youpipe try_map | rayon   |
 | ---- | --------------- | ------- |
-| 10K  | ~64 µs          | ~68 µs  |
-| 100K | ~88 µs          | ~101 µs |
+| 10K  | ~64 µs          | ~66 µs  |
+| 100K | ~85 µs          | ~98 µs  |
 
 ### Mixed Load — `stream()` vs `tokio::spawn_blocking` (`mixed_load`)
 
