@@ -114,31 +114,31 @@ fused `pipe()` — CPU-heavy (100 iters/item, warm input):
 
 | Size | youpipe | rayon  |
 | ---- | ------- | ------ |
-| 1K   | 34 µs   | 40 µs  |
-| 10K  | 66 µs   | 73 µs  |
-| 100K | 106 µs  | 147 µs |
+| 1K   | 62 µs   | 37 µs  |
+| 10K  | 64 µs   | 70 µs  |
+| 100K | 105 µs  | 145 µs |
 
 fused `pipe()` — lightweight `x+1` (warm input):
 
 | Size | youpipe | rayon  |
 | ---- | ------- | ------ |
-| 10K  | 64 µs   | 69 µs  |
-| 100K | 85 µs   | 110 µs |
-| 1M   | 606 µs  | 272 µs |
+| 10K  | 63 µs   | 67 µs  |
+| 100K | 79 µs   | 104 µs |
+| 1M   | 516 µs  | 265 µs |
 
 fused `pipe()` — 3-stage chain (`x+1`, `x*3`, `x-2`):
 
 | Size | youpipe | rayon  |
 | ---- | ------- | ------ |
-| 10K  | 65 µs   | 70 µs  |
-| 100K | 90 µs   | 104 µs |
+| 10K  | 61 µs   | 67 µs  |
+| 100K | 82 µs   | 101 µs |
 
 fused `try_map().try_collect()` — fallible `Result` chain (warm input):
 
-| Size | youpipe | rayon  |
-| ---- | ------- | ------ |
-| 10K  | 64 µs   | 68 µs  |
-| 100K | 88 µs   | 101 µs |
+| Size | youpipe | rayon |
+| ---- | ------- | ----- |
+| 10K  | 64 µs   | 66 µs |
+| 100K | 85 µs   | 98 µs |
 
 streaming `stream()` — single sync stage (`cpu_work`, 100 iters/item):
 

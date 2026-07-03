@@ -557,56 +557,39 @@ where
 
 // ── Join-based parallel helpers ──
 
-/// Items-per-worker below which a batch is routed to the calling thread
-/// instead of the work-stealing pool.
-///
-/// The fork/join path pays a **per-call** fixed cost (external-thread job
-/// injection, latch handoff, worker spin/park rounds, condvar wakeups) that is
-/// independent of `n`. For small `n` that fixed cost dwarfs the per-item
-/// compute, and a plain sequential loop is faster — including faster than the
-/// pathological case where the scheduler's park/wake heuristic thrashes.
-///
-/// See `docs/PERF_NOTES.md` (#1): on a 32-core box with `cpu_heavy` work (100
-/// iterations/item), the measured serial↔parallel crossover is ~3 k items
-/// (1 k: parallel 137 µs vs serial 46 µs; 10 k: parallel 152 µs vs serial
-/// ~460 µs). `64` items/thread lands at ~2 k on 32 cores — below the
-/// crossover, so the 1 k regression is recovered while 100 k–1 M batches
-/// (50–500× above the threshold) are completely unaffected.
-///
-/// This is a heuristic, not a cliff: it only redirects *small* batches to the
-/// cheap serial path. It cannot starve the pool because sub-threshold batches
-/// submit zero jobs, and it is monotonic in the per-item cost (a more
-/// expensive item lowers the real crossover, so serializing even fewer
-/// batches would be safe — the constant is deliberately conservative).
-const SERIAL_ITEMS_PER_THREAD: usize = 64;
-
 /// Whether a batch of `n` items should run sequentially on the calling thread
 /// instead of being split across the pool. `num_threads` is read once by the
 /// caller and passed in to avoid a second `ComputePool::global()` TLS hit.
 ///
-/// The serial↔parallel crossover is `parallel_fixed_overhead / per_item_cost`.
-/// We don't know `per_item_cost`, so the `Workload` hint selects a per-thread
-/// item count that the batch must exceed before we pay the pool's ~120 µs
-/// fixed dispatch cost:
+/// Only the trivial cases short-circuit to serial: an empty or single-item
+/// batch (no parallelism to exploit), or a single-threaded pool (nowhere to
+/// steal to). Everything else goes through the fork/join tree.
 ///
-/// - `Balanced`: uniform items, low average cost → high threshold
-///   (`SERIAL_ITEMS_PER_THREAD`, ~2 k on 32 cores). Measured cpu_heavy
-///   crossover is ~3 k; below it the pool is slower than a plain loop.
-/// - `Unbalanced`: carries an expensive tail, so the average per-item cost is
-///   higher and the crossover lands at a smaller `n` (measured on a 1000×-
-///   spread skewed workload: crossover ~450). Serialize only truly tiny batches
-///   (`/8`). The expensive tail makes *over*-serializing catastrophic — a 1 k
-///   skewed batch is ~7× slower serially than in parallel — so the Unbalanced
-///   multiplier stays small.
-fn prefers_serial(n: usize, num_threads: usize, workload: Workload) -> bool {
-    if n <= 1 || num_threads <= 1 {
-        return true;
-    }
-    let per_thread = match workload {
-        Workload::Balanced => SERIAL_ITEMS_PER_THREAD,
-        Workload::Unbalanced => SERIAL_ITEMS_PER_THREAD / 8,
-    };
-    n <= num_threads * per_thread
+/// # Why this no longer guesses based on batch size
+///
+/// An earlier version routed small batches (`n ≤ num_threads × k`) to a serial
+/// loop to avoid the pool's ~120 µs fixed dispatch overhead (external-thread
+/// job injection + `LockLatch` handoff + worker wake). That was tuned against
+/// the `cpu_heavy` benchmark (~30 ns/item), whose serial↔parallel crossover is
+/// ~3 k items.
+///
+/// The heuristic was **deceptive**: `.collect()` / `.for_each()` advertise
+/// parallelism, but silently ran serially for small batches. Since the
+/// crossover is `fixed_overhead / per_item_cost` and the framework cannot know
+/// `per_item_cost`, the same `n` could mean microseconds of work or seconds
+/// (file IO, crypto, network). A 100-item batch of file encryptions would be
+/// serialized — turning a 4 s parallel run into a 100 s serial one.
+///
+/// The asymmetry is decisive: wrongly parallelizing a cheap small batch costs
+/// ~120 µs (imperceptible); wrongly serializing an expensive small batch costs
+/// the entire batch wall-time. If a user wants serial execution, that is their
+/// decision to make explicitly — the framework's job is to parallelize, not to
+/// second-guess the workload. The ~120 µs overhead on cheap small batches is
+/// accepted as the price of honesty; the right long-term fix is to lower the
+/// cold-inject cost itself (hybrid dispatch — see the flat-dispatch comment
+/// above), not to silently downgrade to serial.
+fn prefers_serial(n: usize, num_threads: usize, _workload: Workload) -> bool {
+    n <= 1 || num_threads <= 1
 }
 
 /// Compute the number of recursive split levels. Aiming at ~`oversplit` tasks
@@ -885,9 +868,9 @@ where
     /// otherwise (filters change output cardinality, so fixed-index writes are
     /// not possible).
     ///
-    /// Small batches (≤ `num_workers * SERIAL_ITEMS_PER_THREAD`) run
-    /// sequentially on the calling thread — see [`prefers_serial`] and
-    /// `docs/PERF_NOTES.md` (#1).
+    /// Only trivially-empty batches (0-1 items or a single-threaded pool) run
+    /// sequentially — see [`prefers_serial`] for why batch-size guessing was
+    /// removed.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn collect(self) -> Vec<O> {
         let items = self.items;
@@ -897,13 +880,9 @@ where
         }
         let num_threads = ComputePool::global().num_workers();
         if prefers_serial(n, num_threads, self.config.workload) {
-            // Dispatch on `MAY_FILTER`: skip the `Option` wrapping on the
-            // pure path so the serial fallback matches a hand-written
-            // `iter().map().collect()`. With `black_box(cpu_work(x))` at 1 k
-            // items this trims ~5 µs of `Option`-discriminant + branch
-            // overhead (the `Identity::apply(item).map(f)` wrapper LLVM cannot
-            // always elide through the trait call), narrowing the gap to the
-            // raw sequential baseline.
+            // Trivial case (n == 1 or single-threaded pool): skip the pool
+            // entirely. Dispatch on `MAY_FILTER` so the pure path matches a
+            // hand-written `iter().map().collect()` — no `Option` wrapper.
             if S::MAY_FILTER {
                 return items
                     .into_iter()
@@ -960,9 +939,9 @@ where
         }
         let num_threads = ComputePool::global().num_workers();
         if prefers_serial(n, num_threads, self.config.workload) {
-            // Serial fallback: no output buffer either. Dispatch on
-            // `MAY_FILTER` to keep the pure path branch-free, same rationale
-            // as `collect`'s serial fallback.
+            // Trivial case (n == 1 or single-threaded pool): run inline, no
+            // output buffer. Dispatch on `MAY_FILTER` to keep the pure path
+            // branch-free.
             if S::MAY_FILTER {
                 for item in items {
                     if let Some(o) = self.stages.apply(item) {

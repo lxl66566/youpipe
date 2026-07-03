@@ -525,9 +525,19 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
 | Size | youpipe | rayon   |
 | ---- | ------- | ------- |
-| 1K   | ~34 µs  | ~40 µs  |
-| 10K  | ~66 µs  | ~73 µs  |
-| 100K | ~106 µs | ~147 µs |
+| 1K   | ~65 µs  | ~39 µs  |
+| 10K  | ~66 µs  | ~72 µs  |
+| 100K | ~106 µs | ~145 µs |
+
+The 1K case trails rayon because the fork/join tree's ~120 µs fixed dispatch
+overhead (external-thread job injection + `LockLatch` handoff) dominates a
+batch whose own work is only ~30 µs. An earlier version silently routed such
+small batches to a serial loop to win this benchmark, but that was deceptive
+(the API promises parallelism) and catastrophic for expensive per-item work
+(file IO, crypto) whose small batches would be wrongly serialized. The
+heuristic was removed — see `prefers_serial` in `src/builder/typed/fused.rs`.
+The principled fix is to lower the cold-inject cost itself, not to
+second-guess the user's per-item cost.
 
 ### Pipeline Fusion (3 stages) vs rayon chain (`pipeline_fusion`, warm input)
 
@@ -546,7 +556,10 @@ cargo profile, and adaptive oversplit (`workload_oversplit`) that drops to
 `oversplit = 1` for small batches (≤ 1024 items/worker) — trimming ~95 fork/join
 internal nodes from 10 k batches and flipping the 10 k case from trailing rayon
 to beating it. The remaining per-call scheduler fixed cost (~50 µs) is now only
-visible on batches far below the serial short-circuit threshold.
+visible on small batches that can no longer amortise it — the serial
+short-circuit that used to hide this cost was removed (see
+`prefers_serial` in `src/builder/typed/fused.rs`), so small cheap batches pay
+the full dispatch overhead rather than being silently downgraded to serial.
 
 ### Lightweight `pipe()` vs rayon (`sync_lightweight`, `x+1`)
 

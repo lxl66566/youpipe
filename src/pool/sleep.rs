@@ -228,8 +228,9 @@ pub(crate) struct IdleState {
 ///
 /// Measured (32-core, A/B vs the all-yield predecessor): `sync_cpu_heavy`
 /// youpipe `pipe().map().collect()` improved −14 % @ 10 k, −18 % @ 100 k;
-/// `pipeline_fusion` and `sync_lightweight` improved −5…−13 %. The 1 k batch is
-/// unchanged because it hits the serial short-circuit and never reaches here.
+/// `pipeline_fusion` and `sync_lightweight` improved −5…−13 %. (The 1 k batch
+/// used to hit a serial short-circuit and never reach here; that heuristic was
+/// later removed — see `prefers_serial` in `builder/typed/fused.rs`.)
 ///
 /// Widening the spin window further (A/B tried 128 in 2026-06) regressed
 /// everything by +20-36 %: 32 workers all spinning burn enough coherence
