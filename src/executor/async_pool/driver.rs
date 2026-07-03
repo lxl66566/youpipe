@@ -1,3 +1,4 @@
+#[cfg(feature = "tokio-runtime")]
 use std::future::Future;
 
 #[cfg(feature = "tokio-runtime")]

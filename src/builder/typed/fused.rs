@@ -3,8 +3,8 @@ use std::{any::Any, marker::PhantomData, panic};
 use super::{
     slots::Slots,
     traits::{
-        Filter, FusedOp, FusedStage, FusedTryOp, FusedTryStage, Identity, InfallibleChain, MapErr,
-        RangeOp, RangeTryOp, StageMarker, SyncMap, TryMap,
+        Filter, FusedOp, FusedSink, FusedStage, FusedTryOp, FusedTryStage, Identity,
+        InfallibleChain, MapErr, RangeOp, RangeTryOp, SinkOp, StageMarker, SyncMap, TryMap,
     },
 };
 use crate::{
@@ -194,6 +194,145 @@ where
             // Recursion already dropped every live slot; freeing buffers is safe.
             drop(input);
             drop(output);
+            panic::resume_unwind(p);
+        }
+    }
+}
+
+// ── Index-based parallel sink (`for_each`) — no output buffer ──
+//
+// The `for_each` terminal applies the fused chain + user closure for side
+// effects only. Unlike `par_index_collect`, it allocates **no output `Slots`**:
+// the leaf reads each input item, runs the chain, hands the result to the
+// closure, and discards it. This is the structural fix for the
+// `par_iter().for_each()` workload shape where `.map(f).collect::<Vec<()>>()`
+// would pay for a pointless n-slot output buffer + n writes.
+
+/// Recursive divide-and-conquer sink. Each leaf claims a disjoint input range
+/// `[start, end)` and consumes it via `op`; no output is written.
+///
+/// Panic safety mirrors `par_index_rec`'s input half: a panicking leaf's
+/// `ForEachGuard` drops the unread tail of its own range, internal nodes
+/// propagate the first `Err`, and the panic-free sibling's range is already
+/// fully consumed (every read slot is uninit, nothing to drop). On return,
+/// every slot in `[start, end)` is either consumed (read) or dropped.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_for_each_rec<T, OP>(
+    input: &Slots<T>,
+    start: usize,
+    end: usize,
+    op: &OP,
+    splits_left: usize,
+) -> Result<(), PanicPayload>
+where
+    T: Send,
+    OP: SinkOp<T>,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: this leaf owns the disjoint range `[start, end)` exclusively.
+        // input[start..end) is fully init; nothing else is touched.
+        let in_slice = unsafe { input.as_slice(start, end) };
+        par_for_each_leaf(in_slice, op);
+        return Ok(());
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = ComputePool::global().join(
+        || par_for_each_rec(input, start, mid, op, splits_left - 1),
+        || par_for_each_rec(input, mid, end, op, splits_left - 1),
+    );
+    match (l, r) {
+        (Ok(()), Ok(())) => Ok(()),
+        // The completed sibling fully consumed its own range (every slot read
+        // → uninit, nothing to drop). The panicking sibling's ForEachGuard
+        // already dropped its unread tail, so no per-range cleanup is needed
+        // here — unlike par_index_rec, there is no output buffer to drop.
+        (Err(p), _) | (_, Err(p)) => Err(p),
+    }
+}
+
+/// Consume `[start, end)` sequentially on the current thread, applying `op`
+/// for its side effect.
+///
+/// Panic safety uses a stack-local `ForEachGuard` whose `Drop` runs only on
+/// unwind — the input-tail mirror of `LeafGuard` (without the output half,
+/// since `for_each` allocates no output buffer). At the panic point in
+/// `op.consume(item)` for iter `i = pos`, item `i` has been moved into `op`
+/// (gone with the panic), `input[i+1..]` is still init (untouched, must be
+/// dropped); `input[..i]` was already moved-out in prior iterations.
+fn par_for_each_leaf<T, OP>(input: &[T], op: &OP)
+where
+    T: Send,
+    OP: SinkOp<T>,
+{
+    /// RAII guard that drops the unread input tail on unwind. Counterpart to
+    /// `LeafGuard` with the output half elided (no output buffer exists).
+    ///
+    /// `pos` tracks the count of fully consumed iterations at the unwind
+    /// point. Item `pos` was moved into `op` and is gone with the panic, so
+    /// we drop `input[pos+1..]` only.
+    struct ForEachGuard<'a, T> {
+        input: &'a [T],
+        pos: usize,
+    }
+
+    impl<T> Drop for ForEachGuard<'_, T> {
+        fn drop(&mut self) {
+            // SAFETY: `pos` reflects the actual consumed-iteration count at
+            // the unwind point. Items `..pos` were already moved out (uninit);
+            // item `pos` was consumed by `op` and is gone; `input[pos+1..]`
+            // is still init and must be dropped.
+            unsafe {
+                let in_live = self.input.as_ptr();
+                for j in (self.pos + 1)..self.input.len() {
+                    std::ptr::drop_in_place(in_live.add(j).cast_mut());
+                }
+            }
+        }
+    }
+
+    let in_ptr = input.as_ptr();
+    let n = input.len();
+
+    let mut g = ForEachGuard { input, pos: 0 };
+
+    while g.pos < n {
+        let i = g.pos;
+        // SAFETY: disjoint index; slot i is init (input). The read moves the
+        // item out of the slot, leaving it uninit — never re-read.
+        let item = unsafe { std::ptr::read(in_ptr.add(i)) };
+        op.consume(item);
+        g.pos = i + 1;
+    }
+
+    // Success: disarm the cleanup Drop.
+    std::mem::forget(g);
+}
+
+/// Drive `par_for_each_rec` over `[0, n)`. Propagates panics after the
+/// recursion's `ForEachGuard` has dropped every unread input slot.
+///
+/// # Panics
+///
+/// Propagates any panic raised by `op`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_for_each<T, OP>(items: Vec<T>, op: &OP, splits: usize)
+where
+    T: Send,
+    OP: SinkOp<T>,
+{
+    let n = items.len();
+    debug_assert!(n > 0);
+    let input = Slots::from_vec(items);
+    let result = par_for_each_rec(&input, 0, n, op, splits);
+    match result {
+        Ok(()) => {
+            // All input slots consumed (read → uninit): dropping the box just
+            // frees memory, no per-slot drops.
+            drop(input);
+        }
+        Err(p) => {
+            // Recursion already dropped every live (unread) input slot.
+            drop(input);
             panic::resume_unwind(p);
         }
     }
@@ -791,6 +930,59 @@ where
             par_index_collect(items, &op, splits)
         }
     }
+
+    /// Execute the fused pipeline, applying `f` to each output for its side
+    /// effect. Returns `()`.
+    ///
+    /// The equivalent of rayon's `par_iter().for_each(..)`. Unlike
+    /// [`.collect()`](Self::collect), **no output `Vec` is allocated**: the
+    /// `for_each` terminal discards each transformed item after invoking `f`.
+    /// For pipelines whose last step is a side effect (file writes, mutation
+    /// of shared state, logging), this avoids the structural cost of a
+    /// pointless `Vec<()>` (or `Vec<O>`) output buffer plus `n` slot writes.
+    ///
+    /// Filter stages are honoured: items dropped by an upstream filter are
+    /// simply not passed to `f`.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain or `f` (after the leaf's
+    /// cleanup guard drops unread input slots).
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn for_each<F>(self, f: F)
+    where
+        F: Fn(O) + Send + Sync + 'static,
+    {
+        let items = self.items;
+        let n = items.len();
+        if n == 0 {
+            return;
+        }
+        let num_threads = ComputePool::global().num_workers();
+        if prefers_serial(n, num_threads, self.config.workload) {
+            // Serial fallback: no output buffer either. Dispatch on
+            // `MAY_FILTER` to keep the pure path branch-free, same rationale
+            // as `collect`'s serial fallback.
+            if S::MAY_FILTER {
+                for item in items {
+                    if let Some(o) = self.stages.apply(item) {
+                        f(o);
+                    }
+                }
+            } else {
+                for item in items {
+                    let o = self.stages.apply_pure(item);
+                    f(o);
+                }
+            }
+            return;
+        }
+
+        let oversplit = workload_oversplit(n, num_threads, self.config.workload);
+        let splits = split_depth(n, num_threads, oversplit);
+        let op = FusedSink(self.stages, f);
+        par_for_each(items, &op, splits);
+    }
 }
 
 // ── TryPipe (fallible fused pipeline) ──
@@ -1000,4 +1192,46 @@ where
         let op = FusedOp(stages);
         par_index_collect(items, &op, splits)
     }
+}
+
+/// `pub(crate)` entry point for the scoped `for_each` terminal. Identical
+/// dispatch logic to `Pipe::for_each` but without `'static` bounds — driven
+/// by `crate::scope::ScopedPipe::for_each`, whose closure lifetime is `'env`.
+///
+/// Soundness rests on the same `ComputePool::join` invariant as
+/// [`fused_collect_scoped`]: the calling thread blocks inside
+/// `Registry::in_worker_cold` until every sub-task finishes, so every `'env`
+/// reference captured by `stages` / `f` outlives the pool's access to them.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn fused_for_each_scoped<S, T, F>(items: Vec<T>, stages: S, f: F, workload: Workload)
+where
+    S: FusedStage<T> + Sync,
+    T: Send,
+    S::Output: Send,
+    F: Fn(S::Output) + Sync,
+{
+    let n = items.len();
+    if n == 0 {
+        return;
+    }
+    let num_threads = ComputePool::global().num_workers();
+    if prefers_serial(n, num_threads, workload) {
+        if S::MAY_FILTER {
+            for item in items {
+                if let Some(o) = stages.apply(item) {
+                    f(o);
+                }
+            }
+        } else {
+            for item in items {
+                let o = stages.apply_pure(item);
+                f(o);
+            }
+        }
+        return;
+    }
+    let oversplit = workload_oversplit(n, num_threads, workload);
+    let splits = split_depth(n, num_threads, oversplit);
+    let op = FusedSink(stages, f);
+    par_for_each(items, &op, splits);
 }

@@ -35,10 +35,12 @@ Pick the entry point by workload:
 | Workload                     | Entry                                                |
 | ---------------------------- | ---------------------------------------------------- |
 | Pure CPU map/filter          | `pipe(items)`                                        |
+| Side-effect only (no output) | `pipe(items).for_each(\|x\| ..)`                     |
 | Async IO, mixed sync+async   | `stream(items).stage_async(...)`                     |
 | Unbalanced CPU workloads     | `pipe(items).with_workload(Unbalanced)`              |
 | Cancellation, fences, expand | `stream(items).with_cancel(..).fence(..).expand(..)` |
 | Borrow stack-local data      | `scope(\|s\| s.pipe(..)....)`                        |
+| Borrow a slice, no clone     | `scope(\|s\| s.pipe(&slice).for_each(\|x\| ..))`     |
 
 Below ~10 µs of total work or ~100 ns per item, youpipe is not recommended —
 the parallel setup overhead won't pay off. Sequential `iter().map().collect()`
@@ -78,6 +80,23 @@ let r: Vec<i32> = (0..1000).stream()
     .fence(FenceMode::Chunked(NonZeroUsize::new(64).unwrap()))
     .stage(|x: i32| x * 2)
     .run();
+
+// for_each: side-effect terminal (no output Vec allocated) — the
+// counterpart of rayon's par_iter().for_each(). `Fn + Sync`, so use
+// atomics/Mutex for accumulation rather than &mut capture.
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+let total = Arc::new(AtomicU64::new(0));
+let t = total.clone();
+pipe(0..1000).for_each(move |x: u64| t.fetch_add(x, Ordering::Relaxed));
+
+// scope + pipe(&slice): borrow without cloning — counterpart of rayon's
+// slice.par_iter(). One Vec<&T> allocation, zero clones of T.
+let files: Vec<String> = (0..50).map(|i| format!("f{i}")).collect();
+let chars = Arc::new(AtomicU64::new(0));
+let c = chars.clone();
+scope(|s| s.pipe(&files).for_each(move |f: &String| {
+    c.fetch_add(f.len() as u64, Ordering::Relaxed);
+}));
 
 // scope borrows local `factor` and `table`, no clone
 let factor = 7;

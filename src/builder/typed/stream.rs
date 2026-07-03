@@ -6,11 +6,13 @@ use std::{marker::PhantomData, sync::Arc};
 
 #[cfg(feature = "tokio-runtime")]
 use crate::handoff::{AsyncReceiver, async_channel, sync_async_channel};
+#[cfg(feature = "tokio-runtime")]
+use crate::state::ReorderBuffer;
 use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
     handoff::{Receiver, Sender, SharedWaitGroup, SyncSender, TryRecvError, channel::channel},
-    state::{FenceBarrier, FenceMode, ReorderBuffer, run_ordered_collect},
+    state::{FenceBarrier, FenceMode, run_ordered_collect},
     sync::CancellationToken,
 };
 

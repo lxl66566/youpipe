@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use crate::builder::{
     Filter, FusedStage, Identity, PipelineConfig, StageMarker, SyncMap, Workload,
-    fused_collect_scoped,
+    fused_collect_scoped, fused_for_each_scoped,
 };
 
 /// Opens a scoped execution context for non-`'static` closures.
@@ -44,6 +44,33 @@ impl<'env> PipelineScope<'env> {
     /// `items` may be any iterator; they are eagerly collected into a `Vec`
     /// (matching the rest of the youpipe API). `T` is inferred from the
     /// iterator's item type.
+    ///
+    /// **Borrowing a slice without cloning.** Passing `&[T]` (or `&Vec<T>`)
+    /// yields `ScopedPipe<'env, _, &'env T, &'env T>`: items enter the
+    /// pipeline as shared references, so chained closures read each item
+    /// without owning or cloning it. The only allocation is one `Vec<&T>` of
+    /// `n` pointers — the youpipe counterpart of rayon's `slice.par_iter()`,
+    /// and much cheaper than cloning `T` for non-`Copy` types like `PathBuf`.
+    ///
+    /// ```rust
+    /// # use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    /// # use youpipe::scope;
+    /// let files: Vec<String> = (0..10).map(|i| format!("file{i}")).collect();
+    /// let total_len = Arc::new(AtomicUsize::new(0));
+    /// let t = total_len.clone();
+    /// scope(|s| {
+    ///     // `&files` borrows — no String clone, just one Vec<&String>.
+    ///     s.pipe(&files).for_each(move |f: &String| {
+    ///         t.fetch_add(f.len(), Ordering::Relaxed);
+    ///     });
+    /// });
+    /// assert_eq!(total_len.load(Ordering::Relaxed),
+    ///            files.iter().map(String::len).sum::<usize>());
+    /// ```
+    ///
+    /// For zero input allocation, pass indices instead:
+    /// `s.pipe(0..slice.len()).for_each(|i: usize| f(&slice[i]))` — only one
+    /// `Vec<usize>` (8 bytes/item) and no `T` clone.
     #[must_use]
     pub fn pipe<I, It>(&self, items: It) -> ScopedPipe<'env, Identity, I, I>
     where
@@ -155,6 +182,40 @@ where
     /// stage chain contains a `Filter`, falls back to per-leaf `Vec` merge.
     pub fn collect(self) -> Vec<O> {
         fused_collect_scoped(self.items, self.stages, self.config.workload)
+    }
+
+    /// Execute the fused pipeline, applying `f` to each output for its side
+    /// effect. The scoped counterpart of [`crate::Pipe::for_each`].
+    ///
+    /// No output `Vec` is allocated — optimal for side-effect terminals that
+    /// borrow stack-local data from the surrounding [`scope`]. Filter stages
+    /// are honoured: items dropped by an upstream filter are not passed to
+    /// `f`.
+    ///
+    /// ```rust
+    /// # use std::sync::{Arc, atomic::{AtomicI32, Ordering}};
+    /// # use youpipe::scope;
+    /// let table: Vec<i32> = (0..10).collect();
+    /// // `for_each` takes `Fn + Sync` (matches rayon): accumulate via
+    /// // atomics, not `&mut` capture. `&table` borrows — no clone of i32.
+    /// let sum = Arc::new(AtomicI32::new(0));
+    /// let s = sum.clone();
+    /// scope(|scope| {
+    ///     scope.pipe(&table).for_each(move |v: &i32| {
+    ///         s.fetch_add(*v, Ordering::Relaxed);
+    ///     });
+    /// });
+    /// assert_eq!(sum.load(Ordering::Relaxed), (0..10).sum::<i32>());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain or `f`.
+    pub fn for_each<F>(self, f: F)
+    where
+        F: Fn(O) + Sync,
+    {
+        fused_for_each_scoped(self.items, self.stages, f, self.config.workload);
     }
 }
 

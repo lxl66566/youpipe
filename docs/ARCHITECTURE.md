@@ -262,6 +262,43 @@ impl<S, I, O> Pipe<S, I, O> {
 - **`MAY_FILTER == true`** — `join_fused_try_collect` (Vec-merge fallback),
   short-circuiting on the first `Err` via `?` and honouring `Filter`.
 
+#### `Pipe::for_each()` / `ScopedPipe::for_each()` — Side-Effect Terminal
+
+```rust
+impl<S, I, O> Pipe<S, I, O> {
+    pub fn for_each<F>(self, f: F) where F: Fn(O) + Send + Sync + 'static;
+}
+impl<S, I, O> ScopedPipe<'_, S, I, O> {
+    pub fn for_each<F>(self, f: F) where F: Fn(O) + Sync;
+}
+```
+
+The counterpart of rayon's `par_iter().for_each(..)`. Allocates **no output
+buffer** — the sink-only `par_for_each` core (`par_for_each_rec` /
+`par_for_each_leaf`) drives only an input `Slots<T>` through the same
+recursive `ComputePool::join` tree as `collect`, but each leaf applies the
+fused chain via `FusedSink(stages, f)` (the `SinkOp` wrapper) and discards
+each result. This is the structural fix for pure-side-effect pipelines: a
+`.map(f).collect::<Vec<()>>()` would otherwise pay for an `n`-slot output
+buffer + `n` writes for data nobody reads.
+
+Panic safety is the input-tail mirror of `LeafGuard`: each leaf's
+`ForEachGuard` drops `input[pos+1..]` on unwind (item `pos` was consumed by
+`op` and is gone), then `mem::forget`s on success. There is no output to
+clean up. Filter stages are honoured — `SinkOp::consume` dispatches on the
+compile-time `MAY_FILTER` constant, so the pure path stays branch-free for
+chains without `Filter`.
+
+#### Borrowed input: `s.pipe(&[T])`
+
+`PipelineScope::pipe` accepts any `IntoIterator`, and `&[T]: IntoIterator<Item = &T>`
+— so `s.pipe(&files)` yields `ScopedPipe<'env, _, &'env T, &'env T>` with no
+clone of `T`. The only allocation is one `Vec<&T>` of `n` pointers (the
+youpipe counterpart of rayon's `slice.par_iter()`). This is the right entry
+point when `T` is expensive to clone (e.g. `PathBuf`, `String`) and the
+pipeline only reads each item by reference. For zero input allocation, pass
+indices: `s.pipe(0..slice.len()).for_each(|i| f(&slice[i]))`.
+
 ### 3.6 `StreamPipe` — Streaming Multi-Stage Pipeline
 
 For workloads that need channel-connected stages, async IO, cancellation,

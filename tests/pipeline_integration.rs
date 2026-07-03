@@ -2,7 +2,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -642,4 +642,182 @@ fn test_try_collect_panic_propagates() {
     assert!(result.is_err());
     let payload = result.unwrap_err();
     assert_eq!(*payload.downcast_ref::<&'static str>().unwrap(), "try boom");
+}
+
+// ── for_each terminal: side-effect-only pipelines (no output buffer) ──
+
+#[test]
+fn test_for_each_basic() {
+    // Single-stage for_each: equivalent to rayon's par_iter().for_each().
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c = counter.clone();
+    pipe(0..1000u64).for_each(move |x: u64| {
+        c.fetch_add(x as usize, Ordering::Relaxed);
+    });
+    let expected: usize = (0..1000).map(|x: usize| x).sum();
+    assert_eq!(counter.load(Ordering::Relaxed), expected);
+}
+
+#[test]
+fn test_for_each_chained_map() {
+    // Multi-stage chain ending in for_each: fuses map+map into one closure.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c = counter.clone();
+    pipe(0..500i32)
+        .map(|x: i32| x + 1)
+        .map(|x: i32| x * 2)
+        .for_each(move |x: i32| {
+            c.fetch_xor(x as usize, Ordering::Relaxed);
+        });
+    let expected: usize = (0..500)
+        .map(|x: i32| (x + 1) * 2)
+        .fold(0, |a, b| a ^ (b as usize));
+    assert_eq!(counter.load(Ordering::Relaxed), expected);
+}
+
+#[test]
+fn test_for_each_filter_skips_dropped() {
+    // Filter is honoured: only even-valued outputs reach f.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c = counter.clone();
+    pipe(0..1000i32)
+        .filter(|x: &i32| x % 2 == 0)
+        .for_each(move |_x: i32| {
+            c.fetch_add(1, Ordering::Relaxed);
+        });
+    assert_eq!(counter.load(Ordering::Relaxed), 500);
+}
+
+#[test]
+fn test_for_each_empty() {
+    let called = Arc::new(AtomicBool::new(false));
+    let c = called.clone();
+    pipe(Vec::<u64>::new()).for_each(move |_: u64| c.store(true, Ordering::Relaxed));
+    assert!(
+        !called.load(Ordering::Relaxed),
+        "for_each on empty input must not call f"
+    );
+}
+
+#[test]
+fn test_for_each_single() {
+    let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let s = sink.clone();
+    pipe(vec![42u64]).for_each(move |x: u64| s.lock().unwrap().push(x));
+    assert_eq!(*sink.lock().unwrap(), vec![42]);
+}
+
+#[test]
+fn test_for_each_parallel_large() {
+    // Large enough to exceed the serial threshold and exercise the parallel
+    // par_for_each path (MAY_FILTER == false → pure leaf).
+    let n: u64 = 50_000;
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c = counter.clone();
+    pipe(0..n).for_each(move |_x: u64| {
+        c.fetch_add(1, Ordering::Relaxed);
+    });
+    assert_eq!(counter.load(Ordering::Relaxed), n as usize);
+}
+
+#[test]
+fn test_for_each_parallel_filter_large() {
+    // Large parallel path with MAY_FILTER == true (filter branch).
+    let n: i32 = 50_000;
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c = counter.clone();
+    pipe(0..n).filter(|x: &i32| *x % 3 == 0).for_each(move |_| {
+        c.fetch_add(1, Ordering::Relaxed);
+    });
+    let expected = (0..n).filter(|x| x % 3 == 0).count();
+    assert_eq!(counter.load(Ordering::Relaxed), expected);
+}
+
+#[test]
+fn test_for_each_panic_propagates_parallel() {
+    // Large batch → parallel par_for_each path. Panic in f must surface.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pipe(0..50_000i32).for_each(|x| {
+            if x == 25_000 {
+                panic!("for_each boom at {x}");
+            }
+        });
+    }));
+    assert!(result.is_err());
+    let payload = result.unwrap_err();
+    let msg = payload.downcast_ref::<String>().expect("String payload");
+    assert_eq!(msg, "for_each boom at 25000");
+}
+
+#[test]
+fn test_for_each_panic_propagates_serial() {
+    // Small batch → serial fallback inside for_each.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pipe(0..100i32).for_each(|x| {
+            if x == 50 {
+                panic!("serial for_each boom");
+            }
+        });
+    }));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_for_each_panic_drops_unread_items() {
+    // A non-Copy input with observable Drop. If ForEachGuard failed to drop
+    // the unread tail, this would leak (miri would flag the UB; under normal
+    // runs the count check confirms the tail was not double-dropped).
+    struct DropCounter {
+        counter: Arc<AtomicUsize>,
+        val: i32,
+    }
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c = counter.clone();
+    let items: Vec<DropCounter> = (0..50_000)
+        .map(|i| DropCounter {
+            counter: c.clone(),
+            val: i,
+        })
+        .collect();
+    let total = items.len();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Parallel path (large batch). Panic mid-batch.
+        pipe(items).for_each(|d: DropCounter| {
+            if d.val == 25_000 {
+                panic!("mid-batch drop boom");
+            }
+        });
+    }));
+    assert!(result.is_err());
+
+    // Every DropCounter must be dropped exactly once: the consumed one (gone
+    // with the panic) and the tail (dropped by ForEachGuard) + all prior
+    // (consumed by successful iterations).
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        total,
+        "every input item must be dropped exactly once on panic"
+    );
+}
+
+#[test]
+fn test_for_each_unbalanced_workload() {
+    // Sanity: the Unbalanced oversplit path produces correct results in
+    // for_each (no slot-validity assumptions violated).
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c = counter.clone();
+    use youpipe::Workload;
+    pipe(0..10_000i32)
+        .with_workload(Workload::Unbalanced)
+        .for_each(move |_| {
+            c.fetch_add(1, Ordering::Relaxed);
+        });
+    assert_eq!(counter.load(Ordering::Relaxed), 10_000);
 }

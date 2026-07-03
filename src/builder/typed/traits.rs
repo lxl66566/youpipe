@@ -227,6 +227,46 @@ where
     }
 }
 
+// ── SinkOp: side-effect terminal (for_each) ──
+//
+// `for_each` does not produce an output buffer. The leaf consumes each item
+// by applying the fused chain and handing the result to the user's `Fn(O)`
+// closure. `apply` (Option-wrapping) is used when `MAY_FILTER` so filtered
+// items simply skip the closure; the branch on `MAY_FILTER` is a compile-time
+// constant, so the pure path stays branch-free for the vectorizer.
+
+/// Sink-only transform: applies the fused chain + user closure for side
+/// effects. Drives the `for_each` terminal — no output buffer is allocated,
+/// which is the structural advantage over `.map(f).collect::<Vec<()>>()`.
+pub(super) trait SinkOp<T>: Sync {
+    fn consume(&self, item: T);
+}
+
+/// Wrapper combining a fused stage chain `S` with a side-effect closure `F`.
+/// The chain produces `O`, which `F` consumes (returning `()`).
+pub(super) struct FusedSink<S, F>(pub(super) S, pub(super) F);
+
+impl<S, F, I, O> SinkOp<I> for FusedSink<S, F>
+where
+    S: FusedStage<I, Output = O> + Sync,
+    F: Fn(O) + Sync,
+{
+    #[inline]
+    fn consume(&self, item: I) {
+        if S::MAY_FILTER {
+            if let Some(o) = self.0.apply(item) {
+                (self.1)(o);
+            }
+        } else {
+            // Pure path — never constructs an `Option`, keeping the leaf loop
+            // branch-free for chains without `Filter` (same rationale as
+            // `RangeOp`/`FusedOp`).
+            let o = self.0.apply_pure(item);
+            (self.1)(o);
+        }
+    }
+}
+
 // ── FusedTryStage trait (fallible chain) ──
 
 /// Compile-time fused stage for a fallible pipeline. The chain threads
