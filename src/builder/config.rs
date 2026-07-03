@@ -2,9 +2,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Workload {
     /// Items are roughly evenly distributed across stages.
-    #[default]
     Balanced,
     /// Items may be heavily concentrated in a subset of stages.
+    #[default]
     Unbalanced,
 }
 
@@ -42,7 +42,7 @@ impl Default for PipelineConfig {
             async_workers: cpus,
             buffer_size: 256,
             io_concurrency: 128,
-            workload: Workload::Balanced,
+            workload: Workload::Unbalanced,
         }
     }
 }

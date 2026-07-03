@@ -1,8 +1,7 @@
 use std::{
     any::Any,
     marker::PhantomData,
-    panic,
-    ptr,
+    panic, ptr,
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -308,7 +307,14 @@ where
             // (outer Err) and returned (inner Err) panic payloads land in the
             // shared slot.
             let r = unwind::halt_unwinding(|| {
-                par_index_rec(&*this.input, &*this.output, this.start, this.end, &*this.op, this.splits)
+                par_index_rec(
+                    &*this.input,
+                    &*this.output,
+                    this.start,
+                    this.end,
+                    &*this.op,
+                    this.splits,
+                )
             });
             match r {
                 Ok(Ok(())) => this.succeeded.store(true, Ordering::Release),
@@ -781,8 +787,9 @@ where
 // chunks (low injector contention, no ramp-up) and let each chunk recurse via
 // the tree (distributed deques + stealing).
 //
-// ✅ DONE (2026-07): `par_index_collect_hybrid` below implements exactly this.
-// A/B vs the single-tree baseline (32-core, sample-size 30, measurement-time 5):
+// `par_index_collect_hybrid` below implements exactly this.
+// A/B vs the single-tree baseline (32-core, sample-size 30, measurement-time
+// 5):
 //
 //   sync_cpu_heavy       1 k: −2.8 %     10 k: −3.6 %     100 k: −1.1 %
 //   pipeline_fusion     10 k: −6.5 %     100 k: −6.7 %

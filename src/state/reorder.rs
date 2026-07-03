@@ -87,9 +87,10 @@ impl<T> ReorderBuffer<T> {
 
     /// Insert `item` and return any newly-contiguous run as a `Vec`.
     ///
-    /// Convenience wrapper around [`insert_into`](Self::insert_into) for callers
-    /// that prefer a returned `Vec` over an out-parameter (e.g. tests). Prefer
-    /// `insert_into` on hot paths to avoid the per-call allocation.
+    /// Convenience wrapper around [`insert_into`](Self::insert_into) for
+    /// callers that prefer a returned `Vec` over an out-parameter (e.g.
+    /// tests). Prefer `insert_into` on hot paths to avoid the per-call
+    /// allocation.
     pub fn insert(&mut self, seq: u64, item: T) -> Vec<T> {
         let mut ready = Vec::new();
         self.insert_into(seq, item, &mut ready);
