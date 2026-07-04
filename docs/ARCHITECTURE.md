@@ -311,6 +311,17 @@ each result. This is the structural fix for pure-side-effect pipelines: a
 `.map(f).collect::<Vec<()>>()` would otherwise pay for an `n`-slot output
 buffer + `n` writes for data nobody reads.
 
+**Hybrid dispatch.** `par_for_each` shares the exact same
+`hybrid_dispatch` machinery as `collect` — `num_threads` broad top-level
+chunks injected in one `inject_batch`, every worker busy at t≈0, each chunk
+recursing via the tree for distributed stealing. The only two differences
+from `collect` (no output buffer, no per-chunk panic cleanup) are abstracted
+behind the `SinkStrategy` impl of the `HybridStrategy` trait, so the
+chunk-layout / inject / `CountLatch::wait_spin` / panic-funnel code is
+written once and monomorphized per terminal (no vtable cost). When reached
+from a worker of the *same* pool (nested `scope`), the hybrid `CountLatch`
+park would deadlock, so it falls back to the single-tree `par_for_each_rec`.
+
 Panic safety is the input-tail mirror of `LeafGuard`: each leaf's
 `ForEachGuard` drops `input[pos+1..]` on unwind (item `pos` was consumed by
 `op` and is gone), then `mem::forget`s on success. There is no output to
@@ -625,6 +636,13 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
 `parking_lot_core` resolves `WaitOnAddress` through `GetModuleHandleA`, a Windows foreign function Miri cannot emulate, whereas the std mutex/condvar are natively supported. The unified API lets callers write `mutex.lock()` once and stay transparent to which backend is active.
 
+### Build-profile guards (`build.rs` + `lib.rs`)
+
+youpipe ships a `.cargo/config.toml` override (`opt-level=3`, `panic=unwind`) that applies inside its workspace but is **not** inherited by downstream crates. Two downstream profile settings are known to be harmful, so youpipe emits compile-time warnings when it detects them, telling the user exactly how to override them for youpipe alone via a `[build] rustflags` entry in their own `.cargo/config.toml`:
+
+- `panic = "abort"` — disables `catch_unwind`, so the `LeafGuard` / `ForEachGuard` panic-safety paths never run; any panic inside a pool worker aborts the process instead of propagating. Detected in `lib.rs` via `#[cfg(panic = "abort")]` (the deprecated-const warning trick) — this is accurate inside the library compilation, unlike cargo's build-script `CARGO_CFG_PANIC` env var which mirrors the build-script's own panic strategy (always `unwind`), not the target crate's.
+- `opt-level = "s"` / `"z"` — disables the leaf-loop auto-vectorizer (~2× regression on the lightweight warm path). Detected in `build.rs` via the `OPT_LEVEL` env var, with `CARGO_ENCODED_RUSTFLAGS` parsing so a `[build] rustflags = ["-C", "opt-level=3"]` override suppresses the warning (no false positive in youpipe's own workspace).
+
 ---
 
 ## 9. Performance Benchmarks
@@ -722,6 +740,27 @@ buffer and writing at known indices instead of the `Vec`-merge fallback.
 | ---- | --------------- | ------- |
 | 10K  | ~64 µs          | ~66 µs  |
 | 100K | ~85 µs          | ~98 µs  |
+
+### `for_each()` vs rayon (`sync_for_each`, cpu_heavy per item, warm input)
+
+| Size | youpipe `for_each` | rayon `for_each` |
+| ---- | ------------------ | ---------------- |
+| 1K   | ~64 µs             | ~49 µs           |
+| 10K  | ~191 µs            | ~204 µs          |
+| 100K | ~1.52 ms           | ~1.46 ms         |
+
+`for_each` was the last fused terminal still on the single-tree path — it
+never went through `par_index_collect_hybrid`'s `inject_batch` +
+`CountLatch::wait_spin` pattern, so it paid the full fork/join ramp-up cost.
+Porting it to the shared `hybrid_dispatch` (via the `SinkStrategy` impl of
+`HybridStrategy`) measured **−8.7 % @ 1K, −7.2 % @ 10K, −5.0 % @ 100K** vs the
+prior tree-only `par_for_each`. At 10K youpipe now beats rayon; the 1K case
+still trails because the off-pool driver blocks instead of participating the
+way rayon's `par_iter` runs inline on the caller (a known remaining gap —
+see `docs/ARCHITECTURE.md` "the off-pool driver blocks" note under
+`sync_cpu_heavy`). The `collect` path is performance-neutral after the
+refactor (all `sync_cpu_heavy` / `pipeline_fusion` / `sync_lightweight` /
+`try_collect` entries "No change" vs the pre-refactor baseline).
 
 ### Mixed Load — `stream()` vs `tokio::spawn_blocking` (`mixed_load`)
 
