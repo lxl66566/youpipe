@@ -11,7 +11,10 @@ use crate::state::ReorderBuffer;
 use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
-    handoff::{Receiver, Sender, SharedWaitGroup, SyncSender, TryRecvError, channel::channel},
+    handoff::{
+        MpscAsyncReceiver, MpscReceiver, Receiver, RecvItem, SendItem, SharedWaitGroup, SyncSender,
+        TryRecvError, channel::channel, mpsc_channel,
+    },
     state::{FenceBarrier, FenceMode, run_ordered_collect},
     sync::CancellationToken,
 };
@@ -140,10 +143,10 @@ fn feed_items<I: Send + 'static>(
 #[allow(clippy::needless_pass_by_value)] // ownership transfer is intentional:
 // taking the endpoints by value ensures the caller cannot retain a clone that
 // would keep the channel open after the workers have finished.
-fn spawn_stage<I, O>(
+fn spawn_stage<I, O, Tx>(
     pool: &ComputePool,
     rx: Receiver<(u64, I)>,
-    tx: Sender<(u64, O)>,
+    tx: Tx,
     parallelism: usize,
     cancel: Option<CancellationToken>,
     stage: impl Fn(I) -> O + Send + Sync + 'static,
@@ -151,6 +154,7 @@ fn spawn_stage<I, O>(
 where
     I: Send + Unpin + 'static,
     O: Send + Unpin + 'static,
+    Tx: SendItem<(u64, O)>,
 {
     let stage = Arc::new(stage);
     let wg = SharedWaitGroup::new();
@@ -191,10 +195,10 @@ where
 /// Each expanded item inherits the parent's `seq` so the collector can group
 /// expansions from the same input.
 #[allow(clippy::needless_pass_by_value)] // runs inside a `pool.submit(move …)`
-fn spawn_expand_stage<I, N>(
+fn spawn_expand_stage<I, N, Tx>(
     pool: &ComputePool,
     rx: Receiver<(u64, I)>,
-    tx: Sender<(u64, N)>,
+    tx: Tx,
     parallelism: usize,
     cancel: Option<CancellationToken>,
     expand: impl Fn(I) -> Vec<N> + Send + Sync + 'static,
@@ -202,6 +206,7 @@ fn spawn_expand_stage<I, N>(
 where
     I: Send + Unpin + 'static,
     N: Send + Unpin + 'static,
+    Tx: SendItem<(u64, N)>,
 {
     let expand = Arc::new(expand);
     let wg = SharedWaitGroup::new();
@@ -249,13 +254,14 @@ where
 // owning `mid_rx` / `fenced_tx` by value lets them drop (and close the channel)
 // when the forwarder returns, which is how the downstream stage detects "no
 // more items" — taking them by reference would keep the channel open forever.
-fn forward_fenced<M>(
+fn forward_fenced<M, Tx>(
     mid_rx: Receiver<(u64, M)>,
-    fenced_tx: Sender<(u64, M)>,
+    fenced_tx: Tx,
     mode: FenceMode,
     cancel: Option<&CancellationToken>,
 ) where
     M: Send + Unpin + 'static,
+    Tx: SendItem<(u64, M)>,
 {
     let mut fence = FenceBarrier::<(u64, M)>::new(mode);
     while let Ok(item) = mid_rx.recv() {
@@ -397,6 +403,24 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     type Out: Send + Unpin + 'static;
     fn spawn(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<Self::Out>;
 
+    /// Like [`spawn`](Self::spawn) but the output channel is MPSC (single
+    /// consumer). The collector in [`StreamPipe::run`] is always the sole
+    /// consumer of the final channel, so using the MPSC ring buffer eliminates
+    /// the per-item `lock cmpxchg` that the MPMC ring buffer pays on every
+    /// `recv` — replaced by a plain `store` on the single-consumer dequeue
+    /// path.
+    ///
+    /// The default implementation delegates to [`spawn`](Self::spawn), which
+    /// keeps the MPMC channel (no regression for stages that don't override).
+    /// Concrete stages that create output channels override this to create an
+    /// [`mpsc_channel`] instead.
+    fn spawn_single(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<Self::Out>
+    where
+        Self: Sized,
+    {
+        self.spawn(rx, ctx)
+    }
+
     /// Number of stages in this chain that consume compute-pool worker slots.
     /// Used by `StreamPipe::run` to divide the pool across stages.
     fn worker_stages(&self) -> usize;
@@ -525,6 +549,11 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
                     });
                 });
             }
+            FinalRx::SyncSingle(_) | FinalRx::AsyncSingle(_) => {
+                unreachable!(
+                    "spawn_for_async calls self.spawn() which never returns Single variants"
+                )
+            }
         }
         a_rx
     }
@@ -534,8 +563,37 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
 /// `StreamPipe::run` collector.
 pub enum FinalRx<T: Send + Unpin + 'static> {
     Sync(Receiver<(u64, T)>),
+    /// MPSC variant — the receiver uses a lighter ring-buffer algorithm
+    /// (store-based dequeue, lock-free waker registry) because the collector
+    /// is the sole consumer. Produced by [`StageSpawn::spawn_single`].
+    SyncSingle(MpscReceiver<(u64, T)>),
     #[cfg(feature = "tokio-runtime")]
     Async(AsyncReceiver<(u64, T)>),
+    #[cfg(feature = "tokio-runtime")]
+    AsyncSingle(MpscAsyncReceiver<(u64, T)>),
+}
+
+/// Extract the sync `Receiver` from a previous stage's [`FinalRx`].
+///
+/// [`StageSpawn::spawn`] never produces `SyncSingle` or `AsyncSingle` (only
+/// [`StageSpawn::spawn_single`] does), so those arms are unreachable here.
+/// Every stage's `spawn`/`spawn_single` calls this to obtain its input channel.
+fn finalize_prev_rx<T: Send + Unpin + 'static>(
+    prev_rx: FinalRx<T>,
+    ctx: &StreamCtx,
+) -> Receiver<(u64, T)> {
+    match prev_rx {
+        FinalRx::Sync(r) => r,
+        FinalRx::SyncSingle(_) => {
+            unreachable!("prev.spawn() never returns SyncSingle")
+        }
+        #[cfg(feature = "tokio-runtime")]
+        FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
+        #[cfg(feature = "tokio-runtime")]
+        FinalRx::AsyncSingle(_) => {
+            unreachable!("prev.spawn() never returns AsyncSingle")
+        }
+    }
 }
 
 /// Shared per-run configuration: pool handles, cancellation, buffer sizing.
@@ -658,13 +716,7 @@ where
     type Out = M;
 
     fn spawn(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<M> {
-        let prev_rx = self.prev.spawn(rx, ctx);
-        let mid_rx = match prev_rx {
-            FinalRx::Sync(r) => r,
-            #[cfg(feature = "tokio-runtime")]
-            FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
-        };
-
+        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
         let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
         let buffer = ctx.buffer_size(parallelism);
         let (out_tx, out_rx) = channel::<(u64, M)>(buffer);
@@ -677,6 +729,30 @@ where
             self.f,
         );
         FinalRx::Sync(out_rx)
+    }
+
+    fn spawn_single(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<M>
+    where
+        Self: Sized,
+    {
+        // Terminal sync stage: output goes to the sole collector, so use the
+        // lighter MPSC ring buffer (store-based dequeue, no mutex waker
+        // registry). Previous stages still use MPMC (`prev.spawn`, not
+        // `prev.spawn_single`) — their output feeds multiple workers in this
+        // stage, so multi-consumer channels are required there.
+        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
+        let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
+        let buffer = ctx.buffer_size(parallelism);
+        let (out_tx, out_rx) = mpsc_channel::<(u64, M)>(buffer);
+        let _wg = spawn_stage(
+            ctx.compute_pool(),
+            mid_rx,
+            out_tx,
+            parallelism,
+            ctx.cancel.clone(),
+            self.f,
+        );
+        FinalRx::SyncSingle(out_rx)
     }
 
     #[cfg(feature = "tokio-runtime")]
@@ -692,11 +768,7 @@ where
         // `stream(..).stage(cpu).stage_async(io)` previously paid for a
         // dedicated OS thread forwarding each item sync→mixed-mode; now the
         // CPU stage's workers ARE the mixed-mode producers.
-        let prev_rx = self.prev.spawn(rx, ctx);
-        let mid_rx = match prev_rx {
-            FinalRx::Sync(r) => r,
-            FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
-        };
+        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
         let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
         let buffer = ctx.buffer_size(parallelism);
         let (out_tx, out_rx) = sync_async_channel::<(u64, M)>(buffer);
@@ -737,13 +809,7 @@ where
     type Out = N;
 
     fn spawn(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<N> {
-        let prev_rx = self.prev.spawn(rx, ctx);
-        let mid_rx = match prev_rx {
-            FinalRx::Sync(r) => r,
-            #[cfg(feature = "tokio-runtime")]
-            FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
-        };
-
+        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
         let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
         let buffer = ctx.buffer_size(parallelism);
         let (out_tx, out_rx) = channel::<(u64, N)>(buffer);
@@ -758,15 +824,30 @@ where
         FinalRx::Sync(out_rx)
     }
 
+    fn spawn_single(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<N>
+    where
+        Self: Sized,
+    {
+        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
+        let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
+        let buffer = ctx.buffer_size(parallelism);
+        let (out_tx, out_rx) = mpsc_channel::<(u64, N)>(buffer);
+        let _wg = spawn_expand_stage(
+            ctx.compute_pool(),
+            mid_rx,
+            out_tx,
+            parallelism,
+            ctx.cancel.clone(),
+            self.f,
+        );
+        FinalRx::SyncSingle(out_rx)
+    }
+
     #[cfg(feature = "tokio-runtime")]
     fn spawn_for_async(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> AsyncReceiver<(u64, N)> {
         // Same direct-handoff optimisation as `SyncStage::spawn_for_async`:
         // expansion workers write the mixed-mode sender directly.
-        let prev_rx = self.prev.spawn(rx, ctx);
-        let mid_rx = match prev_rx {
-            FinalRx::Sync(r) => r,
-            FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
-        };
+        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
         let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
         let buffer = ctx.buffer_size(parallelism);
         let (out_tx, out_rx) = sync_async_channel::<(u64, N)>(buffer);
@@ -803,19 +884,26 @@ where
     type Out = Prev::Out;
 
     fn spawn(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<Prev::Out> {
-        let prev_rx = self.prev.spawn(rx, ctx);
-        let mid_rx = match prev_rx {
-            FinalRx::Sync(r) => r,
-            #[cfg(feature = "tokio-runtime")]
-            FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
-        };
-
+        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = channel::<(u64, Prev::Out)>(buffer);
         let mode = self.mode;
         let cancel = ctx.cancel.clone();
         std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode, cancel.as_ref()));
         FinalRx::Sync(fenced_rx)
+    }
+
+    fn spawn_single(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<Prev::Out>
+    where
+        Self: Sized,
+    {
+        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
+        let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
+        let (fenced_tx, fenced_rx) = mpsc_channel::<(u64, Prev::Out)>(buffer);
+        let mode = self.mode;
+        let cancel = ctx.cancel.clone();
+        std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode, cancel.as_ref()));
+        FinalRx::SyncSingle(fenced_rx)
     }
 
     #[cfg(feature = "tokio-runtime")]
@@ -828,11 +916,7 @@ where
         // directly. It already runs on a dedicated OS thread, so blocking on
         // `send` under backpressure is its natural behaviour — no extra bridge
         // needed between the fence and a downstream async stage.
-        let prev_rx = self.prev.spawn(rx, ctx);
-        let mid_rx = match prev_rx {
-            FinalRx::Sync(r) => r,
-            FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
-        };
+        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = sync_async_channel::<(u64, Prev::Out)>(buffer);
         let mode = self.mode;
@@ -1024,6 +1108,9 @@ where
             });
             a_in_rx
         }
+        FinalRx::SyncSingle(_) => {
+            unreachable!("spawn_async_feeder path never produces SyncSingle")
+        }
         FinalRx::Async(prev_async_rx) => {
             // NOTE(perf): this bridge task is NOT redundant — do not try to
             // remove it by having consumers clone `prev_async_rx` directly.
@@ -1066,6 +1153,10 @@ where
                 }
             });
             a_in_rx
+        }
+        #[cfg(feature = "tokio-runtime")]
+        FinalRx::AsyncSingle(_) => {
+            unreachable!("spawn_async_feeder path never produces AsyncSingle")
         }
     };
     FinalRx::Async(spawn_async_consumers_body::<F, Prev::Out, M, Fut>(
@@ -1379,33 +1470,38 @@ where
         #[cfg(feature = "tokio-runtime")]
         let (final_rx, feeder) = if async_feeder {
             let (feeder_tx, feeder_rx) = sync_async_channel::<(u64, I)>(buffer);
-            // Feed items BEFORE spawning stages: preserves the pre-inline
-            // ordering where the feeder starts while stages are being
-            // submitted. For the inline path, items are already queued when
-            // workers start (no wakeup round-trip). For the thread path, the
-            // feeder pushes concurrently with stage startup.
             let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
             (stages.spawn_async_feeder(feeder_rx, &ctx), feeder)
         } else {
             let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
             let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
-            (stages.spawn(feeder_rx, &ctx), feeder)
+            // Use `spawn_single` so the terminal stage's output channel is MPSC
+            // (store-based dequeue, lock-free waker registry) — the collector is
+            // always the sole consumer of the final channel.
+            (stages.spawn_single(feeder_rx, &ctx), feeder)
         };
         #[cfg(not(feature = "tokio-runtime"))]
         let (final_rx, feeder) = {
             let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
             let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
-            (stages.spawn(feeder_rx, &ctx), feeder)
+            (stages.spawn_single(feeder_rx, &ctx), feeder)
         };
 
         let results = match final_rx {
             FinalRx::Sync(rx) => collect_sync(rx, ordered, n),
+            FinalRx::SyncSingle(rx) => collect_sync(rx, ordered, n),
             #[cfg(feature = "tokio-runtime")]
             FinalRx::Async(rx) => {
                 let pool = ctx
         .acquire_async()
         .expect("failed to build tokio runtime (OS resource limit? pass a custom AsyncPool via with_async_pool to handle this)");
                 pool.block_on(collect_async(rx, ordered, n))
+            }
+            #[cfg(feature = "tokio-runtime")]
+            FinalRx::AsyncSingle(_) => {
+                unreachable!(
+                    "async terminal MPSC not yet implemented; spawn_single delegates to spawn for AsyncStage"
+                )
             }
         };
 
@@ -1425,11 +1521,11 @@ where
 /// first item of each burst goes through the blocking `recv()`.
 #[allow(clippy::needless_pass_by_value)] // `rx` is the terminal drain of the
 // pipeline: `run` passes the sole receiver by value to express "consume fully".
-fn collect_sync<T: Send + Unpin + 'static>(
-    rx: Receiver<(u64, T)>,
-    ordered: bool,
-    n: usize,
-) -> Vec<T> {
+fn collect_sync<R, T>(rx: R, ordered: bool, n: usize) -> Vec<T>
+where
+    R: RecvItem<(u64, T)>,
+    T: Send + Unpin + 'static,
+{
     if ordered {
         run_ordered_collect(&rx, n)
     } else {

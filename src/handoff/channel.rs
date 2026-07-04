@@ -1,4 +1,4 @@
-use crossfire::mpmc;
+use crossfire::{mpmc, mpsc};
 
 /// Blocking MPMC sender.
 pub struct SyncSender<T: Send + 'static> {
@@ -143,10 +143,167 @@ impl<T: Send + Unpin + 'static> Clone for AsyncReceiver<T> {
     }
 }
 
+// ── MPSC (single-consumer) channel types ──
+//
+// Wraps `crossfire::mpsc` whose receiver is `!Clone + !Sync` (single-consumer
+// enforced at the type level). The sender side (`MTx`) is identical to the
+// MPMC sender — `Clone + Sync` — so multi-producer topologies are unaffected.
+//
+// The recv-side ring buffer uses `store` instead of `lock cmpxchg` (single
+// consumer → no contention to CAS against), and the waker registry is a
+// lock-free `WeakCell` instead of `Mutex<VecDeque>`. Profiling showed the MPMC
+// ring-buffer CAS dominates per-item cost; switching the collector channel
+// (always single-consumer) to MPSC eliminates that CAS on every collected item.
+
+/// Multi-producer, single-consumer blocking sender. Same send semantics as
+/// [`SyncSender`] but paired with a [`MpscReceiver`] that uses a lighter
+/// ring-buffer algorithm.
+pub struct MpscSender<T: Send + 'static> {
+    tx: crossfire::MTx<mpsc::Array<T>>,
+}
+
+/// Multi-producer, single-consumer blocking receiver. **Not `Clone`** — the
+/// type system enforces a single consumer, enabling a CAS-free recv path.
+pub struct MpscReceiver<T: Send + 'static> {
+    rx: crossfire::Rx<mpsc::Array<T>>,
+}
+
+/// Create a bounded MPSC (multi-producer, single-consumer) channel.
+///
+/// Prefer this over [`channel`] when there is exactly one consumer — the
+/// receiver uses `store`-based dequeue (no `lock cmpxchg`) and a lock-free
+/// waker registry, eliminating the dominant per-item CAS cost that the MPMC
+/// ring buffer pays on every `recv`.
+#[must_use]
+pub fn mpsc_channel<T: Send + 'static>(capacity: usize) -> (MpscSender<T>, MpscReceiver<T>) {
+    let (tx, rx) = mpsc::bounded_blocking::<T>(capacity);
+    (MpscSender { tx }, MpscReceiver { rx })
+}
+
+impl<T: Send + 'static> MpscSender<T> {
+    pub fn send(&self, item: T) -> Result<(), ChannelError> {
+        self.tx.send(item).map_err(|_| ChannelError::Closed)
+    }
+}
+
+impl<T: Send + 'static> SendItem<T> for MpscSender<T> {
+    #[inline]
+    fn send(&self, item: T) -> Result<(), ChannelError> {
+        MpscSender::send(self, item)
+    }
+}
+
+impl<T: Send + 'static> Clone for MpscSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+impl<T: Send + 'static> MpscReceiver<T> {
+    pub fn recv(&self) -> Result<T, ChannelError> {
+        self.rx.recv().map_err(|_| ChannelError::Closed)
+    }
+
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        self.rx.try_recv().map_err(|e| match e {
+            crossfire::TryRecvError::Empty => TryRecvError::Empty,
+            crossfire::TryRecvError::Disconnected => TryRecvError::Closed,
+        })
+    }
+}
+
+impl<T: Send + 'static> RecvItem<T> for MpscReceiver<T> {
+    #[inline]
+    fn recv(&self) -> Result<T, ChannelError> {
+        MpscReceiver::recv(self)
+    }
+    #[inline]
+    fn try_recv(&self) -> Result<T, TryRecvError> {
+        MpscReceiver::try_recv(self)
+    }
+}
+
+// ── MPSC mixed-mode (sync sender + async single-consumer receiver) ──
+
+/// Async receiver for the MPSC mixed-mode channel. **Not `Clone`** — single
+/// consumer, enabling the lighter MPSC ring buffer.
+pub struct MpscAsyncReceiver<T: Send + Unpin + 'static> {
+    rx: crossfire::AsyncRx<mpsc::Array<T>>,
+}
+
+/// Create a bounded MPSC mixed-mode channel: blocking sync sender paired with
+/// an async single-consumer receiver over the same queue.
+///
+/// This is the MPSC analogue of [`sync_async_channel`]. Use it when the
+/// collector runs as a single async task — the recv side avoids the MPMC
+/// ring-buffer CAS.
+#[must_use]
+pub fn mpsc_sync_async_channel<T: Send + Unpin + 'static>(
+    capacity: usize,
+) -> (MpscSender<T>, MpscAsyncReceiver<T>) {
+    let (tx, rx) = mpsc::bounded_blocking_async::<T>(capacity);
+    (MpscSender { tx }, MpscAsyncReceiver { rx })
+}
+
+impl<T: Send + Unpin + 'static> MpscAsyncReceiver<T> {
+    pub async fn recv(&self) -> Result<T, ChannelError> {
+        self.rx.recv().await.map_err(|_| ChannelError::Closed)
+    }
+
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        self.rx.try_recv().map_err(|e| match e {
+            crossfire::TryRecvError::Empty => TryRecvError::Empty,
+            crossfire::TryRecvError::Disconnected => TryRecvError::Closed,
+        })
+    }
+}
+
 /// Channel is closed (all senders/receivers dropped).
 #[derive(Debug, PartialEq, Eq)]
 pub enum ChannelError {
     Closed,
+}
+
+// ── SendItem trait: abstracts over SyncSender and MpscSender ──
+
+/// A sender that can deliver one item synchronously (blocking until space is
+/// available in a bounded channel). Implemented by both [`SyncSender`] (MPMC
+/// backing) and [`MpscSender`] (MPSC backing) so that [`spawn_stage`] etc. can
+/// be generic over either — letting the collector channel use the lighter MPSC
+/// ring buffer (store-based recv, no mutex waker registry) when there is only
+/// one consumer.
+pub trait SendItem<T>: Clone + Send + 'static {
+    /// Deliver `item`, blocking until the channel has space. Returns
+    /// `ChannelError::Closed` if all receivers have been dropped.
+    fn send(&self, item: T) -> Result<(), ChannelError>;
+}
+
+impl<T: Send + 'static> SendItem<T> for SyncSender<T> {
+    #[inline]
+    fn send(&self, item: T) -> Result<(), ChannelError> {
+        SyncSender::send(self, item)
+    }
+}
+
+/// A sync receiver that can `recv` (blocking) and `try_recv` (non-blocking).
+/// Implemented by both [`SyncReceiver`] (MPMC) and [`MpscReceiver`] (MPSC) so
+/// collector functions can be generic over either.
+pub trait RecvItem<T> {
+    fn recv(&self) -> Result<T, ChannelError>;
+    fn try_recv(&self) -> Result<T, TryRecvError>;
+}
+
+impl<T: Send + 'static> RecvItem<T> for SyncReceiver<T> {
+    #[inline]
+    fn recv(&self) -> Result<T, ChannelError> {
+        SyncReceiver::recv(self)
+    }
+    #[inline]
+    fn try_recv(&self) -> Result<T, TryRecvError> {
+        SyncReceiver::try_recv(self)
+    }
 }
 
 /// Non-blocking send error.

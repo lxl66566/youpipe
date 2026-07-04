@@ -477,7 +477,33 @@ Closure detection is delegated entirely to crossfire: `send`/`recv` return
 `Closed` once crossfire's internal disconnect logic observes that all peers
 have been dropped. No extra flag is maintained.
 
-### 5.2 WaitGroup (`notify.rs`)
+### 5.2 MPSC Channels — Collector Optimisation
+
+The streaming pipeline's collector is always the **sole consumer** of the final
+output channel (multiple worker producers → one collector). This is an MPSC
+topology, yet crossfire's `mpmc` module uses a CAS-based ring buffer
+(`lock cmpxchg` on every dequeue) and a `Mutex<VecDeque>` waker registry —
+both unnecessary for single-consumer patterns.
+
+crossfire ships an `mpsc` module whose receiver uses:
+
+- **`store`-based dequeue** instead of `lock cmpxchg` (single consumer → no
+  contention to CAS against). Profiling showed the MPMC ring-buffer CAS
+  dominates per-item cost (~20–40 % of channel throughput depending on
+  contention).
+- **`WeakCell` waker registry** (lock-free) instead of `Mutex<VecDeque>`.
+
+youpipe exposes this via `MpscSender<T>` / `MpscReceiver<T>` (and the async
+variant `mpsc_sync_async_channel`). The `StageSpawn` trait gains a
+`spawn_single` method that creates the terminal stage's output channel as MPSC
+instead of MPMC; `StreamPipe::run` calls `spawn_single` for the sync terminal
+path. Intermediate stage channels remain MPMC (their receivers are shared
+across multiple worker threads via `clone`).
+
+`SendItem<T>` / `RecvItem<T>` traits abstract over the two channel backings so
+`spawn_stage` and the collector functions are generic without virtual dispatch.
+
+### 5.3 WaitGroup (`notify.rs`)
 
 Counter barrier: `add(n)` increments, `done()` decrements, `wait()` blocks until zero. When count transitions 1→0, condvar broadcasts. Used internally by streaming stages to track worker completion.
 

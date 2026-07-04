@@ -1,4 +1,4 @@
-use crate::{handoff::Receiver, state::ReorderBuffer};
+use crate::{handoff::RecvItem, state::ReorderBuffer};
 
 /// Drain `input_rx` in input-order (sequence-tagged) fashion, returning the
 /// fully ordered result vector.
@@ -8,13 +8,14 @@ use crate::{handoff::Receiver, state::ReorderBuffer};
 /// receiver loop exits once all senders drop, then any remaining buffered
 /// items are flushed in seq order.
 ///
-/// Used by `StreamPipeline`'s ordered run paths; kept here so the reorder
-/// logic lives next to its dependencies rather than inside the builder.
+/// Generic over the receiver type so it works with both MPMC (`Receiver`) and
+/// MPSC (`MpscReceiver`) channels.
 #[must_use]
-pub fn run_ordered_collect<O: Send + 'static>(
-    input_rx: &Receiver<(u64, O)>,
-    expected_items: usize,
-) -> Vec<O> {
+pub fn run_ordered_collect<R, O>(input_rx: &R, expected_items: usize) -> Vec<O>
+where
+    R: RecvItem<(u64, O)>,
+    O: Send + 'static,
+{
     // Size the reorder window to the expected item count (power-of-two,
     // clamped to [1Ki, 1Mi] slots). Smaller windows are cheaper to allocate
     // and scan; larger windows tolerate more reordering. The clamp keeps both

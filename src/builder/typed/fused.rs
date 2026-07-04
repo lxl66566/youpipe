@@ -817,9 +817,9 @@ where
 // (`CountLatch`/`LockLatch`), costing ~10–20 µs of fixed overhead per batch on
 // the driver thread — the dominant remaining cost on the 1 K `cpu_heavy` case.
 // It is now a spin-then-park (`CountLatch::wait_spin`): a bounded tight spin on
-// the SeqCst `counter` covers the small/medium-batch envelope without a syscall,
-// falling through to the condvar only for genuinely long waits. See the
-// `CountLatch::wait_spin` doc in `src/pool/latch.rs` for why the spin must
+// the SeqCst `counter` covers the small/medium-batch envelope without a
+// syscall, falling through to the condvar only for genuinely long waits. See
+// the `CountLatch::wait_spin` doc in `src/pool/latch.rs` for why the spin must
 // still end in the mutex acquire (use-after-free avoidance).
 
 // ── Join-based parallel helpers ──
