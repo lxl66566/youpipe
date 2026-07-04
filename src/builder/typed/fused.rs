@@ -126,13 +126,20 @@ where
     /// `consumed` is therefore always `written + 1` at the panic point, so we
     /// don't track it separately — one less store per iteration on the hot
     /// path (helps the vectorizer keep the index in a register).
-    struct LeafGuard<'a, T, R> {
-        input: &'a [T],
-        output: &'a mut [R],
+    ///
+    /// Stores raw pointers (not `&mut [R]`) so that `mem::forget(g)` on the
+    /// success path doesn't conflict with the raw-pointer writes under
+    /// Tree Borrows: a `&mut [R]` field in the guard would be disabled by
+    /// the foreign write through `out_ptr`, making the `forget` access UB.
+    /// Raw pointers carry no borrow tags, so there is nothing to disable.
+    struct LeafGuard<T, R> {
+        in_ptr: *const T,
+        out_ptr: *mut R,
+        n: usize,
         written: usize,
     }
 
-    impl<T, R> Drop for LeafGuard<'_, T, R> {
+    impl<T, R> Drop for LeafGuard<T, R> {
         fn drop(&mut self) {
             // SAFETY: `written` reflects the actual completed-iteration count
             // at the unwind point. `RangeOp` never filters, so output[..written)
@@ -142,13 +149,11 @@ where
             // panic, so we don't drop input[written].
             unsafe {
                 let i = self.written;
-                let out_live = self.output.as_mut_ptr();
                 for j in 0..i {
-                    std::ptr::drop_in_place(out_live.add(j));
+                    std::ptr::drop_in_place(self.out_ptr.add(j));
                 }
-                let in_live = self.input.as_ptr();
-                for j in (i + 1)..self.input.len() {
-                    std::ptr::drop_in_place(in_live.add(j).cast_mut());
+                for j in (i + 1)..self.n {
+                    std::ptr::drop_in_place(self.in_ptr.add(j).cast_mut());
                 }
             }
         }
@@ -156,16 +161,14 @@ where
 
     debug_assert_eq!(input.len(), output.len());
 
-    // Capture raw pointers up front so the loop can mutate `g.written`
-    // (which borrows `&mut g`) without re-borrowing `input` /
-    // `output` (already borrowed by `g`).
     let in_ptr = input.as_ptr();
     let out_ptr = output.as_mut_ptr();
     let n = input.len();
 
     let mut g = LeafGuard {
-        input,
-        output,
+        in_ptr,
+        out_ptr,
+        n,
         written: 0,
     };
 
@@ -663,26 +666,26 @@ where
 {
     /// RAII guard mirroring `LeafGuard`: drops the partial slot state on
     /// unwind. `Drop` only fires on panic; both success and error paths call
-    /// `mem::forget`.
-    struct TryLeafGuard<'a, T, R> {
-        input: &'a [T],
-        output: &'a mut [R],
+    /// `mem::forget`. Uses raw pointers for the same Tree Borrows reason as
+    /// `LeafGuard` — see the comment there.
+    struct TryLeafGuard<T, R> {
+        in_ptr: *const T,
+        out_ptr: *mut R,
+        n: usize,
         written: usize,
     }
 
-    impl<T, R> Drop for TryLeafGuard<'_, T, R> {
+    impl<T, R> Drop for TryLeafGuard<T, R> {
         fn drop(&mut self) {
             // SAFETY: same reasoning as `LeafGuard::drop` — `written` reflects
             // completed iterations at the unwind point.
             unsafe {
                 let i = self.written;
-                let out_live = self.output.as_mut_ptr();
                 for j in 0..i {
-                    std::ptr::drop_in_place(out_live.add(j));
+                    std::ptr::drop_in_place(self.out_ptr.add(j));
                 }
-                let in_live = self.input.as_ptr();
-                for j in (i + 1)..self.input.len() {
-                    std::ptr::drop_in_place(in_live.add(j).cast_mut());
+                for j in (i + 1)..self.n {
+                    std::ptr::drop_in_place(self.in_ptr.add(j).cast_mut());
                 }
             }
         }
@@ -695,8 +698,9 @@ where
     let n = input.len();
 
     let mut g = TryLeafGuard {
-        input,
-        output,
+        in_ptr,
+        out_ptr,
+        n,
         written: 0,
     };
 
