@@ -26,18 +26,18 @@ impl CancellationToken {
 
     /// Signals cancellation to all token clones.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 
     /// Returns `true` if cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.cancelled.load(Ordering::Relaxed)
     }
 
     /// Clears the cancellation flag, allowing reuse.
     pub fn reset(&self) {
-        self.cancelled.store(false, Ordering::Release);
+        self.cancelled.store(false, Ordering::Relaxed);
     }
 }
 

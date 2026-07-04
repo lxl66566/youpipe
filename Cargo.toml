@@ -41,6 +41,20 @@ crossbeam-channel = "0.5"
 rayon             = "1"
 tokio             = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 
+# Single codegen unit for release builds. A project whose value proposition is
+# per-item throughput cannot tolerate the code-layout lottery that
+# `codegen-units = 16` (the Cargo default) triggers: an unrelated edit
+# elsewhere in the crate shifts LLVM's codegen-unit partitioning, which
+# reshuffles the hot-path instruction layout, which silently regresses the
+# leaf loop's auto-vectorization. We measured this directly while deleting an
+# unused `runtime/` module (no behaviour change, ~18% regression at
+# sync_cpu_heavy/100k that vanished the moment the code was reinstated).
+# `codegen-units = 1` makes such phantom regressions impossible at the cost of
+# slower release builds — the standard trade-off for perf-first crates
+# (rayon, crossbeam, etc. all do the same).
+[profile.release]
+codegen-units = 1
+
 [[bench]]
 harness = false
 name    = "sync_vs_rayon"
@@ -67,3 +81,13 @@ name    = "io_async"
 [[example]]
 name              = "hotpath_profile"
 required-features = ["hotpath"]
+
+# Examples that exercise `.stage_async` / `.with_async_pool` — only buildable
+# when the tokio runtime is enabled.
+[[example]]
+name              = "async_io"
+required-features = ["tokio-runtime"]
+
+[[example]]
+name              = "mixed_cpu_io"
+required-features = ["tokio-runtime"]

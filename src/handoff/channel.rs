@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use crossfire::{mpmc, mpsc};
 
 /// Blocking MPMC sender.
@@ -247,6 +249,53 @@ pub fn mpsc_sync_async_channel<T: Send + Unpin + 'static>(
     (MpscSender { tx }, MpscAsyncReceiver { rx })
 }
 
+/// Multi-producer, single-consumer async sender. Same send semantics as
+/// [`AsyncSender`] but paired with a [`MpscAsyncReceiver`] that uses a lighter
+/// ring-buffer algorithm.
+///
+/// Used by async-stage consumer tasks whose output is drained by the sole
+/// async collector — the recv side avoids the MPMC `lock cmpxchg` on every
+/// collected item.
+pub struct MpscAsyncSender<T: Send + Unpin + 'static> {
+    tx: crossfire::MAsyncTx<mpsc::Array<T>>,
+}
+
+impl<T: Send + Unpin + 'static> MpscAsyncSender<T> {
+    pub async fn send(&self, item: T) -> Result<(), ChannelError> {
+        self.tx.send(item).await.map_err(|_| ChannelError::Closed)
+    }
+
+    pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
+        self.tx.try_send(item).map_err(|e| match e {
+            crossfire::TrySendError::Full(v) => TrySendError::Full(v),
+            crossfire::TrySendError::Disconnected(v) => TrySendError::Closed(v),
+        })
+    }
+}
+
+impl<T: Send + Unpin + 'static> Clone for MpscAsyncSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+/// Create a bounded MPSC async channel: async sender + async single-consumer
+/// receiver over the same queue.
+///
+/// Use this when async-stage consumer tasks feed the sole async collector —
+/// the recv side uses `store`-based dequeue (no `lock cmpxchg`) and a
+/// lock-free `WeakCell` waker registry, eliminating the dominant per-item CAS
+/// cost that the MPMC ring buffer pays on every `recv`.
+#[must_use]
+pub fn mpsc_async_channel<T: Send + Unpin + 'static>(
+    capacity: usize,
+) -> (MpscAsyncSender<T>, MpscAsyncReceiver<T>) {
+    let (tx, rx) = mpsc::bounded_async::<T>(capacity);
+    (MpscAsyncSender { tx }, MpscAsyncReceiver { rx })
+}
+
 impl<T: Send + Unpin + 'static> MpscAsyncReceiver<T> {
     pub async fn recv(&self) -> Result<T, ChannelError> {
         self.rx.recv().await.map_err(|_| ChannelError::Closed)
@@ -303,6 +352,39 @@ impl<T: Send + 'static> RecvItem<T> for SyncReceiver<T> {
     #[inline]
     fn try_recv(&self) -> Result<T, TryRecvError> {
         SyncReceiver::try_recv(self)
+    }
+}
+
+/// Async counterpart to [`RecvItem`]: `recv().await` and `try_recv`. Both
+/// [`AsyncReceiver`] (MPMC) and [`MpscAsyncReceiver`] (MPSC) implement this
+/// so the async collector can drain either backing with one implementation,
+/// avoiding code duplication between the MPMC and MPSC terminal paths.
+pub trait AsyncRecvItem<T> {
+    /// Wait for one item. Resolves to `Err(ChannelError::Closed)` once every
+    /// sender has been dropped.
+    fn recv(&self) -> impl Future<Output = Result<T, ChannelError>>;
+    fn try_recv(&self) -> Result<T, TryRecvError>;
+}
+
+impl<T: Send + Unpin + 'static> AsyncRecvItem<T> for AsyncReceiver<T> {
+    #[inline]
+    async fn recv(&self) -> Result<T, ChannelError> {
+        AsyncReceiver::recv(self).await
+    }
+    #[inline]
+    fn try_recv(&self) -> Result<T, TryRecvError> {
+        AsyncReceiver::try_recv(self)
+    }
+}
+
+impl<T: Send + Unpin + 'static> AsyncRecvItem<T> for MpscAsyncReceiver<T> {
+    #[inline]
+    async fn recv(&self) -> Result<T, ChannelError> {
+        MpscAsyncReceiver::recv(self).await
+    }
+    #[inline]
+    fn try_recv(&self) -> Result<T, TryRecvError> {
+        MpscAsyncReceiver::try_recv(self)
     }
 }
 

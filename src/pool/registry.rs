@@ -531,6 +531,10 @@ where
 // ── RNG ──
 
 /// xorshift* PRNG — fast, tolerates weak seeds (only zero is forbidden).
+///
+/// State is a `Cell<u64>` (not `AtomicU64`): `WorkerThread` is stored in TLS
+/// and only ever touched by its owning worker thread, so single-threaded
+/// interior mutability is both sound and cheaper than an atomic.
 struct XorShift64Star {
     state: Cell<u64>,
 }

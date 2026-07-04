@@ -34,16 +34,21 @@ pub enum Workload {
 }
 
 /// Top-level configuration for a pipeline run.
+///
+/// All fields are `pub(crate)` — construction and mutation go through
+/// [`Default`] + the `with_*` builder methods. This lets the crate add
+/// invariants (e.g. clamping `compute_workers` to ≥ 1) without worrying that
+/// a caller has mutated a field directly.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     /// Number of threads dedicated to CPU-bound (sync) work.
-    pub compute_workers: usize,
+    pub(crate) compute_workers: usize,
     /// Number of OS threads backing the async I/O runtime (tokio worker
     /// threads). Async stages multiplex many more tasks than this via the
     /// runtime's M:N scheduler — see [`Self::io_concurrency`].
-    pub async_workers: usize,
+    pub(crate) async_workers: usize,
     /// Per-channel buffer capacity (items) between stages.
-    pub buffer_size: usize,
+    pub(crate) buffer_size: usize,
     /// Number of concurrently in-flight async I/O tasks per async stage.
     ///
     /// This is the M:N concurrency multiplier: async I/O tasks (e.g.
@@ -51,9 +56,9 @@ pub struct PipelineConfig {
     /// the runtime while waiting, so `io_concurrency` can be far larger than
     /// `async_workers` (the thread count). Defaults to 128 — high enough to
     /// saturate the runtime with yielded waits, bounded to cap memory.
-    pub io_concurrency: usize,
+    pub(crate) io_concurrency: usize,
     /// Expected workload distribution pattern.
-    pub workload: Workload,
+    pub(crate) workload: Workload,
 }
 
 impl Default for PipelineConfig {

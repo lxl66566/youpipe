@@ -27,9 +27,11 @@ impl WaitGroup {
 
     pub fn done(&self) {
         let prev = self.count.fetch_sub(1, Ordering::AcqRel);
-        // Detect unbalanced add/done: without this, an extra `done()` wraps the
-        // counter to usize::MAX and `wait()` blocks forever with no indication.
-        debug_assert!(prev > 0, "WaitGroup::done() called more times than add()");
+        // Fail loudly on an unbalanced add/done: without this, an extra
+        // `done()` wraps the counter to usize::MAX and `wait()` blocks forever
+        // with no indication. A sync primitive must not silently corrupt its
+        // state — surface the bug at the call site instead.
+        assert!(prev > 0, "WaitGroup::done() called more times than add()");
         if prev == 1 {
             let _guard = self.lock.lock();
             self.cvar.notify_all();

@@ -22,6 +22,7 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo nextest run --all-features --no-tests pass && cargo test --doc && cargo check --examples
+      - run: cargo check --no-default-features --examples
       - run: cargo clippy --all-features -- -D warnings
 
   miri:

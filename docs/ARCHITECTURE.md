@@ -40,9 +40,22 @@ separate (work-stealing join vs channel handoff) — see §3.6.
 
 The `scope()` API allows closures to borrow stack-local variables without `'static` bounds. The `'env` lifetime is threaded through `ScopedPipe` and the underlying `fused_collect_scoped` drives the same `ComputePool::join` work-stealing core — whose `Registry::in_worker_cold` blocks the calling thread until every spawned sub-task finishes — guaranteeing borrowed references outlive the pool's access to them.
 
-### Runtime Agnostic
+### Async runtime
 
-Core modules (`builder/`, `handoff/`, `executor/`, `state/`, `scope/`) have zero dependency on any async runtime. The `runtime/` module defines a `Runtime` trait with `TokioRuntime` as the only implementation (behind the `tokio-runtime` feature).
+Async stages (`stage_async`) run on tokio via [`AsyncPool`] (a
+`tokio::runtime::Handle` wrapper). The runtime is feature-gated behind
+`tokio-runtime` (the default); building without it produces a sync-only
+crate that exposes no async APIs (`AsyncStage`, `AsyncPool`, `stage_async`
+all disappear). Callers can attach a managed runtime via `.with_async_pool`
+or let the pipeline build a transient one per `run()` call.
+
+There is intentionally no `Runtime` trait abstraction: the streaming code
+calls tokio APIs directly (e.g. `tokio::spawn`, `Handle::block_on`), and
+introducing a trait would either leak tokio types through it or force a
+wrapper that loses tokio's specific capabilities. `AsyncPool::new(handle, n)`
+already lets a caller hand in any `tokio::runtime::Handle` (including one
+built externally or shared across runs), which covers the realistic
+"runtime-agnostic" use cases without an under-used abstraction layer.
 
 ---
 
@@ -84,10 +97,6 @@ src/
 ├── sync/             # Synchronization primitives
 │   ├── cancel.rs     # CancellationToken (Arc<AtomicBool>)
 │   ├── sys.rs        # Miri-transparent Mutex/Condvar (parking_lot ↔ std)
-│   └── mod.rs
-├── runtime/          # Async runtime abstraction
-│   ├── traits.rs     # Runtime trait (spawn / spawn_blocking / block_on)
-│   ├── tokio_impl.rs # TokioRuntime implementation
 │   └── mod.rs
 ├── pool/             # Rayon-style work-stealing scheduler core
 │   ├── registry.rs   # Registry, WorkerThread, find_work, steal
@@ -493,15 +502,25 @@ crossfire ships an `mpsc` module whose receiver uses:
   contention).
 - **`WeakCell` waker registry** (lock-free) instead of `Mutex<VecDeque>`.
 
-youpipe exposes this via `MpscSender<T>` / `MpscReceiver<T>` (and the async
-variant `mpsc_sync_async_channel`). The `StageSpawn` trait gains a
-`spawn_single` method that creates the terminal stage's output channel as MPSC
-instead of MPMC; `StreamPipe::run` calls `spawn_single` for the sync terminal
-path. Intermediate stage channels remain MPMC (their receivers are shared
-across multiple worker threads via `clone`).
+youpipe exposes this via `MpscSender<T>` / `MpscReceiver<T>` (sync sender +
+sync receiver), `mpsc_sync_async_channel` (sync sender + async receiver),
+and `mpsc_async_channel` (`MpscAsyncSender` + `MpscAsyncReceiver` — both
+ends async, used when async-stage consumer tasks feed the sole async
+collector). The `StageSpawn` trait gains a `spawn_single` method that
+creates the terminal stage's output channel as MPSC instead of MPMC;
+`StreamPipe::try_run` calls `spawn_single` for the terminal path —
+covering sync stages, fence links, expand, and `AsyncStage` (whose
+`spawn_single` override routes the consumer fan-out into an
+`mpsc_async_channel`). Intermediate stage channels remain MPMC (their
+receivers are shared across multiple worker threads via `clone`).
 
-`SendItem<T>` / `RecvItem<T>` traits abstract over the two channel backings so
-`spawn_stage` and the collector functions are generic without virtual dispatch.
+The collector itself is generic over a `RecvItem` (sync) or `AsyncRecvItem`
+(async) trait, so `collect_sync` / `collect_async` drain either the MPMC or
+MPSC backing with one implementation.
+
+`SendItem<T>` / `RecvItem<T>` / `AsyncRecvItem<T>` traits abstract over the
+channel backings (MPMC vs MPSC, sync vs async) so `spawn_stage` and the
+collector functions are generic without virtual dispatch.
 
 ### 5.3 WaitGroup (`notify.rs`)
 
@@ -732,18 +751,3 @@ still leads there.
 1. Define a stage struct implementing `StageMarker<T>` and `FusedStage<T>`
 2. Add a builder method on `Pipe<S, I, O>` returning `Pipe<NewStage<S, ...>, I, NewO>`
 3. In `FusedStage::apply()` (and `apply_pure` if the stage can't filter), compose `self.prev.apply(item)` with the new logic
-
-### Adding a New Runtime
-
-Implement the `Runtime` trait:
-
-```rust
-pub trait Runtime: Send + Sync + 'static {
-    fn spawn<F>(&self, future: F) where F: Future<Output = ()> + Send + 'static;
-    fn spawn_blocking<F, R>(&self, f: F) -> Pin<Box<dyn Future<Output = R> + Send + 'static>>
-    where F: FnOnce() -> R + Send + 'static, R: Send + 'static;
-    fn block_on<F>(&self, future: F) -> F::Output where F: Future;
-}
-```
-
-Add a feature flag in `Cargo.toml` and an implementation module under `runtime/`.

@@ -190,7 +190,8 @@ let r = (0..1000).stream()
 `.fence(mode)` 作用于一个相邻阶段边界。`FenceMode::Barrier` 让上游完全排空后下游
 才开始；`FenceMode::Chunked(k)` 每凑齐 `k` 个元素就立即释放（混合 CPU/IO 的推荐
 默认）。`.run()` 默认按完成顺序返回结果；追加 `.ordered()` 通过 `ReorderBuffer`
-恢复输入顺序。
+恢复输入顺序。tokio runtime 构建失败会让 `.run()` panic；改用 `.try_run()`
+可拿到 `Result`。
 
 ## 工作原理
 

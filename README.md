@@ -218,7 +218,8 @@ count). Bound it to cap memory.
 drains upstream fully before downstream starts; `FenceMode::Chunked(k)`
 releases every `k` items as they form (the default for mixed CPU/IO).
 `.run()` returns results in completion order; append `.ordered()` to restore
-input order via a `ReorderBuffer`.
+input order via a `ReorderBuffer`. `.run()` panics if the tokio runtime
+cannot be built; use `.try_run()` to surface that as a `Result`.
 
 ## How it works
 

@@ -5,15 +5,19 @@ use std::sync::OnceLock;
 use std::{marker::PhantomData, sync::Arc};
 
 #[cfg(feature = "tokio-runtime")]
-use crate::handoff::{AsyncReceiver, async_channel, sync_async_channel};
+use crate::handoff::MpscAsyncReceiver;
+#[cfg(feature = "tokio-runtime")]
+use crate::handoff::{
+    AsyncReceiver, AsyncRecvItem, async_channel, mpsc_async_channel, sync_async_channel,
+};
 #[cfg(feature = "tokio-runtime")]
 use crate::state::ReorderBuffer;
 use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
     handoff::{
-        MpscAsyncReceiver, MpscReceiver, Receiver, RecvItem, SendItem, SharedWaitGroup, SyncSender,
-        TryRecvError, channel::channel, mpsc_channel,
+        MpscReceiver, Receiver, RecvItem, SendItem, SharedWaitGroup, SyncSender, TryRecvError,
+        channel::channel, mpsc_channel,
     },
     state::{FenceBarrier, FenceMode, run_ordered_collect},
     sync::CancellationToken,
@@ -578,6 +582,7 @@ pub enum FinalRx<T: Send + Unpin + 'static> {
 /// [`StageSpawn::spawn`] never produces `SyncSingle` or `AsyncSingle` (only
 /// [`StageSpawn::spawn_single`] does), so those arms are unreachable here.
 /// Every stage's `spawn`/`spawn_single` calls this to obtain its input channel.
+#[cfg_attr(not(feature = "tokio-runtime"), allow(unused_variables))]
 fn finalize_prev_rx<T: Send + Unpin + 'static>(
     prev_rx: FinalRx<T>,
     ctx: &StreamCtx,
@@ -973,6 +978,20 @@ where
         self.prev.worker_stages()
     }
 
+    fn spawn_single(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<M>
+    where
+        Self: Sized,
+    {
+        // Terminal async stage: the collector is the sole consumer of the
+        // output, so use the lighter MPSC async channel (store-based dequeue,
+        // no `lock cmpxchg`). Input channel stays MPMC (`prev.spawn_for_async`)
+        // — multiple async consumer tasks share the input via clone.
+        let a_in_rx = self.prev.spawn_for_async(rx, ctx);
+        FinalRx::AsyncSingle(spawn_async_consumers_body_single::<F, Prev::Out, M, Fut>(
+            self.f, a_in_rx, ctx,
+        ))
+    }
+
     fn first_consumer_is_async(&self) -> Option<bool> {
         // Defer to prev's opinion; if prev had none, *we* are the first real
         // consumer — and we're async.
@@ -1048,6 +1067,66 @@ where
     drop(a_in_rx);
     // Detach: tasks complete as channels close; we don't need the JoinHandles
     // (output is observed via the channel).
+    drop(consumers);
+    a_out_rx
+}
+
+/// Like [`spawn_async_consumers_body`] but produces an MPSC output channel
+/// ([`MpscAsyncReceiver`]) instead of MPMC — the right shape when this is the
+/// terminal async stage and the collector is the sole consumer of the output.
+///
+/// The receiver end uses `store`-based dequeue (no `lock cmpxchg`) and a
+/// lock-free waker registry, eliminating the dominant per-item CAS cost that
+/// the MPMC ring buffer pays on every `recv`. The sender side stays async
+/// (`MpscAsyncSender::send().await`) because the producers are tokio tasks,
+/// not OS threads — a blocking send would stall the runtime worker.
+///
+/// Invoked by [`AsyncStage::spawn_single`] via [`StageSpawn::spawn_single`].
+#[cfg(feature = "tokio-runtime")]
+#[allow(clippy::needless_pass_by_value)] // `f` is moved into the `Arc` shared
+// across consumer tasks; taking it by value expresses "this is the last stop
+// for the closure" (same rationale as `spawn_async_consumers_body`).
+fn spawn_async_consumers_body_single<F, In, M, Fut>(
+    f: F,
+    a_in_rx: AsyncReceiver<(u64, In)>,
+    ctx: &StreamCtx,
+) -> MpscAsyncReceiver<(u64, M)>
+where
+    F: Fn(In) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = M> + Send + 'static,
+    In: Send + Unpin + 'static,
+    M: Send + Unpin + 'static,
+{
+    let concurrency = ctx.config.io_concurrency.max(1).min(ctx.n.max(1));
+    let buffer = ctx.buffer_size(concurrency);
+    let (a_out_tx, a_out_rx) = mpsc_async_channel::<(u64, M)>(buffer);
+    let pool = ctx.acquire_async().expect("failed to build async runtime");
+    let _enter = pool.handle().enter();
+    let f = Arc::new(f);
+    let cancel = ctx.cancel.clone();
+    let mut consumers = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let f = f.clone();
+        let rx = a_in_rx.clone();
+        let tx = a_out_tx.clone();
+        let c = cancel.clone();
+        consumers.push(tokio::spawn(async move {
+            loop {
+                let Ok((seq, item)) = rx.recv().await else {
+                    break;
+                };
+                if cancel_active(c.as_ref()) {
+                    break;
+                }
+                let out = f(item).await;
+                if tx.send((seq, out)).await.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+    drop(a_out_tx);
+    drop(a_in_rx);
     drop(consumers);
     a_out_rx
 }
@@ -1389,12 +1468,43 @@ where
     /// Panics if `.ordered()` is combined with `.expand()` (see
     /// [`FenceMode`] docs), or if the tokio runtime cannot be constructed
     /// (e.g. OS thread/resource limits). To handle runtime construction
-    /// failure gracefully, pass a pre-built [`AsyncPool`] via
-    /// [`with_async_pool`](Self::with_async_pool).
+    /// failure gracefully, use [`try_run`](Self::try_run) or pass a pre-built
+    /// [`AsyncPool`] via [`with_async_pool`](Self::with_async_pool).
     pub fn run(self) -> Vec<O> {
+        self.try_run().expect(
+            "StreamPipe::run: failed to build tokio runtime (OS resource limit? pass a custom \
+             AsyncPool via with_async_pool, or use try_run to handle the failure)",
+        )
+    }
+
+    /// Fallible counterpart to [`run`](Self::run): returns the runtime
+    /// construction error instead of panicking.
+    ///
+    /// The only recoverable failure today is tokio runtime construction
+    /// (e.g. OS thread/resource limits). Programming errors —
+    /// `.ordered()` + `.expand()`, panics inside stage closures, feeder-thread
+    /// join failures — still panic, matching the contract of every other
+    /// youpipe terminal (`.collect()`, `.for_each()`).
+    ///
+    /// ```rust
+    /// # use youpipe::prelude::*;
+    /// // Equivalent to `.run()` for sync chains — the Result matters when
+    /// // the chain contains `.stage_async(..)` and tokio runtime construction
+    /// // might fail.
+    /// let r: Vec<i32> = (0..100).stream()
+    ///     .stage(|x: i32| x + 1)
+    ///     .try_run()
+    ///     .expect("try_run on sync chain never fails");
+    /// assert_eq!(r.len(), 100);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Same programming-error panics as [`run`](Self::run).
+    pub fn try_run(self) -> std::io::Result<Vec<O>> {
         let n = self.items.len();
         if n == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         // `expand` produces multiple outputs sharing one parent seq, but the
         // `ReorderBuffer` (`.ordered()`) is single-item-per-seq — the collision
@@ -1492,21 +1602,18 @@ where
             FinalRx::SyncSingle(rx) => collect_sync(rx, ordered, n),
             #[cfg(feature = "tokio-runtime")]
             FinalRx::Async(rx) => {
-                let pool = ctx
-        .acquire_async()
-        .expect("failed to build tokio runtime (OS resource limit? pass a custom AsyncPool via with_async_pool to handle this)");
+                let pool = ctx.acquire_async()?;
                 pool.block_on(collect_async(rx, ordered, n))
             }
             #[cfg(feature = "tokio-runtime")]
-            FinalRx::AsyncSingle(_) => {
-                unreachable!(
-                    "async terminal MPSC not yet implemented; spawn_single delegates to spawn for AsyncStage"
-                )
+            FinalRx::AsyncSingle(rx) => {
+                let pool = ctx.acquire_async()?;
+                pool.block_on(collect_async(rx, ordered, n))
             }
         };
 
         feeder.join();
-        results
+        Ok(results)
     }
 }
 
@@ -1551,6 +1658,12 @@ where
 /// Async collector: drains `rx` into a `Vec` via the async runtime. If
 /// `ordered`, uses a [`ReorderBuffer`].
 ///
+/// Generic over the async receiver type so it works with both MPMC
+/// ([`AsyncReceiver`]) and MPSC ([`MpscAsyncReceiver`]) channels — the
+/// collector is always the sole consumer of the final channel, and the MPSC
+/// variant eliminates the per-item `lock cmpxchg` that the MPMC ring buffer
+/// pays on every `recv`.
+///
 /// # Burst-drain strategy (unordered path)
 ///
 /// When multiple items land in the channel before the collector loops back
@@ -1571,11 +1684,11 @@ where
 /// For `io_async_pure` at size 500 (~450 items completing in the same ~1 ms
 /// timer tick) the savings is measurable.
 #[cfg(feature = "tokio-runtime")]
-async fn collect_async<T: Send + Unpin + 'static>(
-    rx: AsyncReceiver<(u64, T)>,
-    ordered: bool,
-    n: usize,
-) -> Vec<T> {
+async fn collect_async<R, T>(rx: R, ordered: bool, n: usize) -> Vec<T>
+where
+    R: AsyncRecvItem<(u64, T)>,
+    T: Send + Unpin + 'static,
+{
     if ordered {
         let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
         let mut buffer = ReorderBuffer::new(capacity);

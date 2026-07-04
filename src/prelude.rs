@@ -35,8 +35,11 @@ pub use crate::{
 /// and produce identical types — pick whichever style reads better at the
 /// call site.
 ///
-/// Sealed: users cannot implement this trait themselves. The set of supported
-/// sources is exactly "anything `IntoIterator`".
+/// Not user-implementable: the blanket impl over `IntoIterator` already
+/// covers every valid source, and a hand-written impl would either duplicate
+/// that coverage or break the `IntoIterator` contract. There is no super-trait
+/// gate only because there is nothing to gate — users gain nothing by
+/// implementing this trait themselves.
 pub trait IterExt: IntoIterator + Sized {
     /// Build a fused CPU pipeline. Equivalent to [`pipe`](crate::pipe).
     ///
