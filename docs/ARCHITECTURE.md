@@ -353,6 +353,27 @@ oversubscription than the global pool, soundly beating rayon's global pool.
 created once and reused across many `collect()` / `for_each()` calls — important
 for tight loops where per-call pool construction (~ms) would dominate.
 
+**Convenience: `with_oversubscribe(factor)`.** All three builders also accept
+`.with_oversubscribe(factor)` — a one-liner that internally creates a pool
+sized to `factor × num_cpus` at execution time. This is the shortest path for
+one-shot blocking-IO pipelines:
+
+```rust
+pipe(files)
+    .with_oversubscribe(2)   // ← factor × num_cpus threads
+    .for_each(|f| { /* read → crypto → write */ });
+```
+
+The pool is **transient** — created at `.collect()` / `.for_each()` time and
+dropped when the terminal returns. For repeated calls in a tight loop,
+pre-create the pool and use `.with_compute_pool(pool.clone())` instead (clone
+is cheap: `Arc` + one atomic). If both are set, `with_compute_pool` takes
+precedence.
+
+**Do not** use oversubscription for pure-CPU workloads — extra threads beyond
+the core count only add context-switch overhead and cache thrashing (measured
+10–30 % regression on CPU benchmarks).
+
 ### 3.6 `StreamPipe` — Streaming Multi-Stage Pipeline
 
 For workloads that need channel-connected stages, async IO, cancellation,

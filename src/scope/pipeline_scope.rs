@@ -85,6 +85,7 @@ impl<'env> PipelineScope<'env> {
             stages: Identity,
             config: PipelineConfig::default(),
             compute_pool: None,
+            oversubscribe: None,
             _marker: PhantomData,
         }
     }
@@ -115,6 +116,8 @@ pub struct ScopedPipe<'env, S = Identity, I = (), O = ()> {
     config: PipelineConfig,
     /// Custom compute pool — see [`crate::Pipe::with_compute_pool`].
     compute_pool: Option<ComputePool>,
+    /// Oversubscribe factor — see [`crate::Pipe::with_oversubscribe`].
+    oversubscribe: Option<std::num::NonZeroUsize>,
     _marker: PhantomData<(&'env (), O)>,
 }
 
@@ -145,6 +148,31 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
         self
     }
 
+    /// Oversubscribe the compute pool — see
+    /// [`crate::Pipe::with_oversubscribe`] for the full guidance. Same
+    /// semantics: creates a transient `factor × num_cpus` thread pool at
+    /// `.collect()` / `.for_each()` time.
+    ///
+    /// Inside a [`scope`] this is the shortest path to oversubscription for a
+    /// blocking-IO workload that borrows stack-local data:
+    ///
+    /// ```rust
+    /// use youpipe::scope;
+    ///
+    /// let key_cache: Vec<u8> = vec![0x42; 32];
+    /// scope(|s| {
+    ///     s.pipe(0..100)
+    ///         .with_oversubscribe(2)
+    ///         .map(|i: i32| i + key_cache[0] as i32)
+    ///         .for_each(|_| { /* blocking IO */ });
+    /// });
+    /// ```
+    #[must_use]
+    pub fn with_oversubscribe(mut self, factor: usize) -> Self {
+        self.oversubscribe = std::num::NonZeroUsize::new(factor.max(1));
+        self
+    }
+
     /// Append a synchronous map stage: `Fn(O) -> N`. The output type changes
     /// to `N`; the pipeline input `I` is unchanged.
     pub fn map<N>(
@@ -164,6 +192,7 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
             },
             config: self.config,
             compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
             _marker: PhantomData,
         }
     }
@@ -184,6 +213,7 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
             },
             config: self.config,
             compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
             _marker: PhantomData,
         }
     }
@@ -201,10 +231,9 @@ where
     /// top-level `Pipe::collect` — no `'static` bound required. When the
     /// stage chain contains a `Filter`, falls back to per-leaf `Vec` merge.
     pub fn collect(self) -> Vec<O> {
-        let pool = match &self.compute_pool {
-            Some(p) => p,
-            None => ComputePool::global(),
-        };
+        let exec =
+            crate::builder::resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+        let pool = exec.as_pool();
         fused_collect_scoped(self.items, self.stages, self.config.workload, pool)
     }
 
@@ -239,10 +268,9 @@ where
     where
         F: Fn(O) + Sync,
     {
-        let pool = match &self.compute_pool {
-            Some(p) => p,
-            None => ComputePool::global(),
-        };
+        let exec =
+            crate::builder::resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+        let pool = exec.as_pool();
         fused_for_each_scoped(self.items, self.stages, f, self.config.workload, pool);
     }
 }
@@ -404,5 +432,20 @@ mod tests {
         });
         let expected: i64 = (0..500i64).sum();
         assert_eq!(sum.load(std::sync::atomic::Ordering::Relaxed), expected);
+    }
+
+    /// `with_oversubscribe` inside a scope — the convenience method works
+    /// identically to `with_compute_pool` but without manual pool creation.
+    #[test]
+    fn test_scope_with_oversubscribe() {
+        let multiplier = 5i32;
+        let result = scope(|s| {
+            s.pipe(0..1000)
+                .with_oversubscribe(2)
+                .map(|x: i32| x * multiplier)
+                .collect()
+        });
+        let expected: Vec<i32> = (0..1000).map(|x| x * 5).collect();
+        assert_eq!(result, expected);
     }
 }

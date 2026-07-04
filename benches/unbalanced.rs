@@ -440,7 +440,7 @@ fn bench_fused_oversubscribe(c: &mut Criterion) {
             });
         });
 
-        // Oversubscribed: 2× num_cpus threads.
+        // Oversubscribed: 2× num_cpus threads (pre-created pool — fastest).
         group.bench_function(BenchmarkId::new("fused_oversub_2x", size), |b| {
             let pool = ComputePool::new(ncpus * 2);
             b.iter(|| {
@@ -448,6 +448,24 @@ fn bench_fused_oversubscribe(c: &mut Criterion) {
                 let s = sum.clone();
                 pipe(0..size)
                     .with_compute_pool(pool.clone())
+                    .with_workload(Workload::Unbalanced)
+                    .for_each(move |i: i32| {
+                        let micros = if i % 10 == 0 { 2000 } else { 100 };
+                        std::thread::sleep(std::time::Duration::from_micros(micros as u64));
+                        s.fetch_add(i as u64, std::sync::atomic::Ordering::Relaxed);
+                    });
+                std::hint::black_box(sum.load(std::sync::atomic::Ordering::Relaxed));
+            });
+        });
+
+        // Oversubscribed via the convenience method (transient pool per call).
+        // Demonstrates the ~ms pool construction overhead vs pre-created pool.
+        group.bench_function(BenchmarkId::new("fused_oversub_2x_transient", size), |b| {
+            b.iter(|| {
+                let sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let s = sum.clone();
+                pipe(0..size)
+                    .with_oversubscribe(2)
                     .with_workload(Workload::Unbalanced)
                     .for_each(move |i: i32| {
                         let micros = if i % 10 == 0 { 2000 } else { 100 };

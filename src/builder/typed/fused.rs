@@ -1,6 +1,7 @@
 use std::{
     any::Any,
     marker::PhantomData,
+    num::NonZeroUsize,
     panic, ptr,
     sync::{
         Mutex,
@@ -29,6 +30,57 @@ type PanicPayload = Box<dyn Any + Send>;
 /// Shared first-panic slot for hybrid dispatch. `halt_unwinding` catches each
 /// chunk's panic before it reaches the lock, so the mutex is never poisoned.
 type PanicSlot = Mutex<Option<PanicPayload>>;
+
+// ── Pool resolution for the fused path ──
+//
+// Three sources of a compute pool, checked in priority order:
+//   1. `with_compute_pool(pool)` — explicit, always wins.
+//   2. `with_oversubscribe(factor)` — a hint that creates a transient pool
+//      sized to `factor × num_cpus` at execution time.
+//   3. Neither → the global pool (one thread per core).
+//
+// The transient pool from (2) is owned by `ExecPool::Owned` and lives on the
+// stack frame of the terminal method (`.collect()` / `.for_each()` / …),
+// outliving all uses of the `&ComputePool` reference it hands out. Dropping
+// it at the end of the terminal call tears down the worker threads — correct
+// for a one-shot pipeline, but a per-call ~ms cost that tight loops should
+// avoid by pre-creating a pool and using `with_compute_pool` instead.
+
+/// The compute pool that a fused terminal (`.collect()` / `.for_each()` / …)
+/// drives its fork-join work through.
+pub(crate) enum ExecPool<'a> {
+    /// A borrowed reference — either the global pool or a user-supplied pool.
+    Ref(&'a ComputePool),
+    /// A transient pool created from an oversubscribe factor. Owned so it is
+    /// dropped (and its worker threads joined) when the terminal returns.
+    Owned(ComputePool),
+}
+
+impl ExecPool<'_> {
+    pub(crate) fn as_pool(&self) -> &ComputePool {
+        match self {
+            ExecPool::Ref(p) => p,
+            ExecPool::Owned(p) => p,
+        }
+    }
+}
+
+/// Resolve the pool for a fused terminal call.
+///
+/// Precedence: explicit `compute_pool` > `oversubscribe` factor > global pool.
+pub(crate) fn resolve_exec_pool(
+    compute_pool: Option<&ComputePool>,
+    oversubscribe: Option<NonZeroUsize>,
+) -> ExecPool<'_> {
+    if let Some(p) = compute_pool {
+        return ExecPool::Ref(p);
+    }
+    if let Some(factor) = oversubscribe {
+        let ncpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        return ExecPool::Owned(ComputePool::new(ncpus * factor.get()));
+    }
+    ExecPool::Ref(ComputePool::global())
+}
 
 /// Recursive index-based parallel fill. Each leaf claims a disjoint index range
 /// `[start, end)` and writes outputs into `output[start..end)` by index — no
@@ -1032,6 +1084,7 @@ where
         stages: Identity,
         config: PipelineConfig::default(),
         compute_pool: None,
+        oversubscribe: None,
         _marker: PhantomData,
     }
 }
@@ -1057,6 +1110,10 @@ pub struct Pipe<S = Identity, I = (), O = ()> {
     /// oversubscribing threads for blocking-IO sync workloads (e.g.
     /// `ComputePool::new(num_cpus * 2)` to fill CPU gaps during IO stalls).
     compute_pool: Option<ComputePool>,
+    /// Oversubscribe factor from [`Pipe::with_oversubscribe`]. Resolved to a
+    /// transient `ComputePool` at execution time. Ignored when `compute_pool`
+    /// is `Some` (explicit pool takes precedence).
+    oversubscribe: Option<NonZeroUsize>,
     _marker: PhantomData<O>,
 }
 
@@ -1108,6 +1165,93 @@ impl<S, I, O> Pipe<S, I, O> {
         self
     }
 
+    /// Oversubscribe the compute pool by `factor` for **blocking-IO sync
+    /// workloads** — a convenience that internally creates a pool with
+    /// `factor × num_cpus` threads at execution time, so you don't have to
+    /// call [`ComputePool::new`] and [`Pipe::with_compute_pool`] yourself.
+    ///
+    /// # When to use this
+    ///
+    /// The default pool (one thread per core) is optimal for **CPU-bound**
+    /// work. But when each leaf blocks on a syscall — file IO, network, locks
+    /// — the blocked thread's core sits idle with no stealable work to fill
+    /// the gap (all remaining leaves are held by other blocked workers).
+    /// Wall time then exceeds rayon despite youpipe's better per-CPU
+    /// efficiency, simply because cores aren't saturated.
+    ///
+    /// An oversubscribed pool (`factor = 2` → 2× threads) lets other threads
+    /// use those idle cores for CPU work (crypto, compression, …) while
+    /// blocked threads wait. This is the same technique tokio's
+    /// `spawn_blocking` pool and [`crate::StreamPipe::with_compute_pool`] use.
+    ///
+    /// # When NOT to use this
+    ///
+    /// **Do not** use this for pure-CPU workloads (in-memory transforms,
+    /// number-crunching, no syscalls in the hot loop). Extra threads beyond
+    /// the core count only add context-switch overhead, cache thrashing, and
+    /// work-stealing contention — measured 10–30 % regression on the
+    /// `sync_vs_rayon` CPU benchmarks. The default (no oversubscription) is
+    /// already optimal for that case.
+    ///
+    /// # Choosing a factor
+    ///
+    /// | Workload shape | Recommended `factor` |
+    /// |----------------|----------------------|
+    /// | CPU + fast IO (NVMe, page cache) | 1 (no benefit) |
+    /// | CPU + slow IO (HDD, cold reads) | 2–3 |
+    /// | CPU + network / lock contention | 3–4 |
+    /// | Mostly IO, light CPU | 4–8 |
+    ///
+    /// Start with `2`; if wall time is still dominated by idle cores (visible
+    /// as `User ≪ wall × cores` in `time`), increase. Diminishing returns
+    /// set in quickly once the IO bandwidth itself becomes the bottleneck.
+    ///
+    /// # `with_oversubscribe` vs `with_compute_pool`
+    ///
+    /// `with_oversubscribe(factor)` creates a **transient** pool at
+    /// `.collect()` / `.for_each()` time and drops it when the terminal
+    /// returns. That is fine for a one-shot pipeline, but in a tight loop the
+    /// per-call pool construction (~ms for thread spawn + priming) dominates.
+    /// For repeated calls, pre-create the pool and use
+    /// [`Pipe::with_compute_pool`]:
+    ///
+    /// ```rust
+    /// use youpipe::{pipe, ComputePool};
+    ///
+    /// // Pre-create once; clone is cheap (Arc + one atomic).
+    /// let pool = ComputePool::new(128);
+    /// for batch in std::iter::repeat_with(|| vec![0u64; 1000]).take(20) {
+    ///     pipe(batch)
+    ///         .with_compute_pool(pool.clone())
+    ///         .map(|x: u64| x + 1)
+    ///         .for_each(|_| ());
+    /// }
+    /// ```
+    ///
+    /// If both `with_compute_pool` and `with_oversubscribe` are set, the
+    /// explicit pool wins and the factor is ignored.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use youpipe::pipe;
+    ///
+    /// // Each item does blocking IO (file read + crypto + write).
+    /// // factor = 2 → 2× num_cpus threads fill IO-stall gaps with CPU work.
+    /// let files: Vec<String> = (0..100).map(|i| format!("file{i}")).collect();
+    /// pipe(files)
+    ///     .with_oversubscribe(2)
+    ///     .for_each(|f: String| {
+    ///         // read(&f) → encrypt → write(out)
+    ///         let _ = f;
+    ///     });
+    /// ```
+    #[must_use]
+    pub fn with_oversubscribe(mut self, factor: usize) -> Self {
+        self.oversubscribe = NonZeroUsize::new(factor.max(1));
+        self
+    }
+
     /// Append a synchronous map stage: `Fn(O) -> N`.
     ///
     /// The output type changes to `N`; the pipeline input `I` is unchanged.
@@ -1130,6 +1274,7 @@ impl<S, I, O> Pipe<S, I, O> {
             },
             config: self.config,
             compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
             _marker: PhantomData,
         }
     }
@@ -1150,6 +1295,7 @@ impl<S, I, O> Pipe<S, I, O> {
             },
             config: self.config,
             compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
             _marker: PhantomData,
         }
     }
@@ -1187,6 +1333,7 @@ impl<S, I, O> Pipe<S, I, O> {
             },
             config: self.config,
             compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
             _marker: PhantomData,
         }
     }
@@ -1217,10 +1364,8 @@ where
         if n == 0 {
             return Vec::new();
         }
-        let pool = match &self.compute_pool {
-            Some(p) => p,
-            None => ComputePool::global(),
-        };
+        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+        let pool = exec.as_pool();
         let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads, self.config.workload) {
             // Trivial case (n == 1 or single-threaded pool): skip the pool
@@ -1281,10 +1426,8 @@ where
         if n == 0 {
             return;
         }
-        let pool = match &self.compute_pool {
-            Some(p) => p,
-            None => ComputePool::global(),
-        };
+        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+        let pool = exec.as_pool();
         let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads, self.config.workload) {
             // Trivial case (n == 1 or single-threaded pool): run inline, no
@@ -1326,6 +1469,8 @@ pub struct TryPipe<S = Identity, I = (), O = (), E = std::convert::Infallible> {
     config: PipelineConfig,
     /// Custom compute pool — see [`Pipe::with_compute_pool`].
     compute_pool: Option<ComputePool>,
+    /// Oversubscribe factor — see [`Pipe::with_oversubscribe`].
+    oversubscribe: Option<NonZeroUsize>,
     _marker: PhantomData<(O, E)>,
 }
 
@@ -1351,6 +1496,15 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
         self
     }
 
+    /// Oversubscribe the compute pool — see [`Pipe::with_oversubscribe`] for
+    /// the full guidance. Same semantics: creates a transient
+    /// `factor × num_cpus` thread pool at `.try_collect()` time.
+    #[must_use]
+    pub fn with_oversubscribe(mut self, factor: usize) -> Self {
+        self.oversubscribe = NonZeroUsize::new(factor.max(1));
+        self
+    }
+
     /// Append an infallible map stage. The error type `E` is unchanged.
     pub fn map<N>(
         self,
@@ -1369,6 +1523,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
             },
             config: self.config,
             compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
             _marker: PhantomData,
         }
     }
@@ -1390,6 +1545,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
             },
             config: self.config,
             compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
             _marker: PhantomData,
         }
     }
@@ -1415,6 +1571,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
             },
             config: self.config,
             compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
             _marker: PhantomData,
         }
     }
@@ -1437,6 +1594,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
             },
             config: self.config,
             compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
             _marker: PhantomData,
         }
     }
@@ -1459,10 +1617,8 @@ where
         if n == 0 {
             return Ok(Vec::new());
         }
-        let pool = match &self.compute_pool {
-            Some(p) => p,
-            None => ComputePool::global(),
-        };
+        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+        let pool = exec.as_pool();
         let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads, self.config.workload) {
             let mut out = Vec::with_capacity(n);
@@ -1677,5 +1833,71 @@ mod tests {
             "expected ≤4 concurrent on a 2-thread pool, got {max} — \
              custom pool not used?"
         );
+    }
+
+    #[test]
+    fn test_with_oversubscribe_collect() {
+        let result: Vec<i32> = pipe(0..1000)
+            .with_oversubscribe(2)
+            .map(|x: i32| x * 3)
+            .collect();
+        let expected: Vec<i32> = (0..1000).map(|x| x * 3).collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_with_oversubscribe_for_each() {
+        let sum = Arc::new(AtomicUsize::new(0));
+        let s = sum.clone();
+        pipe(0u32..1000)
+            .with_oversubscribe(2)
+            .for_each(move |x: u32| {
+                s.fetch_add(x as usize, Ordering::Relaxed);
+            });
+        let expected: usize = (0..1000usize).sum();
+        assert_eq!(sum.load(Ordering::Relaxed), expected);
+    }
+
+    /// `with_compute_pool` takes precedence over `with_oversubscribe`: when
+    /// both are set, the explicit pool wins and the factor is ignored.
+    #[test]
+    fn test_compute_pool_precedence_over_oversubscribe() {
+        let pool = ComputePool::new(1);
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let a = active.clone();
+        let m = max_active.clone();
+
+        pipe(0..500)
+            // Both set — the 1-thread pool must win over the factor.
+            .with_compute_pool(pool)
+            .with_oversubscribe(100)
+            .for_each(move |x: i32| {
+                let cur = a.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(cur, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_micros(100));
+                a.fetch_sub(1, Ordering::SeqCst);
+                std::hint::black_box(x);
+            });
+
+        let max = max_active.load(Ordering::SeqCst);
+        // 1-thread pool → at most 2 concurrent (1 worker + possible driver).
+        // If the oversubscribe factor (100× num_cpus) had won, this would
+        // be 20+.
+        assert!(
+            max <= 2,
+            "expected ≤2 concurrent on 1-thread pool, got {max} — \
+             oversubscribe factor overrode the explicit pool?"
+        );
+    }
+
+    #[test]
+    fn test_with_oversubscribe_try_collect() {
+        let result: Result<Vec<i32>, &'static str> = pipe(0..1000)
+            .with_oversubscribe(2)
+            .try_map(|x: i32| Ok::<i32, &str>(x + 1))
+            .try_collect();
+        let expected: Vec<i32> = (1..=1000).collect();
+        assert_eq!(result.unwrap(), expected);
     }
 }
