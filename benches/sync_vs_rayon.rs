@@ -228,11 +228,65 @@ fn bench_try_collect(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_for_each_vs_rayon(c: &mut Criterion) {
+    // `for_each` exercises the sink-only hybrid dispatch path (`SinkStrategy`).
+    // Mirrors `bench_par_map_vs_rayon` / `bench_lightweight_work` but ends in
+    // `.for_each(..)` instead of `.collect()`, so the comparison isolates the
+    // dispatch machinery (no output buffer allocation / writes) and documents
+    // the ramp-up win from sharing `hybrid_dispatch` with the collect path.
+    let mut group = c.benchmark_group("sync_for_each");
+    for size in [1_000, 10_000, 100_000] {
+        let data: Vec<u64> = (0..size).collect();
+
+        group.throughput(Throughput::Elements(size));
+
+        // CPU-heavy: same per-item work as `bench_par_map_vs_rayon`. The sink
+        // accumulates into a relaxed atomic so the closure is not optimised
+        // away, but the atomic is uncontended (one store per item, no RMW loop).
+        let sink = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        group.bench_with_input(
+            BenchmarkId::new("youpipe_cpu_heavy", size),
+            &data,
+            |b, data| {
+                b.iter_batched(
+                    || warm_clone(data),
+                    |v| {
+                        let sink = sink.clone();
+                        youpipe::pipe(v)
+                            .map(|x| black_box(cpu_work(x)))
+                            .for_each(move |r| {
+                                sink.fetch_add(r, std::sync::atomic::Ordering::Relaxed);
+                            });
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("rayon_cpu_heavy", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let sink = sink.clone();
+                    data.par_iter()
+                        .map(|&x| black_box(cpu_work(x)))
+                        .for_each(move |r| {
+                            sink.fetch_add(r, std::sync::atomic::Ordering::Relaxed);
+                        });
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_par_map_vs_rayon,
     bench_pipeline_fusion,
     bench_lightweight_work,
-    bench_try_collect
+    bench_try_collect,
+    bench_for_each_vs_rayon
 );
 criterion_main!(benches);
