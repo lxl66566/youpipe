@@ -24,6 +24,35 @@
     clippy::doc_markdown
 )]
 
+// ── Compile-time guard: `panic = "abort"` disables panic safety ──
+//
+// youpipe's pool/join machinery (LeafGuard / ForEachGuard cleanup of partial
+// slot state, `halt_unwinding` / `resume_unwind` propagation, `AbortIfPanic`
+// guards) relies on unwinding. Under `panic = "abort"` every `catch_unwind` is
+// a no-op: a panic inside any pool worker aborts the whole process instead of
+// propagating to the caller — a failing item kills the process rather than
+// erroring the pipeline.
+//
+// This `cfg` is accurate inside the library compilation, unlike build-script
+// env vars (`CARGO_CFG_PANIC` mirrors the build-script's own panic strategy,
+// always `unwind`, not the target crate's — verified). The `deprecated`-const
+// indirection is the standard stable-Rust trick for emitting a compile-time
+// warning from a `cfg` gate without a proc-macro.
+#[cfg(panic = "abort")]
+const _: () = {
+    #[deprecated(
+        since = "0.4.0",
+        note = "youpipe is compiled with `panic = \"abort\"`; any panic inside a pool worker will \
+                abort the whole process instead of propagating to the caller. The \
+                LeafGuard / ForEachGuard panic-safety paths never run under abort. To restore \
+                panic propagation, force `panic = \"unwind\"` for youpipe via a \
+                `.cargo/config.toml` override: `[build] rustflags = [\"-C\", \"panic=unwind\"]`. \
+                See youpipe's own `.cargo/config.toml` for the worked example."
+    )]
+    const PANIC_ABORT_DISABLES_SAFETY: () = ();
+    const _: () = PANIC_ABORT_DISABLES_SAFETY;
+};
+
 pub mod builder;
 pub mod executor;
 pub mod handoff;
