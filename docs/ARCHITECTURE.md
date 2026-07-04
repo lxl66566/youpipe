@@ -257,6 +257,7 @@ impl<S, I, O> Pipe<S, I, O> {
     pub fn map<N>(...)  -> Pipe<SyncMap<S, ...>, I, N>
     pub fn filter(...)  -> Pipe<Filter<S, ...>, I, O>
     pub fn try_map<N, E>(...) -> TryPipe<TryMap<InfallibleChain<S, E>, ...>, I, N, E>
+    pub fn with_compute_pool(pool: ComputePool) -> Self
     pub fn collect(self) -> Vec<O>
 }
 ```
@@ -274,9 +275,10 @@ impl<S, I, O> Pipe<S, I, O> {
   dispatch). Each leaf receives `&[T]` / `&mut [R]` slice views and runs the
   `RangeOp` (`FusedOp(stages)`) through `apply_pure` — branch-free and
   vectorizable. Workload selects the oversplit factor per §3.1. The hybrid
-  path is skipped when `.collect()` is reached from inside a pool worker
-  (e.g. nested `scope`), where the `CountLatch` park would deadlock — the
-  single-tree `par_index_rec` runs instead.
+  path is skipped when `.collect()` is reached from inside a worker of the
+  *same* pool (e.g. nested `scope`), where the `CountLatch` park would
+  deadlock — the single-tree `par_index_rec` runs instead. A worker of a
+  *different* pool can safely take the hybrid path.
 - **`MAY_FILTER == true`** — `join_fused_collect` recursively halves the `Vec`,
   each leaf filters into a per-leaf `Vec`, results merged by `extend`.
 
@@ -325,6 +327,31 @@ youpipe counterpart of rayon's `slice.par_iter()`). This is the right entry
 point when `T` is expensive to clone (e.g. `PathBuf`, `String`) and the
 pipeline only reads each item by reference. For zero input allocation, pass
 indices: `s.pipe(0..slice.len()).for_each(|i| f(&slice[i]))`.
+
+#### `with_compute_pool` — Oversubscription for Blocking IO
+
+All three fused builders (`Pipe`, `TryPipe`, `ScopedPipe`) accept a custom
+`ComputePool` via `.with_compute_pool(pool)`. When omitted, the pipeline runs
+on the global pool (one thread per core).
+
+The primary use case is **blocking-IO sync workloads** — e.g. file
+encryption/decryption where each leaf does `read → crypto → write`. The global
+pool's `num_cpus` threads cap blocking concurrency at the core count: when a
+leaf blocks on a syscall, its core sits idle with no stealable work to fill the
+gap (all remaining leaves are being processed by other blocked workers). This
+is the "cores idle during IO stalls" regime where wall time exceeds rayon
+despite youpipe's better per-CPU efficiency.
+
+An oversubscribed pool (e.g. `ComputePool::new(num_cpus * 2)`) lets other
+threads use those idle cores for CPU work while blocked threads wait — the same
+technique tokio's `spawn_blocking` and `StreamPipe::with_compute_pool` use.
+Benchmarked (`fused_oversubscribe`, 32-core): a mixed CPU+IO `for_each` over
+1000 items (90% × 100µs IO, 10% × 2ms tail) ran ~1.8× faster with 2×
+oversubscription than the global pool, soundly beating rayon's global pool.
+
+`ComputePool` is cheap to clone (`Arc` + one atomic), so the pool can be
+created once and reused across many `collect()` / `for_each()` calls — important
+for tight loops where per-call pool construction (~ms) would dominate.
 
 ### 3.6 `StreamPipe` — Streaming Multi-Stage Pipeline
 
@@ -421,7 +448,9 @@ same recursive work-stealing `par_index_collect` core as `Pipe::collect`
 soundness story rests on `ComputePool::join`: the calling thread blocks in
 `Registry::in_worker_cold` until every sub-task finishes, which guarantees
 every `'env` reference captured by a scoped closure outlives the pool's
-access to it.
+access to it. `.with_compute_pool(pool)` is supported — the headline use case
+is oversubscribing threads for blocking-IO workloads while still borrowing
+stack-local data (key caches, lookup tables) by reference.
 
 ---
 

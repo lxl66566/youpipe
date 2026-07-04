@@ -95,6 +95,23 @@ impl ComputePool {
     pub(crate) fn registry(&self) -> &Arc<Registry> {
         &self.registry
     }
+
+    /// Returns `true` if the current thread is a worker on *this* pool.
+    ///
+    /// Used by the fused path to decide between the hybrid dispatcher (safe
+    /// only off-pool — its `CountLatch` park would deadlock a same-pool
+    /// worker) and the single-tree recursion. When a user supplies a custom
+    /// `ComputePool` via `with_compute_pool`, a worker of the *global* pool is
+    /// "off-pool" relative to the custom one and may safely take the hybrid
+    /// path; only a worker of the *same* pool must fall back.
+    pub(crate) fn is_on_this_pool(&self) -> bool {
+        let wt = pool::registry::WorkerThread::current();
+        if wt.is_null() {
+            return false;
+        }
+        // SAFETY: `wt` is non-null — set by a pool worker's `main_loop`.
+        unsafe { (*wt).registry_id() == self.registry.id() }
+    }
 }
 
 impl Drop for ComputePool {

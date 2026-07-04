@@ -1,8 +1,11 @@
 use std::marker::PhantomData;
 
-use crate::builder::{
-    Filter, FusedStage, Identity, PipelineConfig, StageMarker, SyncMap, Workload,
-    fused_collect_scoped, fused_for_each_scoped,
+use crate::{
+    builder::{
+        Filter, FusedStage, Identity, PipelineConfig, StageMarker, SyncMap, Workload,
+        fused_collect_scoped, fused_for_each_scoped,
+    },
+    executor::compute::ComputePool,
 };
 
 /// Opens a scoped execution context for non-`'static` closures.
@@ -81,6 +84,7 @@ impl<'env> PipelineScope<'env> {
             items: items.into_iter().collect(),
             stages: Identity,
             config: PipelineConfig::default(),
+            compute_pool: None,
             _marker: PhantomData,
         }
     }
@@ -109,6 +113,8 @@ pub struct ScopedPipe<'env, S = Identity, I = (), O = ()> {
     items: Vec<I>,
     stages: S,
     config: PipelineConfig,
+    /// Custom compute pool — see [`crate::Pipe::with_compute_pool`].
+    compute_pool: Option<ComputePool>,
     _marker: PhantomData<(&'env (), O)>,
 }
 
@@ -124,6 +130,18 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
     #[must_use]
     pub fn with_workload(mut self, workload: Workload) -> Self {
         self.config.workload = workload;
+        self
+    }
+
+    /// Attach a custom [`ComputePool`] — see
+    /// [`crate::Pipe::with_compute_pool`].
+    ///
+    /// The primary use case inside a [`scope`] is oversubscribing threads for
+    /// blocking-IO sync workloads (e.g. file encryption/decryption) while still
+    /// borrowing stack-local data (key caches, lookup tables) by reference.
+    #[must_use]
+    pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
+        self.compute_pool = Some(pool);
         self
     }
 
@@ -145,6 +163,7 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
                 f,
             },
             config: self.config,
+            compute_pool: self.compute_pool,
             _marker: PhantomData,
         }
     }
@@ -164,6 +183,7 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
                 f,
             },
             config: self.config,
+            compute_pool: self.compute_pool,
             _marker: PhantomData,
         }
     }
@@ -181,7 +201,11 @@ where
     /// top-level `Pipe::collect` — no `'static` bound required. When the
     /// stage chain contains a `Filter`, falls back to per-leaf `Vec` merge.
     pub fn collect(self) -> Vec<O> {
-        fused_collect_scoped(self.items, self.stages, self.config.workload)
+        let pool = match &self.compute_pool {
+            Some(p) => p,
+            None => ComputePool::global(),
+        };
+        fused_collect_scoped(self.items, self.stages, self.config.workload, pool)
     }
 
     /// Execute the fused pipeline, applying `f` to each output for its side
@@ -215,7 +239,11 @@ where
     where
         F: Fn(O) + Sync,
     {
-        fused_for_each_scoped(self.items, self.stages, f, self.config.workload);
+        let pool = match &self.compute_pool {
+            Some(p) => p,
+            None => ComputePool::global(),
+        };
+        fused_for_each_scoped(self.items, self.stages, f, self.config.workload, pool);
     }
 }
 
@@ -339,5 +367,42 @@ mod tests {
             .count();
         assert_eq!(total.0, expected_hits);
         assert_eq!(total.1, expected_total);
+    }
+
+    /// ScopedPipe supports a custom ComputePool — the headline use case is
+    /// oversubscribing threads for blocking-IO workloads (e.g. file
+    /// encryption) while still borrowing stack-local data by reference.
+    #[test]
+    fn test_scope_with_compute_pool() {
+        let multiplier = 7i32;
+        let pool = ComputePool::new(4);
+        let result = scope(|s| {
+            s.pipe(0..1000)
+                .with_compute_pool(pool)
+                .map(|x: i32| x * multiplier)
+                .collect()
+        });
+        let expected: Vec<i32> = (0..1000).map(|x| x * 7).collect();
+        assert_eq!(result, expected);
+    }
+
+    /// `for_each` with a custom pool inside a scope, borrowing a stack-local
+    /// table.
+    #[test]
+    fn test_scope_with_compute_pool_for_each() {
+        let table: Vec<i32> = (0..500).collect();
+        let pool = ComputePool::new(4);
+        let sum = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let s = sum.clone();
+        scope(|scope| {
+            scope
+                .pipe(&table)
+                .with_compute_pool(pool)
+                .for_each(move |v: &i32| {
+                    s.fetch_add(i64::from(*v), std::sync::atomic::Ordering::Relaxed);
+                });
+        });
+        let expected: i64 = (0..500i64).sum();
+        assert_eq!(sum.load(std::sync::atomic::Ordering::Relaxed), expected);
     }
 }

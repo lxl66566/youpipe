@@ -2,7 +2,7 @@ use std::hint::black_box as bb;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rayon::prelude::*;
-use youpipe::{Workload, pipe, stream};
+use youpipe::{ComputePool, Workload, pipe, stream};
 
 /// Clone `src` and warm it into cache so the measured time reflects framework
 /// overhead, not allocator/page-fault latency. See `sync_vs_rayon.rs`.
@@ -409,6 +409,90 @@ fn bench_mixed_unbalanced(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Fused oversubscription: blocking-IO `for_each` with custom pool ──
+//
+// Simulates a mixed CPU+IO workload (read-compute-write per item) where each
+// leaf blocks on `thread::sleep`. The global pool (num_cpus threads) leaves
+// cores idle during IO stalls; an oversubscribed pool fills those gaps.
+
+fn bench_fused_oversubscribe(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fused_oversubscribe");
+    group.sample_size(10);
+
+    let ncpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+
+    for size in [200, 1000] {
+        group.throughput(Throughput::Elements(size as u64));
+
+        // Baseline: global pool (num_cpus threads).
+        group.bench_function(BenchmarkId::new("fused_global", size), |b| {
+            b.iter(|| {
+                let sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let s = sum.clone();
+                pipe(0..size)
+                    .with_workload(Workload::Unbalanced)
+                    .for_each(move |i: i32| {
+                        let micros = if i % 10 == 0 { 2000 } else { 100 };
+                        std::thread::sleep(std::time::Duration::from_micros(micros as u64));
+                        s.fetch_add(i as u64, std::sync::atomic::Ordering::Relaxed);
+                    });
+                std::hint::black_box(sum.load(std::sync::atomic::Ordering::Relaxed));
+            });
+        });
+
+        // Oversubscribed: 2× num_cpus threads.
+        group.bench_function(BenchmarkId::new("fused_oversub_2x", size), |b| {
+            let pool = ComputePool::new(ncpus * 2);
+            b.iter(|| {
+                let sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let s = sum.clone();
+                pipe(0..size)
+                    .with_compute_pool(pool.clone())
+                    .with_workload(Workload::Unbalanced)
+                    .for_each(move |i: i32| {
+                        let micros = if i % 10 == 0 { 2000 } else { 100 };
+                        std::thread::sleep(std::time::Duration::from_micros(micros as u64));
+                        s.fetch_add(i as u64, std::sync::atomic::Ordering::Relaxed);
+                    });
+                std::hint::black_box(sum.load(std::sync::atomic::Ordering::Relaxed));
+            });
+        });
+
+        // Oversubscribed: 4× num_cpus threads.
+        group.bench_function(BenchmarkId::new("fused_oversub_4x", size), |b| {
+            let pool = ComputePool::new(ncpus * 4);
+            b.iter(|| {
+                let sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let s = sum.clone();
+                pipe(0..size)
+                    .with_compute_pool(pool.clone())
+                    .with_workload(Workload::Unbalanced)
+                    .for_each(move |i: i32| {
+                        let micros = if i % 10 == 0 { 2000 } else { 100 };
+                        std::thread::sleep(std::time::Duration::from_micros(micros as u64));
+                        s.fetch_add(i as u64, std::sync::atomic::Ordering::Relaxed);
+                    });
+                std::hint::black_box(sum.load(std::sync::atomic::Ordering::Relaxed));
+            });
+        });
+
+        // rayon reference (global pool, num_cpus threads).
+        group.bench_function(BenchmarkId::new("rayon_global", size), |b| {
+            b.iter(|| {
+                let sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let s = sum.clone();
+                (0..size).into_par_iter().for_each(move |i: i32| {
+                    let micros = if i % 10 == 0 { 2000 } else { 100 };
+                    std::thread::sleep(std::time::Duration::from_micros(micros as u64));
+                    s.fetch_add(i as u64, std::sync::atomic::Ordering::Relaxed);
+                });
+                std::hint::black_box(sum.load(std::sync::atomic::Ordering::Relaxed));
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_cpu_unbalanced_skewed,
@@ -416,5 +500,6 @@ criterion_group!(
     bench_cpu_unbalanced_stream,
     bench_io_unbalanced,
     bench_mixed_unbalanced,
+    bench_fused_oversubscribe,
 );
 criterion_main!(benches);

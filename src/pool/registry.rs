@@ -112,7 +112,7 @@ impl Registry {
     }
 
     /// Opaque identity for this registry.
-    fn id(&self) -> usize {
+    pub(crate) fn id(&self) -> usize {
         std::ptr::from_ref::<Self>(self) as usize
     }
 
@@ -324,7 +324,7 @@ impl WorkerThread {
     }
 
     #[inline]
-    fn registry_id(&self) -> usize {
+    pub(crate) fn registry_id(&self) -> usize {
         self.registry.id()
     }
 

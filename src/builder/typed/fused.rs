@@ -21,7 +21,6 @@ use crate::{
     pool::{
         job::{Job, JobRef},
         latch::{CountLatch, Latch},
-        registry::WorkerThread,
         unwind,
     },
 };
@@ -43,6 +42,7 @@ type PanicSlot = Mutex<Option<PanicPayload>>;
 /// path) or dropped, and every input slot is consumed.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn par_index_rec<T, R, OP>(
+    pool: &ComputePool,
     input: &Slots<T>,
     output: &Slots<R>,
     start: usize,
@@ -65,9 +65,9 @@ where
         return Ok(());
     }
     let mid = start + (end - start) / 2;
-    let (l, r) = ComputePool::global().join(
-        || par_index_rec(input, output, start, mid, op, splits_left - 1),
-        || par_index_rec(input, output, mid, end, op, splits_left - 1),
+    let (l, r) = pool.join(
+        || par_index_rec(pool, input, output, start, mid, op, splits_left - 1),
+        || par_index_rec(pool, input, output, mid, end, op, splits_left - 1),
     );
     match (l, r) {
         (Ok(()), Ok(())) => Ok(()),
@@ -192,7 +192,7 @@ where
 ///
 /// Propagates any panic raised by `op`.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn par_index_collect<T, R, OP>(items: Vec<T>, op: &OP, splits: usize) -> Vec<R>
+fn par_index_collect<T, R, OP>(items: Vec<T>, op: &OP, splits: usize, pool: &ComputePool) -> Vec<R>
 where
     T: Send,
     R: Send,
@@ -200,7 +200,7 @@ where
 {
     let n = items.len();
     debug_assert!(n > 0);
-    let num_threads = ComputePool::global().num_workers();
+    let num_threads = pool.num_workers();
     let input = Slots::from_vec(items);
     let output = Slots::<R>::uninit(n);
 
@@ -213,14 +213,16 @@ where
     // avoiding its large-N regression (only `num_threads` items through the
     // injector, not `N`).
     //
-    // Fall back to the single-tree path when already on a pool worker: the
-    // hybrid path blocks the caller on a `CountLatch`/`LockLatch`, which would
-    // deadlock a pool worker (it must steal while waiting, not park).
-    let on_pool = !WorkerThread::current().is_null();
+    // Fall back to the single-tree path when already on a worker of THIS pool:
+    // the hybrid path blocks the caller on a `CountLatch`/`LockLatch`, which
+    // would deadlock a same-pool worker (it must steal while waiting, not
+    // park). A worker of a *different* pool is fine — it can park without
+    // deadlocking this pool's workers.
+    let on_pool = pool.is_on_this_pool();
     let result = if on_pool {
-        par_index_rec(&input, &output, 0, n, op, splits)
+        par_index_rec(pool, &input, &output, 0, n, op, splits)
     } else {
-        par_index_collect_hybrid(&input, &output, n, op, splits, num_threads)
+        par_index_collect_hybrid(pool, &input, &output, n, op, splits, num_threads)
     };
     match result {
         Ok(()) => {
@@ -273,6 +275,10 @@ struct ChunkJob<T, R, OP> {
     start: usize,
     end: usize,
     splits: usize,
+    /// The compute pool to use for within-chunk recursion. Raw pointer to the
+    /// `ComputePool` on the driver's stack frame; valid because the driver
+    /// blocks on the `CountLatch` until every chunk finishes.
+    pool: *const ComputePool,
     /// Shared count latch; decremented on completion (success or panic).
     latch: *const CountLatch,
     /// Shared first-panic slot.
@@ -288,10 +294,10 @@ struct ChunkJob<T, R, OP> {
 // SAFETY: the raw pointers reference data owned by the driver's stack frame;
 // the driver blocks on the CountLatch until every chunk finishes, so the
 // pointed-to data outlives every `execute` call. The shared `Slots`/`op`/
-// `latch`/`panic_slot` are accessed from distinct workers but over disjoint
-// index ranges (`Slots`) or through `Sync` types (`OP: Sync`, `CountLatch`,
-// `Mutex`); each `ChunkJob` itself is touched by exactly one worker (the one
-// that pops its `JobRef`).
+// `pool`/`latch`/`panic_slot` are accessed from distinct workers but over
+// disjoint index ranges (`Slots`) or through `Sync` types (`OP: Sync`,
+// `ComputePool: Sync`, `CountLatch`, `Mutex`); each `ChunkJob` itself is
+// touched by exactly one worker (the one that pops its `JobRef`).
 unsafe impl<T: Send, R: Send, OP: Sync> Send for ChunkJob<T, R, OP> {}
 
 impl<T, R, OP> Job for ChunkJob<T, R, OP>
@@ -311,6 +317,7 @@ where
             // shared slot.
             let r = unwind::halt_unwinding(|| {
                 par_index_rec(
+                    &*this.pool,
                     &*this.input,
                     &*this.output,
                     this.start,
@@ -348,6 +355,7 @@ where
 /// double-drop).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn par_index_collect_hybrid<T, R, OP>(
+    pool: &ComputePool,
     input: &Slots<T>,
     output: &Slots<R>,
     n: usize,
@@ -388,6 +396,7 @@ where
             start,
             end,
             splits: chunk_splits,
+            pool: ptr::from_ref(pool),
             latch: ptr::from_ref(&latch),
             panic_slot: ptr::from_ref(&panic_slot),
             succeeded: AtomicBool::new(false),
@@ -399,7 +408,7 @@ where
     // One batched inject: a single JEC increment + a single wake cascade,
     // regardless of `num_chunks`. Every idle worker pops a chunk on its next
     // `find_work` → all workers busy from t≈0.
-    let registry = ComputePool::global().registry();
+    let registry = pool.registry();
     let job_refs: Vec<JobRef> = jobs
         .iter()
         .map(|j| unsafe { JobRef::new(std::ptr::from_ref(&**j)) })
@@ -463,6 +472,7 @@ where
 /// every slot in `[start, end)` is either consumed (read) or dropped.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn par_for_each_rec<T, OP>(
+    pool: &ComputePool,
     input: &Slots<T>,
     start: usize,
     end: usize,
@@ -481,9 +491,9 @@ where
         return Ok(());
     }
     let mid = start + (end - start) / 2;
-    let (l, r) = ComputePool::global().join(
-        || par_for_each_rec(input, start, mid, op, splits_left - 1),
-        || par_for_each_rec(input, mid, end, op, splits_left - 1),
+    let (l, r) = pool.join(
+        || par_for_each_rec(pool, input, start, mid, op, splits_left - 1),
+        || par_for_each_rec(pool, input, mid, end, op, splits_left - 1),
     );
     match (l, r) {
         (Ok(()), Ok(())) => Ok(()),
@@ -560,7 +570,7 @@ where
 ///
 /// Propagates any panic raised by `op`.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn par_for_each<T, OP>(items: Vec<T>, op: &OP, splits: usize)
+fn par_for_each<T, OP>(items: Vec<T>, op: &OP, splits: usize, pool: &ComputePool)
 where
     T: Send,
     OP: SinkOp<T>,
@@ -568,7 +578,7 @@ where
     let n = items.len();
     debug_assert!(n > 0);
     let input = Slots::from_vec(items);
-    let result = par_for_each_rec(&input, 0, n, op, splits);
+    let result = par_for_each_rec(pool, &input, 0, n, op, splits);
     match result {
         Ok(()) => {
             // All input slots consumed (read → uninit): dropping the box just
@@ -601,6 +611,7 @@ where
 /// of the leaf's own partial range, identical to `LeafGuard` in
 /// `par_index_leaf`.
 fn par_index_try_rec<T, R, E, OP>(
+    pool: &ComputePool,
     input: &Slots<T>,
     output: &Slots<R>,
     start: usize,
@@ -622,9 +633,9 @@ where
         return Ok(());
     }
     let mid = start + (end - start) / 2;
-    let (l, r) = ComputePool::global().join(
-        || par_index_try_rec(input, output, start, mid, op, splits_left - 1),
-        || par_index_try_rec(input, output, mid, end, op, splits_left - 1),
+    let (l, r) = pool.join(
+        || par_index_try_rec(pool, input, output, start, mid, op, splits_left - 1),
+        || par_index_try_rec(pool, input, output, mid, end, op, splits_left - 1),
     );
     match (l, r) {
         (Ok(()), Ok(())) => Ok(()),
@@ -740,7 +751,12 @@ where
 /// a `Vec<R>`. On error, the recursion has already dropped all init output
 /// slots; on panic, the panic propagates (and the output buffer's init slots
 /// may leak, same as `par_index_collect`).
-fn par_index_try_collect<T, R, E, OP>(items: Vec<T>, op: &OP, splits: usize) -> Result<Vec<R>, E>
+fn par_index_try_collect<T, R, E, OP>(
+    items: Vec<T>,
+    op: &OP,
+    splits: usize,
+    pool: &ComputePool,
+) -> Result<Vec<R>, E>
 where
     T: Send,
     R: Send,
@@ -751,7 +767,7 @@ where
     debug_assert!(n > 0);
     let input = Slots::from_vec(items);
     let output = Slots::<R>::uninit(n);
-    let result = par_index_try_rec(&input, &output, 0, n, op, splits);
+    let result = par_index_try_rec(pool, &input, &output, 0, n, op, splits);
     match result {
         Ok(()) => {
             drop(input);
@@ -922,7 +938,12 @@ fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize
 /// the `MAY_FILTER == true` fallback; output cardinality is unknown up front so
 /// each leaf produces its own `Vec` and results are concatenated.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn join_fused_collect<S, T>(mut items: Vec<T>, stages: &S, splits_left: usize) -> Vec<S::Output>
+fn join_fused_collect<S, T>(
+    pool: &ComputePool,
+    mut items: Vec<T>,
+    stages: &S,
+    splits_left: usize,
+) -> Vec<S::Output>
 where
     S: FusedStage<T> + Sync,
     T: Send,
@@ -936,9 +957,9 @@ where
     }
     let mid = items.len() / 2;
     let right = items.split_off(mid);
-    let (left_r, right_r) = ComputePool::global().join(
-        || join_fused_collect(items, stages, splits_left - 1),
-        || join_fused_collect(right, stages, splits_left - 1),
+    let (left_r, right_r) = pool.join(
+        || join_fused_collect(pool, items, stages, splits_left - 1),
+        || join_fused_collect(pool, right, stages, splits_left - 1),
     );
     let mut result = left_r;
     result.extend(right_r);
@@ -953,6 +974,7 @@ where
 /// infallible/no-filter fast path is reserved for `Pipe::collect`.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn join_fused_try_collect<S, T, E>(
+    pool: &ComputePool,
     mut items: Vec<T>,
     stages: &S,
     splits_left: usize,
@@ -974,9 +996,9 @@ where
     }
     let mid = items.len() / 2;
     let right = items.split_off(mid);
-    let (left_r, right_r) = ComputePool::global().join(
-        || join_fused_try_collect(items, stages, splits_left - 1),
-        || join_fused_try_collect(right, stages, splits_left - 1),
+    let (left_r, right_r) = pool.join(
+        || join_fused_try_collect(pool, items, stages, splits_left - 1),
+        || join_fused_try_collect(pool, right, stages, splits_left - 1),
     );
     match (left_r, right_r) {
         (Ok(mut l), Ok(r)) => {
@@ -1009,6 +1031,7 @@ where
         items: items.into_iter().collect(),
         stages: Identity,
         config: PipelineConfig::default(),
+        compute_pool: None,
         _marker: PhantomData,
     }
 }
@@ -1028,6 +1051,12 @@ pub struct Pipe<S = Identity, I = (), O = ()> {
     items: Vec<I>,
     stages: S,
     config: PipelineConfig,
+    /// Custom compute pool. When `None`, the pipeline runs on
+    /// [`ComputePool::global`] (sized to `num_cpus`). When `Some`, all
+    /// fork-join work is driven through this pool instead — useful for
+    /// oversubscribing threads for blocking-IO sync workloads (e.g.
+    /// `ComputePool::new(num_cpus * 2)` to fill CPU gaps during IO stalls).
+    compute_pool: Option<ComputePool>,
     _marker: PhantomData<O>,
 }
 
@@ -1043,6 +1072,39 @@ impl<S, I, O> Pipe<S, I, O> {
     #[must_use]
     pub fn with_workload(mut self, workload: Workload) -> Self {
         self.config.workload = workload;
+        self
+    }
+
+    /// Attach a custom [`ComputePool`] for the fused pipeline's fork-join work.
+    /// When omitted, the pipeline runs on [`ComputePool::global`] (sized to
+    /// `num_cpus`).
+    ///
+    /// The primary use case is **oversubscribing threads for blocking-IO sync
+    /// workloads**. The global pool has one thread per core, so when a leaf
+    /// task blocks on a syscall (file IO, network, etc.) its core sits idle
+    /// with no stealable work to fill the gap. A larger pool (e.g.
+    /// `ComputePool::new(num_cpus * 2)`) lets other threads use those idle
+    /// cores for CPU work (crypto, compression, etc.) while blocked threads
+    /// wait — the same technique that `tokio::spawn_blocking` and
+    /// [`crate::StreamPipe::with_compute_pool`] use.
+    ///
+    /// `ComputePool` is cheap to clone (`Arc` + one atomic), so the pool can
+    /// be created once and reused across many `collect()` / `for_each()`
+    /// calls — important for tight loops where per-call pool construction
+    /// (~ms) would dominate.
+    ///
+    /// ```rust
+    /// use youpipe::{pipe, ComputePool};
+    ///
+    /// let pool = ComputePool::new(128);
+    /// let result: Vec<i32> = pipe(0..100)
+    ///     .with_compute_pool(pool)
+    ///     .map(|x: i32| x + 1)
+    ///     .collect();
+    /// ```
+    #[must_use]
+    pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
+        self.compute_pool = Some(pool);
         self
     }
 
@@ -1067,6 +1129,7 @@ impl<S, I, O> Pipe<S, I, O> {
                 f,
             },
             config: self.config,
+            compute_pool: self.compute_pool,
             _marker: PhantomData,
         }
     }
@@ -1086,6 +1149,7 @@ impl<S, I, O> Pipe<S, I, O> {
                 f,
             },
             config: self.config,
+            compute_pool: self.compute_pool,
             _marker: PhantomData,
         }
     }
@@ -1122,6 +1186,7 @@ impl<S, I, O> Pipe<S, I, O> {
                 f,
             },
             config: self.config,
+            compute_pool: self.compute_pool,
             _marker: PhantomData,
         }
     }
@@ -1147,11 +1212,16 @@ where
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn collect(self) -> Vec<O> {
         let items = self.items;
+        let stages = self.stages;
         let n = items.len();
         if n == 0 {
             return Vec::new();
         }
-        let num_threads = ComputePool::global().num_workers();
+        let pool = match &self.compute_pool {
+            Some(p) => p,
+            None => ComputePool::global(),
+        };
+        let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads, self.config.workload) {
             // Trivial case (n == 1 or single-threaded pool): skip the pool
             // entirely. Dispatch on `MAY_FILTER` so the pure path matches a
@@ -1159,12 +1229,12 @@ where
             if S::MAY_FILTER {
                 return items
                     .into_iter()
-                    .filter_map(|item| self.stages.apply(item))
+                    .filter_map(|item| stages.apply(item))
                     .collect();
             }
             return items
                 .into_iter()
-                .map(|item| self.stages.apply_pure(item))
+                .map(|item| stages.apply_pure(item))
                 .collect();
         }
 
@@ -1176,10 +1246,10 @@ where
         let splits = split_depth(n, num_threads, oversplit);
 
         if S::MAY_FILTER {
-            join_fused_collect(items, &self.stages, splits)
+            join_fused_collect(pool, items, &stages, splits)
         } else {
-            let op = FusedOp(self.stages);
-            par_index_collect(items, &op, splits)
+            let op = FusedOp(stages);
+            par_index_collect(items, &op, splits, pool)
         }
     }
 
@@ -1206,24 +1276,29 @@ where
         F: Fn(O) + Send + Sync + 'static,
     {
         let items = self.items;
+        let stages = self.stages;
         let n = items.len();
         if n == 0 {
             return;
         }
-        let num_threads = ComputePool::global().num_workers();
+        let pool = match &self.compute_pool {
+            Some(p) => p,
+            None => ComputePool::global(),
+        };
+        let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads, self.config.workload) {
             // Trivial case (n == 1 or single-threaded pool): run inline, no
             // output buffer. Dispatch on `MAY_FILTER` to keep the pure path
             // branch-free.
             if S::MAY_FILTER {
                 for item in items {
-                    if let Some(o) = self.stages.apply(item) {
+                    if let Some(o) = stages.apply(item) {
                         f(o);
                     }
                 }
             } else {
                 for item in items {
-                    let o = self.stages.apply_pure(item);
+                    let o = stages.apply_pure(item);
                     f(o);
                 }
             }
@@ -1232,8 +1307,8 @@ where
 
         let oversplit = workload_oversplit(n, num_threads, self.config.workload);
         let splits = split_depth(n, num_threads, oversplit);
-        let op = FusedSink(self.stages, f);
-        par_for_each(items, &op, splits);
+        let op = FusedSink(stages, f);
+        par_for_each(items, &op, splits, pool);
     }
 }
 
@@ -1249,6 +1324,8 @@ pub struct TryPipe<S = Identity, I = (), O = (), E = std::convert::Infallible> {
     items: Vec<I>,
     stages: S,
     config: PipelineConfig,
+    /// Custom compute pool — see [`Pipe::with_compute_pool`].
+    compute_pool: Option<ComputePool>,
     _marker: PhantomData<(O, E)>,
 }
 
@@ -1264,6 +1341,13 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
     #[must_use]
     pub fn with_workload(mut self, workload: Workload) -> Self {
         self.config.workload = workload;
+        self
+    }
+
+    /// Attach a custom [`ComputePool`] — see [`Pipe::with_compute_pool`].
+    #[must_use]
+    pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
+        self.compute_pool = Some(pool);
         self
     }
 
@@ -1284,6 +1368,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
                 f,
             },
             config: self.config,
+            compute_pool: self.compute_pool,
             _marker: PhantomData,
         }
     }
@@ -1304,6 +1389,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
                 f,
             },
             config: self.config,
+            compute_pool: self.compute_pool,
             _marker: PhantomData,
         }
     }
@@ -1328,6 +1414,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
                 f,
             },
             config: self.config,
+            compute_pool: self.compute_pool,
             _marker: PhantomData,
         }
     }
@@ -1349,6 +1436,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
                 f,
             },
             config: self.config,
+            compute_pool: self.compute_pool,
             _marker: PhantomData,
         }
     }
@@ -1366,15 +1454,20 @@ where
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn try_collect(self) -> Result<Vec<O>, E> {
         let items = self.items;
+        let stages = self.stages;
         let n = items.len();
         if n == 0 {
             return Ok(Vec::new());
         }
-        let num_threads = ComputePool::global().num_workers();
+        let pool = match &self.compute_pool {
+            Some(p) => p,
+            None => ComputePool::global(),
+        };
+        let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads, self.config.workload) {
             let mut out = Vec::with_capacity(n);
             for item in items {
-                if let Some(o) = self.stages.try_apply(item)? {
+                if let Some(o) = stages.try_apply(item)? {
                     out.push(o);
                 }
             }
@@ -1384,14 +1477,14 @@ where
         let oversplit = workload_oversplit(n, num_threads, self.config.workload);
         let splits = split_depth(n, num_threads, oversplit);
         if S::MAY_FILTER {
-            join_fused_try_collect(items, &self.stages, splits)
+            join_fused_try_collect(pool, items, &stages, splits)
         } else {
             // Fast path: no filter → output cardinality == input cardinality.
             // Pre-allocate the output buffer and write at known indices,
             // avoiding the per-split `Vec::split_off` allocations of the
             // merge path.
-            let op = FusedTryOp(self.stages);
-            par_index_try_collect(items, &op, splits)
+            let op = FusedTryOp(stages);
+            par_index_try_collect(items, &op, splits, pool)
         }
     }
 }
@@ -1413,6 +1506,7 @@ pub(crate) fn fused_collect_scoped<S, T>(
     items: Vec<T>,
     stages: S,
     workload: Workload,
+    pool: &ComputePool,
 ) -> Vec<S::Output>
 where
     S: FusedStage<T> + Sync,
@@ -1423,7 +1517,7 @@ where
     if n == 0 {
         return Vec::new();
     }
-    let num_threads = ComputePool::global().num_workers();
+    let num_threads = pool.num_workers();
     if prefers_serial(n, num_threads, workload) {
         if S::MAY_FILTER {
             return items
@@ -1439,10 +1533,10 @@ where
     let oversplit = workload_oversplit(n, num_threads, workload);
     let splits = split_depth(n, num_threads, oversplit);
     if S::MAY_FILTER {
-        join_fused_collect(items, &stages, splits)
+        join_fused_collect(pool, items, &stages, splits)
     } else {
         let op = FusedOp(stages);
-        par_index_collect(items, &op, splits)
+        par_index_collect(items, &op, splits, pool)
     }
 }
 
@@ -1455,8 +1549,13 @@ where
 /// `Registry::in_worker_cold` until every sub-task finishes, so every `'env`
 /// reference captured by `stages` / `f` outlives the pool's access to them.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) fn fused_for_each_scoped<S, T, F>(items: Vec<T>, stages: S, f: F, workload: Workload)
-where
+pub(crate) fn fused_for_each_scoped<S, T, F>(
+    items: Vec<T>,
+    stages: S,
+    f: F,
+    workload: Workload,
+    pool: &ComputePool,
+) where
     S: FusedStage<T> + Sync,
     T: Send,
     S::Output: Send,
@@ -1466,7 +1565,7 @@ where
     if n == 0 {
         return;
     }
-    let num_threads = ComputePool::global().num_workers();
+    let num_threads = pool.num_workers();
     if prefers_serial(n, num_threads, workload) {
         if S::MAY_FILTER {
             for item in items {
@@ -1485,5 +1584,98 @@ where
     let oversplit = workload_oversplit(n, num_threads, workload);
     let splits = split_depth(n, num_threads, oversplit);
     let op = FusedSink(stages, f);
-    par_for_each(items, &op, splits);
+    par_for_each(items, &op, splits, pool);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    #[test]
+    fn test_with_compute_pool_collect() {
+        let pool = ComputePool::new(4);
+        let result: Vec<i32> = pipe(0..1000)
+            .with_compute_pool(pool)
+            .map(|x: i32| x * 2)
+            .collect();
+        let expected: Vec<i32> = (0..1000).map(|x| x * 2).collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_with_compute_pool_for_each() {
+        let pool = ComputePool::new(4);
+        let sum = Arc::new(AtomicUsize::new(0));
+        let s = sum.clone();
+        pipe(0u32..1000)
+            .with_compute_pool(pool)
+            .for_each(move |x: u32| {
+                s.fetch_add(x as usize, Ordering::Relaxed);
+            });
+        let expected: usize = (0..1000usize).sum();
+        assert_eq!(sum.load(Ordering::Relaxed), expected);
+    }
+
+    #[test]
+    fn test_with_compute_pool_filter_chain() {
+        let pool = ComputePool::new(4);
+        let result: Vec<i32> = pipe(0..1000)
+            .with_compute_pool(pool)
+            .map(|x: i32| x + 1)
+            .filter(|x: &i32| *x % 3 == 0)
+            .map(|x: i32| x * 10)
+            .collect();
+        let expected: Vec<i32> = (1..=1000).filter(|x| x % 3 == 0).map(|x| x * 10).collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_with_compute_pool_try_collect() {
+        let pool = ComputePool::new(4);
+        let result: Result<Vec<i32>, &'static str> = pipe(0..1000)
+            .with_compute_pool(pool)
+            .try_map(|x: i32| Ok::<i32, &str>(x + 1))
+            .try_collect();
+        let expected: Vec<i32> = (1..=1000).collect();
+        assert_eq!(result.unwrap(), expected);
+    }
+
+    /// A 2-thread custom pool must cap concurrency far below the global
+    /// pool's thread count — proving the fused path dispatches to the
+    /// user-supplied pool, not the global one.
+    #[test]
+    fn test_with_compute_pool_limits_parallelism() {
+        let pool = ComputePool::new(2);
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let a = active.clone();
+        let m = max_active.clone();
+
+        pipe(0..2000)
+            .with_compute_pool(pool)
+            .with_workload(Workload::Balanced)
+            .for_each(move |x: i32| {
+                let cur = a.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(cur, Ordering::SeqCst);
+                // Enough work per item to guarantee overlap on a 2-thread pool.
+                std::thread::sleep(std::time::Duration::from_micros(50));
+                a.fetch_sub(1, Ordering::SeqCst);
+                std::hint::black_box(x);
+            });
+
+        let max = max_active.load(Ordering::SeqCst);
+        // 2 pool workers → at most ~3 concurrent (the off-pool driver may
+        // briefly participate via the hybrid path's tree). The global pool
+        // (32 threads) would show 20+.
+        assert!(
+            max <= 4,
+            "expected ≤4 concurrent on a 2-thread pool, got {max} — \
+             custom pool not used?"
+        );
+    }
 }
