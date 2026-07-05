@@ -266,8 +266,9 @@ impl<S, I, O> Pipe<S, I, O> {
 
 - **`MAY_FILTER == false`** — the index-based fast path. Input + output `Slots`
   are allocated once, then the top-level dispatcher splits `[0, n)` into
-  **`num_threads` contiguous chunks** and injects them in a single
-  `inject_batch` (hybrid flat/tree dispatch — see `par_index_collect_hybrid`).
+  **`num_threads` contiguous chunks** stored in a single `Box<[ChunkJob]>` (one
+  heap allocation for all chunks, not per-chunk `Box`es) and injects them in a
+  single `inject_batch` (hybrid flat/tree dispatch — see `hybrid_dispatch`).
   Every pool worker pops a chunk on its first `find_work`, so all workers are
   busy from t≈0 — no fork/join ramp-up. Each chunk then recurses via
   `ComputePool::join` (the per-chunk tree uses distributed local deques +
@@ -688,8 +689,13 @@ The residual ~21 µs is no longer the condvar handshake — it is the inject+
 wake cascade (pushing `num_threads` JobRefs through the injector + waking the
 workers) plus the fact that the off-pool driver blocks instead of participating
 in the work the way rayon's calling thread does (rayon's `par_iter` runs inline
-on the caller). Closing it further would need the driver to run one chunk
-inline, which is a separate change.
+on the caller). An attempt to close it by injecting a single root job (mirroring
+rayon's `join` unfold) **regressed** — the log2(num_threads) ramp-up via
+work-stealing cost more than the per-chunk overhead it saved on youpipe's st3 +
+concurrent_queue scheduler (unlike rayon's crossbeam_deque). The real win was
+eliminating the per-chunk heap allocations: all `num_threads` chunks now share
+one `Box<[ChunkJob]>` (1 allocation instead of N), which shaved a further
+~3 % off 1K–10K batches.
 
 An earlier version silently routed small batches to a serial loop to win this
 benchmark, but that was deceptive (the API promises parallelism) and
@@ -745,12 +751,12 @@ buffer and writing at known indices instead of the `Vec`-merge fallback.
 
 | Size | youpipe `for_each` | rayon `for_each` |
 | ---- | ------------------ | ---------------- |
-| 1K   | ~64 µs             | ~49 µs           |
-| 10K  | ~191 µs            | ~204 µs          |
-| 100K | ~1.52 ms           | ~1.46 ms         |
+| 1K   | ~62 µs             | ~47 µs           |
+| 10K  | ~183 µs            | ~203 µs          |
+| 100K | ~1.54 ms           | ~1.49 ms         |
 
 `for_each` was the last fused terminal still on the single-tree path — it
-never went through `par_index_collect_hybrid`'s `inject_batch` +
+never went through `hybrid_dispatch`'s `inject_batch` +
 `CountLatch::wait_spin` pattern, so it paid the full fork/join ramp-up cost.
 Porting it to the shared `hybrid_dispatch` (via the `SinkStrategy` impl of
 `HybridStrategy`) measured **−8.7 % @ 1K, −7.2 % @ 10K, −5.0 % @ 100K** vs the
@@ -758,9 +764,13 @@ prior tree-only `par_for_each`. At 10K youpipe now beats rayon; the 1K case
 still trails because the off-pool driver blocks instead of participating the
 way rayon's `par_iter` runs inline on the caller (a known remaining gap —
 see `docs/ARCHITECTURE.md` "the off-pool driver blocks" note under
-`sync_cpu_heavy`). The `collect` path is performance-neutral after the
-refactor (all `sync_cpu_heavy` / `pipeline_fusion` / `sync_lightweight` /
-`try_collect` entries "No change" vs the pre-refactor baseline).
+`sync_cpu_heavy`). A subsequent change consolidated all `num_threads` chunk
+jobs into a single `Box<[ChunkJob]>` (1 heap allocation instead of N+1),
+which shaved a further **~3 % @ 1K–10K** by eliminating the per-chunk
+malloc/free overhead. An attempt to instead inject a single root job (rayon's
+`join`-unfold pattern) **regressed** — the work-stealing ramp-up cost exceeded
+the per-chunk savings on youpipe's scheduler, so the hybrid chunk strategy was
+kept.
 
 ### Mixed Load — `stream()` vs `tokio::spawn_blocking` (`mixed_load`)
 

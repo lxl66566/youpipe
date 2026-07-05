@@ -440,11 +440,12 @@ where
     }
 }
 
-/// One top-level chunk of a hybrid-dispatched parallel operation. Heap-
-/// allocated (stable address); referenced by the injected `JobRef`. Carries
-/// raw pointers to the shared `Slots`/`strategy`/`latch`/`panic_slot`, which
-/// all live on the driver's stack frame — sound because the driver blocks on
-/// the `CountLatch` until every chunk has executed.
+/// One top-level chunk of a hybrid-dispatched parallel operation. Stored in a
+/// single contiguous `Box<[ChunkJob]>` shared by all chunks (not individually
+/// boxed); referenced by the injected `JobRef`. Carries raw pointers to the
+/// shared `Slots`/`strategy`/`latch`/`panic_slot`, which all live on the
+/// driver's stack frame — sound because the driver blocks on the `CountLatch`
+/// until every chunk has executed.
 struct ChunkJob<T, S: HybridStrategy<T>> {
     input: *const Slots<T>,
     strategy: *const S,
@@ -555,19 +556,22 @@ where
     let latch = CountLatch::with_count(num_chunks, None);
 
     // Build contiguous ranges as evenly as possible (first `rem` chunks get one
-    // extra item). ChunkJobs are boxed so their addresses stay pinned
-    // regardless of the Vec reallocating its backing buffer. The borrowed
-    // `strategy` lives on the caller's stack frame (which blocks on this call
-    // until `wait_spin` returns), so the raw pointer below is valid for every
-    // chunk's `execute`.
+    // extra item). All ChunkJobs share ONE heap allocation (`Box<[ChunkJob]>`,
+    // frozen via `into_boxed_slice` so element addresses are stable for the
+    // injected `JobRef`s). This replaces the previous per-chunk `Box<ChunkJob>`
+    // — `num_threads` heap allocations → 1 — which was the dominant per-chunk
+    // fixed cost on small batches (notably the 1 K `for_each` gap to rayon).
+    // The borrowed `strategy` lives on the caller's stack frame (which blocks on
+    // this call until `wait_spin` returns), so the raw pointer below is valid
+    // for every chunk's `execute`.
     let chunk = n / num_chunks;
     let rem = n % num_chunks;
-    let mut jobs: Vec<Box<ChunkJob<T, S>>> = Vec::with_capacity(num_chunks);
+    let mut jobs: Vec<ChunkJob<T, S>> = Vec::with_capacity(num_chunks);
     let mut start = 0;
     for i in 0..num_chunks {
         let size = chunk + usize::from(i < rem);
         let end = start + size;
-        jobs.push(Box::new(ChunkJob {
+        jobs.push(ChunkJob {
             input: ptr::from_ref(input),
             strategy: ptr::from_ref(strategy),
             start,
@@ -577,20 +581,22 @@ where
             latch: ptr::from_ref(&latch),
             panic_slot: ptr::from_ref(&panic_slot),
             succeeded: AtomicBool::new(false),
-        }));
+        });
         start = end;
     }
     debug_assert_eq!(start, n);
+    // Freeze: capacity == len so this is a no-op realloc. The boxed slice's
+    // backing buffer outlives every chunk's `execute` (driver blocks on
+    // `wait_spin` below until the last chunk signals).
+    let jobs: Box<[ChunkJob<T, S>]> = jobs.into_boxed_slice();
 
     // One batched inject: a single JEC increment + a single wake cascade,
     // regardless of `num_chunks`. Every idle worker pops a chunk on its next
-    // `find_work` → all workers busy from t≈0.
+    // `find_work` → all workers busy from t≈0. The JobRefs are produced lazily
+    // from the boxed slice (no intermediate `Vec<JobRef>` allocation).
     let registry = pool.registry();
-    let job_refs: Vec<JobRef> = jobs
-        .iter()
-        .map(|j| unsafe { JobRef::new(std::ptr::from_ref(&**j)) })
-        .collect();
-    registry.inject_batch(job_refs.into_iter());
+    let job_refs = jobs.iter().map(|j| unsafe { JobRef::new(ptr::from_ref(j)) });
+    registry.inject_batch(job_refs);
 
     // Block the external thread until every chunk has signalled. `CountLatch`
     // with no owner uses a `LockLatch` (parking-lot condvar) — correct for an
