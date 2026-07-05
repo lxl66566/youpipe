@@ -13,13 +13,16 @@
 //! callers that prefer the function-call style or want to keep the iterator
 //! type's method namespace clean.
 
+#[cfg(feature = "compio-runtime")]
+pub use crate::runtime::CompioPool;
 #[cfg(feature = "tokio-runtime")]
-pub use crate::executor::AsyncPool;
+pub use crate::runtime::TokioPool;
 pub use crate::{
     Identity, Pipe, PipelineConfig, StreamPipe, StreamStart, Workload,
     executor::ComputePool,
     handoff::{Receiver, Sender, async_channel, channel},
     pipe,
+    runtime::{AsyncRuntime, DefaultRuntime},
     scope::{PipelineScope, ScopedPipe, scope},
     state::{FenceBarrier, FenceMode, ReorderBuffer},
     stream,

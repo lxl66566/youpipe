@@ -58,6 +58,7 @@ pub mod executor;
 pub mod handoff;
 pub(crate) mod pool;
 pub mod prelude;
+pub mod runtime;
 pub mod scope;
 pub mod state;
 pub mod sync;
@@ -67,12 +68,15 @@ pub use builder::{
     Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, Pipe, PipelineConfig,
     StageMarker, StreamPipe, StreamStart, SyncMap, TryMap, TryPipe, Workload, pipe, stream,
 };
-#[cfg(feature = "tokio-runtime")]
-pub use executor::AsyncPool;
 pub use executor::ComputePool;
 pub use handoff::{
     AsyncReceiver, AsyncSender, Receiver, Sender, SharedWaitGroup, async_channel, channel,
 };
+#[cfg(feature = "compio-runtime")]
+pub use runtime::CompioPool;
+#[cfg(feature = "tokio-runtime")]
+pub use runtime::TokioPool;
+pub use runtime::{AsyncRuntime, DefaultRuntime, NoRuntime};
 pub use scope::{PipelineScope, ScopedPipe, scope};
 pub use state::{FenceBarrier, FenceMode, ReorderBuffer};
 pub use sync::CancellationToken;

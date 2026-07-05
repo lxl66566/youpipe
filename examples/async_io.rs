@@ -36,7 +36,7 @@
 //!
 //! // 2. Reuse one runtime across many `run()` calls (criterion benches,
 //! //    long-lived services). Construction (~ms) is paid once.
-//! let pool = AsyncPool::from_default().expect("async runtime");
+//! let pool = TokioPool::build_default().expect("async runtime");
 //! items0.stream().with_async_pool(pool).stage_async(...).run();
 //! // (the pool is moved into the run; rebuild per call or wrap a Handle
 //! // yourself to truly share across runs.)

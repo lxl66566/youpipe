@@ -18,7 +18,7 @@
 use std::{hint::black_box as bb, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use youpipe::{AsyncPool, PipelineConfig, stream};
+use youpipe::{PipelineConfig, TokioPool, stream};
 
 /// CPU work, variable cost controlled by `iters`.
 fn cpu_work(x: u64, iters: u32) -> u64 {
@@ -93,7 +93,7 @@ fn bench_pure_io_async(c: &mut Criterion) {
         // pool is built once and reused across iterations (runtime creation is
         // ~ms and would otherwise dominate smaller sizes).
         {
-            let pool = AsyncPool::from_global(num_cpus()).expect("async runtime");
+            let pool = TokioPool::build(num_cpus()).expect("async runtime");
             let pool_handle = pool.handle().clone();
             group.bench_with_input(
                 BenchmarkId::new("youpipe_async", size),
@@ -102,7 +102,7 @@ fn bench_pure_io_async(c: &mut Criterion) {
                     b.iter(|| {
                         let r = stream(tasks.clone())
                             .with_config(PipelineConfig::default().with_io_concurrency(512))
-                            .with_async_pool(AsyncPool::new(pool_handle.clone(), num_cpus()))
+                            .with_async_pool(TokioPool::new(pool_handle.clone(), num_cpus()))
                             .stage_async(|(x, dur): (u64, Duration)| async move {
                                 async_io(x, dur).await
                             })
@@ -212,7 +212,7 @@ fn bench_mixed_cpu_io(c: &mut Criterion) {
         // youpipe run_mixed_async: sync CPU on compute pool → async IO on the
         // async runtime (overlapping stages).
         {
-            let pool = AsyncPool::from_global(num_cpus()).expect("async runtime");
+            let pool = TokioPool::build(num_cpus()).expect("async runtime");
             let pool_handle = pool.handle().clone();
             group.bench_with_input(
                 BenchmarkId::new("youpipe_mixed_async", size),
@@ -221,7 +221,7 @@ fn bench_mixed_cpu_io(c: &mut Criterion) {
                     b.iter(|| {
                         let r = stream(items.clone())
                             .with_config(PipelineConfig::default().with_io_concurrency(512))
-                            .with_async_pool(AsyncPool::new(pool_handle.clone(), num_cpus()))
+                            .with_async_pool(TokioPool::new(pool_handle.clone(), num_cpus()))
                             .stage(|((x, iters), dur): ((u64, u32), Duration)| {
                                 (bb(cpu_work(x, iters)), dur)
                             })

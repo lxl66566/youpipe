@@ -42,20 +42,50 @@ The `scope()` API allows closures to borrow stack-local variables without `'stat
 
 ### Async runtime
 
-Async stages (`stage_async`) run on tokio via [`AsyncPool`] (a
-`tokio::runtime::Handle` wrapper). The runtime is feature-gated behind
-`tokio-runtime` (the default); building without it produces a sync-only
-crate that exposes no async APIs (`AsyncStage`, `AsyncPool`, `stage_async`
-all disappear). Callers can attach a managed runtime via `.with_async_pool`
-or let the pipeline build a transient one per `run()` call.
+Async stages (`stage_async`) run on a pluggable [`AsyncRuntime`] backend.
+The crate ships two backends, selected by feature flag:
 
-There is intentionally no `Runtime` trait abstraction: the streaming code
-calls tokio APIs directly (e.g. `tokio::spawn`, `Handle::block_on`), and
-introducing a trait would either leak tokio types through it or force a
-wrapper that loses tokio's specific capabilities. `AsyncPool::new(handle, n)`
-already lets a caller hand in any `tokio::runtime::Handle` (including one
-built externally or shared across runs), which covers the realistic
-"runtime-agnostic" use cases without an under-used abstraction layer.
+- **`tokio-runtime`** (the default): [`TokioPool`] wraps a
+  `tokio::runtime::Handle`. The runtime's M:N work-stealing scheduler
+  multiplexes `io_concurrency` tasks over `async_workers` OS threads.
+- **`compio-runtime`**: [`CompioPool`] adapts compio's **thread-local,
+  single-threaded** `Runtime` to the streaming topology via a hybrid split
+  (see `src/runtime/compio.rs` module docs): `spawn` (the `Send` consumer
+  futures) dispatches to a dedicated worker thread that owns one compio
+  runtime; `block_on` (the `!Send` collector future) runs locally on the
+  caller thread's lazily-created runtime. The two runtimes communicate purely
+  through crossfire channels — runtime-agnostic, because a crossfire wake
+  routes through compio's `Local::schedule` to the driver waker.
+
+Both may be enabled simultaneously; the caller picks the backend per
+`StreamPipe` via `.with_async_pool(pool)`, or relies on `DefaultRuntime`
+(tokio when available). Building without *any* backend feature yields a
+sync-only crate: `AsyncStage` / `stage_async` disappear, `R` defaults to
+`NoRuntime` (whose trait methods panic but are unreachable on sync-only
+chains).
+
+`StreamPipe<S, I, O, R: AsyncRuntime = DefaultRuntime>` is generic over the
+backend so every `spawn` / `block_on` monomorphises to the concrete type —
+zero virtual dispatch. Sync-only chains never instantiate `R`, so the
+abstraction is free for them. Callers attach a managed runtime via
+`.with_async_pool` (changing `R` to the pool's type) or let the pipeline
+build a transient one per `run()` call.
+
+There is intentionally no runtime-specific coupling in the streaming code:
+`pool.spawn(fut)` / `pool.block_on(fut)` replaced the old direct
+`tokio::spawn` / `Handle::enter` calls. The `enter()` guard was dropped
+entirely — `Handle::spawn` is explicit (needs no TLS context), and compio's
+scoped-tls `enter` has no RAII guard so it could not live next to tokio's
+anyway. The channel layer (`crossfire`) is the runtime-agnostic bridge
+between sync and async stages under both backends.
+
+> **compio caveat.** compio's own IO/timer primitives (`time::sleep`,
+> file/net ops) return `!Send` futures (they hold `Rc`-refs to the driver).
+> `stage_async` requires `Fut: Send` (tokio's multi-thread backend needs it),
+> so those primitives cannot appear directly inside a `stage_async` closure.
+> The streaming consumers themselves (crossfire + `Send` user logic) are
+> `Send`, so the common streaming use case works; integrating compio-native
+> IO is left to a future `!Send`-aware spawn path.
 
 ---
 
@@ -70,7 +100,7 @@ src/
 │       ├── mod.rs    # Re-exports
 │       ├── fused.rs  # pipe(), Pipe<S,I,O>, TryPipe<S,I,O,E>, par_index_* core,
 │       │             #   fused_collect_scoped (pub(crate) entry for scope)
-│       ├── stream.rs # stream(), StreamPipe<S,I,O>, StageSpawn typestate chain
+│       ├── stream.rs # stream(), StreamPipe<S,I,O,R>, StageSpawn typestate chain
 │       ├── traits.rs # FusedStage / FusedTryStage / RangeOp / stage markers
 │       │             #   (SyncMap / Filter / TryMap / MapErr / InfallibleChain)
 │       └── slots.rs  # Slots<T> index-based zero-copy buffer
@@ -78,14 +108,15 @@ src/
 │   ├── compute/      # st3 work-stealing CPU thread pool
 │   │   ├── mod.rs    # ComputePool unit tests
 │   │   └── worker.rs # ComputePool: Injector/Stealer/sleep counters wake/graceful shutdown/join
-│   ├── async_pool/   # Tokio async task pool (feature-gated)
-│   │   ├── mod.rs
-│   │   └── driver.rs # AsyncPool (tokio::runtime::Handle wrapper)
 │   └── mod.rs
 ├── handoff/          # Data transfer layer
 │   ├── channel.rs    # MPMC channels (crossfire wrapper: sync + async)
 │   ├── notify.rs     # WaitGroup (counter barrier for stage synchronization)
 │   └── mod.rs
+├── runtime/          # Pluggable async-runtime backend for streaming .stage_async
+│   ├── mod.rs        # AsyncRuntime trait, NoRuntime, DefaultRuntime alias
+│   ├── tokio.rs      # TokioPool (tokio::runtime::Handle wrapper)
+│   └── compio.rs     # CompioPool (hybrid: worker-thread spawn + local block_on)
 ├── state/            # Ordered output & streaming execution
 │   ├── reorder.rs    # ReorderBuffer<T> (bitmask slot array for restoring ordered output)
 │   ├── fence.rs      # FenceBarrier<T> (configurable chunk_size barrier)
@@ -420,12 +451,14 @@ stages so `.run()` divides `compute_workers` across sync stages, preventing the
 
 #### Async IO stages
 
-`.stage_async()` is gated behind the `tokio-runtime` feature. It runs an IO
-stage as **`io_concurrency` async tasks** on a tokio runtime
-([`AsyncPool`]). The runtime's M:N scheduler multiplexes those tasks over
-`async_workers` OS threads: each task yields its thread back to the runtime while
-it awaits (e.g. `tokio::time::sleep`, real network/disk IO), so concurrency is
-bounded by `io_concurrency` — **not** by the thread count.
+`.stage_async()` is gated behind any backend feature (`tokio-runtime` or
+`compio-runtime`). It runs an IO stage as **`io_concurrency` async tasks** on
+an [`AsyncRuntime`] backend ([`TokioPool`] or [`CompioPool`]). The runtime's
+scheduler multiplexes those tasks over `async_workers` OS threads (M:N for
+tokio; single-threaded cooperative for compio — see `src/runtime/compio.rs`):
+each task yields its thread back to the runtime while it awaits (e.g. a timer,
+real network/disk IO), so concurrency is bounded by `io_concurrency` — **not**
+by the thread count.
 
 This is the right tool when IO waits actually yield. For work that _blocks_ the
 OS thread (e.g. `std::thread::sleep`), a sync `.stage()` is preferable: a
@@ -459,7 +492,7 @@ under backpressure, stalling every other task on it (or deadlocking a
 single-worker runtime — covered by the
 `test_sync_to_async_does_not_stall_tokio_driver` regression test).
 
-An [`AsyncPool`] may be attached via `.with_async_pool(...)` and reused across
+A managed runtime may be attached via `.with_async_pool(...)` and reused across
 runs; otherwise a transient runtime is built per call (simpler, but pays
 ~ms runtime construction each time — avoid inside tight loops).
 

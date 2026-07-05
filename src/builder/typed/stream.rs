@@ -1,17 +1,7 @@
-#[cfg(feature = "tokio-runtime")]
-use std::future::Future;
-#[cfg(feature = "tokio-runtime")]
-use std::sync::OnceLock;
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+use std::{future::Future, sync::OnceLock};
 use std::{marker::PhantomData, sync::Arc};
 
-#[cfg(feature = "tokio-runtime")]
-use crate::handoff::MpscAsyncReceiver;
-#[cfg(feature = "tokio-runtime")]
-use crate::handoff::{
-    AsyncReceiver, AsyncRecvItem, async_channel, mpsc_async_channel, sync_async_channel,
-};
-#[cfg(feature = "tokio-runtime")]
-use crate::state::ReorderBuffer;
 use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
@@ -19,8 +9,17 @@ use crate::{
         MpscReceiver, Receiver, RecvItem, SendItem, SharedWaitGroup, SyncSender, TryRecvError,
         channel::channel, mpsc_channel,
     },
+    runtime::{AsyncRuntime, DefaultRuntime},
     state::{FenceBarrier, FenceMode, run_ordered_collect},
     sync::CancellationToken,
+};
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+use crate::{
+    handoff::{
+        AsyncReceiver, AsyncRecvItem, MpscAsyncReceiver, async_channel, mpsc_async_channel,
+        sync_async_channel,
+    },
+    state::ReorderBuffer,
 };
 
 // ── Streaming pipeline (chainable, data-first) ──
@@ -37,8 +36,9 @@ use crate::{
 //   feeder → [stage 1 workers] → mid₁ → [stage 2 workers] → mid₂ → … →
 // collector
 //
-// Stages may be sync (run on `ComputePool`), async (run on `AsyncPool` via
-// tokio tasks), or a fence (forward-fence thread between adjacent stages).
+// Stages may be sync (run on `ComputePool`), async (run on an `AsyncRuntime`
+// backend via runtime tasks), or a fence (forward-fence thread between
+// adjacent stages).
 
 /// True iff `cancel` is set and the pipeline should stop feeding new work.
 #[inline]
@@ -51,10 +51,10 @@ fn cancel_active(cancel: Option<&CancellationToken>) -> bool {
 /// (sync / expand / fence) follows an async stage in the chain — the previous
 /// stage's output arrives on an async channel but this stage's workers expect a
 /// sync one.
-#[cfg(feature = "tokio-runtime")]
-fn bridge_async_to_sync<T: Send + Unpin + 'static>(
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
     rx: AsyncReceiver<(u64, T)>,
-    ctx: &StreamCtx,
+    ctx: &StreamCtx<'_, R>,
 ) -> Receiver<(u64, T)> {
     let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
     let (s_tx, s_rx) = channel::<(u64, T)>(buffer);
@@ -307,7 +307,7 @@ fn forward_fenced<M, Tx>(
 ///     .ordered()
 ///     .run();
 /// ```
-pub struct StreamPipe<S = StreamStart, I = (), O = ()> {
+pub struct StreamPipe<S = StreamStart, I = (), O = (), R: AsyncRuntime = DefaultRuntime> {
     items: Vec<I>,
     stages: S,
     config: PipelineConfig,
@@ -317,10 +317,10 @@ pub struct StreamPipe<S = StreamStart, I = (), O = ()> {
     /// pool — useful for oversubscribing threads for blocking-IO sync stages
     /// (e.g. `ComputePool::new(512)` to match tokio's `spawn_blocking` pool).
     compute_pool: Option<ComputePool>,
-    #[cfg(feature = "tokio-runtime")]
-    async_pool: Option<crate::executor::AsyncPool>,
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    async_pool: Option<R>,
     ordered: bool,
-    _marker: PhantomData<O>,
+    _marker: PhantomData<(O, R)>,
 }
 
 /// Typestate marker for the start of a streaming chain (no stages yet).
@@ -332,7 +332,7 @@ pub struct StreamStart;
 /// Unlike the fused [`crate::Pipe`], a `StreamPipe` always materialises each
 /// stage's output through a channel — useful for backpressure-aware flows,
 /// async IO stages, fences between stages, or cooperative cancellation.
-pub fn stream<I, It>(items: It) -> StreamPipe<StreamStart, I, I>
+pub fn stream<I, It>(items: It) -> StreamPipe<StreamStart, I, I, DefaultRuntime>
 where
     It: IntoIterator<Item = I>,
     I: Send + Unpin + 'static,
@@ -343,7 +343,7 @@ where
         config: PipelineConfig::default(),
         cancel: None,
         compute_pool: None,
-        #[cfg(feature = "tokio-runtime")]
+        #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
         async_pool: None,
         ordered: false,
         _marker: PhantomData,
@@ -368,9 +368,10 @@ pub struct ExpandStage<Prev, F> {
     pub(super) f: F,
 }
 
-/// Async stage: `Fn(O) -> Future<Output = N>`, runs as `io_concurrency` tokio
-/// tasks on the [`AsyncPool`]. Gated behind the `tokio-runtime` feature.
-#[cfg(feature = "tokio-runtime")]
+/// Async stage: `Fn(O) -> Future<Output = N>`, runs as `io_concurrency` tasks
+/// on the [`AsyncRuntime`](crate::AsyncRuntime) backend. Gated behind any
+/// backend feature (`tokio-runtime` or `compio-runtime`).
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
 #[derive(Clone)]
 pub struct AsyncStage<Prev, F> {
     pub(super) prev: Prev,
@@ -405,7 +406,11 @@ pub struct FenceLink<Prev> {
 /// mode that bit the pre-fusion API.
 pub trait StageSpawn<In: Send + Unpin + 'static> {
     type Out: Send + Unpin + 'static;
-    fn spawn(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<Self::Out>;
+    fn spawn<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Self::Out>;
 
     /// Like [`spawn`](Self::spawn) but the output channel is MPSC (single
     /// consumer). The collector in [`StreamPipe::run`] is always the sole
@@ -418,11 +423,15 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     /// keeps the MPMC channel (no regression for stages that don't override).
     /// Concrete stages that create output channels override this to create an
     /// [`mpsc_channel`] instead.
-    fn spawn_single(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<Self::Out>
+    fn spawn_single<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Self::Out>
     where
         Self: Sized,
     {
-        self.spawn(rx, ctx)
+        self.spawn::<R>(rx, ctx)
     }
 
     /// Number of stages in this chain that consume compute-pool worker slots.
@@ -464,21 +473,25 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     /// The default implementation bridges `AsyncReceiver → Receiver` (one
     /// tokio task) and delegates to [`Self::spawn`]. Stages whose immediate
     /// consumer is async should override to skip the bridge.
-    #[cfg(feature = "tokio-runtime")]
-    fn spawn_async_feeder(self, rx: AsyncReceiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<Self::Out>
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    fn spawn_async_feeder<R: AsyncRuntime>(
+        self,
+        rx: AsyncReceiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Self::Out>
     where
         Self: Sized,
     {
         // Bridge async→sync on a dedicated OS thread, then delegate to the
         // sync `spawn` path. The bridge MUST run on an OS thread (via
-        // `bridge_async_to_sync`), not a `tokio::spawn` task:
-        // `SyncSender::send` is blocking, and running it inside a tokio task
-        // would park the tokio worker thread whenever the downstream sync
+        // `bridge_async_to_sync`), not a runtime task:
+        // `SyncSender::send` is blocking, and running it inside an async task
+        // would park the runtime worker thread whenever the downstream sync
         // stage exerts backpressure — the "one thread is both async driver
         // and blocking worker" anti-pattern that stalls every other task on
         // that worker.
-        let s_rx = bridge_async_to_sync(rx, ctx);
-        self.spawn(s_rx, ctx)
+        let s_rx = bridge_async_to_sync::<_, R>(rx, ctx);
+        self.spawn::<R>(s_rx, ctx)
     }
 
     /// Spawn this stage to feed a downstream **async** consumer, returning the
@@ -499,11 +512,11 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     /// regardless of whether the preceding stage is sync or async: each stage
     /// picks the channel kind that lets its producers run with the least
     /// friction (mixed-mode for sync producers, fully-async for async ones).
-    #[cfg(feature = "tokio-runtime")]
-    fn spawn_for_async(
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    fn spawn_for_async<R: AsyncRuntime>(
         self,
         rx: Receiver<(u64, In)>,
-        ctx: &StreamCtx,
+        ctx: &StreamCtx<'_, R>,
     ) -> AsyncReceiver<(u64, Self::Out)>
     where
         Self: Sized,
@@ -511,7 +524,7 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
         // Default: spawn normally, then bridge the output (sync or async) into
         // a mixed-mode channel. Sync stages override this to skip the bridge
         // — see `SyncStage::spawn_for_async`.
-        let fr = self.spawn(rx, ctx);
+        let fr = self.spawn::<R>(rx, ctx);
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (tx, a_rx) = sync_async_channel::<(u64, Self::Out)>(buffer);
         let cancel = ctx.cancel.clone();
@@ -571,9 +584,9 @@ pub enum FinalRx<T: Send + Unpin + 'static> {
     /// (store-based dequeue, lock-free waker registry) because the collector
     /// is the sole consumer. Produced by [`StageSpawn::spawn_single`].
     SyncSingle(MpscReceiver<(u64, T)>),
-    #[cfg(feature = "tokio-runtime")]
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
     Async(AsyncReceiver<(u64, T)>),
-    #[cfg(feature = "tokio-runtime")]
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
     AsyncSingle(MpscAsyncReceiver<(u64, T)>),
 }
 
@@ -582,19 +595,22 @@ pub enum FinalRx<T: Send + Unpin + 'static> {
 /// [`StageSpawn::spawn`] never produces `SyncSingle` or `AsyncSingle` (only
 /// [`StageSpawn::spawn_single`] does), so those arms are unreachable here.
 /// Every stage's `spawn`/`spawn_single` calls this to obtain its input channel.
-#[cfg_attr(not(feature = "tokio-runtime"), allow(unused_variables))]
-fn finalize_prev_rx<T: Send + Unpin + 'static>(
+#[cfg_attr(
+    not(any(feature = "tokio-runtime", feature = "compio-runtime")),
+    allow(unused_variables)
+)]
+fn finalize_prev_rx<T: Send + Unpin + 'static, R: AsyncRuntime>(
     prev_rx: FinalRx<T>,
-    ctx: &StreamCtx,
+    ctx: &StreamCtx<'_, R>,
 ) -> Receiver<(u64, T)> {
     match prev_rx {
         FinalRx::Sync(r) => r,
         FinalRx::SyncSingle(_) => {
             unreachable!("prev.spawn() never returns SyncSingle")
         }
-        #[cfg(feature = "tokio-runtime")]
-        FinalRx::Async(r) => bridge_async_to_sync(r, ctx),
-        #[cfg(feature = "tokio-runtime")]
+        #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+        FinalRx::Async(r) => bridge_async_to_sync::<_, R>(r, ctx),
+        #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
         FinalRx::AsyncSingle(_) => {
             unreachable!("prev.spawn() never returns AsyncSingle")
         }
@@ -604,7 +620,12 @@ fn finalize_prev_rx<T: Send + Unpin + 'static>(
 /// Shared per-run configuration: pool handles, cancellation, buffer sizing.
 /// Built fresh in `StreamPipe::run` and passed by reference to every stage's
 /// `spawn` call.
-pub struct StreamCtx<'a> {
+///
+/// Generic over the async runtime backend `R`. Sync-only chains still
+/// instantiate this (with `R = NoRuntime` by default) but never call
+/// [`Self::acquire_async`], so the `NoRuntime` methods' panics stay
+/// unreachable.
+pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     pub config: &'a PipelineConfig,
     pub cancel: Option<CancellationToken>,
     pub n: usize,
@@ -617,27 +638,31 @@ pub struct StreamCtx<'a> {
     /// Custom compute pool (cloned from the builder's `with_compute_pool`).
     /// When `None`, sync stages use [`ComputePool::global`].
     pub compute_pool: Option<ComputePool>,
-    #[cfg(feature = "tokio-runtime")]
-    pub async_pool: Option<crate::executor::AsyncPool>,
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    pub async_pool: Option<R>,
     /// Lazily-constructed runtime for this single `run()` call, used when the
     /// caller did not attach one via [`StreamPipe::with_async_pool`].
     ///
     /// Without this cache every `acquire_async()` call (one per async stage
-    /// plus one per sync→async bridge) would build a *fresh* tokio runtime —
+    /// plus one per sync→async bridge) would build a *fresh* runtime —
     /// each costing ~ms — silently wrecking small workloads. The cache keeps
     /// the "no config needed" default path fast: a single runtime is built on
     /// first use and dropped at the end of `run()`.
     ///
-    /// Stored as `io::Result` (not just `AsyncPool`) so a construction failure
+    /// Stored as `io::Result` (not just the pool) so a construction failure
     /// is reported identically to every caller — `OnceLock::get_or_init`
     /// runs the initializer exactly once and hands back the same outcome to
     /// every subsequent `acquire_async()` call. (`OnceLock::get_or_try_init`
     /// would be the natural fit but is still unstable as of 1.85.)
-    #[cfg(feature = "tokio-runtime")]
-    pub(crate) cached_pool: OnceLock<std::io::Result<crate::executor::AsyncPool>>,
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    pub(crate) cached_pool: OnceLock<std::io::Result<R>>,
+    /// Carries the backend type `R` even when no backend feature is enabled
+    /// (then the `async_pool` / `cached_pool` fields don't exist, so `R`
+    /// would otherwise be an unused type parameter). Zero-sized at runtime.
+    _marker: PhantomData<R>,
 }
 
-impl StreamCtx<'_> {
+impl<R: AsyncRuntime> StreamCtx<'_, R> {
     pub fn buffer_size(&self, parallelism: usize) -> usize {
         self.config.buffer_size.max(parallelism * 4)
     }
@@ -653,31 +678,25 @@ impl StreamCtx<'_> {
 
     /// Acquire an async runtime for this run.
     ///
-    /// - If the caller attached a pool via `with_async_pool`, wrap its handle
-    ///   (cheap — `Handle` is internally `Arc`-refcounted).
-    /// - Otherwise build one lazily on first call and cache it in
+    /// - If the caller attached a pool via `with_async_pool`, hand back a cheap
+    ///   clone (the backend's `Clone` is `Arc`/`Handle`-refcounted).
+    /// - Otherwise build one lazily on first call via
+    ///   [`AsyncRuntime::build_default`] and cache it in
     ///   [`StreamCtx::cached_pool`] so subsequent calls in the same `run()`
-    ///   reuse the same runtime instead of paying the ~ms construction cost
-    ///   again.
-    #[cfg(feature = "tokio-runtime")]
-    pub fn acquire_async(&self) -> std::io::Result<crate::executor::AsyncPool> {
+    ///   reuse the same runtime instead of paying the construction cost again.
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    pub fn acquire_async(&self) -> std::io::Result<R> {
         if let Some(p) = &self.async_pool {
-            return Ok(crate::executor::AsyncPool::new(
-                p.handle().clone(),
-                self.config.async_workers,
-            ));
+            return Ok(p.clone());
         }
         // First caller builds; everyone else in this `run()` reuses the same
         // runtime. `get_or_init` is thread-safe — bridges from different
         // stages may race on first call.
         let cached = self
             .cached_pool
-            .get_or_init(|| crate::executor::AsyncPool::from_global(self.config.async_workers));
+            .get_or_init(|| R::build_default(self.config.async_workers));
         match cached {
-            Ok(p) => Ok(crate::executor::AsyncPool::new(
-                p.handle().clone(),
-                self.config.async_workers,
-            )),
+            Ok(p) => Ok(p.clone()),
             // Rebuild an equivalent error so the same failure is surfaced
             // afresh to every caller rather than moving the singleton out of
             // the lock (`io::Error` is not `Clone`).
@@ -689,7 +708,7 @@ impl StreamCtx<'_> {
 // StreamStart: identity spawn — returns rx unchanged.
 impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
     type Out = I;
-    fn spawn(self, rx: Receiver<(u64, I)>, _ctx: &StreamCtx) -> FinalRx<I> {
+    fn spawn<R: AsyncRuntime>(self, rx: Receiver<(u64, I)>, _ctx: &StreamCtx<'_, R>) -> FinalRx<I> {
         FinalRx::Sync(rx)
     }
     fn worker_stages(&self) -> usize {
@@ -698,8 +717,12 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
     fn first_consumer_is_async(&self) -> Option<bool> {
         None
     }
-    #[cfg(feature = "tokio-runtime")]
-    fn spawn_async_feeder(self, rx: AsyncReceiver<(u64, I)>, _ctx: &StreamCtx) -> FinalRx<I> {
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    fn spawn_async_feeder<R: AsyncRuntime>(
+        self,
+        rx: AsyncReceiver<(u64, I)>,
+        _ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<I> {
         // Identity — pass the async feeder rx through unchanged so the
         // wrapping AsyncStage can consume it directly. This is the key
         // hop-elimination: when the chain is `stream(..).stage_async(..)`,
@@ -720,8 +743,8 @@ where
 {
     type Out = M;
 
-    fn spawn(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<M> {
-        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
+    fn spawn<R: AsyncRuntime>(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx<'_, R>) -> FinalRx<M> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
         let buffer = ctx.buffer_size(parallelism);
         let (out_tx, out_rx) = channel::<(u64, M)>(buffer);
@@ -736,7 +759,11 @@ where
         FinalRx::Sync(out_rx)
     }
 
-    fn spawn_single(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<M>
+    fn spawn_single<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<M>
     where
         Self: Sized,
     {
@@ -745,7 +772,7 @@ where
         // registry). Previous stages still use MPMC (`prev.spawn`, not
         // `prev.spawn_single`) — their output feeds multiple workers in this
         // stage, so multi-consumer channels are required there.
-        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
         let buffer = ctx.buffer_size(parallelism);
         let (out_tx, out_rx) = mpsc_channel::<(u64, M)>(buffer);
@@ -760,8 +787,12 @@ where
         FinalRx::SyncSingle(out_rx)
     }
 
-    #[cfg(feature = "tokio-runtime")]
-    fn spawn_for_async(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> AsyncReceiver<(u64, M)> {
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    fn spawn_for_async<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> AsyncReceiver<(u64, M)> {
         // Direct sync→async handoff: ComputePool workers write the mixed-mode
         // `SyncSender` directly — no bridge thread. The workers are OS threads,
         // so blocking on `send` under backpressure simply parks the worker
@@ -773,7 +804,7 @@ where
         // `stream(..).stage(cpu).stage_async(io)` previously paid for a
         // dedicated OS thread forwarding each item sync→mixed-mode; now the
         // CPU stage's workers ARE the mixed-mode producers.
-        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
         let buffer = ctx.buffer_size(parallelism);
         let (out_tx, out_rx) = sync_async_channel::<(u64, M)>(buffer);
@@ -813,8 +844,8 @@ where
 {
     type Out = N;
 
-    fn spawn(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<N> {
-        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
+    fn spawn<R: AsyncRuntime>(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx<'_, R>) -> FinalRx<N> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
         let buffer = ctx.buffer_size(parallelism);
         let (out_tx, out_rx) = channel::<(u64, N)>(buffer);
@@ -829,11 +860,15 @@ where
         FinalRx::Sync(out_rx)
     }
 
-    fn spawn_single(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<N>
+    fn spawn_single<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<N>
     where
         Self: Sized,
     {
-        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
         let buffer = ctx.buffer_size(parallelism);
         let (out_tx, out_rx) = mpsc_channel::<(u64, N)>(buffer);
@@ -848,11 +883,15 @@ where
         FinalRx::SyncSingle(out_rx)
     }
 
-    #[cfg(feature = "tokio-runtime")]
-    fn spawn_for_async(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> AsyncReceiver<(u64, N)> {
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    fn spawn_for_async<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> AsyncReceiver<(u64, N)> {
         // Same direct-handoff optimisation as `SyncStage::spawn_for_async`:
         // expansion workers write the mixed-mode sender directly.
-        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
         let buffer = ctx.buffer_size(parallelism);
         let (out_tx, out_rx) = sync_async_channel::<(u64, N)>(buffer);
@@ -888,8 +927,12 @@ where
 {
     type Out = Prev::Out;
 
-    fn spawn(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<Prev::Out> {
-        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
+    fn spawn<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Prev::Out> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = channel::<(u64, Prev::Out)>(buffer);
         let mode = self.mode;
@@ -898,11 +941,15 @@ where
         FinalRx::Sync(fenced_rx)
     }
 
-    fn spawn_single(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<Prev::Out>
+    fn spawn_single<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Prev::Out>
     where
         Self: Sized,
     {
-        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = mpsc_channel::<(u64, Prev::Out)>(buffer);
         let mode = self.mode;
@@ -911,17 +958,17 @@ where
         FinalRx::SyncSingle(fenced_rx)
     }
 
-    #[cfg(feature = "tokio-runtime")]
-    fn spawn_for_async(
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    fn spawn_for_async<R: AsyncRuntime>(
         self,
         rx: Receiver<(u64, In)>,
-        ctx: &StreamCtx,
+        ctx: &StreamCtx<'_, R>,
     ) -> AsyncReceiver<(u64, Prev::Out)> {
         // Direct handoff: the fence forwarder writes the mixed-mode sender
         // directly. It already runs on a dedicated OS thread, so blocking on
         // `send` under backpressure is its natural behaviour — no extra bridge
         // needed between the fence and a downstream async stage.
-        let mid_rx = finalize_prev_rx(self.prev.spawn(rx, ctx), ctx);
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = sync_async_channel::<(u64, Prev::Out)>(buffer);
         let mode = self.mode;
@@ -947,7 +994,7 @@ where
 
 // AsyncStage<Prev, F>: recurse into prev (likely sync), bridge sync→async,
 // then spawn `io_concurrency` async tasks on the runtime.
-#[cfg(feature = "tokio-runtime")]
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
 impl<Prev, F, In, M, Fut> StageSpawn<In> for AsyncStage<Prev, F>
 where
     Prev: StageSpawn<In>,
@@ -959,18 +1006,22 @@ where
 {
     type Out = M;
 
-    fn spawn(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<M> {
-        FinalRx::Async(self.spawn_for_async(rx, ctx))
+    fn spawn<R: AsyncRuntime>(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx<'_, R>) -> FinalRx<M> {
+        FinalRx::Async(self.spawn_for_async::<R>(rx, ctx))
     }
 
-    fn spawn_for_async(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> AsyncReceiver<(u64, M)> {
+    fn spawn_for_async<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> AsyncReceiver<(u64, M)> {
         // async → async: recurse via prev's `spawn_for_async` to obtain our
         // input channel — mixed-mode when prev is sync (ComputePool workers
         // write the sender directly, **no bridge thread**), fully-async when
-        // prev is async (tokio-task funnel). Then run the consumer fan-out.
+        // prev is async (runtime-task funnel). Then run the consumer fan-out.
         // The output is already a fully-async channel, handed back directly.
-        let a_in_rx = self.prev.spawn_for_async(rx, ctx);
-        spawn_async_consumers_body::<F, Prev::Out, M, Fut>(self.f, a_in_rx, ctx)
+        let a_in_rx = self.prev.spawn_for_async::<R>(rx, ctx);
+        spawn_async_consumers_body::<F, Prev::Out, M, Fut, R>(self.f, a_in_rx, ctx)
     }
 
     fn worker_stages(&self) -> usize {
@@ -978,7 +1029,11 @@ where
         self.prev.worker_stages()
     }
 
-    fn spawn_single(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<M>
+    fn spawn_single<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<M>
     where
         Self: Sized,
     {
@@ -986,10 +1041,10 @@ where
         // output, so use the lighter MPSC async channel (store-based dequeue,
         // no `lock cmpxchg`). Input channel stays MPMC (`prev.spawn_for_async`)
         // — multiple async consumer tasks share the input via clone.
-        let a_in_rx = self.prev.spawn_for_async(rx, ctx);
-        FinalRx::AsyncSingle(spawn_async_consumers_body_single::<F, Prev::Out, M, Fut>(
-            self.f, a_in_rx, ctx,
-        ))
+        let a_in_rx = self.prev.spawn_for_async::<R>(rx, ctx);
+        FinalRx::AsyncSingle(
+            spawn_async_consumers_body_single::<F, Prev::Out, M, Fut, R>(self.f, a_in_rx, ctx),
+        )
     }
 
     fn first_consumer_is_async(&self) -> Option<bool> {
@@ -1002,14 +1057,18 @@ where
         self.prev.has_expand()
     }
 
-    fn spawn_async_feeder(self, rx: AsyncReceiver<(u64, In)>, ctx: &StreamCtx) -> FinalRx<M> {
+    fn spawn_async_feeder<R: AsyncRuntime>(
+        self,
+        rx: AsyncReceiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<M> {
         // Recurse via `spawn_async_feeder`. When prev is `StreamStart`, this
         // returns the feeder rx unchanged as `FinalRx::Async` — letting us
         // consume it directly and skip the sync→async bridge entirely. Other
         // prev stages fall back to the default impl (bridge async→sync) and
         // end up going through the normal sync `spawn` path.
-        let prev_rx = self.prev.spawn_async_feeder(rx, ctx);
-        spawn_async_consumers::<Prev, F, In, M, Fut>(self.f, prev_rx, ctx)
+        let prev_rx = self.prev.spawn_async_feeder::<R>(rx, ctx);
+        spawn_async_consumers::<Prev, F, In, M, Fut, R>(self.f, prev_rx, ctx)
     }
 }
 
@@ -1020,35 +1079,38 @@ where
 /// points: `AsyncStage::spawn_for_async` (the `spawn` path — `a_in_rx` arrives
 /// directly from `prev.spawn_for_async`) and `spawn_async_consumers` (the
 /// `spawn_async_feeder` path — `a_in_rx` is bridged from a `FinalRx` first).
-#[cfg(feature = "tokio-runtime")]
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
 #[allow(clippy::needless_pass_by_value)] // ownership transfer is intentional:
 // `f` is moved into the `Arc` shared across consumer tasks; taking it by value
 // expresses "this is the last stop for the closure".
-fn spawn_async_consumers_body<F, In, M, Fut>(
+fn spawn_async_consumers_body<F, In, M, Fut, R>(
     f: F,
     a_in_rx: AsyncReceiver<(u64, In)>,
-    ctx: &StreamCtx,
+    ctx: &StreamCtx<'_, R>,
 ) -> AsyncReceiver<(u64, M)>
 where
     F: Fn(In) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = M> + Send + 'static,
     In: Send + Unpin + 'static,
     M: Send + Unpin + 'static,
+    R: AsyncRuntime,
 {
     let concurrency = ctx.config.io_concurrency.max(1).min(ctx.n.max(1));
     let buffer = ctx.buffer_size(concurrency);
     let (a_out_tx, a_out_rx) = async_channel::<(u64, M)>(buffer);
     let pool = ctx.acquire_async().expect("failed to build async runtime");
-    let _enter = pool.handle().enter();
     let f = Arc::new(f);
     let cancel = ctx.cancel.clone();
-    let mut consumers = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
         let f = f.clone();
         let rx = a_in_rx.clone();
         let tx = a_out_tx.clone();
         let c = cancel.clone();
-        consumers.push(tokio::spawn(async move {
+        // Spawn via the runtime-agnostic backend. `pool.spawn` is the explicit
+        // spawn (tokio `Handle::spawn`, compio thread-local runtime) — it does
+        // not depend on a TLS current-runtime context, so no `enter()` guard is
+        // needed (and compio's scoped-tls `enter` has no RAII guard anyway).
+        pool.spawn(async move {
             loop {
                 let Ok((seq, item)) = rx.recv().await else {
                     break;
@@ -1061,13 +1123,10 @@ where
                     break;
                 }
             }
-        }));
+        });
     }
     drop(a_out_tx);
     drop(a_in_rx);
-    // Detach: tasks complete as channels close; we don't need the JoinHandles
-    // (output is observed via the channel).
-    drop(consumers);
     a_out_rx
 }
 
@@ -1082,35 +1141,34 @@ where
 /// not OS threads — a blocking send would stall the runtime worker.
 ///
 /// Invoked by [`AsyncStage::spawn_single`] via [`StageSpawn::spawn_single`].
-#[cfg(feature = "tokio-runtime")]
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
 #[allow(clippy::needless_pass_by_value)] // `f` is moved into the `Arc` shared
 // across consumer tasks; taking it by value expresses "this is the last stop
 // for the closure" (same rationale as `spawn_async_consumers_body`).
-fn spawn_async_consumers_body_single<F, In, M, Fut>(
+fn spawn_async_consumers_body_single<F, In, M, Fut, R>(
     f: F,
     a_in_rx: AsyncReceiver<(u64, In)>,
-    ctx: &StreamCtx,
+    ctx: &StreamCtx<'_, R>,
 ) -> MpscAsyncReceiver<(u64, M)>
 where
     F: Fn(In) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = M> + Send + 'static,
     In: Send + Unpin + 'static,
     M: Send + Unpin + 'static,
+    R: AsyncRuntime,
 {
     let concurrency = ctx.config.io_concurrency.max(1).min(ctx.n.max(1));
     let buffer = ctx.buffer_size(concurrency);
     let (a_out_tx, a_out_rx) = mpsc_async_channel::<(u64, M)>(buffer);
     let pool = ctx.acquire_async().expect("failed to build async runtime");
-    let _enter = pool.handle().enter();
     let f = Arc::new(f);
     let cancel = ctx.cancel.clone();
-    let mut consumers = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
         let f = f.clone();
         let rx = a_in_rx.clone();
         let tx = a_out_tx.clone();
         let c = cancel.clone();
-        consumers.push(tokio::spawn(async move {
+        pool.spawn(async move {
             loop {
                 let Ok((seq, item)) = rx.recv().await else {
                     break;
@@ -1123,11 +1181,10 @@ where
                     break;
                 }
             }
-        }));
+        });
     }
     drop(a_out_tx);
     drop(a_in_rx);
-    drop(consumers);
     a_out_rx
 }
 
@@ -1149,14 +1206,14 @@ where
 ///   async → async: tokio task + async `send().await` over a fully async
 ///                 channel. Blocking on the runtime worker thread would stall
 ///                 the executor, so this side stays async.
-#[cfg(feature = "tokio-runtime")]
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
 #[allow(clippy::needless_pass_by_value)] // ownership transfer is intentional:
 // `f` is moved into the `Arc` shared across consumer tasks; taking it by value
 // expresses "this is the last stop for the closure".
-fn spawn_async_consumers<Prev, F, In, M, Fut>(
+fn spawn_async_consumers<Prev, F, In, M, Fut, R>(
     f: F,
     prev_rx: FinalRx<Prev::Out>,
-    ctx: &StreamCtx,
+    ctx: &StreamCtx<'_, R>,
 ) -> FinalRx<M>
 where
     Prev: StageSpawn<In>,
@@ -1165,6 +1222,7 @@ where
     In: Send + Unpin + 'static,
     Prev::Out: Send + Unpin + 'static,
     M: Send + Unpin + 'static,
+    R: AsyncRuntime,
 {
     let buffer = ctx.buffer_size(ctx.config.io_concurrency.max(1).min(ctx.n.max(1)));
     let bridge_cancel = ctx.cancel.clone();
@@ -1220,8 +1278,7 @@ where
             // the consumer fan-out. Keep it.
             let (a_in_tx, a_in_rx) = async_channel::<(u64, Prev::Out)>(buffer);
             let pool = ctx.acquire_async().expect("failed to build async runtime");
-            let _enter = pool.handle().enter();
-            tokio::spawn(async move {
+            pool.spawn(async move {
                 while let Ok(item) = prev_async_rx.recv().await {
                     if cancel_active(bridge_cancel.as_ref()) {
                         return;
@@ -1233,19 +1290,19 @@ where
             });
             a_in_rx
         }
-        #[cfg(feature = "tokio-runtime")]
+        #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
         FinalRx::AsyncSingle(_) => {
             unreachable!("spawn_async_feeder path never produces AsyncSingle")
         }
     };
-    FinalRx::Async(spawn_async_consumers_body::<F, Prev::Out, M, Fut>(
+    FinalRx::Async(spawn_async_consumers_body::<F, Prev::Out, M, Fut, R>(
         f, a_in_rx, ctx,
     ))
 }
 
 // ── StreamPipe builder methods ──
 
-impl<S, I, O> StreamPipe<S, I, O> {
+impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// Override the default [`PipelineConfig`].
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
@@ -1274,13 +1331,27 @@ impl<S, I, O> StreamPipe<S, I, O> {
     /// [`Self::stage_async`]) reuse it across runs instead of building a
     /// transient runtime per call.
     ///
-    /// Recommended inside tight loops (e.g. criterion benches): tokio runtime
+    /// This changes the pipeline's runtime type parameter to `R2`, so a chain
+    /// built without it (defaulting to [`DefaultRuntime`]) is monomorphised to
+    /// the concrete backend you pass here.
+    ///
+    /// Recommended inside tight loops (e.g. criterion benches): runtime
     /// construction costs ~ms, which would otherwise dominate small workloads.
-    #[cfg(feature = "tokio-runtime")]
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
     #[must_use]
-    pub fn with_async_pool(mut self, pool: crate::executor::AsyncPool) -> Self {
-        self.async_pool = Some(pool);
-        self
+    pub fn with_async_pool<R2: AsyncRuntime>(self, pool: R2) -> StreamPipe<S, I, O, R2> {
+        // Rebuild with the new runtime type, transplanting every other field.
+        // The `async_pool` field is the only one whose type depends on `R`.
+        StreamPipe {
+            items: self.items,
+            stages: self.stages,
+            config: self.config,
+            cancel: self.cancel,
+            compute_pool: self.compute_pool,
+            async_pool: Some(pool),
+            ordered: self.ordered,
+            _marker: PhantomData,
+        }
     }
 
     /// Attach a custom [`ComputePool`] for sync stages. When omitted, sync
@@ -1322,7 +1393,7 @@ impl<S, I, O> StreamPipe<S, I, O> {
     pub fn stage<N>(
         self,
         f: impl Fn(O) -> N + Send + Sync + 'static,
-    ) -> StreamPipe<SyncStage<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N>
+    ) -> StreamPipe<SyncStage<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N, R>
     where
         N: Send + Unpin + 'static,
     {
@@ -1335,7 +1406,7 @@ impl<S, I, O> StreamPipe<S, I, O> {
             config: self.config,
             cancel: self.cancel,
             compute_pool: self.compute_pool,
-            #[cfg(feature = "tokio-runtime")]
+            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
             async_pool: self.async_pool,
             ordered: self.ordered,
             _marker: PhantomData,
@@ -1345,10 +1416,13 @@ impl<S, I, O> StreamPipe<S, I, O> {
     /// Append a 1-to-N expansion stage: `Fn(O) -> Vec<N>`. Each input item
     /// produces zero or more outputs (like `flat_map`); expanded items inherit
     /// the parent's sequence tag for ordered collection.
+    #[allow(clippy::type_complexity)] // typestate builder return type; the
+    // `impl Fn` + nested `ExpandStage` + `R` param are inherent to the design
+    // and not helpfully decomposable.
     pub fn expand<N>(
         self,
         f: impl Fn(O) -> Vec<N> + Send + Sync + 'static,
-    ) -> StreamPipe<ExpandStage<S, impl Fn(O) -> Vec<N> + Send + Sync + 'static>, I, N>
+    ) -> StreamPipe<ExpandStage<S, impl Fn(O) -> Vec<N> + Send + Sync + 'static>, I, N, R>
     where
         N: Send + Unpin + 'static,
     {
@@ -1361,7 +1435,7 @@ impl<S, I, O> StreamPipe<S, I, O> {
             config: self.config,
             cancel: self.cancel,
             compute_pool: self.compute_pool,
-            #[cfg(feature = "tokio-runtime")]
+            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
             async_pool: self.async_pool,
             ordered: self.ordered,
             _marker: PhantomData,
@@ -1399,7 +1473,7 @@ impl<S, I, O> StreamPipe<S, I, O> {
     ///   starts (hard isolation; max peak memory, no staging overlap).
     /// - [`FenceMode::Chunked`] releases batches as soon as they form so the
     ///   two sides overlap — the right default for mixed CPU/IO loads.
-    pub fn fence(self, mode: FenceMode) -> StreamPipe<FenceLink<S>, I, O> {
+    pub fn fence(self, mode: FenceMode) -> StreamPipe<FenceLink<S>, I, O, R> {
         StreamPipe {
             items: self.items,
             stages: FenceLink {
@@ -1409,7 +1483,7 @@ impl<S, I, O> StreamPipe<S, I, O> {
             config: self.config,
             cancel: self.cancel,
             compute_pool: self.compute_pool,
-            #[cfg(feature = "tokio-runtime")]
+            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
             async_pool: self.async_pool,
             ordered: self.ordered,
             _marker: PhantomData,
@@ -1417,18 +1491,19 @@ impl<S, I, O> StreamPipe<S, I, O> {
     }
 
     /// Append an async IO stage: `Fn(O) -> Future<Output = N>`. Runs as
-    /// `io_concurrency` tokio tasks on the [`AsyncPool`] — the runtime's M:N
-    /// scheduler multiplexes those tasks over `async_workers` OS threads, so
-    /// concurrency is bounded by `io_concurrency` (not by the thread count).
+    /// `io_concurrency` tasks on the [`AsyncRuntime`] backend — the runtime's
+    /// scheduler multiplexes those tasks over `async_workers` OS threads (M:N
+    /// for tokio; thread-per-runtime for compio), so concurrency is bounded by
+    /// `io_concurrency` (not by the thread count).
     ///
     /// For work that *blocks* the OS thread (e.g. `std::thread::sleep`), prefer
     /// [`Self::stage`]: a blocking call inside an async task stalls a runtime
     /// worker and forfeits the M:N advantage.
-    #[cfg(feature = "tokio-runtime")]
+    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
     pub fn stage_async<N, Fut>(
         self,
         f: impl Fn(O) -> Fut + Send + Sync + 'static,
-    ) -> StreamPipe<AsyncStage<S, impl Fn(O) -> Fut + Send + Sync + 'static>, I, N>
+    ) -> StreamPipe<AsyncStage<S, impl Fn(O) -> Fut + Send + Sync + 'static>, I, N, R>
     where
         N: Send + Unpin + 'static,
         Fut: Future<Output = N> + Send + 'static,
@@ -1451,7 +1526,7 @@ impl<S, I, O> StreamPipe<S, I, O> {
 
 // ── Run (execute the chain) ──
 
-impl<S, I, O> StreamPipe<S, I, O>
+impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R>
 where
     S: StageSpawn<I, Out = O>,
     I: Send + Unpin + 'static,
@@ -1466,21 +1541,21 @@ where
     /// # Panics
     ///
     /// Panics if `.ordered()` is combined with `.expand()` (see
-    /// [`FenceMode`] docs), or if the tokio runtime cannot be constructed
+    /// [`FenceMode`] docs), or if the async runtime cannot be constructed
     /// (e.g. OS thread/resource limits). To handle runtime construction
     /// failure gracefully, use [`try_run`](Self::try_run) or pass a pre-built
-    /// [`AsyncPool`] via [`with_async_pool`](Self::with_async_pool).
+    /// backend via [`with_async_pool`](Self::with_async_pool).
     pub fn run(self) -> Vec<O> {
         self.try_run().expect(
-            "StreamPipe::run: failed to build tokio runtime (OS resource limit? pass a custom \
-             AsyncPool via with_async_pool, or use try_run to handle the failure)",
+            "StreamPipe::run: failed to build async runtime (OS resource limit? pass a custom \
+             backend via with_async_pool, or use try_run to handle the failure)",
         )
     }
 
     /// Fallible counterpart to [`run`](Self::run): returns the runtime
     /// construction error instead of panicking.
     ///
-    /// The only recoverable failure today is tokio runtime construction
+    /// The only recoverable failure today is async runtime construction
     /// (e.g. OS thread/resource limits). Programming errors —
     /// `.ordered()` + `.expand()`, panics inside stage closures, feeder-thread
     /// join failures — still panic, matching the contract of every other
@@ -1489,7 +1564,7 @@ where
     /// ```rust
     /// # use youpipe::prelude::*;
     /// // Equivalent to `.run()` for sync chains — the Result matters when
-    /// // the chain contains `.stage_async(..)` and tokio runtime construction
+    /// // the chain contains `.stage_async(..)` and runtime construction
     /// // might fail.
     /// let r: Vec<i32> = (0..100).stream()
     ///     .stage(|x: i32| x + 1)
@@ -1522,7 +1597,7 @@ where
             config,
             cancel,
             compute_pool,
-            #[cfg(feature = "tokio-runtime")]
+            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
             async_pool,
             ordered,
             _marker,
@@ -1536,16 +1611,17 @@ where
         let worker_stages = stages.worker_stages().max(1);
         let per_stage_parallelism = (config.compute_workers / worker_stages).max(1);
 
-        let ctx = StreamCtx {
+        let ctx: StreamCtx<'_, R> = StreamCtx {
             config: &config,
             cancel,
             n,
             per_stage_parallelism,
             compute_pool,
-            #[cfg(feature = "tokio-runtime")]
+            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
             async_pool,
-            #[cfg(feature = "tokio-runtime")]
+            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
             cached_pool: OnceLock::new(),
+            _marker: PhantomData,
         };
 
         let buffer = ctx.buffer_size(per_stage_parallelism);
@@ -1566,46 +1642,46 @@ where
         // async (-> `spawn_async_feeder`). The sender side (`SyncSender`) is
         // the same type either way, so [`feed_items`] handles both.
         //
-        // Without `tokio-runtime`, `AsyncStage` doesn't exist, so
+        // Without any backend feature, `AsyncStage` doesn't exist, so
         // `first_consumer_is_async` can never return `Some(true)` and the
         // async branch is unreachable; the `cfg_not` block keeps the function
         // compilable in that configuration.
         let async_feeder = stages.first_consumer_is_async() == Some(true);
         let feeder_cancel = ctx.cancel.clone();
         debug_assert!(
-            cfg!(feature = "tokio-runtime") || !async_feeder,
-            "first_consumer_is_async == Some(true) requires the tokio-runtime feature"
+            cfg!(any(feature = "tokio-runtime", feature = "compio-runtime")) || !async_feeder,
+            "first_consumer_is_async == Some(true) requires an async runtime backend feature"
         );
 
-        #[cfg(feature = "tokio-runtime")]
+        #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
         let (final_rx, feeder) = if async_feeder {
             let (feeder_tx, feeder_rx) = sync_async_channel::<(u64, I)>(buffer);
             let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
-            (stages.spawn_async_feeder(feeder_rx, &ctx), feeder)
+            (stages.spawn_async_feeder::<R>(feeder_rx, &ctx), feeder)
         } else {
             let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
             let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
             // Use `spawn_single` so the terminal stage's output channel is MPSC
             // (store-based dequeue, lock-free waker registry) — the collector is
             // always the sole consumer of the final channel.
-            (stages.spawn_single(feeder_rx, &ctx), feeder)
+            (stages.spawn_single::<R>(feeder_rx, &ctx), feeder)
         };
-        #[cfg(not(feature = "tokio-runtime"))]
+        #[cfg(not(any(feature = "tokio-runtime", feature = "compio-runtime")))]
         let (final_rx, feeder) = {
             let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
             let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
-            (stages.spawn_single(feeder_rx, &ctx), feeder)
+            (stages.spawn_single::<R>(feeder_rx, &ctx), feeder)
         };
 
         let results = match final_rx {
             FinalRx::Sync(rx) => collect_sync(rx, ordered, n),
             FinalRx::SyncSingle(rx) => collect_sync(rx, ordered, n),
-            #[cfg(feature = "tokio-runtime")]
+            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
             FinalRx::Async(rx) => {
                 let pool = ctx.acquire_async()?;
                 pool.block_on(collect_async(rx, ordered, n))
             }
-            #[cfg(feature = "tokio-runtime")]
+            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
             FinalRx::AsyncSingle(rx) => {
                 let pool = ctx.acquire_async()?;
                 pool.block_on(collect_async(rx, ordered, n))
@@ -1683,7 +1759,7 @@ where
 /// This converts the per-item `await` cost into a per-burst `await` cost.
 /// For `io_async_pure` at size 500 (~450 items completing in the same ~1 ms
 /// timer tick) the savings is measurable.
-#[cfg(feature = "tokio-runtime")]
+#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
 async fn collect_async<R, T>(rx: R, ordered: bool, n: usize) -> Vec<T>
 where
     R: AsyncRecvItem<(u64, T)>,
