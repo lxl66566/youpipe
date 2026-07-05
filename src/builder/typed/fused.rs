@@ -341,7 +341,8 @@ where
 ///
 /// Implemented by [`CollectStrategy`] (`.collect()`) and [`SinkStrategy`]
 /// (`.for_each()`). Each bundles the operation + any per-op shared state (the
-/// output buffer for collect) and exposes the recursive chunk driver plus the
+/// output buffer for collect) and exposes the recursive chunk driver, the
+/// sequential leaf runner (for driver-inline participation), and the
 /// successful-chunk panic cleanup.
 trait HybridStrategy<T>: Sync {
     /// Recursively drive chunk `[start, end)`, returning `Err(first_panic)`.
@@ -357,13 +358,21 @@ trait HybridStrategy<T>: Sync {
         splits: usize,
     ) -> Result<(), PanicPayload>;
 
+    /// Run `[start, end)` sequentially on the current thread — no `pool.join`,
+    /// no scheduling. Used by the off-pool driver to participate in the work:
+    /// it processes one chunk inline while the pool handles the rest (mirrors
+    /// rayon's calling-thread participation). Panics propagate naturally to
+    /// the caller's `halt_unwinding`.
+    fn run_sequential(&self, input: &Slots<T>, start: usize, end: usize);
+
     /// Drop resources held by a *successful* chunk when some other chunk
     /// panicked, so the caller can free the shared buffers without leak or
     /// double-drop. No-op for sink-only.
     ///
     /// # Safety
     ///
-    /// `run_chunk` must have returned `Ok(())` for `[start, end)` on `input`.
+    /// `run_chunk` or `run_sequential` must have fully completed `[start, end)`
+    /// without panic.
     unsafe fn cleanup_success_chunk(&self, start: usize, end: usize);
 }
 
@@ -395,6 +404,16 @@ where
         splits: usize,
     ) -> Result<(), PanicPayload> {
         par_index_rec(pool, input, self.output, start, end, self.op, splits)
+    }
+
+    #[inline]
+    fn run_sequential(&self, input: &Slots<T>, start: usize, end: usize) {
+        // SAFETY: disjoint range — the caller (driver or leaf) owns
+        // `[start, end)` exclusively. Input slots are init; output slots
+        // are uninit.
+        let in_slice = unsafe { input.as_slice(start, end) };
+        let out_slice = unsafe { self.output.as_mut_slice(start, end) };
+        par_index_leaf(in_slice, out_slice, self.op);
     }
 
     #[inline]
@@ -430,6 +449,13 @@ where
         splits: usize,
     ) -> Result<(), PanicPayload> {
         par_for_each_rec(pool, input, start, end, self.op, splits)
+    }
+
+    #[inline]
+    fn run_sequential(&self, input: &Slots<T>, start: usize, end: usize) {
+        // SAFETY: disjoint range — the caller owns `[start, end)` exclusively.
+        let in_slice = unsafe { input.as_slice(start, end) };
+        par_for_each_leaf(in_slice, self.op);
     }
 
     #[inline]
@@ -523,10 +549,21 @@ where
 }
 
 /// Hybrid top-level dispatcher. Splits `[0, n)` into `num_chunks` contiguous
-/// ranges, injects one `ChunkJob` per range, and blocks until all complete.
-/// Returns `Err(first_panic)` if any chunk panicked (after the strategy has
-/// cleaned up the successful chunks' per-chunk resources so the caller can
-/// free the shared buffers without leak or double-drop).
+/// ranges. Chunk 0 is run **inline on the driver thread** (mirrors rayon's
+/// off-pool path where the calling thread participates); chunks 1..num_chunks
+/// are injected as `ChunkJob`s and the driver blocks until all complete.
+///
+/// Running one chunk on the driver saves 1 injector push and reduces the
+/// condvar wake cascade by 1 (the `new_injected_jobs` logic wakes
+/// `min(num_chunks - awake_but_idle, sleepers)` workers — one fewer chunk
+/// means one fewer wakee). The driver's chunk overlaps the pool's inject +
+/// processing, so it never adds to wall time. The driver never serializes
+/// more than `1/num_chunks` of the batch — the same fraction one pool worker
+/// would handle.
+///
+/// Returns `Err(first_panic)` if any chunk (driver or pool) panicked (after
+/// the strategy has cleaned up the successful chunks' per-chunk resources so
+/// the caller can free the shared buffers without leak or double-drop).
 ///
 /// Generic over [`HybridStrategy`] so both `.collect()` (`CollectStrategy`,
 /// writes an output buffer) and `.for_each()` (`SinkStrategy`, sink-only) share
@@ -552,26 +589,54 @@ where
     let chunk_log2 = num_chunks.next_power_of_two().trailing_zeros() as usize;
     let chunk_splits = splits.saturating_sub(chunk_log2);
 
-    let panic_slot: PanicSlot = Mutex::new(None);
-    let latch = CountLatch::with_count(num_chunks, None);
-
-    // Build contiguous ranges as evenly as possible (first `rem` chunks get one
-    // extra item). All ChunkJobs share ONE heap allocation (`Box<[ChunkJob]>`,
-    // frozen via `into_boxed_slice` so element addresses are stable for the
-    // injected `JobRef`s). This replaces the previous per-chunk `Box<ChunkJob>`
-    // — `num_threads` heap allocations → 1 — which was the dominant per-chunk
-    // fixed cost on small batches (notably the 1 K `for_each` gap to rayon).
-    // The borrowed `strategy` lives on the caller's stack frame (which blocks on
-    // this call until `wait_spin` returns), so the raw pointer below is valid
-    // for every chunk's `execute`.
     let chunk = n / num_chunks;
     let rem = n % num_chunks;
-    let mut jobs: Vec<ChunkJob<T, S>> = Vec::with_capacity(num_chunks);
-    let mut start = 0;
-    for i in 0..num_chunks {
+
+    // Driver-inline participation: the off-pool calling thread runs chunk 0
+    // while the pool handles the rest — mirroring rayon's off-pool path.
+    // This saves 1 injector push and reduces the condvar wake cascade by 1
+    // (the `new_injected_jobs` logic wakes one fewer sleeping worker).
+    //
+    // Guarded by `chunk_splits == 0` so the driver only runs a single leaf
+    // (≈ n/num_threads items, sub-microsecond for the small/medium batches
+    // this targets). For large batches (`chunk_splits > 0`) the driver
+    // chunk would be a multi-leaf range processed sequentially — its memory
+    // traffic competes with the pool workers' bandwidth on memory-bound
+    // workloads, which regressed `sync_lightweight` 1 M by ~3 %. Keeping
+    // the driver to leaf-size avoids that: the driver's memory footprint is
+    // ≤ 1/num_threads of the batch, the same as one pool worker's share.
+    let driver_participates = chunk_splits == 0;
+    let first_pool_chunk = usize::from(driver_participates);
+    let pool_chunks = num_chunks - first_pool_chunk;
+    // `prefers_serial` guarantees num_chunks ≥ 2 here, so pool_chunks ≥ 1.
+    let panic_slot: PanicSlot = Mutex::new(None);
+    let latch = CountLatch::with_count(pool_chunks, None);
+
+    // Build pool chunk jobs (chunks `first_pool_chunk..num_chunks`). All
+    // ChunkJobs share ONE heap allocation (`Box<[ChunkJob]>`, frozen via
+    // `into_boxed_slice` so element addresses are stable for the injected
+    // `JobRef`s). The borrowed `strategy` lives on the caller's stack frame
+    // (which blocks on this call until `wait_spin` returns), so the raw
+    // pointer below is valid for every chunk's `execute`.
+    //
+    // Chunk boundaries: chunk i covers `[i*chunk + min(i,rem), next)`. The
+    // driver (if participating) owns chunk 0 = `[0, chunk + usize::from(rem >
+    // 0)]`; pool chunks follow contiguously.
+    let driver_start;
+    let driver_end;
+    if driver_participates {
+        driver_start = 0;
+        driver_end = chunk + usize::from(rem > 0);
+    } else {
+        driver_start = 0;
+        driver_end = 0;
+    }
+    let mut jobs_vec: Vec<ChunkJob<T, S>> = Vec::with_capacity(pool_chunks);
+    let mut start = driver_end;
+    for i in first_pool_chunk..num_chunks {
         let size = chunk + usize::from(i < rem);
         let end = start + size;
-        jobs.push(ChunkJob {
+        jobs_vec.push(ChunkJob {
             input: ptr::from_ref(input),
             strategy: ptr::from_ref(strategy),
             start,
@@ -585,37 +650,60 @@ where
         start = end;
     }
     debug_assert_eq!(start, n);
-    // Freeze: capacity == len so this is a no-op realloc. The boxed slice's
-    // backing buffer outlives every chunk's `execute` (driver blocks on
-    // `wait_spin` below until the last chunk signals).
-    let jobs: Box<[ChunkJob<T, S>]> = jobs.into_boxed_slice();
+    let jobs: Box<[ChunkJob<T, S>]> = jobs_vec.into_boxed_slice();
 
-    // One batched inject: a single JEC increment + a single wake cascade,
-    // regardless of `num_chunks`. Every idle worker pops a chunk on its next
-    // `find_work` → all workers busy from t≈0. The JobRefs are produced lazily
-    // from the boxed slice (no intermediate `Vec<JobRef>` allocation).
+    // Inject pool chunks: a single JEC increment + a single wake cascade.
+    // Every idle worker pops a chunk on its next `find_work`. The JobRefs are
+    // produced lazily from the boxed slice (no intermediate `Vec<JobRef>`
+    // allocation).
     let registry = pool.registry();
-    let job_refs = jobs.iter().map(|j| unsafe { JobRef::new(ptr::from_ref(j)) });
+    let job_refs = jobs
+        .iter()
+        .map(|j| unsafe { JobRef::new(ptr::from_ref(j)) });
     registry.inject_batch(job_refs);
 
-    // Block the external thread until every chunk has signalled. `CountLatch`
-    // with no owner uses a `LockLatch` (parking-lot condvar) — correct for an
-    // off-pool caller (a pool worker must NOT take this path; see the guard in
-    // `par_index_collect` / `par_for_each`).
+    // Run chunk 0 inline on the driver thread, concurrently with the pool
+    // (only when `driver_participates`; otherwise `driver_end == 0` and the
+    // call is a no-op on an empty range). Any panic is caught by
+    // `halt_unwinding` and funnelled into the shared `panic_slot` (first
+    // writer wins). `driver_ok` tracks success for the panic-cleanup path
+    // below.
+    let mut driver_ok = false;
+    if driver_participates {
+        let driver_result = unwind::halt_unwinding(|| {
+            strategy.run_sequential(input, driver_start, driver_end);
+        });
+        match driver_result {
+            Ok(()) => driver_ok = true,
+            Err(p) => {
+                let mut slot = panic_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if slot.is_none() {
+                    *slot = Some(p);
+                }
+            }
+        }
+    }
+
+    // Block the external thread until every pool chunk has signalled.
+    // `CountLatch` with no owner uses a `LockLatch` (parking-lot condvar) —
+    // correct for an off-pool caller (a pool worker must NOT take this path;
+    // see the guard in `par_index_collect` / `par_for_each`).
     //
     // `wait_spin` instead of `wait`: spin-then-park. The condvar park/notify
-    // handshake is ~10–20 µs of fixed overhead per batch (two syscalls + a wake
-    // cascade); for small/medium batches whose own parallel work is only tens
-    // of µs that handshake dominated the wall time (the 1 K `cpu_heavy` case
-    // trailed rayon almost entirely on this). Spinning on the SeqCst counter
-    // for a bounded budget lets the last chunk's decrement land inside the spin
-    // window and skips the syscall; long waits still fall through to the
-    // condvar. See `CountLatch::wait_spin` for the synchronization argument.
+    // handshake is ~10–20 µs of fixed overhead per batch (two syscalls + a
+    // wake cascade); for small/medium batches whose own parallel work is only
+    // tens of µs that handshake dominated the wall time. Spinning on the
+    // SeqCst counter for a bounded budget lets the last chunk's decrement
+    // land inside the spin window and skips the syscall; long waits still
+    // fall through to the condvar. See `CountLatch::wait_spin` for the
+    // synchronization argument.
     latch.wait_spin();
 
-    // After `wait` returns every chunk's `execute` has run `CountLatch::set`;
-    // the SeqCst fence there carries the `succeeded` Release store into our
-    // Acquire load below.
+    // After `wait_spin` returns every pool chunk's `execute` has run
+    // `CountLatch::set`; the SeqCst fence there carries the `succeeded`
+    // Release store into our Acquire load below.
     let panic_payload = panic_slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -628,9 +716,16 @@ where
         for j in &jobs {
             if j.succeeded.load(Ordering::Acquire) {
                 // SAFETY: `succeeded` is set only after `run_chunk` returned
-                // `Ok(())`, which is the precondition of `cleanup_success_chunk`.
+                // `Ok(())`, which is the precondition of
+                // `cleanup_success_chunk`.
                 unsafe { (*j.strategy).cleanup_success_chunk(j.start, j.end) };
             }
+        }
+        // Clean up the driver chunk if it succeeded but a pool chunk panicked.
+        // SAFETY: `driver_ok` is set only after `run_sequential` completed
+        // without panic, which fully processed `[driver_start, driver_end)`.
+        if driver_ok {
+            unsafe { strategy.cleanup_success_chunk(driver_start, driver_end) };
         }
         return Err(p);
     }

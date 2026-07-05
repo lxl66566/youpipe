@@ -687,15 +687,21 @@ two changes that together removed ~11 µs of fixed overhead:
 
 The residual ~21 µs is no longer the condvar handshake — it is the inject+
 wake cascade (pushing `num_threads` JobRefs through the injector + waking the
-workers) plus the fact that the off-pool driver blocks instead of participating
-in the work the way rayon's calling thread does (rayon's `par_iter` runs inline
-on the caller). An attempt to close it by injecting a single root job (mirroring
+workers). An attempt to close it by injecting a single root job (mirroring
 rayon's `join` unfold) **regressed** — the log2(num_threads) ramp-up via
-work-stealing cost more than the per-chunk overhead it saved on youpipe's st3 +
-concurrent_queue scheduler (unlike rayon's crossbeam_deque). The real win was
-eliminating the per-chunk heap allocations: all `num_threads` chunks now share
-one `Box<[ChunkJob]>` (1 allocation instead of N), which shaved a further
-~3 % off 1K–10K batches.
+work-stealing cost more than the per-chunk overhead it saved (hotpath
+confirmed `steal` at ~98 ns is not the bottleneck; the inject + wake cascade
+is). The real wins were:
+
+1. **`Box<[ChunkJob]>` consolidation**: all `num_threads` chunks share one
+   heap allocation (1 instead of N), saving the per-chunk malloc/free.
+2. **Driver-inline participation** (mirrors rayon's calling thread): chunk 0
+   runs on the off-pool driver while the pool handles chunks 1..N. This saves
+   1 injector push and reduces the condvar wake cascade by 1. Guarded by
+   `chunk_splits == 0` (small/medium batches where the chunk is a single leaf)
+   to avoid memory-bandwidth contention on large memory-bound workloads.
+
+Together these shaved ~5–8 % off 1K–10K `collect` batches.
 
 An earlier version silently routed small batches to a serial loop to win this
 benchmark, but that was deceptive (the API promises parallelism) and
