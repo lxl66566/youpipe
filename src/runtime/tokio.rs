@@ -92,10 +92,10 @@ impl AsyncRuntime for TokioPool {
         F: Future<Output = ()> + Send + 'static,
     {
         // `Handle::spawn` is explicit (does not depend on the TLS current-runtime
-        // context set by `Handle::enter`), so no enter-guard is needed here —
-        // this is what lets the runtime abstraction drop the `enter()` concept
-        // entirely (compio's scoped-tls `enter` is closure-scoped and has no
-        // RAII guard, so it could not live next to tokio's guard anyway).
+        // context set by `Handle::enter`), so no enter-guard is needed here.
+        // This is what lets the runtime abstraction drop the `enter()` concept
+        // entirely — and keeps the door open for a future backend whose
+        // runtime-context mechanism has no RAII guard at all.
         self.handle.spawn(fut);
     }
 

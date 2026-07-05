@@ -72,8 +72,6 @@ pub use executor::ComputePool;
 pub use handoff::{
     AsyncReceiver, AsyncSender, Receiver, Sender, SharedWaitGroup, async_channel, channel,
 };
-#[cfg(feature = "compio-runtime")]
-pub use runtime::CompioPool;
 #[cfg(feature = "tokio-runtime")]
 pub use runtime::TokioPool;
 pub use runtime::{AsyncRuntime, DefaultRuntime, NoRuntime};

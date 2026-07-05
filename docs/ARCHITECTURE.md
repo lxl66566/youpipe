@@ -43,49 +43,33 @@ The `scope()` API allows closures to borrow stack-local variables without `'stat
 ### Async runtime
 
 Async stages (`stage_async`) run on a pluggable [`AsyncRuntime`] backend.
-The crate ships two backends, selected by feature flag:
-
-- **`tokio-runtime`** (the default): [`TokioPool`] wraps a
-  `tokio::runtime::Handle`. The runtime's M:N work-stealing scheduler
-  multiplexes `io_concurrency` tasks over `async_workers` OS threads.
-- **`compio-runtime`**: [`CompioPool`] adapts compio's **thread-local,
-  single-threaded** `Runtime` to the streaming topology via a hybrid split
-  (see `src/runtime/compio.rs` module docs): `spawn` (the `Send` consumer
-  futures) dispatches to a dedicated worker thread that owns one compio
-  runtime; `block_on` (the `!Send` collector future) runs locally on the
-  caller thread's lazily-created runtime. The two runtimes communicate purely
-  through crossfire channels — runtime-agnostic, because a crossfire wake
-  routes through compio's `Local::schedule` to the driver waker.
-
-Both may be enabled simultaneously; the caller picks the backend per
-`StreamPipe` via `.with_async_pool(pool)`, or relies on `DefaultRuntime`
-(tokio when available). Building without *any* backend feature yields a
-sync-only crate: `AsyncStage` / `stage_async` disappear, `R` defaults to
-`NoRuntime` (whose trait methods panic but are unreachable on sync-only
-chains).
+**tokio is the only concrete backend today** (`tokio-runtime` feature, the
+default; [`TokioPool`] wraps a `tokio::runtime::Handle`), but the runtime is
+abstracted so the streaming code never calls tokio APIs directly —
+`pool.spawn(fut)` / `pool.block_on(fut)` replaced the old `tokio::spawn` /
+`Handle::enter` calls. A future non-tokio backend (a thread-per-core runtime,
+monoio, …) slots in as one more `AsyncRuntime` impl without touching
+`stream.rs`.
 
 `StreamPipe<S, I, O, R: AsyncRuntime = DefaultRuntime>` is generic over the
 backend so every `spawn` / `block_on` monomorphises to the concrete type —
 zero virtual dispatch. Sync-only chains never instantiate `R`, so the
 abstraction is free for them. Callers attach a managed runtime via
-`.with_async_pool` (changing `R` to the pool's type) or let the pipeline
-build a transient one per `run()` call.
+`.with_async_pool` (changing `R` to the pool's type) or let the pipeline build
+a transient one per `run()` call.
 
-There is intentionally no runtime-specific coupling in the streaming code:
-`pool.spawn(fut)` / `pool.block_on(fut)` replaced the old direct
-`tokio::spawn` / `Handle::enter` calls. The `enter()` guard was dropped
-entirely — `Handle::spawn` is explicit (needs no TLS context), and compio's
-scoped-tls `enter` has no RAII guard so it could not live next to tokio's
-anyway. The channel layer (`crossfire`) is the runtime-agnostic bridge
-between sync and async stages under both backends.
+The `enter()` guard was dropped entirely — `Handle::spawn` is explicit (needs
+no TLS current-runtime context), and a future backend whose context mechanism
+has no RAII guard would not have been representable alongside it. The channel
+layer (`crossfire`) keeps sync and async stages decoupled from the executor.
 
-> **compio caveat.** compio's own IO/timer primitives (`time::sleep`,
-> file/net ops) return `!Send` futures (they hold `Rc`-refs to the driver).
-> `stage_async` requires `Fut: Send` (tokio's multi-thread backend needs it),
-> so those primitives cannot appear directly inside a `stage_async` closure.
-> The streaming consumers themselves (crossfire + `Send` user logic) are
-> `Send`, so the common streaming use case works; integrating compio-native
-> IO is left to a future `!Send`-aware spawn path.
+> **Note on `block_on`'s `!Send` bound.** `collect_async` borrows crossfire's
+> MPSC async receiver (`!Sync`), so its future is `!Send`; the trait's
+> `block_on` therefore deliberately omits `F: Send`. tokio's `Handle::block_on`
+> runs the future inline on the calling thread and has no `Send` bound, so the
+> abstraction matches. A future backend that wanted to drive `block_on` on
+> another thread would have to reconcile this with the `!Send` collector
+> future.
 
 ---
 
@@ -115,8 +99,7 @@ src/
 │   └── mod.rs
 ├── runtime/          # Pluggable async-runtime backend for streaming .stage_async
 │   ├── mod.rs        # AsyncRuntime trait, NoRuntime, DefaultRuntime alias
-│   ├── tokio.rs      # TokioPool (tokio::runtime::Handle wrapper)
-│   └── compio.rs     # CompioPool (hybrid: worker-thread spawn + local block_on)
+│   └── tokio.rs      # TokioPool (tokio::runtime::Handle wrapper)
 ├── state/            # Ordered output & streaming execution
 │   ├── reorder.rs    # ReorderBuffer<T> (bitmask slot array for restoring ordered output)
 │   ├── fence.rs      # FenceBarrier<T> (configurable chunk_size barrier)
@@ -451,14 +434,13 @@ stages so `.run()` divides `compute_workers` across sync stages, preventing the
 
 #### Async IO stages
 
-`.stage_async()` is gated behind any backend feature (`tokio-runtime` or
-`compio-runtime`). It runs an IO stage as **`io_concurrency` async tasks** on
-an [`AsyncRuntime`] backend ([`TokioPool`] or [`CompioPool`]). The runtime's
-scheduler multiplexes those tasks over `async_workers` OS threads (M:N for
-tokio; single-threaded cooperative for compio — see `src/runtime/compio.rs`):
-each task yields its thread back to the runtime while it awaits (e.g. a timer,
-real network/disk IO), so concurrency is bounded by `io_concurrency` — **not**
-by the thread count.
+`.stage_async()` is gated behind the `tokio-runtime` feature. It runs an IO
+stage as **`io_concurrency` async tasks** on the [`AsyncRuntime`] backend
+([`TokioPool`] — a `tokio::runtime::Handle` wrapper). The runtime's M:N
+work-stealing scheduler multiplexes those tasks over `async_workers` OS
+threads: each task yields its thread back to the runtime while it awaits (e.g.
+`tokio::time::sleep`, real network/disk IO), so concurrency is bounded by
+`io_concurrency` — **not** by the thread count.
 
 This is the right tool when IO waits actually yield. For work that _blocks_ the
 OS thread (e.g. `std::thread::sleep`), a sync `.stage()` is preferable: a

@@ -1,4 +1,4 @@
-#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 use std::{future::Future, sync::OnceLock};
 use std::{marker::PhantomData, sync::Arc};
 
@@ -13,7 +13,7 @@ use crate::{
     state::{FenceBarrier, FenceMode, run_ordered_collect},
     sync::CancellationToken,
 };
-#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 use crate::{
     handoff::{
         AsyncReceiver, AsyncRecvItem, MpscAsyncReceiver, async_channel, mpsc_async_channel,
@@ -51,7 +51,7 @@ fn cancel_active(cancel: Option<&CancellationToken>) -> bool {
 /// (sync / expand / fence) follows an async stage in the chain — the previous
 /// stage's output arrives on an async channel but this stage's workers expect a
 /// sync one.
-#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
     rx: AsyncReceiver<(u64, T)>,
     ctx: &StreamCtx<'_, R>,
@@ -317,7 +317,7 @@ pub struct StreamPipe<S = StreamStart, I = (), O = (), R: AsyncRuntime = Default
     /// pool — useful for oversubscribing threads for blocking-IO sync stages
     /// (e.g. `ComputePool::new(512)` to match tokio's `spawn_blocking` pool).
     compute_pool: Option<ComputePool>,
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     async_pool: Option<R>,
     ordered: bool,
     _marker: PhantomData<(O, R)>,
@@ -343,7 +343,7 @@ where
         config: PipelineConfig::default(),
         cancel: None,
         compute_pool: None,
-        #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+        #[cfg(feature = "tokio-runtime")]
         async_pool: None,
         ordered: false,
         _marker: PhantomData,
@@ -369,9 +369,9 @@ pub struct ExpandStage<Prev, F> {
 }
 
 /// Async stage: `Fn(O) -> Future<Output = N>`, runs as `io_concurrency` tasks
-/// on the [`AsyncRuntime`](crate::AsyncRuntime) backend. Gated behind any
-/// backend feature (`tokio-runtime` or `compio-runtime`).
-#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+/// on the [`AsyncRuntime`](crate::AsyncRuntime) backend. Gated behind the
+/// `tokio-runtime` feature.
+#[cfg(feature = "tokio-runtime")]
 #[derive(Clone)]
 pub struct AsyncStage<Prev, F> {
     pub(super) prev: Prev,
@@ -473,7 +473,7 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     /// The default implementation bridges `AsyncReceiver → Receiver` (one
     /// tokio task) and delegates to [`Self::spawn`]. Stages whose immediate
     /// consumer is async should override to skip the bridge.
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     fn spawn_async_feeder<R: AsyncRuntime>(
         self,
         rx: AsyncReceiver<(u64, In)>,
@@ -512,7 +512,7 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     /// regardless of whether the preceding stage is sync or async: each stage
     /// picks the channel kind that lets its producers run with the least
     /// friction (mixed-mode for sync producers, fully-async for async ones).
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     fn spawn_for_async<R: AsyncRuntime>(
         self,
         rx: Receiver<(u64, In)>,
@@ -584,9 +584,9 @@ pub enum FinalRx<T: Send + Unpin + 'static> {
     /// (store-based dequeue, lock-free waker registry) because the collector
     /// is the sole consumer. Produced by [`StageSpawn::spawn_single`].
     SyncSingle(MpscReceiver<(u64, T)>),
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     Async(AsyncReceiver<(u64, T)>),
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     AsyncSingle(MpscAsyncReceiver<(u64, T)>),
 }
 
@@ -595,10 +595,7 @@ pub enum FinalRx<T: Send + Unpin + 'static> {
 /// [`StageSpawn::spawn`] never produces `SyncSingle` or `AsyncSingle` (only
 /// [`StageSpawn::spawn_single`] does), so those arms are unreachable here.
 /// Every stage's `spawn`/`spawn_single` calls this to obtain its input channel.
-#[cfg_attr(
-    not(any(feature = "tokio-runtime", feature = "compio-runtime")),
-    allow(unused_variables)
-)]
+#[cfg_attr(not(feature = "tokio-runtime"), allow(unused_variables))]
 fn finalize_prev_rx<T: Send + Unpin + 'static, R: AsyncRuntime>(
     prev_rx: FinalRx<T>,
     ctx: &StreamCtx<'_, R>,
@@ -608,9 +605,9 @@ fn finalize_prev_rx<T: Send + Unpin + 'static, R: AsyncRuntime>(
         FinalRx::SyncSingle(_) => {
             unreachable!("prev.spawn() never returns SyncSingle")
         }
-        #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+        #[cfg(feature = "tokio-runtime")]
         FinalRx::Async(r) => bridge_async_to_sync::<_, R>(r, ctx),
-        #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+        #[cfg(feature = "tokio-runtime")]
         FinalRx::AsyncSingle(_) => {
             unreachable!("prev.spawn() never returns AsyncSingle")
         }
@@ -638,7 +635,7 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// Custom compute pool (cloned from the builder's `with_compute_pool`).
     /// When `None`, sync stages use [`ComputePool::global`].
     pub compute_pool: Option<ComputePool>,
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     pub async_pool: Option<R>,
     /// Lazily-constructed runtime for this single `run()` call, used when the
     /// caller did not attach one via [`StreamPipe::with_async_pool`].
@@ -654,7 +651,7 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// runs the initializer exactly once and hands back the same outcome to
     /// every subsequent `acquire_async()` call. (`OnceLock::get_or_try_init`
     /// would be the natural fit but is still unstable as of 1.85.)
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     pub(crate) cached_pool: OnceLock<std::io::Result<R>>,
     /// Carries the backend type `R` even when no backend feature is enabled
     /// (then the `async_pool` / `cached_pool` fields don't exist, so `R`
@@ -684,7 +681,7 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     ///   [`AsyncRuntime::build_default`] and cache it in
     ///   [`StreamCtx::cached_pool`] so subsequent calls in the same `run()`
     ///   reuse the same runtime instead of paying the construction cost again.
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     pub fn acquire_async(&self) -> std::io::Result<R> {
         if let Some(p) = &self.async_pool {
             return Ok(p.clone());
@@ -717,7 +714,7 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
     fn first_consumer_is_async(&self) -> Option<bool> {
         None
     }
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     fn spawn_async_feeder<R: AsyncRuntime>(
         self,
         rx: AsyncReceiver<(u64, I)>,
@@ -787,7 +784,7 @@ where
         FinalRx::SyncSingle(out_rx)
     }
 
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     fn spawn_for_async<R: AsyncRuntime>(
         self,
         rx: Receiver<(u64, In)>,
@@ -883,7 +880,7 @@ where
         FinalRx::SyncSingle(out_rx)
     }
 
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     fn spawn_for_async<R: AsyncRuntime>(
         self,
         rx: Receiver<(u64, In)>,
@@ -958,7 +955,7 @@ where
         FinalRx::SyncSingle(fenced_rx)
     }
 
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     fn spawn_for_async<R: AsyncRuntime>(
         self,
         rx: Receiver<(u64, In)>,
@@ -994,7 +991,7 @@ where
 
 // AsyncStage<Prev, F>: recurse into prev (likely sync), bridge sync→async,
 // then spawn `io_concurrency` async tasks on the runtime.
-#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 impl<Prev, F, In, M, Fut> StageSpawn<In> for AsyncStage<Prev, F>
 where
     Prev: StageSpawn<In>,
@@ -1079,7 +1076,7 @@ where
 /// points: `AsyncStage::spawn_for_async` (the `spawn` path — `a_in_rx` arrives
 /// directly from `prev.spawn_for_async`) and `spawn_async_consumers` (the
 /// `spawn_async_feeder` path — `a_in_rx` is bridged from a `FinalRx` first).
-#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 #[allow(clippy::needless_pass_by_value)] // ownership transfer is intentional:
 // `f` is moved into the `Arc` shared across consumer tasks; taking it by value
 // expresses "this is the last stop for the closure".
@@ -1107,9 +1104,9 @@ where
         let tx = a_out_tx.clone();
         let c = cancel.clone();
         // Spawn via the runtime-agnostic backend. `pool.spawn` is the explicit
-        // spawn (tokio `Handle::spawn`, compio thread-local runtime) — it does
-        // not depend on a TLS current-runtime context, so no `enter()` guard is
-        // needed (and compio's scoped-tls `enter` has no RAII guard anyway).
+        // spawn — it does not depend on a TLS current-runtime context, so no
+        // `enter()` guard is needed (a future non-tokio backend's scoped-tls
+        // `enter` would have no RAII guard anyway).
         pool.spawn(async move {
             loop {
                 let Ok((seq, item)) = rx.recv().await else {
@@ -1141,7 +1138,7 @@ where
 /// not OS threads — a blocking send would stall the runtime worker.
 ///
 /// Invoked by [`AsyncStage::spawn_single`] via [`StageSpawn::spawn_single`].
-#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 #[allow(clippy::needless_pass_by_value)] // `f` is moved into the `Arc` shared
 // across consumer tasks; taking it by value expresses "this is the last stop
 // for the closure" (same rationale as `spawn_async_consumers_body`).
@@ -1206,7 +1203,7 @@ where
 ///   async → async: tokio task + async `send().await` over a fully async
 ///                 channel. Blocking on the runtime worker thread would stall
 ///                 the executor, so this side stays async.
-#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 #[allow(clippy::needless_pass_by_value)] // ownership transfer is intentional:
 // `f` is moved into the `Arc` shared across consumer tasks; taking it by value
 // expresses "this is the last stop for the closure".
@@ -1290,7 +1287,7 @@ where
             });
             a_in_rx
         }
-        #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+        #[cfg(feature = "tokio-runtime")]
         FinalRx::AsyncSingle(_) => {
             unreachable!("spawn_async_feeder path never produces AsyncSingle")
         }
@@ -1337,7 +1334,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     ///
     /// Recommended inside tight loops (e.g. criterion benches): runtime
     /// construction costs ~ms, which would otherwise dominate small workloads.
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     #[must_use]
     pub fn with_async_pool<R2: AsyncRuntime>(self, pool: R2) -> StreamPipe<S, I, O, R2> {
         // Rebuild with the new runtime type, transplanting every other field.
@@ -1406,7 +1403,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
             config: self.config,
             cancel: self.cancel,
             compute_pool: self.compute_pool,
-            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+            #[cfg(feature = "tokio-runtime")]
             async_pool: self.async_pool,
             ordered: self.ordered,
             _marker: PhantomData,
@@ -1435,7 +1432,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
             config: self.config,
             cancel: self.cancel,
             compute_pool: self.compute_pool,
-            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+            #[cfg(feature = "tokio-runtime")]
             async_pool: self.async_pool,
             ordered: self.ordered,
             _marker: PhantomData,
@@ -1483,7 +1480,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
             config: self.config,
             cancel: self.cancel,
             compute_pool: self.compute_pool,
-            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+            #[cfg(feature = "tokio-runtime")]
             async_pool: self.async_pool,
             ordered: self.ordered,
             _marker: PhantomData,
@@ -1492,14 +1489,13 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
 
     /// Append an async IO stage: `Fn(O) -> Future<Output = N>`. Runs as
     /// `io_concurrency` tasks on the [`AsyncRuntime`] backend — the runtime's
-    /// scheduler multiplexes those tasks over `async_workers` OS threads (M:N
-    /// for tokio; thread-per-runtime for compio), so concurrency is bounded by
-    /// `io_concurrency` (not by the thread count).
+    /// scheduler multiplexes those tasks over `async_workers` OS threads, so
+    /// concurrency is bounded by `io_concurrency` (not by the thread count).
     ///
     /// For work that *blocks* the OS thread (e.g. `std::thread::sleep`), prefer
     /// [`Self::stage`]: a blocking call inside an async task stalls a runtime
     /// worker and forfeits the M:N advantage.
-    #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+    #[cfg(feature = "tokio-runtime")]
     pub fn stage_async<N, Fut>(
         self,
         f: impl Fn(O) -> Fut + Send + Sync + 'static,
@@ -1597,7 +1593,7 @@ where
             config,
             cancel,
             compute_pool,
-            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+            #[cfg(feature = "tokio-runtime")]
             async_pool,
             ordered,
             _marker,
@@ -1617,9 +1613,9 @@ where
             n,
             per_stage_parallelism,
             compute_pool,
-            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+            #[cfg(feature = "tokio-runtime")]
             async_pool,
-            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+            #[cfg(feature = "tokio-runtime")]
             cached_pool: OnceLock::new(),
             _marker: PhantomData,
         };
@@ -1649,11 +1645,11 @@ where
         let async_feeder = stages.first_consumer_is_async() == Some(true);
         let feeder_cancel = ctx.cancel.clone();
         debug_assert!(
-            cfg!(any(feature = "tokio-runtime", feature = "compio-runtime")) || !async_feeder,
+            cfg!(feature = "tokio-runtime") || !async_feeder,
             "first_consumer_is_async == Some(true) requires an async runtime backend feature"
         );
 
-        #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+        #[cfg(feature = "tokio-runtime")]
         let (final_rx, feeder) = if async_feeder {
             let (feeder_tx, feeder_rx) = sync_async_channel::<(u64, I)>(buffer);
             let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
@@ -1666,7 +1662,7 @@ where
             // always the sole consumer of the final channel.
             (stages.spawn_single::<R>(feeder_rx, &ctx), feeder)
         };
-        #[cfg(not(any(feature = "tokio-runtime", feature = "compio-runtime")))]
+        #[cfg(not(feature = "tokio-runtime"))]
         let (final_rx, feeder) = {
             let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
             let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
@@ -1676,12 +1672,12 @@ where
         let results = match final_rx {
             FinalRx::Sync(rx) => collect_sync(rx, ordered, n),
             FinalRx::SyncSingle(rx) => collect_sync(rx, ordered, n),
-            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+            #[cfg(feature = "tokio-runtime")]
             FinalRx::Async(rx) => {
                 let pool = ctx.acquire_async()?;
                 pool.block_on(collect_async(rx, ordered, n))
             }
-            #[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+            #[cfg(feature = "tokio-runtime")]
             FinalRx::AsyncSingle(rx) => {
                 let pool = ctx.acquire_async()?;
                 pool.block_on(collect_async(rx, ordered, n))
@@ -1759,7 +1755,7 @@ where
 /// This converts the per-item `await` cost into a per-burst `await` cost.
 /// For `io_async_pure` at size 500 (~450 items completing in the same ~1 ms
 /// timer tick) the savings is measurable.
-#[cfg(any(feature = "tokio-runtime", feature = "compio-runtime"))]
+#[cfg(feature = "tokio-runtime")]
 async fn collect_async<R, T>(rx: R, ordered: bool, n: usize) -> Vec<T>
 where
     R: AsyncRecvItem<(u64, T)>,

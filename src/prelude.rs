@@ -13,8 +13,6 @@
 //! callers that prefer the function-call style or want to keep the iterator
 //! type's method namespace clean.
 
-#[cfg(feature = "compio-runtime")]
-pub use crate::runtime::CompioPool;
 #[cfg(feature = "tokio-runtime")]
 pub use crate::runtime::TokioPool;
 pub use crate::{

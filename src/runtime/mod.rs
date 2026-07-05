@@ -1,19 +1,21 @@
 //! Pluggable async runtime backend for streaming pipelines.
 //!
 //! Streaming stages that need async IO (`.stage_async(..)`) run on an
-//! [`AsyncRuntime`] — an abstraction over the concrete executor (tokio, compio,
-//! …). The fused CPU path (`pipe` / `scope`) is fully sync and never touches
-//! this trait.
+//! [`AsyncRuntime`] — an abstraction over the concrete executor. The fused CPU
+//! path (`pipe` / `scope`) is fully sync and never touches this trait.
 //!
 //! # Why a trait, not tokio directly
 //!
 //! youpipe originally called tokio APIs directly (`tokio::spawn`,
-//! `Handle::block_on`). Supporting compio — whose `Runtime` is thread-local
-//! (`!Send`, `Rc`-backed) and single-threaded — without leaking tokio types
-//! required a narrow abstraction. The runtime is touched only at
-//! **per-run** stage-assembly time (spawn `io_concurrency` consumer tasks) and
-//! once at collection (`block_on`), never in the per-item hot path, so the
-//! abstraction is cost-free in steady state.
+//! `Handle::block_on`). Introducing a narrow trait lets the streaming code
+//! describe only what it needs (spawn a fire-and-forget task; block on the
+//! collector future) and keeps the concrete executor choice out of the
+//! streaming machinery. The runtime is touched only at **per-run**
+//! stage-assembly time (spawn `io_concurrency` consumer tasks) and once at
+//! collection (`block_on`), never in the per-item hot path, so the
+//! abstraction is cost-free in steady state — and it opens the door to a
+//! future non-tokio backend (e.g. a thread-per-core runtime, monoio) without
+//! touching `stream.rs`.
 //!
 //! # Generic over the backend
 //!
@@ -25,17 +27,14 @@
 //!
 //! # Backends
 //!
-//! - [`TokioPool`] (`tokio-runtime`): wraps a `tokio::runtime::Handle`. The
-//!   runtime's M:N scheduler multiplexes many tasks over `n` OS threads.
-//! - [`CompioPool`] (`compio-runtime`): owns `n` OS threads, each with its own
-//!   thread-local compio `Runtime` (compio runtimes are `!Send`). A shared
-//!   mixed-mode channel feeds futures to whichever worker is idle; `block_on`
-//!   delegates by spawning + joining on a oneshot.
+//! - [`TokioPool`] (`tokio-runtime`, the default): wraps a
+//!   `tokio::runtime::Handle`. The runtime's M:N work-stealing scheduler
+//!   multiplexes many tasks over `n` OS threads.
 
 use std::{future::Future, pin::Pin};
 
-/// Owned, sendable future. Used internally by backends that must move a future
-/// across threads before spawning it (notably [`CompioPool`]).
+/// Owned, sendable future. Kept for backends that must move a future across
+/// threads before spawning it.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A pluggable async runtime backend for streaming pipelines.
@@ -67,11 +66,9 @@ pub trait AsyncRuntime: Clone + Send + Sync + 'static {
     /// any) does not cancel the task — termination is observed through channel
     /// disconnect, matching the streaming topology's completion model.
     ///
-    /// `F: Send` is required because the tokio multi-thread backend spawns into
-    /// a shared scheduler accessed from multiple OS threads. (compio's
-    /// thread-local backend does not need it, but the bound is harmless since
-    /// every future youpipe actually spawns — the async consumer tasks — is
-    /// `Send`.)
+    /// `F: Send` is required because the backend may spawn into a scheduler
+    /// shared across OS threads. This is harmless for the futures youpipe
+    /// actually spawns (the async consumer tasks are `Send`).
     fn spawn<F>(&self, fut: F)
     where
         F: Future<Output = ()> + Send + 'static;
@@ -80,18 +77,17 @@ pub trait AsyncRuntime: Clone + Send + Sync + 'static {
     ///
     /// Deliberately **not** `F: Send`: the collector future (`collect_async`)
     /// borrows crossfire's MPSC async receiver, which is `!Sync`, making the
-    /// future `!Send`. tokio's `Handle::block_on` has no `Send` bound, and
-    /// compio runs `block_on` on a thread-local single-threaded runtime, so
-    /// neither backend requires the future to cross a thread boundary. (An
-    /// earlier draft tried delegating compio's `block_on` to a worker thread,
-    /// but that demands `F: Send` — incompatible with the crossfire receiver.)
+    /// future `!Send`. tokio's `Handle::block_on` runs the future inline on the
+    /// calling thread and has no `Send` bound, so the abstraction matches. (A
+    /// future backend that wanted to drive `block_on` on another thread would
+    /// have to reconcile this with the `!Send` collector future.)
     fn block_on<T, F>(&self, fut: F) -> T
     where
         T: Send + 'static,
         F: Future<Output = T>;
 
-    /// Number of OS threads backing the runtime (tokio worker threads, compio
-    /// worker threads, …). Used only for reporting / sizing, not for spawning.
+    /// Number of OS threads backing the runtime. Used only for reporting /
+    /// sizing, not for spawning.
     fn num_workers(&self) -> usize;
 }
 
@@ -101,12 +97,12 @@ pub trait AsyncRuntime: Clone + Send + Sync + 'static {
 /// `.stage_async(..)`) never instantiates the runtime, so the panic paths are
 /// unreachable in that configuration. The type exists purely so that
 /// `StreamPipe<S, I, O, R = DefaultRuntime>` compiles with `R = NoRuntime` when
-/// neither `tokio-runtime` nor `compio-runtime` is on.
+/// neither backend feature is on.
 ///
 /// Adding `.stage_async(..)` to a chain requires a real backend; the builder
-/// method is feature-gated to disappear entirely unless at least one backend
-/// feature is enabled, so misuse surfaces as a compile error rather than the
-/// runtime panic here.
+/// method is feature-gated to disappear entirely unless the backend feature is
+/// enabled, so misuse surfaces as a compile error rather than the runtime panic
+/// here.
 #[derive(Clone, Copy, Debug)]
 pub struct NoRuntime;
 
@@ -114,7 +110,7 @@ impl AsyncRuntime for NoRuntime {
     fn build_default(_workers: usize) -> std::io::Result<Self> {
         panic!(
             "NoRuntime::build_default: no async runtime backend is enabled. \
-             Enable the `tokio-runtime` or `compio-runtime` feature on youpipe."
+             Enable the `tokio-runtime` feature on youpipe."
         );
     }
 
@@ -146,29 +142,19 @@ mod tokio;
 #[cfg(feature = "tokio-runtime")]
 pub use self::tokio::TokioPool;
 
-#[cfg(feature = "compio-runtime")]
-mod compio;
-
-#[cfg(feature = "compio-runtime")]
-pub use self::compio::CompioPool;
-
 /// The default runtime backend, selected by feature flags.
 ///
-/// - `tokio-runtime` (default) → [`TokioPool`]
-/// - else `compio-runtime` → [`CompioPool`]
+/// - `tokio-runtime` (the default) → [`TokioPool`]
 /// - else [`NoRuntime`] (sync-only streaming)
 #[cfg(feature = "tokio-runtime")]
 pub type DefaultRuntime = TokioPool;
 
-#[cfg(all(not(feature = "tokio-runtime"), feature = "compio-runtime"))]
-pub type DefaultRuntime = CompioPool;
-
-#[cfg(not(any(feature = "tokio-runtime", feature = "compio-runtime")))]
+#[cfg(not(feature = "tokio-runtime"))]
 pub type DefaultRuntime = NoRuntime;
 
-/// `true` iff at least one async runtime backend feature is enabled. Gates the
+/// `true` iff the async runtime backend is enabled. Gates the
 /// `stage_async` / `AsyncStage` machinery in `stream.rs`.
 #[must_use]
 pub const fn backend_enabled() -> bool {
-    cfg!(any(feature = "tokio-runtime", feature = "compio-runtime"))
+    cfg!(feature = "tokio-runtime")
 }

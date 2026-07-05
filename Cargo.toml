@@ -13,16 +13,14 @@ version      = "0.4.0"
 
 [features]
 default = ["tokio-runtime"]
-# ── Async runtime backends for streaming `.stage_async(..)` stages ──
-# At least one backend must be enabled to use async stages; the fused CPU path
-# (`pipe` / `scope`) is fully sync and needs neither. Both may be enabled
-# simultaneously — the caller picks the backend per `StreamPipe` via
-# `with_async_pool` (or relies on `DefaultRuntime`, which prefers tokio).
+# ── Async runtime backend for streaming `.stage_async(..)` stages ──
+# The fused CPU path (`pipe` / `scope`) is fully sync and needs no backend.
 #
-# `dep:` prefixes disambiguate the feature from the same-named optional
-# dependency (`compio-runtime` is both a youpipe feature and a crate).
-compio-runtime = ["dep:compio-driver", "dep:compio-runtime"]
-tokio-runtime  = ["dep:tokio"]
+# The runtime is abstracted behind `AsyncRuntime` (see `src/runtime/`): tokio
+# is the only concrete backend today, but the trait + `StreamPipe<.., R:
+# AsyncRuntime>` plumbing is kept generic so a future backend (a thread-per-core
+# runtime, monoio, …) slots in without touching the streaming code.
+tokio-runtime = ["dep:tokio"]
 # ── Optional permanent instrumentation (zero-cost when off) ──
 # `hotpath` is an optional dependency; when none of these features are enabled
 # the `#[cfg_attr(feature = "hotpath", hotpath::measure)]` probes are stripped at
@@ -37,12 +35,6 @@ hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
-# compio backend: `polling` driver is portable (no io-uring kernel requirement),
-# `time` surfaces `compio_runtime::time` so users' stage closures can call
-# `compio_runtime::time::sleep`. Switch the driver feature to `io-uring` for
-# best perf on a real Linux box.
-compio-driver    = { version = "0.12", optional = true, default-features = false, features = ["polling"] }
-compio-runtime   = { version = "0.12", optional = true, default-features = false, features = ["time"] }
 concurrent-queue = "2.5"
 crossfire        = "3.1"
 hotpath          = { version = "0.19", optional = true }
