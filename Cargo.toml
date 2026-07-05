@@ -2,7 +2,7 @@
 categories   = ["concurrency"]
 description  = "High-performance data-first pipelines with fused CPU stages and streaming async IO"
 edition      = "2024"
-exclude      = ["/docs", "/.github", "/AGENTS.md", "/.opencode", "/.vscode", "/examples"]
+exclude      = ["/docs", "/.github", "/AGENTS.md", "/.opencode", "/.vscode", "/perf"]
 keywords     = ["parallel", "pipeline", "concurrency", "map-reduce", "work-stealing"]
 license      = "Apache-2.0"
 name         = "youpipe"
@@ -74,13 +74,6 @@ name    = "unbalanced"
 [[bench]]
 harness = false
 name    = "io_async"
-
-# One-shot profiling driver: builds only with `--features hotpath`. Sets up the
-# HotpathGuard, runs a representative `pipe().map().collect()` workload, and
-# dumps a structured report. See docs/PERF_NOTES.md (#1).
-[[example]]
-name              = "hotpath_profile"
-required-features = ["hotpath"]
 
 # Examples that exercise `.stage_async` / `.with_async_pool` — only buildable
 # when the tokio runtime is enabled.

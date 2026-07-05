@@ -3,7 +3,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use crate::sync::sys::{Condvar, Mutex};
+use crate::util::sys::{Condvar, Mutex};
 
 pub struct WaitGroup {
     count: AtomicUsize,

@@ -13,7 +13,7 @@ use std::{
 };
 
 use super::registry::Registry;
-use crate::sync::sys::{Condvar, Mutex};
+use crate::util::sys::{Condvar, Mutex};
 
 /// Trait for latches that can be set. Operates on `*const Self` to allow the
 /// latch to become dangling during `set` (the waiter may wake and deallocate).

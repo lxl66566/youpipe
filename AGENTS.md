@@ -39,9 +39,9 @@ temperature: 0
 - 推荐使用 hotpath 库进行可观测的插桩性能测试，一次编写永久受益。关键路径植入 `#[cfg_attr(feature = "hotpath", hotpath::measure)]`（同步/异步函数均可用）。用法：
   ```sh
   # 人类可读表格
-  cargo run --release --example hotpath_profile --features hotpath
+  cargo run --release -p hotpath-profile
   # 结构化 JSON 落盘（便于 A/B 对比）
   HOTPATH_OUTPUT_FORMAT=json-pretty HOTPATH_OUTPUT_PATH=target/hotpath-report.json \
-  cargo run --release --example hotpath_profile --features hotpath
+  cargo run --release -p hotpath-profile
   ```
 - miri 测试：`MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo miri test`

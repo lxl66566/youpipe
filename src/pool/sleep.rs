@@ -8,9 +8,9 @@ use std::{
 };
 
 use super::latch::CoreLatch;
-use crate::{
-    sync::sys::{Condvar, Mutex},
-    util::CachePadded,
+use crate::util::{
+    CachePadded,
+    sys::{Condvar, Mutex},
 };
 
 // ── Packed counter layout ──

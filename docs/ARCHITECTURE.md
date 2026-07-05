@@ -628,7 +628,7 @@ Stage completion is signalled purely by channel disconnect (all sender clones dr
 
 ## 8. Miri Compatibility
 
-The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
+The `util/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
 | Environment | Injector mutex                                                                |
 | ----------- | ----------------------------------------------------------------------------- |
@@ -637,12 +637,12 @@ The `pool/sys` module provides a unified `Mutex` API via `cfg(miri)`:
 
 `parking_lot_core` resolves `WaitOnAddress` through `GetModuleHandleA`, a Windows foreign function Miri cannot emulate, whereas the std mutex/condvar are natively supported. The unified API lets callers write `mutex.lock()` once and stay transparent to which backend is active.
 
-### Build-profile guards (`build.rs` + `lib.rs`)
+### Build-profile guard (`lib.rs`)
 
-youpipe ships a `.cargo/config.toml` override (`opt-level=3`, `panic=unwind`) that applies inside its workspace but is **not** inherited by downstream crates. Two downstream profile settings are known to be harmful, so youpipe emits compile-time warnings when it detects them, telling the user exactly how to override them for youpipe alone via a `[build] rustflags` entry in their own `.cargo/config.toml`:
+youpipe ships a `.cargo/config.toml` override (`opt-level=3`, `panic=unwind`) that applies inside its workspace but is **not** inherited by downstream crates. Two downstream profile settings are known to be harmful; one is detected at compile time, the other is documented only:
 
 - `panic = "abort"` — disables `catch_unwind`, so the `LeafGuard` / `ForEachGuard` panic-safety paths never run; any panic inside a pool worker aborts the process instead of propagating. Detected in `lib.rs` via `#[cfg(panic = "abort")]` (the deprecated-const warning trick) — this is accurate inside the library compilation, unlike cargo's build-script `CARGO_CFG_PANIC` env var which mirrors the build-script's own panic strategy (always `unwind`), not the target crate's.
-- `opt-level = "s"` / `"z"` — disables the leaf-loop auto-vectorizer (~2× regression on the lightweight warm path). Detected in `build.rs` via the `OPT_LEVEL` env var, with `CARGO_ENCODED_RUSTFLAGS` parsing so a `[build] rustflags = ["-C", "opt-level=3"]` override suppresses the warning (no false positive in youpipe's own workspace).
+- `opt-level = "s"` / `"z"` — disables the leaf-loop auto-vectorizer (~2× regression on the lightweight warm path). No longer detected at compile time: the rationale and the `[build] rustflags = ["-C", "opt-level=3"]` override recipe live in youpipe's own `.cargo/config.toml` comment for downstream users to copy.
 
 ---
 

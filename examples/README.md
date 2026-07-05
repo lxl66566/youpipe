@@ -1,22 +1,19 @@
 # Examples
 
 Each example is a self-contained, runnable program demonstrating one feature of
-youpipe. Most are single files under `examples/` and can be run with:
+youpipe: a single file under `examples/`, run with:
 
 ```bash
 cargo run --release --example <name>
 ```
 
-Standalone packages (with their own `Cargo.toml`) live under `examples/<name>/`;
-run them from their own directory:
-
-```bash
-cd examples/<name> && cargo run --release
-```
-
 > Always use `--release` — debug builds don't exercise the work-stealing
 > scheduler or the tokio runtime realistically, and most examples compare
 > against production-grade baselines (rayon, tokio).
+
+> Heavier standalone benchmarks (multi-strategy comparisons, real-disk IO) and
+> the `hotpath` profiling driver live under `../perf/`, separate from these
+> didactic examples.
 
 ## Two equivalent API styles
 
@@ -57,8 +54,6 @@ form for explicitness; user code typically uses the prelude form.
 | Do 1-to-N flatMap-style expansion | [`nested_expand`](nested_expand.rs) | `.expand()` vs rayon `flat_map` vs std |
 | Build a multi-stage streaming CPU chain | [`stream_chain`](stream_chain.rs) | `stream().stage().stage()` vs tokio `spawn_blocking` |
 | Cancel a pipeline mid-flight | [`cancellation`](cancellation.rs) | `with_cancel(token)` aborts feeder + workers + bridges |
-| Profile internal hot paths | [`hotpath_profile`](hotpath_profile.rs) | `--features hotpath` only — per-function timing without `perf` |
-| Compare 5 strategies on a mixed CPU/IO pipeline | [`pipeline_bench`](pipeline-bench) | youpipe mixed/sync vs rayon vs tokio vs sequential |
 
 ## Detailed notes
 
@@ -152,66 +147,31 @@ canceller thread signals the token after 5 ms; the feeder, every stage worker,
 and every bridge thread check the token per iteration. In-flight items are
 drained to completion but no new items are accepted.
 
-### `hotpath_profile`
-
-Not a user-facing example — it's a one-shot profiling driver for the internal
-work-stealing pool. Builds only with `--features hotpath`:
-
-```bash
-# Human-readable table
-cargo run --release --example hotpath_profile --features hotpath
-
-# Focused scenario
-cargo run --release --example hotpath_profile --features hotpath -- 10000 heavy 200
-
-# Structured JSON for A/B comparison
-HOTPATH_OUTPUT_FORMAT=json-pretty HOTPATH_OUTPUT_PATH=target/hotpath-report.json \
-  cargo run --release --example hotpath_profile --features hotpath
-```
-
-Every `#[cfg_attr(feature = "hotpath", hotpath::measure)]` probe planted in
-`src/pool/` and `src/builder/` records call-count / latency / percentile data.
-The probes are permanent (feature-gated to no-ops in normal builds), so you
-can re-run this whenever the scheduler changes to see — without `perf` and
-without reading disassembly — exactly how many times each worker parked, how
-long each `join`/`steal`/`inject` took, and where the per-call fixed overhead
-is actually spent.
-
-### `pipeline_bench`
-
-A standalone benchmarking package that compares five strategies on the same
-heavy-tailed document processing pipeline (IO read → CPU analysis → IO write):
-
-1. **Sequential** — single-threaded baseline
-2. **Rayon** `par_iter` — batch parallel, IO blocks the thread pool
-3. **Tokio** — async IO + `spawn_blocking` for CPU (oversubscribes cores)
-4. **Youpipe all-sync** — three stages on the work-stealing compute pool
-5. **Youpipe mixed** — async IO on tokio (M:N), CPU on compute pool (← fastest)
-
-Document sizes follow a log-normal distribution (~8 KB median, 260 KB P99),
-creating realistic workload imbalance. No actual disk IO — latencies are
-simulated with `thread::sleep` / `tokio::time::sleep`. The output includes a
-profiled sequential breakdown, a ranked results table, and analysis of the
-observed differences.
-
-```bash
-cd examples/pipeline-bench && cargo run --release
-```
-
-Environment variable: `N_DOCS=2000` (change the number of documents).
-
 ## Related benchmarks
 
 The examples are didactic — they print timing comparisons but use small inputs
-and run once. For rigorous, repeatable measurements see `../benches/`:
+and run once. For rigorous, repeatable measurements see:
 
-| Bench | What it measures |
-|---|---|
-| `sync_vs_rayon` | CPU-heavy + lightweight fused `pipe` vs rayon `par_iter` |
-| `mixed_load` | Mixed CPU/IO `stream` vs `tokio::spawn_blocking` |
-| `io_async` | Async IO (pure + mixed sync+async) — yielding IO, M:N |
-| `async_vs_tokio` | Stream vs `tokio::spawn_blocking` |
-| `unbalanced` | Skewed workloads, Balanced vs Unbalanced |
-| `channel_bench` | Channel throughput vs crossbeam / std mpsc |
+- `../benches/` — criterion micro-benchmarks integrated into the workspace.
 
-Run any of them with `cargo bench --bench <name>`.
+  | Bench | What it measures |
+  |---|---|
+  | `sync_vs_rayon` | CPU-heavy + lightweight fused `pipe` vs rayon `par_iter` |
+  | `mixed_load` | Mixed CPU/IO `stream` vs `tokio::spawn_blocking` |
+  | `io_async` | Async IO (pure + mixed sync+async) — yielding IO, M:N |
+  | `async_vs_tokio` | Stream vs `tokio::spawn_blocking` |
+  | `unbalanced` | Skewed workloads, Balanced vs Unbalanced |
+  | `channel_bench` | Channel throughput vs crossbeam / std mpsc |
+
+  Run any of them with `cargo bench --bench <name>`.
+
+- `../perf/` — standalone application-level benchmark packages and the
+  `hotpath` profiling driver (not didactic; for maintainer/perf work).
+
+  | Package | What it does |
+  |---|---|
+  | `hotpath-profile` | Drives every `#[hotpath::measure]` probe under a `HotpathGuard`; per-function timing/percentiles without `perf` |
+  | `pipeline-bench` | 5-strategy comparison on a heavy-tailed document pipeline (youpipe mixed/sync vs rayon vs tokio vs sequential) |
+  | `file-encrypt-bench` | Real-disk mixed CPU/IO: read skewed-size files, zstd+AES-256-GCM, write back — youpipe vs rayon vs tokio |
+
+  Run from the repo root with `cargo run --release -p <name>`.

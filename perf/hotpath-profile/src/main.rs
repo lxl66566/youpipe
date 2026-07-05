@@ -1,24 +1,23 @@
-//! One-shot profiling driver for the work-stealing pool. Builds only with
-//! `--features hotpath` (see `Cargo.toml`'s `[[example]]` `required-features`).
-//!
-//! Every `#[hotpath::measure]` probe planted in `src/pool/` and `src/builder/`
-//! records call-count / latency / percentile data under a `HotpathGuard`.
+//! One-shot profiling driver for the work-stealing pool. Standalone package
+//! under `perf/`; depends on youpipe's `hotpath` feature, which turns every
+//! `#[hotpath::measure]` probe planted in `src/pool/` and `src/builder/` into a
+//! real per-function recorder under a `HotpathGuard`.
 //!
 //! ```text
 //! # default: sweep small→large cpu_heavy batches
-//! cargo run --release --example hotpath_profile --features hotpath
+//! cargo run --release -p hotpath-profile
 //!
 //! # focused scenario (for isolating one bottleneck):
-//! #   hotpath_profile [size] [heavy|light] [iters]
-//! cargo run --release --example hotpath_profile --features hotpath -- 10000 heavy 200
-//! cargo run --release --example hotpath_profile --features hotpath -- 1000000 light 20
+//! #   hotpath-profile [size] [heavy|light] [iters]
+//! cargo run --release -p hotpath-profile -- 10000 heavy 200
+//! cargo run --release -p hotpath-profile -- 1000000 light 20
 //! ```
 //!
 //! For machine-readable output (A/B comparisons), override without touching the
 //! code via env vars:
 //! ```text
 //! HOTPATH_OUTPUT_FORMAT=json-pretty HOTPATH_OUTPUT_PATH=target/hotpath-report.json \
-//!   cargo run --release --example hotpath_profile --features hotpath -- 1000000 light 20
+//!   cargo run --release -p hotpath-profile -- 1000000 light 20
 //! ```
 //!
 //! The probes are permanent (feature-gated to no-ops in normal builds), so you

@@ -1,0 +1,15 @@
+[package]
+description  = "One-shot profiling driver for youpipe's work-stealing pool via the hotpath feature"
+edition      = "2024"
+name         = "hotpath-profile"
+publish      = false
+rust-version = "1.85"
+version      = "0.1.0"
+
+[dependencies]
+# The `hotpath` feature turns youpipe's permanent `#[cfg_attr(feature = "hotpath",
+# hotpath::measure)]` probes into real per-function timing/alloc/CPU recorders.
+# `hotpath` must match youpipe's pinned version so the probes and the
+# `HotpathGuard` below share the same global state.
+hotpath = "0.19"
+youpipe = { path = "../..", features = ["hotpath"] }

@@ -8,7 +8,7 @@
 //! reproducible.
 //!
 //! ```text
-//! cd examples/pipeline-bench && cargo run --release
+//! cd perf/pipeline-bench && cargo run --release
 //! ```
 //!
 //! Environment:

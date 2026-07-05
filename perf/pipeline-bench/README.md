@@ -73,7 +73,7 @@
 
 ## 【复现】
 
-`cd examples/pipeline_bench && cargo run --release`
+`cd perf/pipeline-bench && cargo run --release`
 
 环境变量：
 
