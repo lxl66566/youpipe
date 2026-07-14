@@ -13,6 +13,7 @@ pub(crate) mod join;
 pub(crate) mod latch;
 pub(crate) mod registry;
 pub(crate) mod sleep;
+pub(crate) mod sleep_mask;
 pub(crate) mod unwind;
 
 pub(crate) use registry::{Registry, global_registry};

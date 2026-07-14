@@ -115,6 +115,7 @@ src/
 ├── pool/             # Rayon-style work-stealing scheduler core
 │   ├── registry.rs   # Registry, WorkerThread, find_work, steal
 │   ├── sleep.rs      # AtomicCounters sleep/wake governance
+│   ├── sleep_mask.rs # SleepMask: fixed inline [AtomicU64; N] sleeping bitmask
 │   ├── latch.rs      # CoreLatch / SpinLatch / LockLatch / CountLatch
 │   ├── job.rs        # JobRef (type-erased), StackJob, HeapJob
 │   ├── join.rs       # fork-join
@@ -518,6 +519,7 @@ Worker₃ ←→ Stealer₃
 - Built on `st3` (bounded lock-free LIFO deque): each worker has a local LIFO deque (FIFO stealing); other workers steal via `Stealer`
 - Global injector is a lock-free `concurrent_queue::ConcurrentQueue` (unbounded) that accepts externally submitted tasks and local-queue overflow
 - `EventCount`-style packed atomic counters (`pool/sleep.rs`) wake idle workers
+- `SleepMask` (`pool/sleep_mask.rs`): fixed-size inline `[AtomicU64; N]` bitmask tracking which workers are parked, so `wake_any_threads` jumps straight to set bits instead of linearly locking every worker's `is_blocked` mutex. `THREADS_BITS` is sized so the mask fits in one cache line (8 words = 64 B on 64-bit, covering up to 511 workers). The single-`AtomicUsize` predecessor silently aliased bits for `worker_index >= 64` (`1usize << 64` wraps to bit 0 in Rust) and deadlocked under heavy oversubscription; see `sleep_mask.rs` module doc.
 
 ### Task Submission Flow
 

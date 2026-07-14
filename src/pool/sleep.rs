@@ -7,7 +7,7 @@ use std::{
     thread,
 };
 
-use super::latch::CoreLatch;
+use super::{latch::CoreLatch, sleep_mask::SleepMask};
 use crate::util::{
     CachePadded,
     sys::{Condvar, Mutex},
@@ -16,8 +16,14 @@ use crate::util::{
 // ── Packed counter layout ──
 
 /// Number of bits used for each thread counter field.
+///
+/// Sized so that `SleepMask` — a `[AtomicU64; ceil(THREADS_MAX/64)]` inline
+/// array — fits in exactly one cache line: 9 bits → max 511 threads →
+/// 8 words × 8 B = 64 B. 511 covers any realistic machine (largest cloud
+/// bare-metal = 448 vCPUs). The remaining 46 bits feed the JEC, which is
+/// far more than the 32 bits the old `THREADS_BITS = 16` left.
 #[cfg(target_pointer_width = "64")]
-const THREADS_BITS: usize = 16;
+const THREADS_BITS: usize = 9;
 
 #[cfg(target_pointer_width = "32")]
 const THREADS_BITS: usize = 8;
@@ -194,12 +200,20 @@ pub(crate) struct Sleep {
     /// to exactly the set bits, so awake workers are never touched.
     ///
     /// The mask is racy by design (set in `sleep()` under the worker's own
-    /// mutex, cleared in `wake_specific_thread` under the same mutex); a
-    /// stale set bit just causes one redundant lock attempt that returns
-    /// `false`. A stale clear bit just causes a missed wake, which is
-    /// recovered by the existing JEC/`increment_jobs_event_counter_if`
-    /// retry loop (sleepers re-check `jobs_counter` before parking).
-    sleeping_mask: CachePadded<AtomicUsize>,
+    /// mutex, cleared in `wake_specific_thread` under the same mutex); a stale
+    /// set bit just causes one redundant lock attempt that returns `false`.
+    /// A stale clear bit just causes a missed wake, which is recovered by
+    /// the existing JEC/`increment_jobs_event_counter_if` retry loop
+    /// (sleepers re-check `jobs_counter` before parking).
+    ///
+    /// `CachePadded` isolates the mask on its own cache line(s). Without it,
+    /// `words[0]` shares a line with `counters` — every `set`/`clear`
+    /// (`fetch_or`/`fetch_and`) bounces the line and invalidates the hot
+    /// counter read path (every idle round does `counters.load`). A/B
+    /// measured (5-round, youpipe/rayon ratio to cancel system bias):
+    /// without padding, `sync_cpu_heavy` and `try_collect` regressed +3-5 %
+    /// on 1 k–100 k batches; with padding the regression disappears.
+    sleeping_mask: CachePadded<SleepMask>,
 }
 
 #[derive(Default)]
@@ -258,7 +272,7 @@ impl Sleep {
         Sleep {
             worker_sleep_states: (0..n_threads).map(|_| CachePadded::default()).collect(),
             counters: AtomicCounters::new(),
-            sleeping_mask: CachePadded::new(AtomicUsize::new(0)),
+            sleeping_mask: CachePadded(SleepMask::new(n_threads)),
         }
     }
 
@@ -349,15 +363,14 @@ impl Sleep {
         // `wake_specific_thread` blocks here until our `condvar.wait` releases
         // the mutex (by which point `*is_blocked == true`, so the waker finds
         // us rather than missing the wake).
-        let bit = 1usize << worker_index;
-        self.sleeping_mask.fetch_or(bit, Ordering::Release);
+        self.sleeping_mask.set(worker_index);
 
         loop {
             let counters = self.counters.load(Ordering::SeqCst);
 
             // JEC changed since we got sleepy — new work was posted. Search again.
             if counters.jobs_counter() != idle.jobs_counter {
-                self.sleeping_mask.fetch_and(!bit, Ordering::Release);
+                self.sleeping_mask.clear(worker_index);
                 idle.wake_partly();
                 latch.wake_up();
                 return;
@@ -373,7 +386,7 @@ impl Sleep {
         if has_injected_jobs() {
             self.counters.sub_sleeping_thread();
             // We never reached `condvar.wait`, so no waker cleared our bit.
-            self.sleeping_mask.fetch_and(!bit, Ordering::Release);
+            self.sleeping_mask.clear(worker_index);
         } else {
             // If we don't see an injected job (the normal case), then flag
             // ourselves as asleep and wait till we are notified.
@@ -416,7 +429,7 @@ impl Sleep {
         let counters = self
             .counters
             .increment_jobs_event_counter_if(JobsEventCounter::is_sleepy);
-        // Both values are bounded by THREADS_MAX (≤65535 on 64-bit), safe to truncate
+        // Both values are bounded by THREADS_MAX (≤511 on 64-bit), safe to truncate
         let num_awake_but_idle = counters.awake_but_idle_threads() as u32;
         let num_sleepers = counters.sleeping_threads() as u32;
 
@@ -435,27 +448,9 @@ impl Sleep {
 
     #[cold]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    fn wake_any_threads(&self, mut num_to_wake: u32) {
-        if num_to_wake == 0 {
-            return;
-        }
-        // Snapshot the sleeping mask and walk only set bits. Each bit is
-        // racing with the worker's own sleep/wake transitions, so the mask
-        // may be stale — `wake_specific_thread` re-checks `is_blocked` under
-        // the worker's mutex and returns `false` for any bit we no longer
-        // own. Reload the mask after a failed wake to pick up bits the
-        // racing sleeper just published.
-        let mut mask = self.sleeping_mask.load(Ordering::Acquire);
-        while num_to_wake > 0 && mask != 0 {
-            let i = mask.trailing_zeros() as usize;
-            mask &= !(1usize << i);
-            if self.wake_specific_thread(i) {
-                num_to_wake -= 1;
-            } else {
-                // Bit was stale; reload in case a fresh sleeper published.
-                mask = self.sleeping_mask.load(Ordering::Acquire);
-            }
-        }
+    fn wake_any_threads(&self, num_to_wake: u32) {
+        self.sleeping_mask
+            .wake_scan(num_to_wake, |i| self.wake_specific_thread(i));
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -474,8 +469,7 @@ impl Sleep {
                 *is_blocked = false;
                 // Clear the sleeping bit before notifying so concurrent
                 // `wake_any_threads` scanners don't pile onto this worker.
-                self.sleeping_mask
-                    .fetch_and(!(1 << index), Ordering::Release);
+                self.sleeping_mask.clear(index);
                 // Decrement sleeping counter here (not in the woken thread)
                 // so other posters see the updated count sooner.
                 self.counters.sub_sleeping_thread();

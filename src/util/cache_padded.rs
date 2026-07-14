@@ -3,14 +3,6 @@
 #[derive(Default)]
 pub(crate) struct CachePadded<T>(pub(crate) T);
 
-impl<T> CachePadded<T> {
-    /// Wrap `value` in its own cache line.
-    #[inline]
-    pub(crate) fn new(value: T) -> Self {
-        CachePadded(value)
-    }
-}
-
 impl<T> std::ops::Deref for CachePadded<T> {
     type Target = T;
     #[inline]
