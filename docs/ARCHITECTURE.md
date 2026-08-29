@@ -295,6 +295,14 @@ impl<S, I, O> Pipe<S, I, O> {
   *same* pool (e.g. nested `scope`), where the `CountLatch` park would
   deadlock — the single-tree `par_index_rec` runs instead. A worker of a
   *different* pool can safely take the hybrid path.
+  The dispatcher is generic only over the item type: the per-terminal
+  strategy (`CollectStrategy` / `SinkStrategy` / `TryStrategy`) crosses a
+  type-erased `ErasedStrategy` boundary (three fn pointers + a context
+  pointer). This is deliberate — a per-strategy monomorphized dispatcher
+  measurably regressed the untouched collect path via codegen-layout shifts
+  (+16…30 % at 10k–100k, A/B-measured), while the erased dispatcher compiles
+  once and its ~`num_threads` indirect calls per run are far off the hot
+  path.
 - **`MAY_FILTER == true`** — `join_fused_collect` recursively halves the `Vec`,
   each leaf filters into a per-leaf `Vec`, results merged by `extend`.
 
@@ -304,6 +312,14 @@ impl<S, I, O> Pipe<S, I, O> {
   mirroring `collect()`'s zero-allocation strategy but with `RangeTryOp` /
   `FusedTryOp` wrappers that short-circuit on `Err`. Each leaf's `TryLeafGuard`
   cleans up partial output on both panic (unwind) and error (explicit) paths.
+  Off-pool callers take the same hybrid flat/tree dispatch as `collect` /
+  `for_each` (via the `TryStrategy` impl of `HybridStrategy` — see the
+  type-erased `ErasedStrategy` note under "Hybrid dispatch"): `num_threads`
+  broad chunks injected in one `inject_batch`, every worker busy at t≈0.
+  The first `Err(e)` lands in the shared failure slot (first writer wins;
+  a panic outranks it, mirroring the tree path's unwind-through-match
+  semantics). Measured (criterion, 32-core): −48 % @ 10 k, −17 % @ 100 k vs
+  the previous single-tree path.
 - **`MAY_FILTER == true`** — `join_fused_try_collect` (Vec-merge fallback),
   short-circuiting on the first `Err` via `?` and honouring `Filter`.
 
@@ -334,7 +350,8 @@ recursing via the tree for distributed stealing. The only two differences
 from `collect` (no output buffer, no per-chunk panic cleanup) are abstracted
 behind the `SinkStrategy` impl of the `HybridStrategy` trait, so the
 chunk-layout / inject / `CountLatch::wait_spin` / panic-funnel code is
-written once and monomorphized per terminal (no vtable cost). When reached
+written once and shared with `try_collect`'s `TryStrategy` too (no vtable
+cost — see the `ErasedStrategy` note). When reached
 from a worker of the *same* pool (nested `scope`), the hybrid `CountLatch`
 park would deadlock, so it falls back to the single-tree `par_for_each_rec`.
 

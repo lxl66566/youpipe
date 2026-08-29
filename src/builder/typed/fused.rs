@@ -27,9 +27,6 @@ use crate::{
 };
 
 type PanicPayload = Box<dyn Any + Send>;
-/// Shared first-panic slot for hybrid dispatch. `halt_unwinding` catches each
-/// chunk's panic before it reaches the lock, so the mutex is never poisoned.
-type PanicSlot = Mutex<Option<PanicPayload>>;
 
 // ── Pool resolution for the fused path ──
 //
@@ -273,27 +270,33 @@ where
     let on_pool = pool.is_on_this_pool();
     let result = if on_pool {
         par_index_rec(pool, &input, &output, 0, n, op, splits)
+            .err()
+            .map(ErasedFailure::Panic)
     } else {
         let strategy = CollectStrategy {
             output: &output,
             op,
         };
-        hybrid_dispatch(pool, &input, &strategy, n, splits, num_threads)
+        hybrid_dispatch(
+            pool,
+            &input,
+            &ErasedStrategy::from(&strategy),
+            n,
+            splits,
+            num_threads,
+        )
+        .err()
     };
-    match result {
-        Ok(()) => {
-            // Input fully consumed (all uninit): dropping the box just frees
-            // memory. Output fully init: transmute into the result Vec.
-            drop(input);
-            output.into_vec()
-        }
-        Err(p) => {
-            // Recursion already dropped every live slot; freeing buffers is safe.
-            drop(input);
-            drop(output);
-            panic::resume_unwind(p);
-        }
+    if let Some(f) = result {
+        // Recursion already dropped every live slot; freeing buffers is safe.
+        drop(input);
+        drop(output);
+        resume_panic(f);
     }
+    // Input fully consumed (all uninit): dropping the box just frees memory.
+    // Output fully init: transmute into the result Vec.
+    drop(input);
+    output.into_vec()
 }
 
 // ── Hybrid flat/tree top-level dispatch ──
@@ -314,38 +317,105 @@ where
 //
 // Panic plumbing: injected jobs must NOT let a panic reach the worker's
 // `AbortIfPanic`. Each chunk's body is wrapped in `halt_unwinding`; the first
-// panic is funnelled into a shared `PanicSlot`, every chunk (success or panic)
-// decrements the `CountLatch`, and the driver — after `wait()` — drops the
-// output ranges of successful chunks (failed chunks already cleaned their own
-// ranges inside `par_index_rec`) and resumes the captured panic.
+// failure (panic, or the fallible op's first `Err`) is funnelled into a shared
+// failure slot, every chunk (success or failure) decrements the `CountLatch`,
+// and the driver — after `wait_spin()` — drops the output ranges of
+// successful chunks (failed chunks already cleaned their own ranges inside
+// the recursion) and resumes the captured failure.
 
-// ── Strategy abstraction: collect vs for_each share one dispatcher ──
+// ── Strategy abstraction: collect / for_each / try_collect share one
+// dispatcher ──
 //
 // The hybrid dispatcher's machinery (chunk layout, single `inject_batch`,
-// `CountLatch::wait_spin`, shared `PanicSlot` funnel) is identical for every
-// terminal. The only two things that differ are:
+// `CountLatch::wait_spin`, shared failure-slot funnel) is identical for every
+// terminal. The strategies differ only in:
 //
 //   1. The recursive chunk driver — `par_index_rec` writes to a shared output
-//      `Slots<R>` (`collect`); `par_for_each_rec` is sink-only (`for_each`).
-//   2. The panic cleanup — `collect` must drop successful chunks' output ranges
-//      so the caller can free the buffers; `for_each` has nothing to clean (the
-//      failed chunk's `ForEachGuard` already dropped its own unread input tail,
-//      successful chunks fully consumed their input).
+//      `Slots<R>` (`collect`); `par_for_each_rec` is sink-only (`for_each`);
+//      `par_index_try_rec` short-circuits into a shared error slot
+//      (`try_collect`'s no-filter fast path).
+//   2. The failure cleanup — `collect`/`try_collect` must drop successful
+//      chunks' output ranges so the caller can free the buffers; `for_each` has
+//      nothing to clean (the failed chunk's `ForEachGuard` already dropped its
+//      own unread input tail).
 //
-// [`HybridStrategy`] abstracts exactly those two differences so the dispatcher
-// is written once as [`hybrid_dispatch`]. Both strategies are monomorphized
-// (the trait is never used as `dyn`), so there is no vtable / indirection
-// cost on the per-chunk path; the per-item leaf loops are untouched.
+// [`HybridStrategy`] abstracts exactly those differences so the dispatcher is
+// written once as [`hybrid_dispatch`]. The strategy crosses into the
+// dispatcher behind the type-erased [`ErasedStrategy`] boundary (see its doc
+// for why — tl;dr: monomorphizing the dispatcher per strategy measurably
+// regressed the untouched collect path via codegen layout shifts), so the
+// dispatcher compiles once per `T`; the per-item leaf loops stay inside the
+// monomorphized strategy methods.
+
+/// How a hybrid-dispatched chunk (or the driver chunk) can fail.
+///
+/// For the infallible strategies (`CollectStrategy` / `SinkStrategy`) only the
+/// `Panic` variant is reachable. The fallible strategy (`TryStrategy`)
+/// additionally carries the op's first `Err(e)`.
+///
+/// A panic outranks an op failure: the single-tree path propagates a panicking
+/// leaf's unwind straight through the parent's `Result` match (discarding any
+/// sibling `Err` it was about to return), so "panic wins" reproduces the
+/// tree's observable semantics.
+enum ErasedFailure {
+    /// Op-level failure, type-erased (only produced by fallible strategies).
+    /// Boxed once per failed run — failures are cold, the boxing cost is
+    /// irrelevant.
+    Op(Box<dyn Any + Send>),
+    /// A panic payload.
+    Panic(PanicPayload),
+}
+
+impl ErasedFailure {
+    /// First-writer-wins record, except a panic always displaces a previously
+    /// recorded op failure (see the type doc for why).
+    fn record(slot: &Mutex<Option<Self>>, failure: Self) {
+        let mut slot = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (&mut *slot, failure) {
+            (None, f) | (Some(ErasedFailure::Op(_)), f @ ErasedFailure::Panic(_)) => {
+                // First failure wins — except a late panic, which displaces an
+                // earlier recorded op failure.
+                *slot = Some(f);
+            }
+            // First failure wins otherwise.
+            (Some(_), _) => {}
+        }
+    }
+}
+
+/// First-failure kind for the fallible hybrid strategy.
+enum TryFailure<E> {
+    Error(E),
+    Panic(PanicPayload),
+}
 
 /// Per-operation execution strategy for hybrid flat/tree top-level dispatch.
 ///
-/// Implemented by [`CollectStrategy`] (`.collect()`) and [`SinkStrategy`]
-/// (`.for_each()`). Each bundles the operation + any per-op shared state (the
-/// output buffer for collect) and exposes the recursive chunk driver, the
-/// sequential leaf runner (for driver-inline participation), and the
-/// successful-chunk panic cleanup.
+/// Implemented by [`CollectStrategy`] (`.collect()`), [`SinkStrategy`]
+/// (`.for_each()`), and [`TryStrategy`] (`.try_collect()`, the no-filter fast
+/// path). Each bundles the operation + any per-op shared state (the output
+/// buffer for collect) and exposes the recursive chunk driver, the sequential
+/// leaf runner (for driver-inline participation), and the successful-chunk
+/// failure cleanup.
+///
+/// The strategy is handed to [`hybrid_dispatch`] behind the type-erased
+/// [`ErasedStrategy`] boundary (three fn pointers + a context pointer), so the
+/// dispatcher and its `ChunkJob` compile exactly once per `T` instead of once
+/// per terminal. The indirect calls happen once per chunk (~`num_threads` per
+/// run), far off the per-item hot path — and keeping the dispatcher
+/// non-generic measurably matters: adding a third monomorphized instantiation
+/// for `try_collect` shifted codegen layout enough to regress the *untouched*
+/// collect path +16…30 % at 10k–100k (measured; this project is acutely
+/// layout-sensitive — see the `codegen-units = 1` note in `Cargo.toml`).
 trait HybridStrategy<T>: Sync {
-    /// Recursively drive chunk `[start, end)`, returning `Err(first_panic)`.
+    /// What a failed chunk produces. Must be `Any + Send` so the erased
+    /// boundary can box it into [`ErasedFailure::Op`] and the caller can
+    /// downcast it back.
+    type Failure: Any + Send;
+
+    /// Recursively drive chunk `[start, end)`, returning `Err(failure)`.
     /// The strategy's recursion must catch its own panics (via
     /// `unwind::halt_unwinding`) so a panicking chunk never reaches the
     /// worker's `AbortIfPanic`.
@@ -356,17 +426,22 @@ trait HybridStrategy<T>: Sync {
         start: usize,
         end: usize,
         splits: usize,
-    ) -> Result<(), PanicPayload>;
+    ) -> Result<(), Self::Failure>;
 
     /// Run `[start, end)` sequentially on the current thread — no `pool.join`,
     /// no scheduling. Used by the off-pool driver to participate in the work:
     /// it processes one chunk inline while the pool handles the rest (mirrors
     /// rayon's calling-thread participation). Panics propagate naturally to
-    /// the caller's `halt_unwinding`.
-    fn run_sequential(&self, input: &Slots<T>, start: usize, end: usize);
+    /// the caller's `halt_unwinding`; op failures come back as `Err`.
+    fn run_sequential(
+        &self,
+        input: &Slots<T>,
+        start: usize,
+        end: usize,
+    ) -> Result<(), Self::Failure>;
 
     /// Drop resources held by a *successful* chunk when some other chunk
-    /// panicked, so the caller can free the shared buffers without leak or
+    /// failed, so the caller can free the shared buffers without leak or
     /// double-drop. No-op for sink-only.
     ///
     /// # Safety
@@ -374,6 +449,64 @@ trait HybridStrategy<T>: Sync {
     /// `run_chunk` or `run_sequential` must have fully completed `[start, end)`
     /// without panic.
     unsafe fn cleanup_success_chunk(&self, start: usize, end: usize);
+}
+
+/// Signature of [`HybridStrategy::run_chunk`] behind the erased boundary.
+type ErasedRunChunk<T> =
+    unsafe fn(*const (), &ComputePool, &Slots<T>, usize, usize, usize) -> Result<(), ErasedFailure>;
+
+/// Type-erased [`HybridStrategy`] handle passed to [`hybrid_dispatch`].
+///
+/// `ctx` points at the concrete strategy living on the caller's stack frame;
+/// the fn pointers know the concrete type and cast it back. Non-capturing
+/// closures coerce to `unsafe fn` pointers, so each strategy pays one
+/// trampoline that boxes failures into [`ErasedFailure`].
+// Manual impls: derived ones would add undesired `T: Copy` bounds — the
+// phantom `T` only appears in fn-pointer signatures.
+impl<T> Clone for ErasedStrategy<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for ErasedStrategy<T> {}
+
+struct ErasedStrategy<T> {
+    ctx: *const (),
+    /// SAFETY contracts mirror the `HybridStrategy` methods.
+    run_chunk: ErasedRunChunk<T>,
+    run_sequential: unsafe fn(*const (), &Slots<T>, usize, usize) -> Result<(), ErasedFailure>,
+    cleanup_success: unsafe fn(*const (), usize, usize),
+}
+
+// SAFETY: the fn pointers only ever dereference `ctx`, which points at a
+// `HybridStrategy` (whose impl requires `Sync`) that outlives the dispatch.
+unsafe impl<T> Sync for ErasedStrategy<T> {}
+
+impl<T, S> From<&S> for ErasedStrategy<T>
+where
+    S: HybridStrategy<T>,
+{
+    fn from(strategy: &S) -> Self {
+        let ctx = ptr::from_ref(strategy).cast::<()>();
+        ErasedStrategy {
+            ctx,
+            // SAFETY: `ctx` is a valid `&S` for the duration of the dispatch
+            // (the caller's frame blocks in `hybrid_dispatch`).
+            run_chunk: |ctx, pool, input, start, end, splits| unsafe {
+                (*ctx.cast::<S>())
+                    .run_chunk(pool, input, start, end, splits)
+                    .map_err(|f| ErasedFailure::Op(Box::new(f)))
+            },
+            run_sequential: |ctx, input, start, end| unsafe {
+                (*ctx.cast::<S>())
+                    .run_sequential(input, start, end)
+                    .map_err(|f| ErasedFailure::Op(Box::new(f)))
+            },
+            cleanup_success: |ctx, start, end| unsafe {
+                (*ctx.cast::<S>()).cleanup_success_chunk(start, end);
+            },
+        }
+    }
 }
 
 /// Hybrid strategy for `.collect()`: writes outputs into a shared `Slots<R>`
@@ -394,6 +527,8 @@ where
     R: Send,
     OP: RangeOp<T, Out = R>,
 {
+    type Failure = PanicPayload;
+
     #[inline]
     fn run_chunk(
         &self,
@@ -407,13 +542,19 @@ where
     }
 
     #[inline]
-    fn run_sequential(&self, input: &Slots<T>, start: usize, end: usize) {
+    fn run_sequential(
+        &self,
+        input: &Slots<T>,
+        start: usize,
+        end: usize,
+    ) -> Result<(), PanicPayload> {
         // SAFETY: disjoint range — the caller (driver or leaf) owns
         // `[start, end)` exclusively. Input slots are init; output slots
         // are uninit.
         let in_slice = unsafe { input.as_slice(start, end) };
         let out_slice = unsafe { self.output.as_mut_slice(start, end) };
         par_index_leaf(in_slice, out_slice, self.op);
+        Ok(())
     }
 
     #[inline]
@@ -439,6 +580,8 @@ where
     T: Send,
     OP: SinkOp<T>,
 {
+    type Failure = PanicPayload;
+
     #[inline]
     fn run_chunk(
         &self,
@@ -452,10 +595,16 @@ where
     }
 
     #[inline]
-    fn run_sequential(&self, input: &Slots<T>, start: usize, end: usize) {
+    fn run_sequential(
+        &self,
+        input: &Slots<T>,
+        start: usize,
+        end: usize,
+    ) -> Result<(), PanicPayload> {
         // SAFETY: disjoint range — the caller owns `[start, end)` exclusively.
         let in_slice = unsafe { input.as_slice(start, end) };
         par_for_each_leaf(in_slice, self.op);
+        Ok(())
     }
 
     #[inline]
@@ -466,15 +615,80 @@ where
     }
 }
 
+/// Hybrid strategy for `.try_collect()`'s no-filter fast path: like
+/// [`CollectStrategy`] it writes outputs into a shared `Slots<R>` at known
+/// indices, but the chunk driver is fallible — the first `Err(e)` is funnelled
+/// into the shared [`TryFailure`] slot instead of a panic-only slot.
+///
+/// Range resolution on each failure kind:
+/// - `Ok(())` chunk — output range fully init; the driver drops it via
+///   `cleanup_success_chunk` when some other chunk failed.
+/// - `Err(e)` chunk — `par_index_try_rec`'s leaf/internal-node cleanup has
+///   already dropped every live output slot and consumed every input slot in
+///   the chunk's range, so nothing remains to clean (mirrors the panicked chunk
+///   of the infallible strategies).
+/// - Panicking chunk — unwinds through the recursion (leaf guard cleans its own
+///   partial range; sibling ranges may leak, same documented behaviour as the
+///   single-tree path).
+struct TryStrategy<'a, R, E, OP> {
+    output: &'a Slots<R>,
+    op: &'a OP,
+    _marker: PhantomData<fn(E)>,
+}
+
+impl<T, R, E, OP> HybridStrategy<T> for TryStrategy<'_, R, E, OP>
+where
+    T: Send,
+    R: Send,
+    E: Send + 'static,
+    OP: RangeTryOp<T, Out = R, Error = E>,
+{
+    type Failure = TryFailure<E>;
+
+    #[inline]
+    fn run_chunk(
+        &self,
+        pool: &ComputePool,
+        input: &Slots<T>,
+        start: usize,
+        end: usize,
+        splits: usize,
+    ) -> Result<(), TryFailure<E>> {
+        par_index_try_rec(pool, input, self.output, start, end, self.op, splits)
+            .map_err(TryFailure::Error)
+    }
+
+    #[inline]
+    fn run_sequential(
+        &self,
+        input: &Slots<T>,
+        start: usize,
+        end: usize,
+    ) -> Result<(), TryFailure<E>> {
+        // SAFETY: disjoint range — the caller (driver) owns `[start, end)`
+        // exclusively. Input slots are init; output slots are uninit.
+        let in_slice = unsafe { input.as_slice(start, end) };
+        let out_slice = unsafe { self.output.as_mut_slice(start, end) };
+        par_index_try_leaf(in_slice, out_slice, self.op).map_err(TryFailure::Error)
+    }
+
+    #[inline]
+    unsafe fn cleanup_success_chunk(&self, start: usize, end: usize) {
+        // SAFETY: caller guarantees the chunk returned `Ok(())`, so those
+        // output slots are fully init and safe to drop.
+        unsafe { self.output.drop_range(start, end) };
+    }
+}
+
 /// One top-level chunk of a hybrid-dispatched parallel operation. Stored in a
 /// single contiguous `Box<[ChunkJob]>` shared by all chunks (not individually
 /// boxed); referenced by the injected `JobRef`. Carries raw pointers to the
-/// shared `Slots`/`strategy`/`latch`/`panic_slot`, which all live on the
+/// shared `Slots`/`ErasedStrategy`/`latch`/failure slot, which all live on the
 /// driver's stack frame — sound because the driver blocks on the `CountLatch`
 /// until every chunk has executed.
-struct ChunkJob<T, S: HybridStrategy<T>> {
+struct ChunkJob<T> {
     input: *const Slots<T>,
-    strategy: *const S,
+    strategy: ErasedStrategy<T>,
     start: usize,
     end: usize,
     splits: usize,
@@ -484,9 +698,10 @@ struct ChunkJob<T, S: HybridStrategy<T>> {
     pool: *const ComputePool,
     /// Shared count latch; decremented on completion (success or panic).
     latch: *const CountLatch,
-    /// Shared first-panic slot.
-    panic_slot: *const PanicSlot,
-    /// Set `true` on success. On panic, stays `false` (the range is already
+    /// Shared first-failure slot (panic, and for fallible strategies the op's
+    /// first `Err`).
+    fail_slot: *const Mutex<Option<ErasedFailure>>,
+    /// Set `true` on success. On failure, stays `false` (the range is already
     /// cleaned up by the strategy's recursion, so the driver skips it during
     /// the Err-path teardown). Written before `latch.set`; the driver reads
     /// it after `latch.wait` returns (the latch's SeqCst provides the
@@ -497,28 +712,27 @@ struct ChunkJob<T, S: HybridStrategy<T>> {
 // SAFETY: the raw pointers reference data owned by the driver's stack frame;
 // the driver blocks on the CountLatch until every chunk finishes, so the
 // pointed-to data outlives every `execute` call. The shared `Slots`/`strategy`/
-// `pool`/`latch`/`panic_slot` are accessed from distinct workers but over
-// disjoint index ranges (`Slots`) or through `Sync` types (`S: HybridStrategy`
-// requires `Sync`, `ComputePool: Sync`, `CountLatch`, `Mutex`); each `ChunkJob`
-// itself is touched by exactly one worker (the one that pops its `JobRef`).
-unsafe impl<T: Send, S: HybridStrategy<T>> Send for ChunkJob<T, S> {}
+// `pool`/`latch`/`fail_slot` are accessed from distinct workers but over
+// disjoint index ranges (`Slots`) or through `Sync` types (`ErasedStrategy:
+// Sync`, `ComputePool: Sync`, `CountLatch`, `Mutex`); each `ChunkJob` itself
+// is touched by exactly one worker (the one that pops its `JobRef`).
+unsafe impl<T: Send> Send for ChunkJob<T> {}
 
-impl<T, S> Job for ChunkJob<T, S>
+impl<T> Job for ChunkJob<T>
 where
     T: Send,
-    S: HybridStrategy<T>,
 {
     unsafe fn execute(this: *const ()) {
         unsafe {
             let this = &*this.cast::<Self>();
             // Catch any panic so it never reaches the worker's `AbortIfPanic`.
-            // The strategy's `run_chunk` returns `Result<(), PanicPayload>`
-            // AND `join` may resume-unwrap a deeper panic through it — so
-            // `halt_unwinding` yields a nested Result that we flatten: both
-            // the propagated (outer Err) and returned (inner Err) panic
-            // payloads land in the shared slot.
+            // The erased `run_chunk` returns `Result<(), ErasedFailure>` AND
+            // `join` may resume-unwrap a deeper panic through it — both the
+            // propagated (outer `Err`) and returned (inner `Err`) failures
+            // land in the shared slot, panic outranking op failures.
             let r = unwind::halt_unwinding(|| {
-                (*this.strategy).run_chunk(
+                (this.strategy.run_chunk)(
+                    this.strategy.ctx,
                     &*this.pool,
                     &*this.input,
                     this.start,
@@ -528,21 +742,11 @@ where
             });
             match r {
                 Ok(Ok(())) => this.succeeded.store(true, Ordering::Release),
-                Ok(Err(p)) | Err(p) => {
-                    // First writer wins; `halt_unwinding` caught any panic
-                    // before we touched the lock, so the mutex is never
-                    // poisoned. `unwrap_or_else(into_inner)` keeps us robust
-                    // even if a future change violates that invariant.
-                    let mut slot = (*this.panic_slot)
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if slot.is_none() {
-                        *slot = Some(p);
-                    }
-                }
+                Ok(Err(f)) => ErasedFailure::record(&*this.fail_slot, f),
+                Err(p) => ErasedFailure::record(&*this.fail_slot, ErasedFailure::Panic(p)),
             }
             // Always signal completion so the driver wakes exactly once the
-            // last chunk finishes, regardless of success/panic mix.
+            // last chunk finishes, regardless of success/failure mix.
             CountLatch::set(this.latch);
         }
     }
@@ -561,25 +765,25 @@ where
 /// more than `1/num_chunks` of the batch — the same fraction one pool worker
 /// would handle.
 ///
-/// Returns `Err(first_panic)` if any chunk (driver or pool) panicked (after
+/// Returns `Err(first_failure)` if any chunk (driver or pool) failed (after
 /// the strategy has cleaned up the successful chunks' per-chunk resources so
-/// the caller can free the shared buffers without leak or double-drop).
+/// the caller can free the shared buffers). The caller downcasts the erased
+/// failure back to its concrete kind.
 ///
-/// Generic over [`HybridStrategy`] so both `.collect()` (`CollectStrategy`,
-/// writes an output buffer) and `.for_each()` (`SinkStrategy`, sink-only) share
-/// the same chunk layout / inject / wait / panic-funnel machinery.
+/// Non-generic over the strategy (see [`ErasedStrategy`]) so this dispatcher
+/// and `ChunkJob` compile once per `T`, serving `.collect()`, `.for_each()`,
+/// and `.try_collect()` alike.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn hybrid_dispatch<T, S>(
+fn hybrid_dispatch<T>(
     pool: &ComputePool,
     input: &Slots<T>,
-    strategy: &S,
+    strategy: &ErasedStrategy<T>,
     n: usize,
     splits: usize,
     num_threads: usize,
-) -> Result<(), PanicPayload>
+) -> Result<(), ErasedFailure>
 where
     T: Send,
-    S: HybridStrategy<T>,
 {
     // One chunk per worker → instant parallel ramp-up. Round up the split
     // depth reduction so the per-chunk tree is shallower: total leaf count
@@ -609,7 +813,7 @@ where
     let first_pool_chunk = usize::from(driver_participates);
     let pool_chunks = num_chunks - first_pool_chunk;
     // `prefers_serial` guarantees num_chunks ≥ 2 here, so pool_chunks ≥ 1.
-    let panic_slot: PanicSlot = Mutex::new(None);
+    let fail_slot: Mutex<Option<ErasedFailure>> = Mutex::new(None);
     let latch = CountLatch::with_count(pool_chunks, None);
 
     // Build pool chunk jobs (chunks `first_pool_chunk..num_chunks`). All
@@ -617,40 +821,36 @@ where
     // `into_boxed_slice` so element addresses are stable for the injected
     // `JobRef`s). The borrowed `strategy` lives on the caller's stack frame
     // (which blocks on this call until `wait_spin` returns), so the raw
-    // pointer below is valid for every chunk's `execute`.
+    // context pointer inside is valid for every chunk's `execute`.
     //
     // Chunk boundaries: chunk i covers `[i*chunk + min(i,rem), next)`. The
     // driver (if participating) owns chunk 0 = `[0, chunk + usize::from(rem >
     // 0)]`; pool chunks follow contiguously.
-    let driver_start;
-    let driver_end;
-    if driver_participates {
-        driver_start = 0;
-        driver_end = chunk + usize::from(rem > 0);
+    let (driver_start, driver_end) = if driver_participates {
+        (0, chunk + usize::from(rem > 0))
     } else {
-        driver_start = 0;
-        driver_end = 0;
-    }
-    let mut jobs_vec: Vec<ChunkJob<T, S>> = Vec::with_capacity(pool_chunks);
+        (0, 0)
+    };
+    let mut jobs_vec: Vec<ChunkJob<T>> = Vec::with_capacity(pool_chunks);
     let mut start = driver_end;
     for i in first_pool_chunk..num_chunks {
         let size = chunk + usize::from(i < rem);
         let end = start + size;
         jobs_vec.push(ChunkJob {
             input: ptr::from_ref(input),
-            strategy: ptr::from_ref(strategy),
+            strategy: *strategy,
             start,
             end,
             splits: chunk_splits,
             pool: ptr::from_ref(pool),
             latch: ptr::from_ref(&latch),
-            panic_slot: ptr::from_ref(&panic_slot),
+            fail_slot: ptr::from_ref(&fail_slot),
             succeeded: AtomicBool::new(false),
         });
         start = end;
     }
     debug_assert_eq!(start, n);
-    let jobs: Box<[ChunkJob<T, S>]> = jobs_vec.into_boxed_slice();
+    let jobs: Box<[ChunkJob<T>]> = jobs_vec.into_boxed_slice();
 
     // Inject pool chunks: a single JEC increment + a single wake cascade.
     // Every idle worker pops a chunk on its next `find_work`. The JobRefs are
@@ -665,31 +865,26 @@ where
     // Run chunk 0 inline on the driver thread, concurrently with the pool
     // (only when `driver_participates`; otherwise `driver_end == 0` and the
     // call is a no-op on an empty range). Any panic is caught by
-    // `halt_unwinding` and funnelled into the shared `panic_slot` (first
-    // writer wins). `driver_ok` tracks success for the panic-cleanup path
-    // below.
+    // `halt_unwinding` and funnelled into the shared failure slot; an op
+    // failure (fallible strategies) is recorded the same way. `driver_ok`
+    // tracks success for the failure-cleanup path below.
     let mut driver_ok = false;
     if driver_participates {
-        let driver_result = unwind::halt_unwinding(|| {
-            strategy.run_sequential(input, driver_start, driver_end);
+        let driver_result = unwind::halt_unwinding(|| unsafe {
+            (strategy.run_sequential)(strategy.ctx, input, driver_start, driver_end)
         });
         match driver_result {
-            Ok(()) => driver_ok = true,
-            Err(p) => {
-                let mut slot = panic_slot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if slot.is_none() {
-                    *slot = Some(p);
-                }
-            }
+            Ok(Ok(())) => driver_ok = true,
+            Ok(Err(f)) => ErasedFailure::record(&fail_slot, f),
+            Err(p) => ErasedFailure::record(&fail_slot, ErasedFailure::Panic(p)),
         }
     }
 
     // Block the external thread until every pool chunk has signalled.
     // `CountLatch` with no owner uses a `LockLatch` (parking-lot condvar) —
     // correct for an off-pool caller (a pool worker must NOT take this path;
-    // see the guard in `par_index_collect` / `par_for_each`).
+    // see the guard in `par_index_collect` / `par_for_each` /
+    // `par_index_try_collect`).
     //
     // `wait_spin` instead of `wait`: spin-then-park. The condvar park/notify
     // handshake is ~10–20 µs of fixed overhead per batch (two syscalls + a
@@ -704,11 +899,11 @@ where
     // After `wait_spin` returns every pool chunk's `execute` has run
     // `CountLatch::set`; the SeqCst fence there carries the `succeeded`
     // Release store into our Acquire load below.
-    let panic_payload = panic_slot
+    let failure = fail_slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    if let Some(p) = panic_payload {
+    if let Some(f) = failure {
         // Let the strategy clean up each successful chunk's per-chunk state
         // (failed chunks already cleaned their own inside the recursion's
         // internal-node / leaf-guard cleanup). After this the caller can free
@@ -716,20 +911,33 @@ where
         for j in &jobs {
             if j.succeeded.load(Ordering::Acquire) {
                 // SAFETY: `succeeded` is set only after `run_chunk` returned
-                // `Ok(())`, which is the precondition of
-                // `cleanup_success_chunk`.
-                unsafe { (*j.strategy).cleanup_success_chunk(j.start, j.end) };
+                // `Ok(())`, which is the precondition of `cleanup_success`.
+                unsafe { (j.strategy.cleanup_success)(j.strategy.ctx, j.start, j.end) };
             }
         }
-        // Clean up the driver chunk if it succeeded but a pool chunk panicked.
+        // Clean up the driver chunk if it succeeded but a pool chunk failed.
         // SAFETY: `driver_ok` is set only after `run_sequential` completed
         // without panic, which fully processed `[driver_start, driver_end)`.
         if driver_ok {
-            unsafe { strategy.cleanup_success_chunk(driver_start, driver_end) };
+            unsafe { (strategy.cleanup_success)(strategy.ctx, driver_start, driver_end) };
         }
-        return Err(p);
+        return Err(f);
     }
     Ok(())
+}
+
+/// Downcast an [`ErasedFailure`] back into the infallible strategies' only
+/// failure kind (a panic payload) and resume the unwind.
+///
+/// # Panics
+///
+/// Panics via `resume_unwind` with the captured payload.
+fn resume_panic(failure: ErasedFailure) -> ! {
+    match failure {
+        ErasedFailure::Panic(p) => panic::resume_unwind(p),
+        // Infallible strategies never record an op failure.
+        ErasedFailure::Op(_) => unreachable!("collect/for_each have no op failure"),
+    }
 }
 
 // ── Index-based parallel sink (`for_each`) — no output buffer ──
@@ -875,20 +1083,30 @@ where
     let on_pool = pool.is_on_this_pool();
     let result = if on_pool {
         par_for_each_rec(pool, &input, 0, n, op, splits)
+            .err()
+            .map(ErasedFailure::Panic)
     } else {
         let strategy = SinkStrategy { op };
-        hybrid_dispatch(pool, &input, &strategy, n, splits, num_threads)
+        hybrid_dispatch(
+            pool,
+            &input,
+            &ErasedStrategy::from(&strategy),
+            n,
+            splits,
+            num_threads,
+        )
+        .err()
     };
     match result {
-        Ok(()) => {
+        Some(f) => {
+            // Recursion already dropped every live (unread) input slot.
+            drop(input);
+            resume_panic(f);
+        }
+        None => {
             // All input slots consumed (read → uninit): dropping the box just
             // frees memory, no per-slot drops.
             drop(input);
-        }
-        Err(p) => {
-            // Recursion already dropped every live (unread) input slot.
-            drop(input);
-            panic::resume_unwind(p);
         }
     }
 }
@@ -1051,6 +1269,12 @@ where
 /// a `Vec<R>`. On error, the recursion has already dropped all init output
 /// slots; on panic, the panic propagates (and the output buffer's init slots
 /// may leak, same as `par_index_collect`).
+///
+/// Off-pool callers take the hybrid flat/tree dispatch path (shared with
+/// `collect` / `for_each` via [`TryStrategy`]): `num_threads` broad chunks
+/// injected in one `inject_batch`, every worker busy at t≈0 — no fork/join
+/// ramp-up. A same-pool caller falls back to the single tree (the hybrid
+/// `CountLatch` park would deadlock a worker of this pool).
 fn par_index_try_collect<T, R, E, OP>(
     items: Vec<T>,
     op: &OP,
@@ -1060,24 +1284,61 @@ fn par_index_try_collect<T, R, E, OP>(
 where
     T: Send,
     R: Send,
-    E: Send,
+    E: Send + 'static,
     OP: RangeTryOp<T, Out = R, Error = E>,
 {
     let n = items.len();
     debug_assert!(n > 0);
+    let num_threads = pool.num_workers();
     let input = Slots::from_vec(items);
     let output = Slots::<R>::uninit(n);
-    let result = par_index_try_rec(pool, &input, &output, 0, n, op, splits);
+
+    let on_pool = pool.is_on_this_pool();
+    let result = if on_pool {
+        par_index_try_rec(pool, &input, &output, 0, n, op, splits)
+            .map_err(|e| TryFailure::Error(e))
+            .err()
+    } else {
+        let strategy = TryStrategy {
+            output: &output,
+            op,
+            _marker: PhantomData,
+        };
+        // Downcast the erased op failure back to `TryFailure<E>`.
+        hybrid_dispatch(
+            pool,
+            &input,
+            &ErasedStrategy::from(&strategy),
+            n,
+            splits,
+            num_threads,
+        )
+        .err()
+        .map(|f| match f {
+            ErasedFailure::Op(b) => match b.downcast::<TryFailure<E>>() {
+                Ok(tf) => *tf,
+                Err(_) => unreachable!("try strategy only records TryFailure<E>"),
+            },
+            ErasedFailure::Panic(p) => TryFailure::Panic(p),
+        })
+    };
     match result {
-        Ok(()) => {
+        None => {
             drop(input);
             Ok(output.into_vec())
         }
-        Err(e) => {
+        Some(TryFailure::Error(e)) => {
             // Recursion already dropped every live output slot.
             drop(input);
             drop(output);
             Err(e)
+        }
+        Some(TryFailure::Panic(p)) => {
+            // Mirrors the single-tree path: a panic unwinds past the buffer
+            // management (init slots may leak, documented above).
+            drop(input);
+            drop(output);
+            panic::resume_unwind(p);
         }
     }
 }
