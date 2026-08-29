@@ -1,4 +1,7 @@
-use crate::{handoff::RecvItem, state::ReorderBuffer};
+use crate::{
+    handoff::{RecvItem, TryRecvError},
+    state::ReorderBuffer,
+};
 
 /// Drain `input_rx` in input-order (sequence-tagged) fashion, returning the
 /// fully ordered result vector.
@@ -10,6 +13,16 @@ use crate::{handoff::RecvItem, state::ReorderBuffer};
 ///
 /// Generic over the receiver type so it works with both MPMC (`Receiver`) and
 /// MPSC (`MpscReceiver`) channels.
+///
+/// # Burst-drain strategy
+///
+/// Mirrors the unordered collector: when multiple items land in the channel
+/// before the collector loops back (common with parallel workers finishing in
+/// bursts), a tight `try_recv` loop absorbs the burst without per-item
+/// blocking-recv overhead (condvar/park bookkeeping inside the channel on the
+/// empty path); only the first item of each burst goes through the blocking
+/// `recv()`. Ordering is unaffected — the [`ReorderBuffer`] re-sequences by
+/// `seq` regardless of arrival order.
 #[must_use]
 pub fn run_ordered_collect<R, O>(input_rx: &R, expected_items: usize) -> Vec<O>
 where
@@ -24,11 +37,25 @@ where
     let capacity = expected_items.next_power_of_two().clamp(1 << 10, 1 << 20);
     let mut buffer = ReorderBuffer::new(capacity);
     let mut results = Vec::with_capacity(expected_items);
-    while let Ok((seq, item)) = input_rx.recv() {
-        // Write directly into `results` — no per-item `Vec` allocation. See
-        // `ReorderBuffer::insert_into` for the rationale.
-        buffer.insert_into(seq, item, &mut results);
+    loop {
+        // Burst-drain: pop everything already queued without blocking.
+        loop {
+            match input_rx.try_recv() {
+                Ok((seq, item)) => buffer.insert_into(seq, item, &mut results),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => {
+                    results.extend(buffer.flush_remaining());
+                    return results;
+                }
+            }
+        }
+        // Queue drained but the channel may still be open — block for one.
+        match input_rx.recv() {
+            Ok((seq, item)) => buffer.insert_into(seq, item, &mut results),
+            Err(_) => {
+                results.extend(buffer.flush_remaining());
+                return results;
+            }
+        }
     }
-    results.extend(buffer.flush_remaining());
-    results
 }
