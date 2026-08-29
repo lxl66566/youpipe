@@ -1761,35 +1761,7 @@ where
     R: AsyncRecvItem<(u64, T)>,
     T: Send + Unpin + 'static,
 {
-    if ordered {
-        let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
-        let mut buffer = ReorderBuffer::new(capacity);
-        let mut results = Vec::with_capacity(n);
-        // Burst-drain, mirroring the unordered path below (and the sync
-        // `run_ordered_collect`): drain whatever is already queued via
-        // `try_recv` (no `await`, no waker registration), then `recv().await`
-        // exactly once to register a waker. Ordering is unaffected — the
-        // `ReorderBuffer` re-sequences by `seq` regardless of arrival order.
-        loop {
-            loop {
-                match rx.try_recv() {
-                    Ok((seq, o)) => buffer.insert_into(seq, o, &mut results),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Closed) => {
-                        results.extend(buffer.flush_remaining());
-                        return results;
-                    }
-                }
-            }
-            match rx.recv().await {
-                Ok((seq, o)) => buffer.insert_into(seq, o, &mut results),
-                Err(_) => {
-                    results.extend(buffer.flush_remaining());
-                    return results;
-                }
-            }
-        }
-    } else {
+    if !ordered {
         let mut results = Vec::with_capacity(n);
         loop {
             // Burst-drain: pop everything already queued without awaiting.
@@ -1809,6 +1781,32 @@ where
                 Ok((_, item)) => results.push(item),
                 Err(_) => return results,
             }
+        }
+    }
+    let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
+    let mut buffer = ReorderBuffer::new(capacity);
+    let mut results = Vec::with_capacity(n);
+    // Burst-drain, mirroring the unordered path above (and the sync
+    // `run_ordered_collect`): drain whatever is already queued via `try_recv`
+    // (no `await`, no waker registration), then `recv().await` exactly once to
+    // register a waker. Ordering is unaffected — the `ReorderBuffer`
+    // re-sequences by `seq` regardless of arrival order.
+    loop {
+        loop {
+            match rx.try_recv() {
+                Ok((seq, o)) => buffer.insert_into(seq, o, &mut results),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => {
+                    results.extend(buffer.flush_remaining());
+                    return results;
+                }
+            }
+        }
+        if let Ok((seq, o)) = rx.recv().await {
+            buffer.insert_into(seq, o, &mut results);
+        } else {
+            results.extend(buffer.flush_remaining());
+            return results;
         }
     }
 }

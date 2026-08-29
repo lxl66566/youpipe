@@ -1,9 +1,12 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+//! `WaitGroup`: a counter barrier used by streaming stages to track worker
+//! completion.
+//!
+//! Atomics/Mutex/Condvar come from `crate::util::sys` so the `loom` feature
+//! can swap them for simulated ones (see `sys.rs`).
 
-use crate::util::sys::{Condvar, Mutex};
+use std::sync::Arc;
+
+use crate::util::sys::{AtomicUsize, Condvar, Mutex, Ordering};
 
 pub struct WaitGroup {
     count: AtomicUsize,
@@ -84,6 +87,61 @@ impl SharedWaitGroup {
 impl Clone for SharedWaitGroup {
     fn clone(&self) -> Self {
         Self(self.0.clone())
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::util::sys::AtomicUsize;
+
+    /// Two `done()`s and a `wait()`: the waiter must observe data published
+    /// before each `done()` (the RMW release-sequence + condvar/mutex must
+    /// establish happens-before), and must not return early while count > 0.
+    #[test]
+    fn waitgroup_wakes_on_last_done_with_visibility() {
+        loom::model(|| {
+            let wg = Arc::new(WaitGroup::new());
+            wg.add(2);
+            let flag_a = Arc::new(AtomicUsize::new(0));
+            let flag_b = Arc::new(AtomicUsize::new(0));
+
+            let wa = Arc::clone(&wg);
+            let fa = Arc::clone(&flag_a);
+            let t1 = loom::thread::spawn(move || {
+                fa.store(1, Ordering::Release);
+                wa.done();
+            });
+            let wb = Arc::clone(&wg);
+            let fb = Arc::clone(&flag_b);
+            let t2 = loom::thread::spawn(move || {
+                fb.store(1, Ordering::Release);
+                wb.done();
+            });
+            wg.wait();
+            t1.join().unwrap();
+            t2.join().unwrap();
+            assert_eq!(flag_a.load(Ordering::Acquire), 1);
+            assert_eq!(flag_b.load(Ordering::Acquire), 1);
+        });
+    }
+
+    /// `add` racing with `wait`: the wait must not miss a concurrent `add`
+    /// that lands before the count's last `done`.
+    #[test]
+    fn waitgroup_add_before_wait() {
+        loom::model(|| {
+            let wg = Arc::new(WaitGroup::new());
+            wg.add(1);
+            let w = Arc::clone(&wg);
+            let t = loom::thread::spawn(move || {
+                w.done();
+            });
+            wg.wait();
+            t.join().unwrap();
+        });
     }
 }
 

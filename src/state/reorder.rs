@@ -60,6 +60,11 @@ impl<T> ReorderBuffer<T> {
     /// value. At 100 k+ items that allocation churn dominated the ordered
     /// collector's cost; this sink variant eliminates it.
     pub fn insert_into(&mut self, seq: u64, item: T, sink: &mut Vec<T>) {
+        // `seq as usize` is safe across all pointer widths: the subsequent
+        // `& self.mask` only keeps the low log2(capacity) bits, so truncation
+        // on 32-bit targets is harmless (capacity is always < 2³²).
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = (seq as usize) & self.mask;
         // Fast path: the item is exactly the next expected one and its slot
         // is not aliased by an outstanding older item — push straight to the
         // sink and advance, skipping the slot write + read-back (3 stores +
@@ -71,19 +76,12 @@ impl<T> ReorderBuffer<T> {
         // (§ type-level doc) the slot for `next_expected` can only be
         // occupied by a duplicate/aliased seq, which the slow path below
         // handles.
-        if seq == self.next_expected
-            && !self.slots[(seq as usize) & self.mask].occupied
-        {
+        if seq == self.next_expected && !self.slots[idx].occupied {
             sink.push(item);
             self.next_expected += 1;
             self.flush_ready_into(sink);
             return;
         }
-        // `seq as usize` is safe across all pointer widths: the subsequent
-        // `& self.mask` only keeps the low log2(capacity) bits, so truncation
-        // on 32-bit targets is harmless (capacity is always < 2³²).
-        #[allow(clippy::cast_possible_truncation)]
-        let idx = (seq as usize) & self.mask;
         let slot = &mut self.slots[idx];
         if slot.occupied {
             // Capacity precondition violated: a different seq aliases this

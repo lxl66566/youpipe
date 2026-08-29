@@ -50,12 +50,11 @@ where
             }
         }
         // Queue drained but the channel may still be open — block for one.
-        match input_rx.recv() {
-            Ok((seq, item)) => buffer.insert_into(seq, item, &mut results),
-            Err(_) => {
-                results.extend(buffer.flush_remaining());
-                return results;
-            }
+        if let Ok((seq, item)) = input_rx.recv() {
+            buffer.insert_into(seq, item, &mut results);
+        } else {
+            results.extend(buffer.flush_remaining());
+            return results;
         }
     }
 }

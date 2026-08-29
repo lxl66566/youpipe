@@ -1,16 +1,14 @@
 //! Sleep / wake governance. Packs three counters into one `AtomicUsize` so that
 //! the fast path (posting work while threads are awake) is pure atomics — no
 //! Mutex/Condvar in the hot path. Adapted from rayon-core (RFC #5).
-
-use std::{
-    sync::atomic::{AtomicUsize, Ordering},
-    thread,
-};
+//!
+//! Atomics/Mutex/Condvar/yield come from `crate::util::sys` so the `loom`
+//! feature can swap them for simulated ones (see `sys.rs`).
 
 use super::{latch::CoreLatch, sleep_mask::SleepMask};
 use crate::util::{
     CachePadded,
-    sys::{Condvar, Mutex},
+    sys::{self, AtomicUsize, Condvar, Mutex, Ordering},
 };
 
 // ── Packed counter layout ──
@@ -172,6 +170,12 @@ impl Counters {
 
     #[inline]
     fn awake_but_idle_threads(self) -> usize {
+        // Protocol invariant: a thread only increments `sleeping` after its
+        // own `start_looking` incremented `inactive`, and its matching
+        // `work_found` (sub_inactive) runs only after its sleeping unit was
+        // removed — so `inactive >= sleeping` always holds. A violation
+        // wraps in release and silently skips wakes; catch it in debug.
+        debug_assert!(self.inactive_threads() >= self.sleeping_threads());
         self.inactive_threads() - self.sleeping_threads()
     }
 
@@ -309,12 +313,12 @@ impl Sleep {
             idle.rounds += 1;
         } else if idle.rounds < ROUNDS_UNTIL_SLEEPY {
             // Yield phase: cooperate with the OS scheduler but stay runnable.
-            thread::yield_now();
+            sys::thread_yield();
             idle.rounds += 1;
         } else if idle.rounds == ROUNDS_UNTIL_SLEEPY {
             idle.jobs_counter = self.announce_sleepy();
             idle.rounds += 1;
-            thread::yield_now();
+            sys::thread_yield();
         } else {
             self.sleep(idle, latch, has_injected_jobs);
         }
@@ -382,7 +386,7 @@ impl Sleep {
         }
 
         // Final check for injected jobs to prevent deadlock.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        sys::fence(Ordering::SeqCst);
         if has_injected_jobs() {
             self.counters.sub_sleeping_thread();
             // We never reached `condvar.wait`, so no waker cleared our bit.
@@ -411,7 +415,7 @@ impl Sleep {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn new_injected_jobs(&self, num_jobs: u32, queue_was_empty: bool) {
         // Fence guarantees sleepy/sleeping threads observe injected work.
-        std::sync::atomic::fence(Ordering::SeqCst);
+        sys::fence(Ordering::SeqCst);
         self.new_jobs(num_jobs, queue_was_empty);
     }
 
@@ -494,5 +498,132 @@ impl IdleState {
     fn wake_partly(&mut self) {
         self.rounds = ROUNDS_UNTIL_SLEEPY;
         self.jobs_counter = JobsEventCounter::DUMMY;
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::util::sys::AtomicUsize;
+
+    /// Drives `Sleep`'s full sleep/wake protocol with one sleeper and one
+    /// poster, letting loom explore every interleaving of:
+    ///
+    ///   sleeper: announce_sleepy → sleep() { get_sleepy; lock; fall_asleep;
+    ///            mask.set; counters CAS; fence; queue check; park }
+    ///   poster:  queue.store(1) → new_injected_jobs(1, true) → wake_specific
+    ///
+    /// Invariants checked by model exhaustion:
+    ///   * liveness — the sleeper always returns (no lost wake: the mask bit is
+    ///     pre-published under the `is_blocked` mutex, and the final
+    ///     `has_injected_jobs` check catches a poster that ran before the
+    ///     sleeper registered itself);
+    ///   * no leak of sleeping state — `sleeping_threads` returns to 0 and the
+    ///     sleeping mask bit is cleared on every path.
+    #[test]
+    fn sleeper_is_woken_by_injected_jobs() {
+        loom::model(|| {
+            let sleep = Arc::new(Sleep::new(2));
+            let latch = Arc::new(CoreLatch::new());
+            // Stand-in for the injector queue: the poster publishes the item
+            // BEFORE bumping the JEC, mirroring `Registry::inject`.
+            let queue = Arc::new(AtomicUsize::new(0));
+
+            let s2 = Arc::clone(&sleep);
+            let l2 = Arc::clone(&latch);
+            let q2 = Arc::clone(&queue);
+            let sleeper = loom::thread::spawn(move || {
+                // Mirror the real idle loop: start_looking (inactive++) →
+                // sleepy announce → sleep() → work_found (inactive--).
+                // Skipping start_looking would violate the sleeping ≤
+                // inactive invariant and underflow `awake_but_idle_threads`.
+                let mut idle = s2.start_looking(0);
+                idle.rounds = ROUNDS_UNTIL_SLEEPY + 1;
+                idle.jobs_counter = s2.announce_sleepy();
+                let parked = |qs: &Arc<AtomicUsize>| qs.load(Ordering::SeqCst) > 0;
+                s2.sleep(&mut idle, &l2, || parked(&q2));
+                s2.work_found();
+            });
+
+            queue.store(1, Ordering::SeqCst);
+            sleep.new_injected_jobs(1, true);
+
+            sleeper.join().unwrap();
+            let counters = sleep.counters.load(Ordering::SeqCst);
+            assert_eq!(counters.sleeping_threads(), 0, "sleeping count leaked");
+            // The latch was never SET by anyone; sleep()'s wake_up must have
+            // restored it to UNSET.
+            assert!(!latch.probe());
+        });
+    }
+
+    /// Variant C — no poster at all, the queue starts non-empty: the sleeper
+    /// must take the final `has_injected_jobs` exit and never park.
+    #[test]
+    fn sleeper_aborts_on_preexisting_queue() {
+        loom::model(|| {
+            let sleep = Arc::new(Sleep::new(2));
+            let latch = Arc::new(CoreLatch::new());
+            let queue = Arc::new(AtomicUsize::new(1));
+
+            let s2 = Arc::clone(&sleep);
+            let l2 = Arc::clone(&latch);
+            let q2 = Arc::clone(&queue);
+            loom::thread::spawn(move || {
+                let mut idle = s2.start_looking(0);
+                idle.rounds = ROUNDS_UNTIL_SLEEPY + 1;
+                idle.jobs_counter = s2.announce_sleepy();
+                s2.sleep(&mut idle, &l2, || q2.load(Ordering::SeqCst) > 0);
+                s2.work_found();
+            })
+            .join()
+            .unwrap();
+
+            let counters = sleep.counters.load(Ordering::SeqCst);
+            assert_eq!(counters.sleeping_threads(), 0, "sleeping count leaked");
+            assert!(!latch.probe());
+        });
+    }
+
+    /// Two sleepers, two injected jobs: both must be woken (the wake scan
+    /// targets `min(num_jobs - awake_idle, sleepers)` sleepers) and all
+    /// sleeping state must be reclaimed.
+    ///
+    /// Uses a preemption-bounded model — 3 threads exhaust the unbounded
+    /// explorer's practical budget; bound 2 still covers the interesting
+    /// park/wake interleavings (standard practice for larger loom models).
+    #[test]
+    fn two_sleepers_both_woken() {
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(2);
+        model.check(|| {
+            let sleep = Arc::new(Sleep::new(2));
+            let queue = Arc::new(AtomicUsize::new(0));
+
+            let mut handles = Vec::new();
+            for worker in 0..2u64 {
+                let s2 = Arc::clone(&sleep);
+                let q2 = Arc::clone(&queue);
+                handles.push(loom::thread::spawn(move || {
+                    let latch = CoreLatch::new();
+                    let mut idle = s2.start_looking(worker as usize);
+                    idle.rounds = ROUNDS_UNTIL_SLEEPY + 1;
+                    idle.jobs_counter = s2.announce_sleepy();
+                    s2.sleep(&mut idle, &latch, || q2.load(Ordering::SeqCst) > 0);
+                    s2.work_found();
+                }));
+            }
+
+            queue.store(2, Ordering::SeqCst);
+            sleep.new_injected_jobs(2, true);
+
+            for h in handles {
+                h.join().unwrap();
+            }
+            let counters = sleep.counters.load(Ordering::SeqCst);
+            assert_eq!(counters.sleeping_threads(), 0, "sleeping count leaked");
+        });
     }
 }

@@ -1,5 +1,9 @@
 /// Cache-line padded wrapper to prevent false sharing.
-#[repr(C, align(64))]
+///
+/// Under the `loom` feature the padding is dropped: the model has no cache
+/// lines to alias, and `repr(align)` around loom's simulated types only
+/// inflates the explored state.
+#[cfg_attr(not(feature = "loom"), repr(C, align(64)))]
 #[derive(Default)]
 pub(crate) struct CachePadded<T>(pub(crate) T);
 

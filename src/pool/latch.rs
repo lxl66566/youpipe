@@ -2,18 +2,14 @@
 //!
 //! A latch starts as false. Eventually `set()` makes it true. Once `probe()`
 //! returns true, all memory effects from before `set()` are visible.
+//!
+//! Atomics/Mutex/Condvar come from `crate::util::sys` so the `loom` feature
+//! can swap them for simulated ones (see `sys.rs`).
 
-use std::{
-    marker::PhantomData,
-    ops::Deref,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{marker::PhantomData, ops::Deref, sync::Arc};
 
 use super::registry::Registry;
-use crate::util::sys::{Condvar, Mutex};
+use crate::util::sys::{AtomicUsize, Condvar, Mutex, Ordering};
 
 /// Trait for latches that can be set. Operates on `*const Self` to allow the
 /// latch to become dangling during `set` (the waiter may wake and deallocate).
@@ -258,6 +254,73 @@ enum CountLatchKind {
     Blocking { latch: LockLatch },
 }
 
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use std::{ptr, sync::Arc};
+
+    use super::*;
+    use crate::util::sys::AtomicUsize;
+
+    /// The 4-state transition protocol: a sleeper may only be told "you were
+    /// sleeping" (`set` returns true) if it had actually reached SLEEPING,
+    /// and after `set` + join the latch must read SET regardless of the
+    /// interleaving.
+    #[test]
+    fn core_latch_sleep_wake_race() {
+        loom::model(|| {
+            let latch = Arc::new(CoreLatch::new());
+            let l2 = Arc::clone(&latch);
+            let sleeper = loom::thread::spawn(move || {
+                if l2.get_sleepy() && l2.fall_asleep() {
+                    // The setter always runs, so the probe eventually flips.
+                    while !l2.probe() {
+                        loom::hint::spin_loop();
+                    }
+                    l2.wake_up();
+                }
+            });
+            let was_sleeping = unsafe { CoreLatch::set(ptr::from_ref(&*latch)) };
+            sleeper.join().unwrap();
+            assert!(latch.probe(), "latch must end SET");
+            // No assertion on `was_sleeping` alone (either transition is
+            // legal), but if set() saw SLEEPING the sleeper must observe SET
+            // before returning — checked by the spin + probe above.
+            let _ = was_sleeping;
+        });
+    }
+
+    /// `CountLatch` (Blocking variant): two setters + a `wait_spin` waiter.
+    /// Relaxed data flags published by each setter must be visible after the
+    /// wait returns — the counter's SeqCst fetch_sub + LockLatch mutex must
+    /// establish the happens-before chain (loom explores the relaxed loads).
+    #[test]
+    fn count_latch_blocking_publishes_setter_writes() {
+        loom::model(|| {
+            let latch = Arc::new(CountLatch::with_count(2, None));
+            let flag_a = Arc::new(AtomicUsize::new(0));
+            let flag_b = Arc::new(AtomicUsize::new(0));
+
+            let la = Arc::clone(&latch);
+            let fa = Arc::clone(&flag_a);
+            let t1 = loom::thread::spawn(move || {
+                fa.store(1, Ordering::Release);
+                unsafe { CountLatch::set(ptr::from_ref(&*la)) };
+            });
+            let lb = Arc::clone(&latch);
+            let fb = Arc::clone(&flag_b);
+            let t2 = loom::thread::spawn(move || {
+                fb.store(1, Ordering::Release);
+                unsafe { CountLatch::set(ptr::from_ref(&*lb)) };
+            });
+            latch.wait_spin();
+            t1.join().unwrap();
+            t2.join().unwrap();
+            assert_eq!(flag_a.load(Ordering::Acquire), 1);
+            assert_eq!(flag_b.load(Ordering::Acquire), 1);
+        });
+    }
+}
+
 impl std::fmt::Debug for CountLatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.kind {
@@ -391,7 +454,14 @@ impl CountLatch {
 /// wake latency) without falling through to the condvar, small enough that a
 /// truly long wait (ms+) only burns ~100 µs of one calling-thread core before
 /// parking. See the `par_index_collect_hybrid` comment in `fused.rs`.
+///
+/// Under `loom` the budget shrinks to keep the model's state space small —
+/// the spin's only synchronization role is the final mutex acquire, which the
+/// model exercises regardless of the iteration count.
+#[cfg(not(feature = "loom"))]
 const OFF_POOL_SPIN_ITERS: usize = 4096;
+#[cfg(feature = "loom")]
+const OFF_POOL_SPIN_ITERS: usize = 2;
 
 impl Latch for CountLatch {
     #[inline]

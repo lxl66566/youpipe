@@ -19,10 +19,12 @@
 //! infinite loop in `wake_any_threads` under heavy oversubscription
 //! (`ComputePool::new(128)` on a 4-core CI runner). The fixed multi-word
 //! array gives every worker a unique bit with zero runtime cost.
-
-use std::sync::atomic::{AtomicU64, Ordering};
+//!
+//! The atomics come from `crate::util::sys` so the `loom` feature can model
+//! them (see `sys.rs`).
 
 use super::sleep::THREADS_MAX;
+use crate::util::sys::{AtomicU64, Ordering};
 
 const BITS_PER_WORD: usize = 64;
 
@@ -65,6 +67,15 @@ impl SleepMask {
     pub(crate) fn clear(&self, worker_index: usize) {
         let (word, bit) = split_index(worker_index);
         self.words[word].fetch_and(!bit, Ordering::Release);
+    }
+
+    /// `(word_index, 1u64 << bit_within_word)` for `worker_index`.
+    #[inline]
+    fn word_and_bit(worker_index: usize) -> (usize, u64) {
+        (
+            worker_index / BITS_PER_WORD,
+            1u64 << (worker_index % BITS_PER_WORD),
+        )
     }
 
     /// Scan all set bits, invoking `wake_fn(worker_index)` for each.
@@ -114,6 +125,76 @@ fn split_index(worker_index: usize) -> (usize, u64) {
     let word = worker_index / BITS_PER_WORD;
     let bit = 1u64 << (worker_index % BITS_PER_WORD);
     (word, bit)
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// Two threads set distinct bits; the scan must wake exactly the set
+    /// bits and terminate.
+    #[test]
+    fn set_then_scan_wakes_both() {
+        loom::model(|| {
+            let mask = Arc::new(SleepMask::new(64));
+            let m = Arc::clone(&mask);
+            let t = loom::thread::spawn(move || {
+                m.set(3);
+            });
+            mask.set(5);
+            t.join().unwrap();
+            let woken = mask.wake_scan(2, |i| {
+                assert!(i == 3 || i == 5, "unexpected wake of {i}");
+                mask.clear(i);
+                true
+            });
+            assert_eq!(woken, 2);
+        });
+    }
+
+    /// A stale bit (its wake_fn returns false) must be re-scanned, and with
+    /// the owner concurrently clearing it the scan must terminate — the
+    /// property that fixed the >64-thread hang documented on the type.
+    #[test]
+    fn stale_bit_with_concurrent_clear_terminates() {
+        loom::model(|| {
+            let mask = Arc::new(SleepMask::new(64));
+            mask.set(0); // "stale": wake_fn rejects it
+            mask.set(1); // real sleeper
+            let m = Arc::clone(&mask);
+            let racer = loom::thread::spawn(move || {
+                m.clear(0); // the stale bit's owner eventually clears it
+            });
+            let woken = mask.wake_scan(1, |i| {
+                mask.clear(i);
+                i != 0
+            });
+            racer.join().unwrap();
+            assert_eq!(woken, 1);
+        });
+    }
+
+    /// Clearing a bit concurrently with the scan must not cause a spurious
+    /// wake (woken counts only wake_fn successes).
+    #[test]
+    fn concurrent_clear_no_spurious_wake() {
+        loom::model(|| {
+            let mask = Arc::new(SleepMask::new(64));
+            mask.set(2);
+            let m = Arc::clone(&mask);
+            let t = loom::thread::spawn(move || {
+                m.clear(2);
+            });
+            let woken = mask.wake_scan(1, |i| {
+                mask.clear(i);
+                true
+            });
+            t.join().unwrap();
+            assert!(woken <= 1);
+        });
+    }
 }
 
 #[cfg(test)]
