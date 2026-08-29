@@ -60,6 +60,25 @@ impl<T> ReorderBuffer<T> {
     /// value. At 100 k+ items that allocation churn dominated the ordered
     /// collector's cost; this sink variant eliminates it.
     pub fn insert_into(&mut self, seq: u64, item: T, sink: &mut Vec<T>) {
+        // Fast path: the item is exactly the next expected one and its slot
+        // is not aliased by an outstanding older item — push straight to the
+        // sink and advance, skipping the slot write + read-back (3 stores +
+        // 2 loads + len bookkeeping) of the buffering path. In the in-order
+        // steady state (the common case for ordered streams under light
+        // load imbalance) this is the whole cost of re-sequencing.
+        //
+        // The `!occupied` guard is defensive: under the capacity contract
+        // (§ type-level doc) the slot for `next_expected` can only be
+        // occupied by a duplicate/aliased seq, which the slow path below
+        // handles.
+        if seq == self.next_expected
+            && !self.slots[(seq as usize) & self.mask].occupied
+        {
+            sink.push(item);
+            self.next_expected += 1;
+            self.flush_ready_into(sink);
+            return;
+        }
         // `seq as usize` is safe across all pointer widths: the subsequent
         // `& self.mask` only keeps the low log2(capacity) bits, so truncation
         // on 32-bit targets is harmless (capacity is always < 2³²).
@@ -176,6 +195,35 @@ mod tests {
         assert_eq!(buf.insert(0, 10), vec![10]);
         assert_eq!(buf.insert(1, 20), vec![20]);
         assert_eq!(buf.insert(2, 30), vec![30]);
+    }
+
+    /// The in-order steady state takes the `seq == next_expected` fast path:
+    /// every item is pushed straight to the sink, no slot bookkeeping.
+    #[test]
+    fn test_fast_path_steady_state() {
+        let mut buf = ReorderBuffer::<i32>::new(16);
+        let mut out = Vec::new();
+        for i in 0..10u64 {
+            buf.insert_into(i, (i * 10) as i32, &mut out);
+        }
+        assert_eq!(out, (0..10).map(|i| i * 10).collect::<Vec<_>>());
+        assert!(buf.is_empty());
+        assert_eq!(buf.next_expected(), 10);
+    }
+
+    /// A fast-path item that unblocks buffered successors must flush them.
+    #[test]
+    fn test_fast_path_flushes_buffered_run() {
+        let mut buf = ReorderBuffer::<i32>::new(16);
+        let mut out = Vec::new();
+        buf.insert_into(2, 30, &mut out); // buffered
+        buf.insert_into(3, 40, &mut out); // buffered
+        assert!(out.is_empty());
+        buf.insert_into(0, 10, &mut out); // fast path — immediately emitted
+        assert_eq!(out, vec![10]);
+        buf.insert_into(1, 20, &mut out); // fast path; flushes 2, 3
+        assert_eq!(out, vec![10, 20, 30, 40]);
+        assert!(buf.is_empty());
     }
 
     #[test]
