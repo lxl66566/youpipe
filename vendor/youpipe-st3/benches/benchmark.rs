@@ -4,8 +4,6 @@ use std::thread::spawn;
 use std::time::Instant;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use num_cpus;
-use st3;
 
 mod generic_queue;
 mod tokio_queue;
@@ -109,8 +107,7 @@ pub fn executor<T, W: GenericWorker<u64> + 'static>(name: &str, c: &mut Criterio
 
                     // Preallocate an array that will be populated with the IDs
                     // of other workers.
-                    let mut other_workers_id = Vec::with_capacity(thread_count - 1);
-                    other_workers_id.resize(thread_count - 1, 0);
+                    let mut other_workers_id = vec![0; thread_count - 1];
 
                     // Block until all threads are ready.
                     let start_time = {
@@ -144,7 +141,7 @@ pub fn executor<T, W: GenericWorker<u64> + 'static>(name: &str, c: &mut Criterio
                                 // queue on a push when many pop/push operations
                                 // are made while a stealer is preempted. In
                                 // such rare cases, spinning is necessary.
-                                while let Err(_) = worker.push(repeat_count - 1) {}
+                                while worker.push(repeat_count - 1).is_err() {}
                             }
                         } else {
                             // No more local tasks, try to steal.
@@ -169,7 +166,7 @@ pub fn executor<T, W: GenericWorker<u64> + 'static>(name: &str, c: &mut Criterio
                                     Ok(repeat_count) => {
                                         // Re-inject the task if needed.
                                         if repeat_count > 0 {
-                                            while let Err(_) = worker.push(repeat_count - 1) {}
+                                            while worker.push(repeat_count - 1).is_err() {}
                                         }
                                         continue 'new_task;
                                     }

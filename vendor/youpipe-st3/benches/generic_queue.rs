@@ -1,7 +1,6 @@
 //! Generic traits for queue benchmarking.
 
 use crate::tokio_queue;
-use st3;
 
 /// Error returned on stealing failure.
 pub enum GenericStealError {
