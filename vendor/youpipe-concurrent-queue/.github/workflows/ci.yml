@@ -1,0 +1,116 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: '0 2 * * 0'
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+  RUSTUP_MAX_RETRIES: 10
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fmt:
+    uses: smol-rs/.github/.github/workflows/fmt.yml@main
+  security_audit:
+    uses: smol-rs/.github/.github/workflows/security_audit.yml@main
+    permissions:
+      checks: write
+      contents: read
+      issues: write
+    secrets: inherit
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        rust: [nightly, beta, stable]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup update ${{ matrix.rust }} && rustup default ${{ matrix.rust }}
+      - run: rustup target add thumbv7m-none-eabi
+      - run: rustup target add wasm32-unknown-unknown
+      - name: Install cargo-hack and wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack,wasm-pack
+      - run: cargo build --all --all-features --all-targets
+      - run: cargo hack build --feature-powerset --no-dev-deps
+      - run: cargo hack build --feature-powerset --no-dev-deps --target thumbv7m-none-eabi --skip std,default
+      - run: cargo test
+      - run: cargo test --features portable-atomic
+      - name: Run with Loom enabled
+        run: cargo test --test loom --features loom
+        env:
+          RUSTFLAGS: ${{ env.RUSTFLAGS }} --cfg loom
+          LOOM_MAX_PREEMPTIONS: 2
+      - name: Check WASM tests
+        run: cargo build --target wasm32-unknown-unknown
+      - run: wasm-pack test --node
+      - run: wasm-pack test --node --no-default-features
+      - run: wasm-pack test --node --no-default-features --features portable-atomic
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+      - run: cargo hack build --rust-version
+      - run: cargo hack build --features portable-atomic --rust-version
+      - run: cargo hack build --target thumbv7m-none-eabi --no-default-features --no-dev-deps --rust-version
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup update stable
+      - run: cargo clippy --all-features --all-targets
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install nightly --component miri && rustup default nightly
+      - run: cargo miri test
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation
+          RUSTFLAGS: ${{ env.RUSTFLAGS }} -Z randomize-layout
+
+  loom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup update stable
+      - name: Loom tests
+        run: cargo test --release --test loom --features loom
+        env:
+          RUSTFLAGS: "--cfg=loom"
+          LOOM_MAX_PREEMPTIONS: 4
+      - name: Loom tests without default features
+        run: cargo test --release --test loom --features loom --no-default-features
+        env:
+          RUSTFLAGS: "--cfg=loom"
+          LOOM_MAX_PREEMPTIONS: 4

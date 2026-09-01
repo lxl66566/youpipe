@@ -44,7 +44,7 @@ hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
-concurrent-queue = "2.5"
+concurrent-queue = { package = "youpipe-concurrent-queue", path = "vendor/youpipe-concurrent-queue" }
 crossfire        = "3.1"
 hotpath          = { version = "0.19", optional = true }
 loom             = { version = "0.7", optional = true }

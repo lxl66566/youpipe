@@ -1,0 +1,61 @@
+# Fork of concurrent-queue (https://github.com/smol-rs/concurrent-queue)
+# vendored into youpipe.
+#
+# Provenance: local fork repo at /root/programs/fork/concurrent-queue,
+# branch `backoff` (commit cde1d12, "Add adaptive backoff to contended
+# retry and wait loops") — upstream v2.5.0 plus the P0 adaptive-backoff
+# optimization from concurrent-queue-PERFORMANCE_REVIEW.md (the dominant
+# win: contended CAS-retry and wait loops now spin with exponential pause
+# instead of bare retrying / immediate yield). See that review for the
+# measured 2-5.6x contention-path improvements and the remaining items.
+#
+# The package is renamed so it can never be confused with the crates.io
+# release; call sites keep importing `concurrent_queue` via the dependency
+# alias in youpipe's Cargo.toml.
+[package]
+name         = "youpipe-concurrent-queue"
+version      = "2.5.0"
+authors      = [
+    "Stjepan Glavina <stjepang@gmail.com>",
+    "Taiki Endo <te316e89@gmail.com>",
+    "John Nunley <dev@notgull.net>"
+]
+edition      = "2021"
+rust-version = "1.60"
+description  = "Concurrent multi-producer multi-consumer queue (youpipe fork)"
+license      = "Apache-2.0 OR MIT"
+repository   = "https://github.com/smol-rs/concurrent-queue"
+keywords     = ["channel", "mpmc", "spsc", "spmc", "mpsc"]
+categories   = ["concurrency"]
+exclude      = ["/.*"]
+
+[lib]
+bench = false
+
+[dependencies]
+crossbeam-utils = { version = "0.8.11", default-features = false }
+portable-atomic = { version = "1", default-features = false, optional = true }
+
+# Enables loom testing. This feature is permanently unstable and the API may
+# change at any time.
+[target.'cfg(loom)'.dependencies]
+loom = { version = "0.7", optional = true }
+
+[[bench]]
+name = "bench"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+easy-parallel = "3.1.0"
+fastrand = "2.0.0"
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[features]
+default = ["std"]
+std = ["crossbeam-utils/std"]
