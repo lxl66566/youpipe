@@ -72,6 +72,11 @@ tokio             = { version = "1", features = ["rt-multi-thread", "macros", "s
 [profile.release]
 codegen-units = 1
 
+# Same rationale as `[profile.release]`, applied to the criterion bench
+# profile so A/B runs can't be distorted by the code-layout lottery either.
+[profile.bench]
+codegen-units = 1
+
 [[bench]]
 harness = false
 name    = "sync_vs_rayon"
