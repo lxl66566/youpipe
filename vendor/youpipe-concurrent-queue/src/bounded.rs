@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, vec::Vec};
-use core::mem::MaybeUninit;
+use core::mem::{self, MaybeUninit};
 
 use crossbeam_utils::CachePadded;
 
@@ -177,7 +177,14 @@ impl<T> Bounded<T> {
             };
 
             // Inspect the corresponding slot.
-            let slot = &self.buffer[index];
+            //
+            // Safety: the wrap calculation turns the stamp around one lap
+            // early, so the index never reaches `buffer.len()` — but the
+            // compiler cannot prove it because the mask width
+            // `(cap + 1).next_power_of_two()` may exceed `cap` (same setup
+            // as crossbeam's ArrayQueue).
+            debug_assert!(index < self.buffer.len());
+            let slot = unsafe { self.buffer.get_unchecked(index) };
             let stamp = slot.stamp.load(Ordering::Acquire);
 
             // If the tail and the stamp match, we may attempt to push.
@@ -230,8 +237,10 @@ impl<T> Bounded<T> {
             let index = head & (self.mark_bit - 1);
             let lap = head & !(self.one_lap - 1);
 
-            // Inspect the corresponding slot.
-            let slot = &self.buffer[index];
+            // Inspect the corresponding slot (same indexing invariant as in
+            // `push_or_else` above).
+            debug_assert!(index < self.buffer.len());
+            let slot = unsafe { self.buffer.get_unchecked(index) };
             let stamp = slot.stamp.load(Ordering::Acquire);
 
             // If the stamp is ahead of the head by 1, we may attempt to pop.
@@ -363,6 +372,12 @@ impl<T> Bounded<T> {
 
 impl<T> Drop for Bounded<T> {
     fn drop(&mut self) {
+        // Dropping is a no-op for types without destructors; skip the
+        // per-slot sweep entirely (same guard as crossbeam's ArrayQueue).
+        if !mem::needs_drop::<T>() {
+            return;
+        }
+
         // Get the index of the head.
         let Self {
             head,

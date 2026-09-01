@@ -1,4 +1,6 @@
+use alloc::alloc::{alloc_zeroed, handle_alloc_error};
 use alloc::boxed::Box;
+use core::alloc::Layout;
 use core::mem::MaybeUninit;
 use core::ptr;
 
@@ -41,18 +43,6 @@ struct Slot<T> {
 }
 
 impl<T> Slot<T> {
-    #[cfg(not(loom))]
-    #[allow(clippy::declare_interior_mutable_const)]
-    const UNINIT: Slot<T> = Slot {
-        value: UnsafeCell::new(MaybeUninit::uninit()),
-        state: AtomicUsize::new(0),
-    };
-
-    #[cfg(not(loom))]
-    fn uninit_block() -> [Slot<T>; BLOCK_CAP] {
-        [Self::UNINIT; BLOCK_CAP]
-    }
-
     #[cfg(loom)]
     fn uninit_block() -> [Slot<T>; BLOCK_CAP] {
         // Repeat this expression 31 times.
@@ -93,12 +83,41 @@ struct Block<T> {
 }
 
 impl<T> Block<T> {
+    const LAYOUT: Layout = {
+        let layout = Layout::new::<Self>();
+        assert!(
+            layout.size() != 0,
+            "Block should never be zero-sized, as it has an AtomicPtr field"
+        );
+        layout
+    };
+
     /// Creates an empty block.
-    fn new() -> Block<T> {
-        Block {
+    #[cfg(not(loom))]
+    fn new() -> Box<Block<T>> {
+        // All-zero bytes are a valid `Block`: `next` is a null pointer,
+        // `state` is 0 (no WRITE/READ/DESTROY bits set) and the `MaybeUninit`
+        // value slots are uninitialized by definition. A zeroed allocation
+        // lets the allocator serve fresh pages without a memset and skips
+        // the per-slot const-array copy of the previous `Box::new(Block)`
+        // (see concurrent-queue-PERFORMANCE_REVIEW.md P2; mirrors
+        // crossbeam's SegQueue).
+        let raw = unsafe { alloc_zeroed(Self::LAYOUT) };
+        if raw.is_null() {
+            handle_alloc_error(Self::LAYOUT);
+        }
+        // Safety: `raw` is a live, zero-initialized allocation for `Self`.
+        unsafe { Box::from_raw(raw.cast()) }
+    }
+
+    /// Creates an empty block (loom build: loom's tracked cell types must be
+    /// constructed directly, not synthesized from zeroed memory).
+    #[cfg(loom)]
+    fn new() -> Box<Block<T>> {
+        Box::new(Block {
             next: AtomicPtr::new(ptr::null_mut()),
             slots: Slot::uninit_block(),
-        }
+        })
     }
 
     /// Waits until the next pointer is set.
@@ -197,13 +216,13 @@ impl<T> Unbounded<T> {
             // If we're going to have to install the next block, allocate it in advance in order to
             // make the wait for other threads as short as possible.
             if offset + 1 == BLOCK_CAP && next_block.is_none() {
-                next_block = Some(Box::new(Block::<T>::new()));
+                next_block = Some(Block::<T>::new());
             }
 
             // If this is the first value to be pushed into the queue, we need to allocate the
             // first block and install it.
             if block.is_null() {
-                let new = Box::into_raw(Box::new(Block::<T>::new()));
+                let new = Box::into_raw(Block::<T>::new());
 
                 if self
                     .tail
