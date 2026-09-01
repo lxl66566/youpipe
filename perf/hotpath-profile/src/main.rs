@@ -52,6 +52,19 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         None => run_sweep(), // backward-compatible default
+        Some("stream") => {
+            let size: usize = args
+                .get(2)
+                .map(String::as_str)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000);
+            let iters: usize = args
+                .get(3)
+                .map(String::as_str)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100);
+            run_stream(size, iters);
+        }
         Some(size) => {
             let size: usize = size.parse().expect("size must be a usize");
             let light = args.get(2).map(String::as_str) == Some("light");
@@ -75,6 +88,22 @@ fn run_sweep() {
         }
         println!("ran size={size}");
     }
+}
+
+/// Streaming-engine scenario: one sync stage, unordered. Exercises the
+/// feeder (inline or pool job), the crossfire channel handoff, the pool
+/// stage workers, and the burst-drain collector.
+fn run_stream(size: usize, iters: usize) {
+    let data: Vec<u64> = (0..size as u64).collect();
+    for _ in 0..iters {
+        let v = data.clone();
+        let out: Vec<u64> = v
+            .stream()
+            .stage(|x: u64| black_box(x.wrapping_add(1)))
+            .run();
+        black_box(out);
+    }
+    println!("ran stream size={size} iters={iters}");
 }
 
 fn run_focused(size: usize, light: bool, iters: usize) {

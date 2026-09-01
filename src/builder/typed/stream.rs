@@ -75,17 +75,30 @@ fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
     s_rx
 }
 
+/// Caught panic payload from a pool-submitted feeder job, re-raised on the
+/// calling thread by [`Feeder::finish`] (preserving the panic-propagation
+/// semantics of the old feeder thread's `join`).
+type FeederPanicSlot = std::sync::Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
+
 /// Handle returned by [`feed_items`]: either an inline push (already done,
-/// nothing to join) or a spawned feeder thread.
+/// nothing to reap) or a feeder job running on the compute pool.
 enum Feeder {
-    Thread(std::thread::JoinHandle<()>),
+    Pool(FeederPanicSlot),
     Inline,
 }
 
 impl Feeder {
-    fn join(self) {
-        if let Self::Thread(h) = self {
-            h.join().expect("feeder thread panicked");
+    fn finish(self) {
+        if let Self::Pool(slot) = self {
+            // Same poison-recovery pattern as the hybrid dispatcher's
+            // fail slot.
+            if let Some(payload) = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                std::panic::resume_unwind(payload);
+            }
         }
     }
 }
@@ -93,9 +106,11 @@ impl Feeder {
 /// Push `items` into the feeder channel.
 ///
 /// When all items fit in the channel buffer (`items.len() ≤ buffer`), push
-/// inline from the calling thread — saving ~20-50 µs of thread-spawn/join
-/// overhead per `run()` call, which is a measurable fraction of small
-/// workloads (e.g. mixed_cpu_io_unbalanced/200 ≈ 680 µs total).
+/// inline from the calling thread — saving all feeder dispatch overhead.
+/// Otherwise the push loop runs as **a job on the compute pool** instead of
+/// a dedicated OS thread: pool workers are long-lived, so this saves the
+/// ~30-80 µs `thread::spawn` + join per `run()` call while keeping the same
+/// effective thread count (one feeder alongside the stage workers).
 ///
 /// # Deadlock safety
 ///
@@ -103,9 +118,23 @@ impl Feeder {
 /// sender never blocks on `Full`: even if every downstream worker is blocked
 /// on the *output* channel, the calling thread finishes pushing, drops the
 /// sender, and proceeds to collect — draining the output and unblocking
-/// workers. With the thread path, the feeder and collector run concurrently
-/// so neither can starve the other.
+/// workers. The pool path is the feeder/collector-concurrency case: the
+/// feeder job feeds while the calling thread collects, so neither can starve
+/// the other; if every pool worker is busy with stage workers, the feeder
+/// job simply runs as soon as any stage worker finishes an item (they all
+/// make progress because the collector drains the terminal channel).
+///
+/// # Panic semantics
+///
+/// The job wraps the push loop in `catch_unwind` (an uncaught panic in a
+/// pool job would abort the process via the worker's `AbortIfPanic`) and
+/// stores the payload; [`Feeder::finish`] re-raises it on the caller after
+/// the collect returns. The payload store happens before the sender drops
+/// (closing the channel), and the close is what releases the collector, so
+/// the caller always observes the payload.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn feed_items<I: Send + 'static>(
+    pool: &ComputePool,
     items: Vec<I>,
     feeder_tx: SyncSender<(u64, I)>,
     cancel: Option<CancellationToken>,
@@ -122,16 +151,26 @@ fn feed_items<I: Send + 'static>(
         }
         Feeder::Inline
     } else {
-        Feeder::Thread(std::thread::spawn(move || {
-            for (seq, item) in items.into_iter().enumerate() {
-                if cancel_active(cancel.as_ref()) {
-                    break;
+        let slot: FeederPanicSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let job_slot = std::sync::Arc::clone(&slot);
+        pool.submit(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                for (seq, item) in items.into_iter().enumerate() {
+                    if cancel_active(cancel.as_ref()) {
+                        break;
+                    }
+                    if feeder_tx.send((seq as u64, item)).is_err() {
+                        break;
+                    }
                 }
-                if feeder_tx.send((seq as u64, item)).is_err() {
-                    break;
-                }
+            }));
+            if let Err(payload) = result {
+                *job_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload);
             }
-        }))
+        });
+        Feeder::Pool(slot)
     }
 }
 
@@ -1652,11 +1691,11 @@ where
         #[cfg(feature = "tokio-runtime")]
         let (final_rx, feeder) = if async_feeder {
             let (feeder_tx, feeder_rx) = sync_async_channel::<(u64, I)>(buffer);
-            let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
+            let feeder = feed_items(ctx.compute_pool(), items, feeder_tx, feeder_cancel, buffer);
             (stages.spawn_async_feeder::<R>(feeder_rx, &ctx), feeder)
         } else {
             let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
-            let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
+            let feeder = feed_items(ctx.compute_pool(), items, feeder_tx, feeder_cancel, buffer);
             // Use `spawn_single` so the terminal stage's output channel is MPSC
             // (store-based dequeue, lock-free waker registry) — the collector is
             // always the sole consumer of the final channel.
@@ -1665,7 +1704,7 @@ where
         #[cfg(not(feature = "tokio-runtime"))]
         let (final_rx, feeder) = {
             let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
-            let feeder = feed_items(items, feeder_tx, feeder_cancel, buffer);
+            let feeder = feed_items(ctx.compute_pool(), items, feeder_tx, feeder_cancel, buffer);
             (stages.spawn_single::<R>(feeder_rx, &ctx), feeder)
         };
 
@@ -1684,7 +1723,7 @@ where
             }
         };
 
-        feeder.join();
+        feeder.finish();
         Ok(results)
     }
 }
@@ -1810,5 +1849,25 @@ where
             results.extend(buffer.flush_remaining());
             return results;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Feeder::finish` re-raises the caught feeder-job payload (the
+    /// panic-propagation contract inherited from the old feeder thread's
+    /// `join`) and is a no-op for the inline variant.
+    #[test]
+    fn test_feeder_finish_resumes_payload() {
+        let slot: FeederPanicSlot = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            Box::new("feeder boom") as Box<dyn std::any::Any + Send>,
+        )));
+        let result = std::panic::catch_unwind(move || Feeder::Pool(slot).finish());
+        let payload = result.expect_err("stored payload must be resumed");
+        assert_eq!(payload.downcast_ref::<&str>().copied(), Some("feeder boom"));
+
+        Feeder::Inline.finish();
     }
 }
