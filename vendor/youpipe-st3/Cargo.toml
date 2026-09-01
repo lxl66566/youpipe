@@ -1,0 +1,64 @@
+# Fork of st3 (https://github.com/asynchronics/st3) vendored into youpipe.
+#
+# Provenance: local fork repo at /root/programs/fork/st3, branch `main`
+# (commit 12d3f1e, "Add performance optimization report") — a heavily
+# optimized line on top of upstream v0.4.1 (bulk segmented steal copies,
+# bounds-check removal, fast empty check, hoisted tail load, uninitialized
+# buffer allocation, in-place Arc construction, single-item transfer fast
+# path) plus the refined `src/transfer.rs` module from the `bulk-transfer`
+# branch (commit 3da1024).
+#
+# The package is renamed so it can never be confused with the crates.io
+# release; the lib target keeps the name `st3` so call sites don't churn.
+[package]
+name         = "youpipe-st3"
+version      = "0.4.1"
+authors      = ["Serge Barral <serge.barral@asynchronics.com>"]
+edition      = "2021"
+rust-version = "1.60"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/asynchronics/st3"
+readme       = "README.md"
+description  = """
+A very fast lock-free, bounded, work-stealing LIFO queue (youpipe fork).
+"""
+categories   = ["concurrency", "data-structures"]
+keywords     = ["queue", "stack", "bounded", "lock-free", "work-stealing"]
+autotests    = false
+autobenches  = false
+
+[lib]
+name = "st3"
+
+[dependencies]
+crossbeam-utils = { version = "0.8.14", default-features = false }
+
+[dev-dependencies]
+criterion       = "0.5"
+oorandom        = "11.1"
+crossbeam-deque = "0.8"
+num_cpus        = "1.13"
+
+[target.'cfg(st3_loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(st3_loom)'] }
+
+[[bench]]
+name   = "benchmark"
+path   = "benches/benchmark.rs"
+harness = false
+
+[[bench]]
+name   = "micro"
+path   = "benches/micro.rs"
+harness = false
+
+# NOTE: the upstream `[profile.bench]` pin (codegen-units=1, lto=true) is
+# dropped here — profile settings in a dependency manifest are ignored by
+# cargo; youpipe's root config governs.
+
+[[test]]
+name = "integration"
+path = "tests/tests.rs"

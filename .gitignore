@@ -1,2 +1,5 @@
 /target
 session-*.md
+# Vendored fork crates: standalone build artifacts (e.g. from `cargo test -p youpipe-st3`)
+vendor/*/target/
+vendor/*/Cargo.lock
