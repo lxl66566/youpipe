@@ -24,6 +24,7 @@ use crate::{
 /// `recv()`. Ordering is unaffected — the [`ReorderBuffer`] re-sequences by
 /// `seq` regardless of arrival order.
 #[must_use]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn run_ordered_collect<R, O>(input_rx: &R, expected_items: usize) -> Vec<O>
 where
     R: RecvItem<(u64, O)>,

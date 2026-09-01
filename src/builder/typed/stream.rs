@@ -1700,6 +1700,7 @@ where
 /// first item of each burst goes through the blocking `recv()`.
 #[allow(clippy::needless_pass_by_value)] // `rx` is the terminal drain of the
 // pipeline: `run` passes the sole receiver by value to express "consume fully".
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_sync<R, T>(rx: R, ordered: bool, n: usize) -> Vec<T>
 where
     R: RecvItem<(u64, T)>,
@@ -1756,6 +1757,7 @@ where
 /// For `io_async_pure` at size 500 (~450 items completing in the same ~1 ms
 /// timer tick) the savings is measurable.
 #[cfg(feature = "tokio-runtime")]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn collect_async<R, T>(rx: R, ordered: bool, n: usize) -> Vec<T>
 where
     R: AsyncRecvItem<(u64, T)>,
