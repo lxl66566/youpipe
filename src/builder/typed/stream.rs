@@ -1737,7 +1737,8 @@ where
 /// channel before the collector loops back (common with parallel workers),
 /// `try_recv` absorbs the burst without per-item condvar overhead. Only the
 /// first item of each burst goes through the blocking `recv()`.
-#[allow(clippy::needless_pass_by_value)] // `rx` is the terminal drain of the
+#[allow(clippy::needless_pass_by_value)]
+// `rx` is the terminal drain of the
 // pipeline: `run` passes the sole receiver by value to express "consume fully".
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_sync<R, T>(rx: R, ordered: bool, n: usize) -> Vec<T>
@@ -1861,9 +1862,10 @@ mod tests {
     /// `join`) and is a no-op for the inline variant.
     #[test]
     fn test_feeder_finish_resumes_payload() {
-        let slot: FeederPanicSlot = std::sync::Arc::new(std::sync::Mutex::new(Some(
-            Box::new("feeder boom") as Box<dyn std::any::Any + Send>,
-        )));
+        let slot: FeederPanicSlot = std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(
+            "feeder boom",
+        )
+            as Box<dyn std::any::Any + Send>)));
         let result = std::panic::catch_unwind(move || Feeder::Pool(slot).finish());
         let payload = result.expect_err("stored payload must be resumed");
         assert_eq!(payload.downcast_ref::<&str>().copied(), Some("feeder boom"));
