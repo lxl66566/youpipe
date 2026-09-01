@@ -39,17 +39,9 @@ pub(crate) struct Registry {
     /// Global injector queue for jobs coming from outside the pool or
     /// overflowing a worker's local deque.
     ///
-    /// A lock-free, epoch-free MPMC queue (`concurrent_queue`) — the same
-    /// block-based algorithm crossbeam's `Injector` used (WRITE/READ/DESTROY
-    /// slot flags + direct `Box::from_raw` reclamation), but in a crate that
-    /// does **not** pull in `crossbeam-epoch` (the source of the Miri UB that
-    /// prompted the st3 migration). Its empty `pop` is 2 Acquire loads + a
-    /// SeqCst fence with no CAS, which is cheaper on this 99%-empty hot
-    /// path than a `Mutex<VecDeque>` *plus* a hand-maintained `AtomicUsize`
-    /// length counter (measured: the extra `fetch_add`/`fetch_sub` on every
-    /// push/pop costs more than it saves). Unbounded, so local-queue
-    /// overflow never drops work.
-    injected_jobs: concurrent_queue::ConcurrentQueue<JobRef>,
+    /// A lock-free, epoch-free MPMC queue (`crossbeam_queue::SegQueue`) —
+    /// unbounded, so local-queue overflow never drops work.
+    injected_jobs: crossbeam_queue::SegQueue<JobRef>,
 
     // When this reaches 0, all work on this registry must be complete. The
     // global pool has a ref that never gets released; a user-created pool
@@ -94,7 +86,7 @@ impl Registry {
         let registry = Arc::new(Registry {
             thread_infos: stealers.into_iter().map(ThreadInfo::new).collect(),
             sleep: Sleep::new(num_threads),
-            injected_jobs: concurrent_queue::ConcurrentQueue::unbounded(),
+            injected_jobs: crossbeam_queue::SegQueue::new(),
             terminate_count: AtomicUsize::new(1),
         });
 
@@ -143,8 +135,8 @@ impl Registry {
         // an optimization hint — correctness rests on `new_injected_jobs`'
         // SeqCst fence + condvar-notify protocol.
         let queue_was_empty = self.injected_jobs.is_empty();
-        // Unbounded queue, never closed → push cannot fail.
-        let _ = self.injected_jobs.push(job_ref);
+        // Unbounded queue → push cannot fail (and returns ()).
+        self.injected_jobs.push(job_ref);
         self.sleep.new_injected_jobs(1, queue_was_empty);
     }
 
@@ -154,7 +146,7 @@ impl Registry {
         let queue_was_empty = self.injected_jobs.is_empty();
         let mut count = 0u32;
         for job_ref in job_refs {
-            let _ = self.injected_jobs.push(job_ref);
+            self.injected_jobs.push(job_ref);
             count += 1;
         }
         if count > 0 {
@@ -167,12 +159,12 @@ impl Registry {
     }
 
     fn pop_injected_job(&self) -> Option<JobRef> {
-        // `ConcurrentQueue::pop`'s empty path is 2 Acquire loads + a SeqCst
-        // fence with no CAS — cheap enough that no separate length fast-path is
+        // `SegQueue::pop`'s empty path is 2 Acquire loads + a SeqCst fence with
+        // no CAS — cheap enough that no separate length fast-path is
         // warranted (verified: a hand-maintained `AtomicUsize` length was
         // measurably slower, since its per-push/per-pop `fetch_add`/`fetch_sub`
         // bounce a cache line on every operation).
-        self.injected_jobs.pop().ok()
+        self.injected_jobs.pop()
     }
 
     // ── Worker coordination ──

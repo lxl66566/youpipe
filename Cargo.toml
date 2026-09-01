@@ -44,7 +44,7 @@ hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
 
 [dependencies]
-concurrent-queue = "2.5"
+crossbeam-queue  = "0.3"
 crossfire        = "3.1"
 hotpath          = { version = "0.19", optional = true }
 loom             = { version = "0.7", optional = true }
@@ -70,6 +70,9 @@ tokio             = { version = "1", features = ["rt-multi-thread", "macros", "s
 # slower release builds — the standard trade-off for perf-first crates
 # (rayon, crossbeam, etc. all do the same).
 [profile.release]
+codegen-units = 1
+
+[profile.bench]
 codegen-units = 1
 
 [[bench]]

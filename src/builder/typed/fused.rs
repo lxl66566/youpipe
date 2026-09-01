@@ -1361,7 +1361,7 @@ where
 // the stolen B" idle-search; the ~120 µs fixed dispatch overhead shrinks.
 //
 // Why it regresses at large N: all N leaf-jobs funnel through the *single*
-// global injector queue (`concurrent_queue`), and 32 workers contending on one
+// global injector queue (`SegQueue`), and 32 workers contending on one
 // MPMC queue for 128+ pops is slower than the tree's distributed model (each
 // worker pushes to its own LIFO deque, peers steal — far less coherence traffic
 // on a single cache line). The bottleneck is fundamental, not tunable away.
