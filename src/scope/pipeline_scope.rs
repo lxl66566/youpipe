@@ -344,7 +344,7 @@ mod tests {
             let items: Vec<i32> = vec![];
             s.pipe(items).map(|x: i32| x * 2).collect()
         });
-        assert!(result.is_empty());
+        assert_eq!(result, Vec::new());
     }
 
     /// Scoped pipelines support type-changing maps too (`i32 -> String`),

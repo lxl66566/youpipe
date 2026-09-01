@@ -202,7 +202,7 @@ mod tests {
         let mut buf = ReorderBuffer::<i32>::new(16);
         let mut out = Vec::new();
         for i in 0..10u64 {
-            buf.insert_into(i, (i * 10) as i32, &mut out);
+            buf.insert_into(i, i32::try_from(i * 10).unwrap(), &mut out);
         }
         assert_eq!(out, (0..10).map(|i| i * 10).collect::<Vec<_>>());
         assert!(buf.is_empty());
@@ -216,7 +216,7 @@ mod tests {
         let mut out = Vec::new();
         buf.insert_into(2, 30, &mut out); // buffered
         buf.insert_into(3, 40, &mut out); // buffered
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::new());
         buf.insert_into(0, 10, &mut out); // fast path — immediately emitted
         assert_eq!(out, vec![10]);
         buf.insert_into(1, 20, &mut out); // fast path; flushes 2, 3
@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn test_out_of_order() {
         let mut buf = ReorderBuffer::<i32>::new(16);
-        assert!(buf.insert(2, 30).is_empty());
+        assert_eq!(buf.insert(2, 30), Vec::new());
         assert_eq!(buf.insert(0, 10), vec![10]);
         assert_eq!(buf.insert(1, 20), vec![20, 30]);
     }
@@ -236,10 +236,10 @@ mod tests {
     fn test_gap() {
         let mut buf = ReorderBuffer::<i32>::new(16);
         assert_eq!(buf.insert(0, 10), vec![10]);
-        assert!(buf.insert(3, 40).is_empty());
-        assert!(buf.insert(5, 60).is_empty());
+        assert_eq!(buf.insert(3, 40), Vec::new());
+        assert_eq!(buf.insert(5, 60), Vec::new());
         assert_eq!(buf.insert(1, 20), vec![20]);
-        assert!(buf.insert(4, 50).is_empty());
+        assert_eq!(buf.insert(4, 50), Vec::new());
     }
 
     #[test]
@@ -256,9 +256,9 @@ mod tests {
     #[test]
     fn test_capacity_overflow() {
         let mut buf = ReorderBuffer::<i32>::new(2);
-        assert!(buf.insert(5, 50).is_empty());
-        assert!(buf.insert(3, 30).is_empty());
-        assert!(buf.insert(1, 10).is_empty());
+        assert_eq!(buf.insert(5, 50), Vec::new());
+        assert_eq!(buf.insert(3, 30), Vec::new());
+        assert_eq!(buf.insert(1, 10), Vec::new());
         assert!(buf.len() <= 2);
     }
 }
