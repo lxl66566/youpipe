@@ -24,8 +24,11 @@ fn test_compute_pool_shared() {
         let p = pool.clone();
         p.submit(move || {
             let mut sum = 0u64;
-            for j in 0..1000 {
-                sum = sum.wrapping_add(j);
+            // Miri: the inner arithmetic depth is irrelevant to the pool
+            // machinery under test — shrink it 50x.
+            let inner: u32 = if cfg!(miri) { 20 } else { 1_000 };
+            for j in 0..inner {
+                sum = sum.wrapping_add(j as u64);
             }
             tx.send((i, sum)).unwrap();
         });
@@ -40,7 +43,10 @@ fn test_compute_pool_many_small_tasks() {
     let pool = Arc::new(youpipe::ComputePool::new(4));
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let wg = youpipe::SharedWaitGroup::new();
-    let total = 10000;
+    // Miri: 10k submit/wait cycles over the injector + steal path take tens
+    // of interpreted minutes; 500 exercises every queue/steal/latch path
+    // (the pool has 4 emulated workers) in seconds.
+    let total = if cfg!(miri) { 500 } else { 10_000 };
     wg.add(total);
     for _ in 0..total {
         let counter = counter.clone();

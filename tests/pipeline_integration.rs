@@ -10,7 +10,11 @@ use youpipe::{FenceMode, pipe, stream};
 
 fn cpu_heavy(x: u64) -> u64 {
     let mut r = x;
-    for _ in 0..200 {
+    // Miri: the arithmetic depth is irrelevant to memory safety — scale the
+    // inner loop down ~50× so the ~30 tests using this helper stay fast
+    // under the interpreter (same closure/dispatch paths per item).
+    let iters: u32 = if cfg!(miri) { 4 } else { 200 };
+    for _ in 0..iters {
         r = r.wrapping_mul(31).wrapping_add(17);
     }
     r
@@ -110,7 +114,9 @@ fn test_try_map_then_map() {
 fn test_try_map_parallel_large() {
     // Large enough to exceed the serial threshold (num_threads * 64) and
     // exercise the index-based parallel fast path (MAY_FILTER == false).
-    let n = 50_000;
+    // Miri: threshold is num_threads*64 and miri's pool is 1 worker, so 2K
+    // items still exceed it at ~40x.
+    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
     let result = pipe(0..n)
         .try_map(|x: i32| -> Result<i32, &str> { Ok(x.wrapping_mul(3)) })
         .map(|x: i32| x + 1)
@@ -124,10 +130,11 @@ fn test_try_map_parallel_large() {
 #[test]
 fn test_try_map_parallel_error_short_circuits() {
     // Error in the parallel path (index-based fast path) must propagate.
-    let n = 50_000;
+    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let err_at = n * 3 / 5;
     let result = pipe(0..n)
-        .try_map(|x: i32| -> Result<i32, String> {
-            if x == 30_000 {
+        .try_map(move |x: i32| -> Result<i32, String> {
+            if x == err_at {
                 Err("mid-batch error".into())
             } else {
                 Ok(x * 2)
@@ -515,13 +522,17 @@ fn test_par_map_counts_items() {
 
 #[test]
 fn test_large_dataset() {
-    let items: Vec<u64> = (0..100_000).collect();
+    // Miri: scaled down 50× — the point is crossing the multi-chunk split
+    // thresholds, not the absolute size, and 2K items already spans several
+    // chunks across the (single) emulated worker.
+    let n: usize = if cfg!(miri) { 2_000 } else { 100_000 };
+    let items: Vec<u64> = (0..n as u64).collect();
     let result = pipe(items).map(|x: u64| x.wrapping_add(1)).collect();
-    assert_eq!(result.len(), 100_000);
+    assert_eq!(result.len(), n);
     let mut r = result;
     r.sort_unstable();
     assert_eq!(r[0], 1);
-    assert_eq!(r[99999], 100_000);
+    assert_eq!(r[n - 1], n as u64);
 }
 
 /// `pipe` accepts any `IntoIterator`, not just `Vec`. Verifies the entry point
@@ -599,10 +610,13 @@ fn test_pipe_panic_propagates_parallel() {
     // Large enough to hit the parallel index-based path (n > serial threshold).
     // A panicking closure must propagate through the join tree and LeafGuard
     // cleanup, surfacing as a real panic on the collecting thread.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _: Vec<i32> = pipe(0..50_000i32)
-            .map(|x| {
-                if x == 25_000 {
+    // Miri: scaled 25x (still >  the 1-thread serial threshold of 64).
+    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let boom_at = n / 2;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _: Vec<i32> = pipe(0..n)
+            .map(move |x| {
+                if x == boom_at {
                     panic!("boom at {x}");
                 }
                 x + 1
@@ -614,7 +628,7 @@ fn test_pipe_panic_propagates_parallel() {
     let msg = payload
         .downcast_ref::<String>()
         .expect("panic payload is String");
-    assert_eq!(msg, "boom at 25000");
+    assert_eq!(msg, format!("boom at {}", n / 2).as_str());
 }
 
 #[test]
@@ -637,10 +651,13 @@ fn test_pipe_panic_propagates_serial() {
 fn test_try_collect_panic_propagates() {
     // Panic inside try_collect's fast path (index-based): the TryLeafGuard
     // must clean up partial output slots before the panic propagates.
+    // Miri: scaled 25x (still > the 1-thread serial threshold of 64).
+    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let panic_at = n / 2;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _: Result<Vec<i32>, &'static str> = pipe(0..50_000i32)
-            .try_map(|x| -> Result<i32, &'static str> {
-                if x == 25_000 {
+        let _: Result<Vec<i32>, &'static str> = pipe(0..n)
+            .try_map(move |x| -> Result<i32, &'static str> {
+                if x == panic_at {
                     panic!("try boom");
                 }
                 Ok(x + 1)
@@ -719,7 +736,7 @@ fn test_for_each_single() {
 fn test_for_each_parallel_large() {
     // Large enough to exceed the serial threshold and exercise the parallel
     // par_for_each path (MAY_FILTER == false → pure leaf).
-    let n: u64 = 50_000;
+    let n: u64 = if cfg!(miri) { 2_000 } else { 50_000 };
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
     pipe(0..n).for_each(move |_x: u64| {
@@ -731,7 +748,7 @@ fn test_for_each_parallel_large() {
 #[test]
 fn test_for_each_parallel_filter_large() {
     // Large parallel path with MAY_FILTER == true (filter branch).
-    let n: i32 = 50_000;
+    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
     pipe(0..n).filter(|x: &i32| *x % 3 == 0).for_each(move |_| {
@@ -744,9 +761,12 @@ fn test_for_each_parallel_filter_large() {
 #[test]
 fn test_for_each_panic_propagates_parallel() {
     // Large batch → parallel par_for_each path. Panic in f must surface.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pipe(0..50_000i32).for_each(|x| {
-            if x == 25_000 {
+    // Miri: scaled 25x (still > the 1-thread serial threshold of 64).
+    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let boom_at = n / 2;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        pipe(0..n).for_each(move |x| {
+            if x == boom_at {
                 panic!("for_each boom at {x}");
             }
         });
@@ -754,7 +774,7 @@ fn test_for_each_panic_propagates_parallel() {
     assert!(result.is_err());
     let payload = result.unwrap_err();
     let msg = payload.downcast_ref::<String>().expect("String payload");
-    assert_eq!(msg, "for_each boom at 25000");
+    assert_eq!(msg, format!("for_each boom at {}", n / 2).as_str());
 }
 
 #[test]
@@ -787,7 +807,10 @@ fn test_for_each_panic_drops_unread_items() {
 
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
-    let items: Vec<DropCounter> = (0..50_000)
+    // Miri: scaled 25x — drop accounting is per-item and exact, so the
+    // smaller batch proves the same LeakGuard property far cheaper.
+    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let items: Vec<DropCounter> = (0..n)
         .map(|i| DropCounter {
             counter: c.clone(),
             val: i,
@@ -795,10 +818,11 @@ fn test_for_each_panic_drops_unread_items() {
         .collect();
     let total = items.len();
 
+    let panic_at = n / 2;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Parallel path (large batch). Panic mid-batch.
-        pipe(items).for_each(|d: DropCounter| {
-            if d.val == 25_000 {
+        pipe(items).for_each(move |d: DropCounter| {
+            if d.val == panic_at {
                 panic!("mid-batch drop boom");
             }
         });
@@ -822,19 +846,21 @@ fn test_for_each_unbalanced_workload() {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
     use youpipe::Workload;
-    pipe(0..10_000i32)
+    let n: i32 = if cfg!(miri) { 1_000 } else { 10_000 };
+    pipe(0..n)
         .with_workload(Workload::Unbalanced)
         .for_each(move |_| {
             c.fetch_add(1, Ordering::Relaxed);
         });
-    assert_eq!(counter.load(Ordering::Relaxed), 10_000);
+    assert_eq!(counter.load(Ordering::Relaxed), n as usize);
 }
 
 #[test]
-// 4 threads x 20k iterations x 1k cpu_heavy items ≈ 10^9+ interpreted ops —
-// days under miri. The spin/latch race this guards against is covered by
-// the loom models (`latch.rs` loom_tests) and this test under real threads.
-#[cfg_attr(miri, ignore)]
+// Native: 4 threads x 20k iterations x 1k cpu_heavy items. Under miri the
+// iteration count shrinks 200x (cpu_heavy itself is scaled down too, see
+// its comment) so the interpreter covers the same spin/latch interleavings
+// in minutes; the exhaustive interleaving analysis lives in the loom models
+// (`latch.rs` loom_tests), this adds the interpreted-memory-model view.
 fn test_hybrid_dispatch_spin_wait_stress() {
     // Regression guard for `CountLatch::wait_spin` (off-pool hybrid driver).
     //
@@ -849,8 +875,8 @@ fn test_hybrid_dispatch_spin_wait_stress() {
     // `cpu_heavy` per item keeps each batch's parallel work inside the spin
     // envelope (~tens of µs), so this exercises the spin fast path, not the
     // condvar fallback.
-    const ITERS: usize = 20_000;
-    const N: usize = 1_000;
+    const ITERS: usize = if cfg!(miri) { 100 } else { 20_000 };
+    const N: usize = if cfg!(miri) { 200 } else { 1_000 };
     let data: Vec<u64> = (0..N as u64).collect();
     std::thread::scope(|s| {
         for _ in 0..4 {
