@@ -6,8 +6,9 @@
 
 ```rust
 pub enum Workload {
-    Balanced,    // default; adaptive oversplit (1× for small batches, 4× for large)
-    Unbalanced,  // 8× oversplit for finer-grained stealing of skewed tails
+    Balanced,               // default; adaptive oversplit (1× for small batches, 4× for large)
+    Unbalanced,             // 8× oversplit for finer-grained stealing of skewed tails
+    Custom(NonZeroUsize),   // pin the oversplit factor manually
 }
 ```
 
@@ -24,13 +25,20 @@ streaming stages). It selects the fork/join oversplit factor
 - `Unbalanced` — a few items are far slower than the rest (skewed tail). Always
   uses 8× oversplit so an idle worker can steal a slow sibling's remaining
   leaves, shrinking tail latency. Opt in only when the tail is genuinely uneven.
+- `Custom(n)` — pin the oversplit factor regardless of batch size: full manual
+  control for benchmarking or known-skew profiles outside the two presets
+  (`1` = coarsest tree, `16` = very fine-grained stealing).
+
+Do not confuse `Workload` (task-split **granularity**, same thread count) with
+`Pipe::with_oversubscribe` (thread-count **multiplier** for blocking-IO sync
+workloads) — see the `with_oversubscribe` doc for the factor guidance table.
 
 **Scope.** Only the fused path (`pipe` / `scope` / `try_map`) consults this.
 The streaming path (`stream(..)`) ignores it: streaming already load-balances
-per-item skew through its MPMC channel + `per_stage_parallelism` workers (a
-stalled worker simply stops draining while peers keep consuming), and there is
-no fork/join oversplit decision to tune. To control streaming tail latency,
-raise `compute_workers` / `per_stage_parallelism`.
+per-item skew through its MPMC channel + per-stage workers (a stalled worker
+simply stops draining while peers keep consuming), and there is no fork/join
+oversplit decision to tune. To control streaming tail latency, raise
+`compute_workers` or pin a stage's `StageOptions::workers`.
 
 ### `Slots<T>` — Index-Based Zero-Copy Buffers
 
@@ -313,17 +321,24 @@ stream(items)                       // StreamPipe<StreamStart, I, I>
 | Builder method        | Runtime topology                                                          |
 | --------------------- | ------------------------------------------------------------------------- |
 | `.stage(f)`           | `parallelism` compute-pool workers pull, apply `f`, forward               |
+| `.stage_with(opts,f)` | same, with `opts.workers` / `opts.buffer` pinning that stage              |
 | `.expand(f)`          | like `.stage` but each input → `Vec<N>` outputs (inherits parent's `seq`) |
 | `.fence(mode)`        | dedicated forwarder thread batching between adjacent stages               |
 | `.stage_async(f)`     | `io_concurrency` tokio tasks on the async runtime (M:N)                   |
+| `.stage_async_with(o,f)` | same, with `opts.io_concurrency` / `opts.buffer` pinning that stage    |
 | `.ordered()`          | feeder tags each item with `seq`; collector reorders via `ReorderBuffer`  |
 | `.with_cancel(token)` | feeder/workers/bridges check `is_cancelled()` per iteration               |
+| `.for_each(f)`        | side-effect terminal: drains item-by-item, no output `Vec` materialised   |
 
 The stage chain is a typestate (`SyncStage<FenceLink<SyncStage<StreamStart,…>>>`)
 walked by the `StageSpawn` trait — `spawn` recurses inside-out (older stages
-first) so the data-flow direction matches. `worker_stages()` counts compute-pool
-stages so `.run()` divides `compute_workers` across sync stages, preventing the
-"stage 1 fills the pool → stage 2 starves → deadlock" failure mode.
+first) so the data-flow direction matches. `stage_budget()` reports the number
+of compute-pool stages plus any `StageOptions::workers` pins, so `.run()`
+first deducts the explicit pins from `compute_workers` and divides the
+remainder equally across the unpinned stages, preventing the "stage 1 fills
+the pool → stage 2 starves → deadlock" failure mode. Per-stage `buffer` /
+`io_concurrency` pins replace the global `buffer_size` (and its
+`downstream_workers × 4` floor) / `io_concurrency` for that stage only.
 
 #### Async IO stages
 

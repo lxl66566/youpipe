@@ -34,8 +34,10 @@ let r: Vec<i32> = (0..1000).pipe().map(|x| x + 1).collect();
 | 纯 CPU map/filter         | `pipe(items)`                                        |
 | 异步 IO、同步+异步混合    | `stream(items).stage_async(...)`                     |
 | 非均衡的 CPU 负载         | `pipe(items).with_workload(Unbalanced)`              |
+| 自定义拆分粒度            | `pipe(items).with_workload(Workload::Custom(n))`     |
 | Cancellation、fence、展开 | `stream(items).with_cancel(..).fence(..).expand(..)` |
 | 借用栈上局部数据          | `scope(\|s\| s.pipe(..)....)`                        |
+| fallible + 借用           | `scope(\|s\| s.pipe(..).try_map(..).try_collect())`  |
 
 总工作量低于 ~10 µs 或单操作低于 ~100 ns 时，不建议使用 youpipe，并行设置开销无法收回成本。此时使用顺序 `iter().map().collect()` 更快。
 
@@ -145,7 +147,7 @@ CPU + IO 混合（两阶段，500 项）：
 
 默认值：`compute_workers = async_workers = available_parallelism`、
 `io_concurrency = 128`、`buffer_size = 256`、`Workload::Balanced`。tokio 运行时在
-首次 `.run()` 时延迟构建，并在该次运行内复用；传入 `AsyncPool` 可跨运行共享。
+首次 `.run()` 时延迟构建，并在该次运行内复用；传入 `TokioPool` 可跨运行共享。
 
 ```rust
 use youpipe::prelude::*;
@@ -156,18 +158,40 @@ let r: Vec<_> = (0..5_000).pipe()
     .map(|x| expensive(x))
     .collect();
 
+// Workload::Custom(n)：自行指定 fork/join 拆分粒度（1 = 最粗，
+// 16 = 面向极端偏斜的细粒度窃取）
+let r: Vec<_> = (0..5_000).pipe()
+    .with_workload(Workload::Custom(std::num::NonZeroUsize::new(16).unwrap()))
+    .map(|x| expensive(x))
+    .collect();
+
 // 调优配置 + 复用运行时
 let cfg = PipelineConfig::default()
     .with_compute_workers(16)
     .with_async_workers(8)
     .with_io_concurrency(512)
     .with_buffer_size(1024);
-let pool = AsyncPool::from_default()?;
+let pool = TokioPool::build_default()?;
 let r = items.stream()
     .with_config(cfg)
     .with_async_pool(pool)
     .stage_async(|x| async move { io(x).await })
     .run();
+
+// 逐阶段调优：重 CPU 阶段固定 8 个 worker，异步阶段固定 512 路 IO 并发 +
+// 深缓冲——未设置的旋钮回落到管线级配置。
+let r: Vec<_> = items.stream()
+    .stage_with(StageOptions::new().workers(8), |x| crunch(x))
+    .stage(|x| light(x))
+    .stage_async_with(
+        StageOptions::new().io_concurrency(512).buffer(1024),
+        |x| async move { io(x).await },
+    )
+    .run();
+
+// 副作用终结器：不物化输出 Vec —— 排空在调用线程上进行，可直接 &mut 捕获。
+let mut total = 0u64;
+stream(0..10_000).stage(|x| x * 2).for_each(|x| total += x);
 
 // 取消
 let token = CancellationToken::new();
@@ -176,8 +200,9 @@ let r = (0..10_000).stream()
     .stage(|x| expensive(x))
     .run();
 
-// 为阻塞 IO 同步阶段过订阅计算线程池
-let pool = ComputePool::new(512);
+// 为阻塞 IO 同步阶段过订阅计算线程池。注意：线程池上限为
+// MAX_COMPUTE_WORKERS（511），更大的值会被静默钳制。
+let pool = ComputePool::new(MAX_COMPUTE_WORKERS);
 let r = (0..1000).stream()
     .with_compute_pool(pool)
     .stage(|x| blocking_io(x))
@@ -185,13 +210,21 @@ let r = (0..1000).stream()
 ```
 
 `io_concurrency` 是 M:N 乘数——异步任务在等待时会放弃 OS 线程，因此该值可以远大于
-`async_workers`（线程数量）。限制此值以控制内存上限。
+`async_workers`（线程数量）。限制此值以控制内存上限。可用
+`StageOptions::io_concurrency` 配合 `.stage_async_with(opts, f)` 按阶段覆盖
+（例如网络阶段 512、磁盘阶段 16）；`.stage_with(opts, f)` 里的
+`StageOptions::workers` 可固定同步阶段的 worker 数——显式 worker 先从
+`compute_workers` 预算中扣除，剩余部分再均分给未指定的阶段。
 
 `.fence(mode)` 作用于一个相邻阶段边界。`FenceMode::Barrier` 让上游完全排空后下游
 才开始；`FenceMode::Chunked(k)` 每凑齐 `k` 个元素就立即释放（混合 CPU/IO 的推荐
 默认）。`.run()` 默认按完成顺序返回结果；追加 `.ordered()` 通过 `ReorderBuffer`
 恢复输入顺序。tokio runtime 构建失败会让 `.run()` panic；改用 `.try_run()`
 可拿到 `Result`。
+
+并非所有配置项对所有引擎都生效：fused `pipe()` 只读取 `compute_workers` 与
+`workload`；`buffer_size` / `async_workers` / `io_concurrency` 仅对流式路径生效。
+线程池规模上限为 `MAX_COMPUTE_WORKERS = 511`（调度器休眠位宽为 9 bit）。
 
 ## 工作原理
 

@@ -328,3 +328,104 @@ fn test_scope_for_each_panic_propagates_parallel() {
         "every scoped input item must be dropped exactly once on panic"
     );
 }
+
+// ── ScopedTryPipe (fallible chains that borrow 'env data) ──
+
+#[test]
+fn test_scoped_try_map_ok() {
+    let factor = 3i32;
+    let r: Result<Vec<i32>, &str> = youpipe::scope(|s| {
+        s.pipe(0..1_000)
+            .try_map(|x: i32| Ok(x * factor)) // borrows `factor`
+            .try_collect()
+    });
+    assert_eq!(r.unwrap(), (0..1_000).map(|x| x * 3).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_scoped_try_map_err_short_circuits() {
+    let limit = 500i32;
+    let r: Result<Vec<i32>, String> = youpipe::scope(|s| {
+        s.pipe(0..1_000)
+            .try_map(|x: i32| {
+                if x > limit {
+                    Err(format!("{x} over {limit}")) // borrows `limit`
+                } else {
+                    Ok(x)
+                }
+            })
+            .try_collect()
+    });
+    // Parallel short-circuit: WHICH failing item wins is racy, only that the
+    // error is one of the over-limit items (and not a success).
+    let err = r.unwrap_err();
+    let n: i32 = err
+        .split_once(" over ")
+        .and_then(|(n, _)| n.parse().ok())
+        .expect("error carries the failing item");
+    assert!((501..1_000).contains(&n), "unexpected error: {err}");
+}
+
+#[test]
+fn test_scoped_try_chain_map_filter_map_err() {
+    let table: Vec<i32> = (0..500).collect();
+    let r: Result<Vec<i32>, &str> = youpipe::scope(|s| {
+        s.pipe(0..table.len())
+            .map(|i: usize| table[i] * 2) // borrows `table`
+            .filter(|x: &i32| *x % 3 == 0)
+            .try_map(|x: i32| if x < 0 { Err("neg") } else { Ok(x + 1) })
+            .map_err(|e| e)
+            .try_collect()
+    });
+    let expected: Vec<i32> = (0..500)
+        .map(|x| x * 2)
+        .filter(|x| x % 3 == 0)
+        .map(|x| x + 1)
+        .collect();
+    assert_eq!(r.unwrap(), expected);
+}
+
+#[test]
+fn test_scoped_try_map_borrowed_slice_input() {
+    // The full headline combo: zero-clone slice input + fallible chain that
+    // borrows scope-local data — impossible before ScopedTryPipe.
+    let files: Vec<String> = (0..200).map(|i| format!("f{i}")).collect();
+    let prefix = "f1";
+    let r: Result<Vec<usize>, &str> = youpipe::scope(|s| {
+        s.pipe(&files)
+            .try_map(|f: &String| {
+                if f.starts_with(prefix) && f.len() > 2 {
+                    Err("colliding prefix")
+                } else {
+                    Ok(f.len())
+                }
+            })
+            .try_collect()
+    });
+    // "f1" itself has len 2 (not > 2), "f10".."f199" collide.
+    assert_eq!(r.unwrap_err(), "colliding prefix");
+}
+
+#[test]
+fn test_scoped_try_empty_input() {
+    let r: Result<Vec<i32>, &str> = youpipe::scope(|s| {
+        s.pipe(Vec::<i32>::new())
+            .try_map(|x| Ok(x * 2))
+            .try_collect()
+    });
+    assert_eq!(r.unwrap(), Vec::<i32>::new());
+}
+
+#[test]
+fn test_scoped_try_with_workload_custom() {
+    let offset = 7i32;
+    let r: Result<Vec<i32>, &str> = youpipe::scope(|s| {
+        s.pipe(0..2_000)
+            .with_workload(youpipe::Workload::Custom(
+                std::num::NonZeroUsize::new(16).unwrap(),
+            ))
+            .try_map(|x: i32| Ok(x + offset))
+            .try_collect()
+    });
+    assert_eq!(r.unwrap(), (0..2_000).map(|x| x + 7).collect::<Vec<_>>());
+}

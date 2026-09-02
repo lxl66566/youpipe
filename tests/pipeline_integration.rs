@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use youpipe::{FenceMode, pipe, stream};
+use youpipe::{FenceMode, Workload, pipe, stream};
 
 fn cpu_heavy(x: u64) -> u64 {
     let mut r = x;
@@ -893,4 +893,239 @@ fn test_hybrid_dispatch_spin_wait_stress() {
             });
         }
     });
+}
+
+// ── Workload::Custom ──
+
+#[test]
+fn test_workload_custom_correctness() {
+    // Custom oversplit produces identical results across factors 1..=32 —
+    // the split granularity must never affect the output.
+    let expected: Vec<u64> = (0..10_000).map(|x| x * 3 + 1).collect();
+    for factor in [1usize, 2, 7, 16, 32] {
+        let r: Vec<u64> = pipe(0..10_000)
+            .with_workload(Workload::Custom(
+                std::num::NonZeroUsize::new(factor).unwrap(),
+            ))
+            .map(|x: u64| x * 3 + 1)
+            .collect();
+        assert_eq!(r, expected, "factor {factor} diverged");
+    }
+}
+
+#[test]
+fn test_workload_custom_try_collect() {
+    let r: Result<Vec<u64>, &str> = pipe(0..1_000)
+        .with_workload(Workload::Custom(std::num::NonZeroUsize::new(4).unwrap()))
+        .try_map(|x: u64| Ok(x + 1))
+        .try_collect();
+    assert_eq!(r.unwrap(), (1..=1_000).collect::<Vec<_>>());
+}
+
+// ── per-stage StageOptions (streaming) ──
+
+#[test]
+// Wall-clock concurrency observation relies on sleep overlap; miri's
+// interpreted slowdown makes it meaningless (but minutes long).
+// NOTE: keep the total pool occupancy short (~100 ms) — this test pins 2
+// global-pool workers with sleeps, and longer runs delay other tests'
+// worker spawn-ups enough to trip their wall-clock assertions (observed with
+// test_fence_cancellation_aborts_early when this ran 500 ms).
+#[cfg_attr(miri, ignore)]
+fn test_stage_options_workers_pins_parallelism() {
+    use std::time::Duration;
+
+    use youpipe::StageOptions;
+
+    // The pinned stage must never exceed 2 concurrent executions, whatever
+    // the default equal-division would have granted it.
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let a = active.clone();
+    let m = max_active.clone();
+    let n = 40usize;
+    stream(0..n)
+        .stage_with(StageOptions::new().workers(2), move |x: usize| {
+            let cur = a.fetch_add(1, Ordering::SeqCst) + 1;
+            m.fetch_max(cur, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(5));
+            a.fetch_sub(1, Ordering::SeqCst);
+            x + 1
+        })
+        .stage(|x: usize| x * 2)
+        .run();
+    let max = max_active.load(Ordering::SeqCst);
+    assert!(
+        max <= 2 + 1, // +1: a worker may increment before the previous
+        // decrement is visible; >3 would mean the pin was ignored
+        "workers(2) pin not honoured: max concurrency {max}"
+    );
+    assert!(max >= 2, "pinned stage never reached 2 workers: {max}");
+}
+
+#[test]
+// Async-task concurrency observation via timer sleeps; meaningless under
+// miri's clock.
+#[cfg_attr(miri, ignore)]
+#[cfg(feature = "tokio-runtime")]
+fn test_stage_options_io_concurrency_pins_fanout() {
+    use std::time::Duration;
+
+    use youpipe::StageOptions;
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let a = active.clone();
+    let m = max_active.clone();
+    let n = 64usize;
+    let r: Vec<usize> = stream(0..n)
+        // Global default is 128; the per-stage pin must win.
+        .with_io_concurrency(128)
+        .stage_async_with(StageOptions::new().io_concurrency(3), move |x: usize| {
+            let a = a.clone();
+            let m = m.clone();
+            async move {
+                let cur = a.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                a.fetch_sub(1, Ordering::SeqCst);
+                x + 1
+            }
+        })
+        .run();
+    assert_eq!(r.len(), n);
+    let max = max_active.load(Ordering::SeqCst);
+    assert!(
+        max <= 3 + 1, // +1: increment visible before the paired decrement
+        "io_concurrency(3) pin not honoured: max fanout {max}"
+    );
+    assert!(max >= 3, "async stage never reached 3 tasks: {max}");
+}
+
+#[test]
+fn test_stage_options_buffer_override_runs() {
+    // A tiny explicit buffer tightens backpressure but must not affect
+    // correctness (items flow through, none dropped).
+    use youpipe::StageOptions;
+
+    // Under miri's single emulated pool worker, any `n > buffer` streaming
+    // run deadlocks regardless of the override (the feeder's pool job and the
+    // stage workers contend for the one thread — same constraint documented
+    // on the prelude doctest). Scale the buffer pins up there so the feeder
+    // still takes the inline path; the tight-backpressure shaping itself is
+    // covered by the native run.
+    let (n, b1, b2) = if cfg!(miri) {
+        (100, 256, 256)
+    } else {
+        (500, 2, 4)
+    };
+    let r: Vec<usize> = stream(0..n)
+        .stage_with(StageOptions::new().buffer(b1), |x: usize| x + 1)
+        .stage_with(StageOptions::new().buffer(b2).workers(3), |x: usize| x * 2)
+        .run();
+    let expected: Vec<usize> = (0..n).map(|x| (x + 1) * 2).collect();
+    let mut sorted = r;
+    sorted.sort_unstable();
+    assert_eq!(sorted, expected);
+}
+
+#[test]
+fn test_stage_options_expand_with_workers() {
+    use youpipe::StageOptions;
+
+    let r: Vec<u32> = stream(0..50u32)
+        .expand_with(StageOptions::new().workers(2), |x| vec![x; x as usize + 1])
+        .run();
+    assert_eq!(
+        r.len(),
+        (0..50u32).map(|x| x as usize + 1).sum::<usize>(),
+        "expand_with dropped items"
+    );
+}
+
+#[test]
+fn test_stage_budget_explicit_deduction() {
+    // 2 explicit stages (4+4 workers) on an 8-worker budget: the unspecified
+    // third stage must still run (≥1 worker), not deadlock — the budget
+    // deduction must not zero it out.
+    use youpipe::StageOptions;
+
+    let r: Vec<usize> = stream(0..100)
+        .with_compute_workers(8)
+        .stage_with(StageOptions::new().workers(4), |x: usize| x + 1)
+        .stage_with(StageOptions::new().workers(4), |x: usize| x + 1)
+        .stage(|x: usize| x * 10)
+        .run();
+    assert_eq!(r.len(), 100);
+    assert_eq!(
+        r.iter().sum::<usize>(),
+        (0..100usize).map(|x| (x + 2) * 10).sum::<usize>()
+    );
+}
+
+// ── StreamPipe::for_each ──
+
+#[test]
+fn test_stream_for_each_unordered_sees_all_items() {
+    // miri: single emulated pool worker — keep n within the default feeder
+    // buffer (256) so the feeder stays on the inline path (see prelude doc).
+    let n: u64 = if cfg!(miri) { 100 } else { 1_000 };
+    let mut total = 0u64;
+    stream(0..n).stage(|x| x * 2).for_each(|x| total += x);
+    assert_eq!(total, (0..n).map(|x| x * 2).sum::<u64>());
+}
+
+#[test]
+fn test_stream_for_each_ordered_sees_input_order() {
+    let mut seen: Vec<u32> = Vec::new();
+    stream(0..150u32)
+        .stage(|x| {
+            // Skew completion order: even items take the slow path.
+            if x % 2 == 0 {
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            x
+        })
+        .ordered()
+        .for_each(|x| seen.push(x));
+    assert_eq!(seen, (0..150).collect::<Vec<u32>>());
+}
+
+#[test]
+#[cfg(feature = "tokio-runtime")]
+fn test_stream_for_each_after_async_stage() {
+    let mut count = 0usize;
+    stream(0..64usize)
+        .stage_async(|x| async move { x + 1 })
+        .for_each(|_| count += 1);
+    assert_eq!(count, 64);
+}
+
+#[test]
+fn test_stream_for_each_empty_input() {
+    let mut calls = 0;
+    let empty: Vec<u64> = Vec::new();
+    stream(empty).stage(|x: u64| x).for_each(|_| calls += 1);
+    assert_eq!(calls, 0);
+}
+
+// ── quick setters ──
+
+#[test]
+fn test_compute_workers_clamped_above_max() {
+    // 10_000 ≫ MAX_COMPUTE_WORKERS (511): the clamp keeps the config usable
+    // instead of tripping the scheduler's THREADS_MAX assert.
+    let n = 100u64;
+    let r: Vec<u64> = pipe(0..n)
+        .with_compute_workers(10_000)
+        .map(|x| x + 1)
+        .collect();
+    assert_eq!(r, (1..=n).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_max_compute_workers_constant() {
+    // The public constant must mirror what ComputePool::new actually clamps
+    // to (511 on 64-bit) — README examples rely on it.
+    assert_eq!(youpipe::MAX_COMPUTE_WORKERS, 511);
 }

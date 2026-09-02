@@ -104,7 +104,8 @@ fn bench_tokio_spawn_blocking(c: &mut Criterion) {
     // Single anchor at 1K: this group only documents tokio's per-spawn
     // overhead ceiling; the same comparison (on identical data, against
     // rayon) lives in `mixed_load`, which is the group A/B verdicts use.
-    for size in [1_000] {
+    {
+        let size = 1_000;
         group.throughput(Throughput::Elements(size as u64));
         group.bench_function(BenchmarkId::new("spawn_blocking_cpu", size), |b| {
             b.iter(|| {

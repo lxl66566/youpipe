@@ -231,6 +231,8 @@ waker overhead.
 
 `youpipe_blocking_oversub` uses `.with_compute_pool(ComputePool::new(512))`
 to match tokio's 512-thread blocking pool, narrowing the gap substantially.
+(512 is silently clamped to `MAX_COMPUTE_WORKERS = 511` — one thread short of
+tokio's pool, immaterial for the comparison.)
 The remaining gap is streaming infrastructure overhead (channel handoff,
 injector scheduling) — the tradeoff for backpressure, ordering, and
 multi-stage composition that raw `spawn_blocking` doesn't provide. For

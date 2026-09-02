@@ -18,12 +18,12 @@
 #[cfg(feature = "tokio-runtime")]
 pub use crate::runtime::TokioPool;
 pub use crate::{
-    Identity, Pipe, PipelineConfig, StreamPipe, StreamStart, Workload,
-    executor::ComputePool,
+    Identity, Pipe, PipelineConfig, StageOptions, StreamPipe, StreamStart, Workload,
+    executor::{ComputePool, compute::MAX_COMPUTE_WORKERS},
     handoff::{Receiver, Sender, async_channel, channel},
     pipe,
     runtime::{AsyncRuntime, DefaultRuntime},
-    scope::{PipelineScope, ScopedPipe, scope},
+    scope::{PipelineScope, ScopedPipe, ScopedTryPipe, scope},
     state::{FenceBarrier, FenceMode, ReorderBuffer},
     stream,
     sync::CancellationToken,

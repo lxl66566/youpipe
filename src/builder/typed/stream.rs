@@ -1,6 +1,6 @@
 #[cfg(feature = "tokio-runtime")]
 use std::{future::Future, sync::OnceLock};
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, num::NonZeroUsize, sync::Arc};
 
 use crate::{
     builder::config::PipelineConfig,
@@ -337,6 +337,117 @@ fn forward_fenced<M, Tx>(
 
 // ── StreamPipe (data-first chainable streaming pipeline) ──
 
+/// Per-stage tuning overrides, chainable like the pipeline itself.
+///
+/// Every field is optional: unset fields fall back to the pipeline-level
+/// [`PipelineConfig`] value (or the runner's equal division of
+/// `compute_workers` across sync stages, for `workers`). Attach to a stage
+/// via [`StreamPipe::stage_with`] / [`StreamPipe::stage_async_with`] /
+/// [`StreamPipe::expand_with`].
+///
+/// ```rust
+/// use youpipe::prelude::*;
+///
+/// // Heavy CPU stage gets 8 workers, light one divides the rest; the async
+/// // stage runs 512 concurrent IO tasks with a deep buffer.
+/// let r: Vec<u64> = (0..1000).stream()
+///     .stage_with(StageOptions::new().workers(8), |x: u64| crunch(x))
+///     .stage(|x: u64| x + 1)
+///     .stage_async_with(
+///         StageOptions::new().io_concurrency(512).buffer(1024),
+///         |x: u64| async move { fetch(x).await },
+///     )
+///     .run();
+/// # fn crunch(x: u64) -> u64 { x }
+/// # async fn fetch(x: u64) -> u64 { x }
+/// ```
+///
+/// # Worker budget semantics (`workers`)
+///
+/// The runner first deducts every explicitly-set `workers` from the pool
+/// budget (`compute_workers`, or the custom pool's size), then divides what
+/// remains equally across the stages that did **not** set `workers`. This
+/// keeps the invariant that the total blocking jobs never exceeds the pool —
+/// the "stage 1 fills the pool, stage 2 starves, deadlock" failure mode.
+/// Consequently a chain of explicit overrides that exceeds the pool still
+/// runs (unspecified stages fall back to 1 worker) but may oversubscribe —
+/// the caller opted into that.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StageOptions {
+    pub(crate) workers: Option<NonZeroUsize>,
+    pub(crate) io_concurrency: Option<NonZeroUsize>,
+    pub(crate) buffer: Option<NonZeroUsize>,
+}
+
+impl StageOptions {
+    /// A fresh options set — everything unset, everything falls back to the
+    /// pipeline-level [`PipelineConfig`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pin this (sync or expand) stage's compute-pool worker count,
+    /// bypassing the equal division of `compute_workers` across stages.
+    ///
+    /// Use when stage costs are known to be unequal: a heavy parse stage
+    /// deserves more workers than a cheap transform. Clamped per-run to the
+    /// item count (`workers = min(workers, n)`) like the default division.
+    #[must_use]
+    pub fn workers(mut self, n: usize) -> Self {
+        self.workers = NonZeroUsize::new(n);
+        self
+    }
+
+    /// Pin this async stage's concurrent-task fan-out, bypassing the global
+    /// `io_concurrency`. The right knob when one async stage talks to a
+    /// high-latency network (wants 512 in flight) while another hits a local
+    /// disk (wants 16).
+    #[must_use]
+    pub fn io_concurrency(mut self, n: usize) -> Self {
+        self.io_concurrency = NonZeroUsize::new(n);
+        self
+    }
+
+    /// Pin this stage's **output** channel capacity, bypassing
+    /// `buffer_size` (and its `downstream_workers * 4` floor). Small buffers
+    /// tighten backpressure (less peak memory); large ones absorb bursts.
+    /// Correctness is unaffected — only throughput/memory trade off.
+    #[must_use]
+    pub fn buffer(mut self, n: usize) -> Self {
+        self.buffer = NonZeroUsize::new(n);
+        self
+    }
+}
+
+/// Per-run worker-budget summary of a stage chain, reported by
+/// [`StageSpawn::stage_budget`] and consumed by `StreamPipe::run` to divide
+/// the pool across sync stages. Internal to the streaming engine (not
+/// re-exported at the crate root).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StageBudget {
+    /// Number of stages that consume compute-pool worker slots.
+    pub stages: usize,
+    /// Number of those stages that pinned their worker count via
+    /// `StageOptions::workers`.
+    pub explicit_stages: usize,
+    /// Sum of the pinned worker counts.
+    pub explicit_workers: usize,
+}
+
+impl StageBudget {
+    /// The per-stage worker count for stages that did not pin one: subtract
+    /// the explicit claims from the pool, divide the rest equally (min 1).
+    pub(crate) fn default_workers(&self, pool_workers: usize) -> usize {
+        let unspecified = self.stages.saturating_sub(self.explicit_stages);
+        if unspecified == 0 {
+            return 1;
+        }
+        let remaining = pool_workers.saturating_sub(self.explicit_workers);
+        (remaining / unspecified).max(1)
+    }
+}
+
 /// Streaming pipeline for workloads that cannot be fused at compile time
 /// (multi-stage channels, fences, async stages, ordered output, cancellation).
 ///
@@ -400,6 +511,7 @@ where
 pub struct SyncStage<Prev, F> {
     pub(super) prev: Prev,
     pub(super) f: F,
+    pub(super) opts: StageOptions,
 }
 
 /// 1-to-N expansion stage: `Fn(O) -> Vec<N>`. Each input item produces zero or
@@ -409,6 +521,7 @@ pub struct SyncStage<Prev, F> {
 pub struct ExpandStage<Prev, F> {
     pub(super) prev: Prev,
     pub(super) f: F,
+    pub(super) opts: StageOptions,
 }
 
 /// Async stage: `Fn(O) -> Future<Output = N>`, runs as `io_concurrency` tasks
@@ -419,6 +532,7 @@ pub struct ExpandStage<Prev, F> {
 pub struct AsyncStage<Prev, F> {
     pub(super) prev: Prev,
     pub(super) f: F,
+    pub(super) opts: StageOptions,
 }
 
 /// Fence link: inserts a [`FenceBarrier`] between two stages. The type is
@@ -439,14 +553,14 @@ pub struct FenceLink<Prev> {
 /// The final receiver is wrapped in [`FinalRx`] so the collector knows whether
 /// to drain synchronously or via the async runtime.
 ///
-/// `worker_stages` returns the number of stages in the chain that consume
-/// **compute-pool worker slots** (sync stages + expand stages). Fence links
-/// and async stages don't count — fences run on a dedicated thread, async
-/// stages run on the async runtime. The runner divides
-/// `config.compute_workers` by this count so the total blocking jobs across
-/// all sync stages never exceeds the pool size, preventing the
-/// "stage 1 holds all pool threads → stage 2 can't start → deadlock" failure
-/// mode that bit the pre-fusion API.
+/// Returns the number of stages in this chain that consume compute-pool
+/// worker slots (sync stages + expand stages). Fence links and async stages
+/// don't count — fences run on a dedicated thread, async stages run on the
+/// async runtime. The runner uses this (via [`StageBudget`]) to divide the
+/// pool budget across stages so the total blocking jobs across all sync
+/// stages never exceeds the pool size, preventing the "stage 1 holds all pool
+/// threads → stage 2 can't start → deadlock" failure mode that bit the
+/// pre-fusion API.
 pub trait StageSpawn<In: Send + Unpin + 'static> {
     type Out: Send + Unpin + 'static;
     fn spawn<R: AsyncRuntime>(
@@ -477,9 +591,10 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
         self.spawn::<R>(rx, ctx)
     }
 
-    /// Number of stages in this chain that consume compute-pool worker slots.
+    /// Worker-budget summary of this chain — number of pool-consuming stages
+    /// plus any per-stage worker counts pinned via `StageOptions::workers`.
     /// Used by `StreamPipe::run` to divide the pool across stages.
-    fn worker_stages(&self) -> usize;
+    fn stage_budget(&self) -> StageBudget;
 
     /// Returns `true` if this chain contains at least one `ExpandStage`.
     ///
@@ -669,11 +784,14 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     pub config: &'a PipelineConfig,
     pub cancel: Option<CancellationToken>,
     pub n: usize,
-    /// Per-stage compute-pool parallelism, set by `StreamPipe::run` as
-    /// `compute_workers / worker_stages` (clamped to ≥ 1). Each sync stage
-    /// uses this many pool workers so the total across all sync stages fits
-    /// inside the pool — preventing the "stage 1 fills the pool, stage 2
-    /// starves, deadlock" failure mode.
+    /// Default per-stage compute-pool parallelism, set by `StreamPipe::run`
+    /// from the worker budget: explicit `StageOptions::workers` pins are
+    /// deducted from `compute_workers` first, then the remainder is divided
+    /// equally across the unpinned sync stages (clamped to ≥ 1). A stage's
+    /// actual worker count is resolved in `StreamCtx::stage_workers`, which
+    /// consults the stage's own `StageOptions` before falling back here.
+    /// Bridges and fences (which have no options of their own) use this value
+    /// directly.
     pub per_stage_parallelism: usize,
     /// Custom compute pool (cloned from the builder's `with_compute_pool`).
     /// When `None`, sync stages use [`ComputePool::global`].
@@ -705,6 +823,35 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
 impl<R: AsyncRuntime> StreamCtx<'_, R> {
     pub fn buffer_size(&self, parallelism: usize) -> usize {
         self.config.buffer_size.max(parallelism * 4)
+    }
+
+    /// Resolve a stage's worker count: the stage's explicit
+    /// `StageOptions::workers` pin, or the runner-computed default division.
+    /// Clamped to `[1, n]` (a stage never gets more workers than items).
+    pub fn stage_workers(&self, opts: &StageOptions) -> usize {
+        let resolved = opts
+            .workers
+            .map_or(self.per_stage_parallelism, NonZeroUsize::get);
+        resolved.min(self.n.max(1)).max(1)
+    }
+
+    /// Resolve a stage's output-channel capacity: the stage's explicit
+    /// `StageOptions::buffer` pin (used verbatim — the caller opted into this
+    /// exact backpressure), or the config value with the
+    /// `downstream_workers * 4` floor.
+    pub fn stage_buffer(&self, opts: &StageOptions, parallelism: usize) -> usize {
+        opts.buffer
+            .map_or_else(|| self.buffer_size(parallelism), NonZeroUsize::get)
+    }
+
+    /// Resolve an async stage's task fan-out: the stage's explicit
+    /// `StageOptions::io_concurrency` pin, or the global config value.
+    /// Clamped to `[1, n]`.
+    pub fn stage_io_concurrency(&self, opts: &StageOptions) -> usize {
+        let resolved = opts
+            .io_concurrency
+            .map_or(self.config.io_concurrency, NonZeroUsize::get);
+        resolved.max(1).min(self.n.max(1))
     }
 
     /// Returns the compute pool for this run: the user-supplied pool from
@@ -751,8 +898,8 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
     fn spawn<R: AsyncRuntime>(self, rx: Receiver<(u64, I)>, _ctx: &StreamCtx<'_, R>) -> FinalRx<I> {
         FinalRx::Sync(rx)
     }
-    fn worker_stages(&self) -> usize {
-        0
+    fn stage_budget(&self) -> StageBudget {
+        StageBudget::default()
     }
     fn first_consumer_is_async(&self) -> Option<bool> {
         None
@@ -785,8 +932,8 @@ where
 
     fn spawn<R: AsyncRuntime>(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx<'_, R>) -> FinalRx<M> {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
-        let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
-        let buffer = ctx.buffer_size(parallelism);
+        let parallelism = ctx.stage_workers(&self.opts);
+        let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = channel::<(u64, M)>(buffer);
         let _wg = spawn_stage(
             ctx.compute_pool(),
@@ -813,8 +960,8 @@ where
         // `prev.spawn_single`) — their output feeds multiple workers in this
         // stage, so multi-consumer channels are required there.
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
-        let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
-        let buffer = ctx.buffer_size(parallelism);
+        let parallelism = ctx.stage_workers(&self.opts);
+        let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = mpsc_channel::<(u64, M)>(buffer);
         let _wg = spawn_stage(
             ctx.compute_pool(),
@@ -845,8 +992,8 @@ where
         // dedicated OS thread forwarding each item sync→mixed-mode; now the
         // CPU stage's workers ARE the mixed-mode producers.
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
-        let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
-        let buffer = ctx.buffer_size(parallelism);
+        let parallelism = ctx.stage_workers(&self.opts);
+        let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = sync_async_channel::<(u64, M)>(buffer);
         let _wg = spawn_stage(
             ctx.compute_pool(),
@@ -859,9 +1006,15 @@ where
         out_rx
     }
 
-    fn worker_stages(&self) -> usize {
+    fn stage_budget(&self) -> StageBudget {
         // This stage consumes a pool slot; recurse to count earlier stages.
-        1 + self.prev.worker_stages()
+        let mut budget = self.prev.stage_budget();
+        budget.stages += 1;
+        if let Some(w) = self.opts.workers {
+            budget.explicit_stages += 1;
+            budget.explicit_workers += w.get();
+        }
+        budget
     }
 
     fn first_consumer_is_async(&self) -> Option<bool> {
@@ -886,8 +1039,8 @@ where
 
     fn spawn<R: AsyncRuntime>(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx<'_, R>) -> FinalRx<N> {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
-        let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
-        let buffer = ctx.buffer_size(parallelism);
+        let parallelism = ctx.stage_workers(&self.opts);
+        let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = channel::<(u64, N)>(buffer);
         let _wg = spawn_expand_stage(
             ctx.compute_pool(),
@@ -909,8 +1062,8 @@ where
         Self: Sized,
     {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
-        let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
-        let buffer = ctx.buffer_size(parallelism);
+        let parallelism = ctx.stage_workers(&self.opts);
+        let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = mpsc_channel::<(u64, N)>(buffer);
         let _wg = spawn_expand_stage(
             ctx.compute_pool(),
@@ -932,8 +1085,8 @@ where
         // Same direct-handoff optimisation as `SyncStage::spawn_for_async`:
         // expansion workers write the mixed-mode sender directly.
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
-        let parallelism = ctx.per_stage_parallelism.min(ctx.n.max(1)).max(1);
-        let buffer = ctx.buffer_size(parallelism);
+        let parallelism = ctx.stage_workers(&self.opts);
+        let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = sync_async_channel::<(u64, N)>(buffer);
         let _wg = spawn_expand_stage(
             ctx.compute_pool(),
@@ -946,8 +1099,14 @@ where
         out_rx
     }
 
-    fn worker_stages(&self) -> usize {
-        1 + self.prev.worker_stages()
+    fn stage_budget(&self) -> StageBudget {
+        let mut budget = self.prev.stage_budget();
+        budget.stages += 1;
+        if let Some(w) = self.opts.workers {
+            budget.explicit_stages += 1;
+            budget.explicit_workers += w.get();
+        }
+        budget
     }
 
     fn first_consumer_is_async(&self) -> Option<bool> {
@@ -1017,9 +1176,9 @@ where
         fenced_rx
     }
 
-    fn worker_stages(&self) -> usize {
+    fn stage_budget(&self) -> StageBudget {
         // Fence runs on a dedicated thread, doesn't consume a pool slot.
-        self.prev.worker_stages()
+        self.prev.stage_budget()
     }
 
     fn first_consumer_is_async(&self) -> Option<bool> {
@@ -1061,12 +1220,12 @@ where
         // prev is async (runtime-task funnel). Then run the consumer fan-out.
         // The output is already a fully-async channel, handed back directly.
         let a_in_rx = self.prev.spawn_for_async::<R>(rx, ctx);
-        spawn_async_consumers_body::<F, Prev::Out, M, Fut, R>(self.f, a_in_rx, ctx)
+        spawn_async_consumers_body::<F, Prev::Out, M, Fut, R>(self.f, a_in_rx, &self.opts, ctx)
     }
 
-    fn worker_stages(&self) -> usize {
+    fn stage_budget(&self) -> StageBudget {
         // Async stage runs on the async runtime, not the compute pool.
-        self.prev.worker_stages()
+        self.prev.stage_budget()
     }
 
     fn spawn_single<R: AsyncRuntime>(
@@ -1083,7 +1242,9 @@ where
         // — multiple async consumer tasks share the input via clone.
         let a_in_rx = self.prev.spawn_for_async::<R>(rx, ctx);
         FinalRx::AsyncSingle(
-            spawn_async_consumers_body_single::<F, Prev::Out, M, Fut, R>(self.f, a_in_rx, ctx),
+            spawn_async_consumers_body_single::<F, Prev::Out, M, Fut, R>(
+                self.f, a_in_rx, &self.opts, ctx,
+            ),
         )
     }
 
@@ -1108,7 +1269,7 @@ where
         // prev stages fall back to the default impl (bridge async→sync) and
         // end up going through the normal sync `spawn` path.
         let prev_rx = self.prev.spawn_async_feeder::<R>(rx, ctx);
-        spawn_async_consumers::<Prev, F, In, M, Fut, R>(self.f, prev_rx, ctx)
+        spawn_async_consumers::<Prev, F, In, M, Fut, R>(self.f, prev_rx, &self.opts, ctx)
     }
 }
 
@@ -1126,6 +1287,7 @@ where
 fn spawn_async_consumers_body<F, In, M, Fut, R>(
     f: F,
     a_in_rx: AsyncReceiver<(u64, In)>,
+    opts: &StageOptions,
     ctx: &StreamCtx<'_, R>,
 ) -> AsyncReceiver<(u64, M)>
 where
@@ -1135,8 +1297,8 @@ where
     M: Send + Unpin + 'static,
     R: AsyncRuntime,
 {
-    let concurrency = ctx.config.io_concurrency.max(1).min(ctx.n.max(1));
-    let buffer = ctx.buffer_size(concurrency);
+    let concurrency = ctx.stage_io_concurrency(opts);
+    let buffer = ctx.stage_buffer(opts, concurrency);
     let (a_out_tx, a_out_rx) = async_channel::<(u64, M)>(buffer);
     let pool = ctx.acquire_async().expect("failed to build async runtime");
     let f = Arc::new(f);
@@ -1188,6 +1350,7 @@ where
 fn spawn_async_consumers_body_single<F, In, M, Fut, R>(
     f: F,
     a_in_rx: AsyncReceiver<(u64, In)>,
+    opts: &StageOptions,
     ctx: &StreamCtx<'_, R>,
 ) -> MpscAsyncReceiver<(u64, M)>
 where
@@ -1197,8 +1360,8 @@ where
     M: Send + Unpin + 'static,
     R: AsyncRuntime,
 {
-    let concurrency = ctx.config.io_concurrency.max(1).min(ctx.n.max(1));
-    let buffer = ctx.buffer_size(concurrency);
+    let concurrency = ctx.stage_io_concurrency(opts);
+    let buffer = ctx.stage_buffer(opts, concurrency);
     let (a_out_tx, a_out_rx) = mpsc_async_channel::<(u64, M)>(buffer);
     let pool = ctx.acquire_async().expect("failed to build async runtime");
     let f = Arc::new(f);
@@ -1253,6 +1416,7 @@ where
 fn spawn_async_consumers<Prev, F, In, M, Fut, R>(
     f: F,
     prev_rx: FinalRx<Prev::Out>,
+    opts: &StageOptions,
     ctx: &StreamCtx<'_, R>,
 ) -> FinalRx<M>
 where
@@ -1264,7 +1428,7 @@ where
     M: Send + Unpin + 'static,
     R: AsyncRuntime,
 {
-    let buffer = ctx.buffer_size(ctx.config.io_concurrency.max(1).min(ctx.n.max(1)));
+    let buffer = ctx.stage_buffer(opts, ctx.stage_io_concurrency(opts));
     let bridge_cancel = ctx.cancel.clone();
     let a_in_rx: AsyncReceiver<(u64, Prev::Out)> = match prev_rx {
         FinalRx::Sync(mid_rx) => {
@@ -1336,7 +1500,7 @@ where
         }
     };
     FinalRx::Async(spawn_async_consumers_body::<F, Prev::Out, M, Fut, R>(
-        f, a_in_rx, ctx,
+        f, a_in_rx, opts, ctx,
     ))
 }
 
@@ -1425,11 +1589,47 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     #[must_use]
     pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
         // Sync config.compute_workers to the pool's actual thread count so
-        // per_stage_parallelism (computed in run() as compute_workers /
-        // worker_stages) matches the available parallelism. Without this,
-        // a 512-thread pool would still only get num_cpus worker jobs.
+        // the worker budget (divided across sync stages in run()) matches the
+        // available parallelism. Without this, a 512-thread pool would still
+        // only get num_cpus worker jobs.
         self.config.compute_workers = pool.num_workers();
         self.compute_pool = Some(pool);
+        self
+    }
+
+    /// Set the compute-pool worker budget that gets divided across sync
+    /// stages (streaming counterpart of the fused path's thread count).
+    /// Unset fields in a [`StageOptions`] attached to a stage fall back to a
+    /// share of this budget.
+    #[must_use]
+    pub fn with_compute_workers(mut self, n: usize) -> Self {
+        self.config.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self
+    }
+
+    /// Set the async runtime's OS-thread count (streaming-only; async stages
+    /// multiplex [`PipelineConfig::io_concurrency`] tasks over these threads).
+    #[must_use]
+    pub fn with_async_workers(mut self, n: usize) -> Self {
+        self.config.async_workers = n.max(1);
+        self
+    }
+
+    /// Set the per-channel buffer capacity between stages (streaming-only).
+    /// See [`PipelineConfig::with_buffer_size`] for the
+    /// `max(downstream_workers * 4)` floor.
+    #[must_use]
+    pub fn with_buffer_size(mut self, n: usize) -> Self {
+        self.config.buffer_size = n.max(1);
+        self
+    }
+
+    /// Set the default concurrent-task fan-out for async stages
+    /// (streaming-only). Overridable per stage via
+    /// [`StageOptions::io_concurrency`] on [`Self::stage_async_with`].
+    #[must_use]
+    pub fn with_io_concurrency(mut self, n: usize) -> Self {
+        self.config.io_concurrency = n.max(1);
         self
     }
 
@@ -1442,11 +1642,35 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     where
         N: Send + Unpin + 'static,
     {
+        self.stage_with(StageOptions::new(), f)
+    }
+
+    /// [`Self::stage`] with per-stage tuning — see [`StageOptions`].
+    ///
+    /// ```rust
+    /// use youpipe::{stream, StageOptions};
+    ///
+    /// // Heavy parse stage pinned to 4 workers; later stages divide the rest.
+    /// let result: Vec<i32> = stream(0..100)
+    ///     .stage_with(StageOptions::new().workers(4), |x: i32| x + 1)
+    ///     .stage(|x: i32| x * 2)
+    ///     .run();
+    /// # assert_eq!(result.len(), 100);
+    /// ```
+    pub fn stage_with<N>(
+        self,
+        opts: StageOptions,
+        f: impl Fn(O) -> N + Send + Sync + 'static,
+    ) -> StreamPipe<SyncStage<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N, R>
+    where
+        N: Send + Unpin + 'static,
+    {
         StreamPipe {
             items: self.items,
             stages: SyncStage {
                 prev: self.stages,
                 f,
+                opts,
             },
             config: self.config,
             cancel: self.cancel,
@@ -1471,11 +1695,27 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     where
         N: Send + Unpin + 'static,
     {
+        self.expand_with(StageOptions::new(), f)
+    }
+
+    /// [`Self::expand`] with per-stage tuning — see [`StageOptions`].
+    #[allow(clippy::type_complexity)] // typestate builder return type; the
+    // `impl Fn` + nested `ExpandStage` + `R` param are inherent to the design
+    // and not helpfully decomposable.
+    pub fn expand_with<N>(
+        self,
+        opts: StageOptions,
+        f: impl Fn(O) -> Vec<N> + Send + Sync + 'static,
+    ) -> StreamPipe<ExpandStage<S, impl Fn(O) -> Vec<N> + Send + Sync + 'static>, I, N, R>
+    where
+        N: Send + Unpin + 'static,
+    {
         StreamPipe {
             items: self.items,
             stages: ExpandStage {
                 prev: self.stages,
                 f,
+                opts,
             },
             config: self.config,
             cancel: self.cancel,
@@ -1552,11 +1792,41 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
         N: Send + Unpin + 'static,
         Fut: Future<Output = N> + Send + 'static,
     {
+        self.stage_async_with(StageOptions::new(), f)
+    }
+
+    /// [`Self::stage_async`] with per-stage tuning — see [`StageOptions`].
+    /// The interesting knob here is [`StageOptions::io_concurrency`]: pin a
+    /// high fan-out for network-bound stages, a low one for disk-bound
+    /// stages, instead of one global `io_concurrency` for the whole chain.
+    ///
+    /// ```rust
+    /// # use youpipe::{stream, StageOptions};
+    /// # async fn fetch(u: u64) -> u64 { u }
+    /// let result: Vec<u64> = stream(0..64)
+    ///     .stage_async_with(
+    ///         StageOptions::new().io_concurrency(32),
+    ///         |u: u64| async move { fetch(u).await },
+    ///     )
+    ///     .run();
+    /// # assert_eq!(result.len(), 64);
+    /// ```
+    #[cfg(feature = "tokio-runtime")]
+    pub fn stage_async_with<N, Fut>(
+        self,
+        opts: StageOptions,
+        f: impl Fn(O) -> Fut + Send + Sync + 'static,
+    ) -> StreamPipe<AsyncStage<S, impl Fn(O) -> Fut + Send + Sync + 'static>, I, N, R>
+    where
+        N: Send + Unpin + 'static,
+        Fut: Future<Output = N> + Send + 'static,
+    {
         StreamPipe {
             items: self.items,
             stages: AsyncStage {
                 prev: self.stages,
                 f,
+                opts,
             },
             config: self.config,
             cancel: self.cancel,
@@ -1569,6 +1839,191 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
 }
 
 // ── Run (execute the chain) ──
+
+/// How a streaming run drains the final receiver: into a `Vec` (`.run()`) or
+/// item-by-item through a closure (`.for_each()` — no output `Vec`
+/// materialised).
+trait Terminal<T>: Sized {
+    type Out: Send + 'static;
+    /// Result for an empty input (nothing is spawned at all).
+    fn drain_empty(self) -> Self::Out;
+    fn drain_sync<R: RecvItem<(u64, T)>>(self, rx: R, ordered: bool, n: usize) -> Self::Out;
+    #[cfg(feature = "tokio-runtime")]
+    fn drain_async<R: AsyncRecvItem<(u64, T)>>(
+        self,
+        rx: R,
+        ordered: bool,
+        n: usize,
+    ) -> impl Future<Output = Self::Out>;
+}
+
+/// `Vec`-materialising terminal — the behaviour of `.run()`.
+struct VecCollector;
+
+impl<T: Send + Unpin + 'static> Terminal<T> for VecCollector {
+    type Out = Vec<T>;
+
+    fn drain_empty(self) -> Vec<T> {
+        Vec::new()
+    }
+
+    fn drain_sync<R: RecvItem<(u64, T)>>(self, rx: R, ordered: bool, n: usize) -> Vec<T> {
+        collect_sync(rx, ordered, n)
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    async fn drain_async<R: AsyncRecvItem<(u64, T)>>(
+        self,
+        rx: R,
+        ordered: bool,
+        n: usize,
+    ) -> Vec<T> {
+        collect_async(rx, ordered, n).await
+    }
+}
+
+/// Side-effect terminal — the behaviour of `.for_each()`. `f` runs on the
+/// calling thread (both the sync drain and the `block_on` async drain), so it
+/// needs no `Send`/`'static` bounds.
+struct ForEachCollector<F> {
+    f: F,
+}
+
+impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<T> for ForEachCollector<F> {
+    type Out = ();
+
+    fn drain_empty(self) {}
+
+    fn drain_sync<R: RecvItem<(u64, T)>>(self, rx: R, ordered: bool, n: usize) {
+        for_each_sync(rx, ordered, n, self.f);
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    async fn drain_async<R: AsyncRecvItem<(u64, T)>>(self, rx: R, ordered: bool, n: usize) {
+        for_each_async(rx, ordered, n, self.f).await;
+    }
+}
+
+/// Item-by-item drain of a sync final receiver, mirroring [`collect_sync`]'s
+/// burst-drain strategy. Ordered mode re-sequences through a [`ReorderBuffer`],
+/// consuming each ready batch (small transient `Vec` per batch, not a full
+/// output buffer).
+#[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
+fn for_each_sync<R, T, F>(rx: R, ordered: bool, n: usize, mut f: F)
+where
+    R: RecvItem<(u64, T)>,
+    T: Send + Unpin + 'static,
+    F: FnMut(T),
+{
+    if !ordered {
+        loop {
+            loop {
+                match rx.try_recv() {
+                    Ok((_, item)) => f(item),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Closed) => return,
+                }
+            }
+            match rx.recv() {
+                Ok((_, item)) => f(item),
+                Err(_) => return,
+            }
+        }
+    }
+    let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
+    let mut buffer = crate::state::ReorderBuffer::new(capacity);
+    let mut batch: Vec<T> = Vec::new();
+    loop {
+        loop {
+            match rx.try_recv() {
+                Ok((seq, item)) => {
+                    batch.extend(buffer.insert(seq, item));
+                    for item in batch.drain(..) {
+                        f(item);
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => {
+                    for item in buffer.flush_remaining() {
+                        f(item);
+                    }
+                    return;
+                }
+            }
+        }
+        if let Ok((seq, item)) = rx.recv() {
+            batch.extend(buffer.insert(seq, item));
+            for item in batch.drain(..) {
+                f(item);
+            }
+        } else {
+            for item in buffer.flush_remaining() {
+                f(item);
+            }
+            return;
+        }
+    }
+}
+
+/// Async counterpart of [`for_each_sync`] — mirrors [`collect_async`]'s
+/// burst-drain phases but applies `f` instead of pushing into a `Vec`.
+#[cfg(feature = "tokio-runtime")]
+#[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
+async fn for_each_async<R, T, F>(rx: R, ordered: bool, n: usize, mut f: F)
+where
+    R: AsyncRecvItem<(u64, T)>,
+    T: Send + Unpin + 'static,
+    F: FnMut(T),
+{
+    if !ordered {
+        loop {
+            loop {
+                match rx.try_recv() {
+                    Ok((_, item)) => f(item),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Closed) => return,
+                }
+            }
+            match rx.recv().await {
+                Ok((_, item)) => f(item),
+                Err(_) => return,
+            }
+        }
+    }
+    let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
+    let mut buffer = crate::state::ReorderBuffer::new(capacity);
+    let mut batch: Vec<T> = Vec::new();
+    loop {
+        loop {
+            match rx.try_recv() {
+                Ok((seq, item)) => {
+                    batch.extend(buffer.insert(seq, item));
+                    for item in batch.drain(..) {
+                        f(item);
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => {
+                    for item in buffer.flush_remaining() {
+                        f(item);
+                    }
+                    return;
+                }
+            }
+        }
+        if let Ok((seq, item)) = rx.recv().await {
+            batch.extend(buffer.insert(seq, item));
+            for item in batch.drain(..) {
+                f(item);
+            }
+        } else {
+            for item in buffer.flush_remaining() {
+                f(item);
+            }
+            return;
+        }
+    }
+}
 
 impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R>
 where
@@ -1596,6 +2051,43 @@ where
         )
     }
 
+    /// Execute the streaming pipeline, applying `f` to each output item for
+    /// its side effect — **no output `Vec` is materialised**.
+    ///
+    /// The streaming counterpart of the fused path's
+    /// [`for_each`](crate::Pipe::for_each): for pipelines whose last step is
+    /// a side effect (file writes, shared-state mutation, logging), this
+    /// avoids the structural cost of an `n`-slot output buffer plus the full
+    /// `Vec` that [`run`](Self::run) would allocate.
+    ///
+    /// Without `.ordered()`, `f` sees items in completion order. With
+    /// `.ordered()`, items are re-sequenced through a [`ReorderBuffer`] in
+    /// input order first (note: `.ordered()` + `.expand()` still panics, same
+    /// as [`run`](Self::run)).
+    ///
+    /// `f` runs on the calling thread, so it needs no `Send`/`'static`
+    /// bounds — accumulate into local state directly, no atomics required.
+    ///
+    /// ```rust
+    /// # use youpipe::stream;
+    /// let mut total = 0u64;
+    /// stream(0..100)
+    ///     .stage(|x: u64| x * 2)
+    ///     .for_each(|x| total += x); // plain &mut capture, no Arc<Atomic>
+    /// assert_eq!(total, (0..100u64).map(|x| x * 2).sum());
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`run`](Self::run).
+    pub fn for_each<F>(self, f: F)
+    where
+        F: FnMut(O),
+    {
+        self.try_exec(ForEachCollector { f })
+            .expect("StreamPipe::for_each: failed to build async runtime (see run/try_run)");
+    }
+
     /// Fallible counterpart to [`run`](Self::run): returns the runtime
     /// construction error instead of panicking.
     ///
@@ -1621,9 +2113,15 @@ where
     ///
     /// Same programming-error panics as [`run`](Self::run).
     pub fn try_run(self) -> std::io::Result<Vec<O>> {
+        self.try_exec(VecCollector)
+    }
+
+    /// Shared execution core: spawn the chain, feed the items, and hand the
+    /// final receiver to a [`Terminal`] sink.
+    fn try_exec<T: Terminal<O>>(self, terminal: T) -> std::io::Result<T::Out> {
         let n = self.items.len();
         if n == 0 {
-            return Ok(Vec::new());
+            return Ok(terminal.drain_empty());
         }
         // `expand` produces multiple outputs sharing one parent seq, but the
         // `ReorderBuffer` (`.ordered()`) is single-item-per-seq — the collision
@@ -1647,13 +2145,15 @@ where
             _marker,
         } = self;
 
-        // Compute the per-stage compute-pool parallelism. Each sync stage
-        // claims an equal slice of `compute_workers` so the total across all
-        // sync stages fits inside the pool — preventing the
-        // "stage 1 fills the pool, stage 2 starves, deadlock" failure mode.
-        // Fences and async stages don't consume pool slots.
-        let worker_stages = stages.worker_stages().max(1);
-        let per_stage_parallelism = (config.compute_workers / worker_stages).max(1);
+        // Compute the default per-stage compute-pool parallelism. Explicit
+        // `StageOptions::workers` pins are deducted from the pool budget
+        // first; the remainder is divided equally across the stages that did
+        // not pin one, so the total across all sync stages fits inside the
+        // pool — preventing the "stage 1 fills the pool, stage 2 starves,
+        // deadlock" failure mode. Fences and async stages don't consume pool
+        // slots.
+        let budget = stages.stage_budget();
+        let per_stage_parallelism = budget.default_workers(config.compute_workers);
 
         let ctx: StreamCtx<'_, R> = StreamCtx {
             config: &config,
@@ -1718,17 +2218,17 @@ where
         };
 
         let results = match final_rx {
-            FinalRx::Sync(rx) => collect_sync(rx, ordered, n),
-            FinalRx::SyncSingle(rx) => collect_sync(rx, ordered, n),
+            FinalRx::Sync(rx) => terminal.drain_sync(rx, ordered, n),
+            FinalRx::SyncSingle(rx) => terminal.drain_sync(rx, ordered, n),
             #[cfg(feature = "tokio-runtime")]
             FinalRx::Async(rx) => {
                 let pool = ctx.acquire_async()?;
-                pool.block_on(collect_async(rx, ordered, n))
+                pool.block_on(terminal.drain_async(rx, ordered, n))
             }
             #[cfg(feature = "tokio-runtime")]
             FinalRx::AsyncSingle(rx) => {
                 let pool = ctx.acquire_async()?;
-                pool.block_on(collect_async(rx, ordered, n))
+                pool.block_on(terminal.drain_async(rx, ordered, n))
             }
         };
 

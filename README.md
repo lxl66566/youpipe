@@ -38,8 +38,10 @@ Pick the entry point by workload:
 | Side-effect only (no output) | `pipe(items).for_each(\|x\| ..)`                     |
 | Async IO, mixed sync+async   | `stream(items).stage_async(...)`                     |
 | Unbalanced CPU workloads     | `pipe(items).with_workload(Unbalanced)`              |
+| Custom split granularity     | `pipe(items).with_workload(Workload::Custom(n))`     |
 | Cancellation, fences, expand | `stream(items).with_cancel(..).fence(..).expand(..)` |
 | Borrow stack-local data      | `scope(\|s\| s.pipe(..)....)`                        |
+| Fallible + borrow            | `scope(\|s\| s.pipe(..).try_map(..).try_collect())`  |
 | Borrow a slice, no clone     | `scope(\|s\| s.pipe(&slice).for_each(\|x\| ..))`     |
 
 Below ~10 µs of total work or ~100 ns per item, youpipe is not recommended —
@@ -170,8 +172,8 @@ Mixed CPU + IO (two stages, 500 items):
 
 Defaults: `compute_workers = async_workers = available_parallelism`,
 `io_concurrency = 128`, `buffer_size = 256`, `Workload::Balanced`. The tokio
-runtime is built lazily on first `.run()` and reused for that run; pass an
-`AsyncPool` to share one across runs.
+runtime is built lazily on first `.run()` and reused for that run; pass a
+`TokioPool` to share one across runs.
 
 ```rust
 use youpipe::prelude::*;
@@ -182,18 +184,42 @@ let r: Vec<_> = (0..5_000).pipe()
     .map(|x| expensive(x))
     .collect();
 
+// Workload::Custom(n): pin the fork/join oversplit yourself (1 = coarsest,
+// 16 = very fine-grained stealing for extreme skew)
+let r: Vec<_> = (0..5_000).pipe()
+    .with_workload(Workload::Custom(std::num::NonZeroUsize::new(16).unwrap()))
+    .map(|x| expensive(x))
+    .collect();
+
 // Tuned config + reused runtime
 let cfg = PipelineConfig::default()
     .with_compute_workers(16)
     .with_async_workers(8)
     .with_io_concurrency(512)
     .with_buffer_size(1024);
-let pool = AsyncPool::from_default()?;
+let pool = TokioPool::build_default()?;
 let r = items.stream()
     .with_config(cfg)
     .with_async_pool(pool)
     .stage_async(|x| async move { io(x).await })
     .run();
+
+// Per-stage tuning: heavy CPU stage pinned to 8 workers, the async stage to
+// 512 concurrent IO tasks with a deep buffer — unset knobs fall back to the
+// pipeline-level config.
+let r: Vec<_> = items.stream()
+    .stage_with(StageOptions::new().workers(8), |x| crunch(x))
+    .stage(|x| light(x))
+    .stage_async_with(
+        StageOptions::new().io_concurrency(512).buffer(1024),
+        |x| async move { io(x).await },
+    )
+    .run();
+
+// Side-effect terminal without materialising the output Vec — plain &mut
+// capture works, the drain runs on the calling thread.
+let mut total = 0u64;
+stream(0..10_000).stage(|x| x * 2).for_each(|x| total += x);
 
 // Cancellation
 let token = CancellationToken::new();
@@ -202,8 +228,9 @@ let r = (0..10_000).stream()
     .stage(|x| expensive(x))
     .run();
 
-// Oversubscribed compute pool for blocking-IO sync stages
-let pool = ComputePool::new(512);
+// Oversubscribed compute pool for blocking-IO sync stages. NOTE: pools are
+// capped at MAX_COMPUTE_WORKERS (511) — larger sizes are silently clamped.
+let pool = ComputePool::new(MAX_COMPUTE_WORKERS);
 let r = (0..1000).stream()
     .with_compute_pool(pool)
     .stage(|x| blocking_io(x))
@@ -212,7 +239,12 @@ let r = (0..1000).stream()
 
 `io_concurrency` is the M:N multiplier — async tasks yield the OS thread
 while waiting, so it can be far larger than `async_workers` (the thread
-count). Bound it to cap memory.
+count). Bound it to cap memory. Override it per async stage with
+`StageOptions::io_concurrency` (e.g. a network stage at 512, a disk stage
+at 16) via `.stage_async_with(opts, f)`; pin sync-stage worker counts with
+`StageOptions::workers` via `.stage_with(opts, f)` — explicit worker claims
+are deducted from the `compute_workers` budget before the rest is divided
+equally across the unpinned stages.
 
 `.fence(mode)` acts on one adjacent stage boundary. `FenceMode::Barrier`
 drains upstream fully before downstream starts; `FenceMode::Chunked(k)`
@@ -220,6 +252,11 @@ releases every `k` items as they form (the default for mixed CPU/IO).
 `.run()` returns results in completion order; append `.ordered()` to restore
 input order via a `ReorderBuffer`. `.run()` panics if the tokio runtime
 cannot be built; use `.try_run()` to surface that as a `Result`.
+
+Not every config knob applies to every engine: a fused `pipe()` reads only
+`compute_workers` and `workload`; `buffer_size` / `async_workers` /
+`io_concurrency` are streaming-only. Pool sizes are capped at
+`MAX_COMPUTE_WORKERS = 511` (the scheduler's sleep bitmask is 9 bits wide).
 
 ## How it works
 

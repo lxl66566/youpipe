@@ -1481,7 +1481,9 @@ const BALANCED_OVERSPLIT: usize = 4;
 /// Oversplit factor for the fork/join tree, adapting to batch size.
 ///
 /// See [`LOW_OVERSPLIT_ITEMS_PER_THREAD`] for the rationale. `Unbalanced`
-/// always uses `8` for the stealing slack its expensive tail needs.
+/// always uses `8` for the stealing slack its expensive tail needs;
+/// `Custom(n)` pins `n` for full manual control (benchmarking, known-skew
+/// workloads outside the two presets).
 fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize {
     match workload {
         Workload::Balanced => {
@@ -1492,6 +1494,7 @@ fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize
             }
         }
         Workload::Unbalanced => 8,
+        Workload::Custom(factor) => factor.get(),
     }
 }
 
@@ -1638,6 +1641,18 @@ impl<S, I, O> Pipe<S, I, O> {
     #[must_use]
     pub fn with_workload(mut self, workload: Workload) -> Self {
         self.config.workload = workload;
+        self
+    }
+
+    /// Set the compute-pool worker budget — see
+    /// [`PipelineConfig::with_compute_workers`]. On the fused path this sizes
+    /// the transient pool behind [`Pipe::with_oversubscribe`]; the global
+    /// pool and an explicit [`Pipe::with_compute_pool`] ignore it. Streaming
+    /// knobs (`buffer_size`, `io_concurrency`, …) have no effect on the fused
+    /// path.
+    #[must_use]
+    pub fn with_compute_workers(mut self, n: usize) -> Self {
+        self.config.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
         self
     }
 
@@ -2003,6 +2018,13 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
         self
     }
 
+    /// Set the compute-pool worker budget — see [`Pipe::with_compute_workers`].
+    #[must_use]
+    pub fn with_compute_workers(mut self, n: usize) -> Self {
+        self.config.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self
+    }
+
     /// Attach a custom [`ComputePool`] — see [`Pipe::with_compute_pool`].
     #[must_use]
     pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
@@ -2255,6 +2277,54 @@ pub(crate) fn fused_for_each_scoped<S, T, F>(
     let splits = split_depth(n, num_threads, oversplit);
     let op = FusedSink(stages, f);
     par_for_each(items, &op, splits, pool);
+}
+
+/// `pub(crate)` entry point for the scoped fallible terminal
+/// (`ScopedTryPipe::try_collect`). Identical dispatch logic to
+/// `TryPipe::try_collect` but without `'static` bounds on the stage chain —
+/// the closure/stage lifetime is `'env`.
+///
+/// `E` still requires `'static`: the fast (no-filter) path routes through the
+/// hybrid dispatcher, whose panic/failure payloads are type-erased
+/// `Box<dyn Any>` and downcast back by concrete type. Error types that borrow
+/// scope-local data therefore cannot use the scoped fallible path — in
+/// practice fallible closures borrow *inputs* (`'env` on the closure) while
+/// the error is an owned/`'static` type, so this rarely bites.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn fused_try_collect_scoped<S, T, E>(
+    items: Vec<T>,
+    stages: S,
+    workload: Workload,
+    pool: &ComputePool,
+) -> Result<Vec<S::Output>, E>
+where
+    S: FusedTryStage<T, Error = E> + Sync,
+    T: Send,
+    S::Output: Send,
+    E: Send + 'static,
+{
+    let n = items.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let num_threads = pool.num_workers();
+    if prefers_serial(n, num_threads, workload) {
+        let mut out = Vec::with_capacity(n);
+        for item in items {
+            if let Some(o) = stages.try_apply(item)? {
+                out.push(o);
+            }
+        }
+        return Ok(out);
+    }
+    let oversplit = workload_oversplit(n, num_threads, workload);
+    let splits = split_depth(n, num_threads, oversplit);
+    if S::MAY_FILTER {
+        join_fused_try_collect(pool, items, &stages, splits)
+    } else {
+        let op = FusedTryOp(stages);
+        par_index_try_collect(items, &op, splits, pool)
+    }
 }
 
 #[cfg(test)]

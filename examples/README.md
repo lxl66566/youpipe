@@ -94,7 +94,7 @@ tail latency). Compares youpipe's `stream().stage_async()` (M:N, default
 `io_concurrency=128`) vs `tokio::spawn` per item (the async ceiling). The two
 should land within a small constant of each other.
 
-This is the simplest async example: no explicit `AsyncPool`, no
+This is the simplest async example: no explicit `TokioPool`, no
 `PipelineConfig` — defaults only. The module header documents the tuning form.
 
 ### `mixed_cpu_io`

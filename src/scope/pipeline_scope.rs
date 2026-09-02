@@ -2,8 +2,9 @@ use std::marker::PhantomData;
 
 use crate::{
     builder::{
-        Filter, FusedStage, Identity, PipelineConfig, StageMarker, SyncMap, Workload,
-        fused_collect_scoped, fused_for_each_scoped,
+        Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, PipelineConfig,
+        StageMarker, SyncMap, TryMap, Workload, fused_collect_scoped, fused_for_each_scoped,
+        fused_try_collect_scoped,
     },
     executor::compute::ComputePool,
 };
@@ -136,6 +137,16 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
         self
     }
 
+    /// Set the compute-pool worker budget — see
+    /// [`crate::PipelineConfig::with_compute_workers`]. The fused path reads
+    /// only this and `with_workload`; streaming-only knobs have no effect
+    /// here.
+    #[must_use]
+    pub fn with_compute_workers(mut self, n: usize) -> Self {
+        self.config.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self
+    }
+
     /// Attach a custom [`ComputePool`] — see
     /// [`crate::Pipe::with_compute_pool`].
     ///
@@ -216,6 +227,227 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
             oversubscribe: self.oversubscribe,
             _marker: PhantomData,
         }
+    }
+
+    /// Enter a fallible chain: appends a fallible map stage and switches the
+    /// builder to [`ScopedTryPipe`], whose `.try_collect()` returns a `Result`.
+    /// The scoped counterpart of [`crate::Pipe::try_map`] — the closure may
+    /// borrow stack-local data via `'env` while the error type `E` must be
+    /// `'static` (owned errors; see [`ScopedTryPipe`]).
+    ///
+    /// ```rust
+    /// # use youpipe::scope;
+    /// let limit = 50i32;
+    /// // Borrows `limit` from the enclosing scope inside a fallible chain.
+    /// let r: Result<Vec<i32>, &str> = scope(|s| {
+    ///     s.pipe(0..100)
+    ///         .try_map(|x: i32| if x > limit { Err("too big") } else { Ok(x * 2) })
+    ///         .try_collect()
+    /// });
+    /// assert_eq!(r.unwrap_err(), "too big");
+    /// ```
+    #[allow(clippy::type_complexity)] // typestate builder return type — same
+    // shape as `Pipe::try_map`; the nested `InfallibleChain` adapter is what
+    // lets the infallible prefix compose with fallible stages.
+    pub fn try_map<N, E>(
+        self,
+        f: impl Fn(O) -> Result<N, E> + Sync + 'env,
+    ) -> ScopedTryPipe<
+        'env,
+        TryMap<InfallibleChain<S, E>, impl Fn(O) -> Result<N, E> + Sync + 'env>,
+        I,
+        N,
+        E,
+    >
+    where
+        S: StageMarker<I, Output = O> + FusedStage<I>,
+        O: Send,
+        N: Send,
+        E: Send + 'static,
+    {
+        ScopedTryPipe {
+            items: self.items,
+            stages: TryMap {
+                prev: InfallibleChain(self.stages, PhantomData),
+                f,
+            },
+            config: self.config,
+            compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// A fallible fused pipeline that may borrow non-`'static` data from the
+/// enclosing [`scope`]. Obtained from [`ScopedPipe::try_map`]; mirrors
+/// [`crate::TryPipe`] with `'env` closure bounds.
+///
+/// The error type `E` must be `'static` (unlike the closures, which borrow
+/// freely): the fast collect path routes failures through the hybrid
+/// dispatcher's type-erased panic/failure slots, which downcast by concrete
+/// type. In practice fallible closures borrow *inputs* while errors are owned
+/// (`&'static str`, `anyhow::Error`, domain enums), so this is rarely a
+/// constraint.
+pub struct ScopedTryPipe<'env, S = Identity, I = (), O = (), E = std::convert::Infallible> {
+    items: Vec<I>,
+    stages: S,
+    config: PipelineConfig,
+    /// Custom compute pool — see [`crate::Pipe::with_compute_pool`].
+    compute_pool: Option<ComputePool>,
+    /// Oversubscribe factor — see [`crate::Pipe::with_oversubscribe`].
+    oversubscribe: Option<std::num::NonZeroUsize>,
+    _marker: PhantomData<(&'env (), O, E)>,
+}
+
+impl<'env, S, I, O, E> ScopedTryPipe<'env, S, I, O, E> {
+    /// Override the default [`PipelineConfig`].
+    #[must_use]
+    pub fn with_config(mut self, config: PipelineConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Tune the workload split factor. Default is [`Workload::Balanced`].
+    #[must_use]
+    pub fn with_workload(mut self, workload: Workload) -> Self {
+        self.config.workload = workload;
+        self
+    }
+
+    /// Set the compute-pool worker budget — see
+    /// [`crate::PipelineConfig::with_compute_workers`]. Only this and
+    /// `with_workload` affect the fused path.
+    #[must_use]
+    pub fn with_compute_workers(mut self, n: usize) -> Self {
+        self.config.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self
+    }
+
+    /// Attach a custom [`ComputePool`] — see
+    /// [`crate::Pipe::with_compute_pool`].
+    #[must_use]
+    pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
+        self.compute_pool = Some(pool);
+        self
+    }
+
+    /// Oversubscribe the compute pool — see
+    /// [`crate::Pipe::with_oversubscribe`] for the full guidance.
+    #[must_use]
+    pub fn with_oversubscribe(mut self, factor: usize) -> Self {
+        self.oversubscribe = std::num::NonZeroUsize::new(factor.max(1));
+        self
+    }
+
+    /// Append an infallible map stage. The error type `E` is unchanged.
+    pub fn map<N>(
+        self,
+        f: impl Fn(O) -> N + Sync + 'env,
+    ) -> ScopedTryPipe<'env, SyncMap<S, impl Fn(O) -> N + Sync + 'env>, I, N, E>
+    where
+        S: StageMarker<I, Output = O>,
+        O: Send,
+        N: Send,
+    {
+        ScopedTryPipe {
+            items: self.items,
+            stages: SyncMap {
+                prev: self.stages,
+                f,
+            },
+            config: self.config,
+            compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Append a filter stage. Items where `f` returns `false` are dropped from
+    /// the output (no error is signalled).
+    pub fn filter(
+        self,
+        f: impl Fn(&O) -> bool + Sync + 'env,
+    ) -> ScopedTryPipe<'env, Filter<S, impl Fn(&O) -> bool + Sync + 'env>, I, O, E>
+    where
+        S: StageMarker<I, Output = O>,
+    {
+        ScopedTryPipe {
+            items: self.items,
+            stages: Filter {
+                prev: self.stages,
+                f,
+            },
+            config: self.config,
+            compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Append another fallible map stage. The closure must produce the same
+    /// error type `E` (use `.map_err()` upstream to convert).
+    #[allow(clippy::type_complexity)] // typestate chain return — see `try_map`.
+    pub fn try_map<N>(
+        self,
+        f: impl Fn(O) -> Result<N, E> + Sync + 'env,
+    ) -> ScopedTryPipe<'env, TryMap<S, impl Fn(O) -> Result<N, E> + Sync + 'env>, I, N, E>
+    where
+        S: StageMarker<I, Output = O> + FusedTryStage<I, Error = E>,
+        O: Send,
+        N: Send,
+    {
+        ScopedTryPipe {
+            items: self.items,
+            stages: TryMap {
+                prev: self.stages,
+                f,
+            },
+            config: self.config,
+            compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Convert the error type from `E` to `E2`.
+    pub fn map_err<E2>(
+        self,
+        f: impl Fn(E) -> E2 + Sync + 'env,
+    ) -> ScopedTryPipe<'env, MapErr<S, impl Fn(E) -> E2 + Sync + 'env>, I, O, E2>
+    where
+        E: Send + 'static,
+        E2: Send + 'static,
+    {
+        ScopedTryPipe {
+            items: self.items,
+            stages: MapErr {
+                prev: self.stages,
+                f,
+            },
+            config: self.config,
+            compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<S, I, O, E> ScopedTryPipe<'_, S, I, O, E>
+where
+    S: FusedTryStage<I, Output = O, Error = E> + Sync,
+    I: Send,
+    O: Send,
+    E: Send + 'static,
+{
+    /// Execute the fused fallible pipeline, short-circuiting on the first
+    /// error. Drives the same work-stealing core as
+    /// [`crate::TryPipe::try_collect`], minus the `'static` bounds.
+    pub fn try_collect(self) -> Result<Vec<O>, E> {
+        let exec =
+            crate::builder::resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+        let pool = exec.as_pool();
+        fused_try_collect_scoped(self.items, self.stages, self.config.workload, pool)
     }
 }
 

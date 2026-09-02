@@ -40,6 +40,11 @@ impl ComputePool {
     }
 
     /// Create a new pool with `num_workers` threads.
+    ///
+    /// `num_workers` is clamped to `[1, MAX_COMPUTE_WORKERS]` (511): the
+    /// scheduler's sleep bitmask addresses at most 511 workers. The clamp is
+    /// silent — use [`MAX_COMPUTE_WORKERS`](crate::MAX_COMPUTE_WORKERS) to
+    /// query the cap programmatically.
     #[must_use]
     pub fn new(num_workers: usize) -> Self {
         let registry = Registry::new(num_workers);

@@ -66,15 +66,16 @@ pub(crate) mod util;
 
 pub use builder::{
     Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, Pipe, PipelineConfig,
-    StageMarker, StreamPipe, StreamStart, SyncMap, TryMap, TryPipe, Workload, pipe, stream,
+    StageMarker, StageOptions, StreamPipe, StreamStart, SyncMap, TryMap, TryPipe, Workload, pipe,
+    stream,
 };
-pub use executor::ComputePool;
+pub use executor::{ComputePool, compute::MAX_COMPUTE_WORKERS};
 pub use handoff::{
     AsyncReceiver, AsyncSender, Receiver, Sender, SharedWaitGroup, async_channel, channel,
 };
 #[cfg(feature = "tokio-runtime")]
 pub use runtime::TokioPool;
 pub use runtime::{AsyncRuntime, DefaultRuntime, NoRuntime};
-pub use scope::{PipelineScope, ScopedPipe, scope};
+pub use scope::{PipelineScope, ScopedPipe, ScopedTryPipe, scope};
 pub use state::{FenceBarrier, FenceMode, ReorderBuffer};
 pub use sync::CancellationToken;
