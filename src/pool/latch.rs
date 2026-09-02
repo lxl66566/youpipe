@@ -3,7 +3,7 @@
 //! A latch starts as false. Eventually `set()` makes it true. Once `probe()`
 //! returns true, all memory effects from before `set()` are visible.
 //!
-//! Atomics/Mutex/Condvar come from `crate::util::sys` so the `loom` feature
+//! Atomics/Mutex/Condvar come from `crate::util::sys` so `--cfg loom`
 //! can swap them for simulated ones (see `sys.rs`).
 
 use std::{marker::PhantomData, ops::Deref, sync::Arc};
@@ -254,7 +254,7 @@ enum CountLatchKind {
     Blocking { latch: LockLatch },
 }
 
-#[cfg(all(test, feature = "loom"))]
+#[cfg(all(test, loom))]
 mod loom_tests {
     use std::{ptr, sync::Arc};
 
@@ -458,9 +458,9 @@ impl CountLatch {
 /// Under `loom` the budget shrinks to keep the model's state space small —
 /// the spin's only synchronization role is the final mutex acquire, which the
 /// model exercises regardless of the iteration count.
-#[cfg(not(feature = "loom"))]
+#[cfg(not(loom))]
 const OFF_POOL_SPIN_ITERS: usize = 4096;
-#[cfg(feature = "loom")]
+#[cfg(loom)]
 const OFF_POOL_SPIN_ITERS: usize = 2;
 
 impl Latch for CountLatch {

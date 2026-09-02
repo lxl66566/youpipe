@@ -43,3 +43,24 @@ jobs:
       # `.cargo/config.toml` MIRIFLAGS (-Zmiri-ignore-leaks) is applied
       # automatically for the global pool's intentionally-leaked threads.
       - run: cargo miri test --lib -- --skip tests_that_need_many_threads
+
+  loom:
+    name: loom model tests
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: dtolnay/rust-toolchain@stable
+      # Loom is switched on by the `--cfg loom` rustflag, not a cargo feature
+      # (see Cargo.toml). Regular unit tests cannot run on loom's simulated
+      # primitives, so filter to the `loom_tests` modules.
+      - run: RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
+      # The vendored queue's models need upstream's preemption bound to
+      # finish in seconds instead of hours (LOOM_MAX_PREEMPTIONS=2).
+      - run: RUSTFLAGS="--cfg loom" cargo test --manifest-path vendor/youpipe-concurrent-queue/Cargo.toml --test loom
+        env:
+          LOOM_MAX_PREEMPTIONS: "2"

@@ -1,7 +1,7 @@
 //! `WaitGroup`: a counter barrier used by streaming stages to track worker
 //! completion.
 //!
-//! Atomics/Mutex/Condvar come from `crate::util::sys` so the `loom` feature
+//! Atomics/Mutex/Condvar come from `crate::util::sys` so `--cfg loom`
 //! can swap them for simulated ones (see `sys.rs`).
 
 use std::sync::Arc;
@@ -90,7 +90,7 @@ impl Clone for SharedWaitGroup {
     }
 }
 
-#[cfg(all(test, feature = "loom"))]
+#[cfg(all(test, loom))]
 mod loom_tests {
     use std::sync::Arc;
 

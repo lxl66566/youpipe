@@ -20,7 +20,7 @@
 //! (`ComputePool::new(128)` on a 4-core CI runner). The fixed multi-word
 //! array gives every worker a unique bit with zero runtime cost.
 //!
-//! The atomics come from `crate::util::sys` so the `loom` feature can model
+//! The atomics come from `crate::util::sys` so `--cfg loom` can model
 //! them (see `sys.rs`).
 
 use super::sleep::THREADS_MAX;
@@ -127,7 +127,7 @@ fn split_index(worker_index: usize) -> (usize, u64) {
     (word, bit)
 }
 
-#[cfg(all(test, feature = "loom"))]
+#[cfg(all(test, loom))]
 mod loom_tests {
     use std::sync::Arc;
 

@@ -9,7 +9,7 @@ The `util/sys` module provides a unified `Mutex`/`Condvar`/atomics API via
 | ----------- | ------------- | ------- |
 | Production  | `parking_lot` (fairer, no poisoning) | `std::sync::atomic` |
 | Miri        | `std::sync` (newtype shim, infallible `lock()`) | `std::sync::atomic` |
-| `loom` feature | `loom::sync` (newtype shim, infallible `lock()`) | `loom::sync::atomic` |
+| `--cfg loom` | `loom::sync` (newtype shim, infallible `lock()`) | `loom::sync::atomic` |
 
 `parking_lot_core` resolves `WaitOnAddress` through `GetModuleHandleA`, a
 Windows foreign function Miri cannot emulate, whereas the std primitives are
@@ -19,16 +19,20 @@ natively supported by the interpreter. The unified API lets callers write
 The pool's synchronization cores (`pool/sleep.rs`, `pool/latch.rs`,
 `pool/sleep_mask.rs`, `handoff/notify.rs`) source their atomics, locks, and
 `thread_yield` from `util/sys` — *nothing else in the crate does* — so under
-the `loom` feature exactly those primitives become model-checked simulations
+`--cfg loom` exactly those primitives become model-checked simulations
 while the rest of the crate keeps real ones. `Registry` spawns real OS
 threads (which loom cannot simulate), so the model tests drive the
 primitives directly with `loom::thread`:
 
 ```sh
-# Model tests live in #[cfg(all(test, feature = "loom"))] mod loom_tests
+# Model tests live in #[cfg(all(test, loom))] mod loom_tests
 # inside each primitive's file. Filter to them — the regular (real-thread)
 # tests cannot run on simulated primitives.
-cargo test --features loom --lib -- loom_tests
+#
+# The `--cfg loom` rustflag (NOT a cargo feature — see Cargo.toml for the
+# rationale) is the ecosystem-standard loom switch, matching crossbeam and
+# the vendored youpipe-concurrent-queue.
+RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
 ```
 
 What the models cover:

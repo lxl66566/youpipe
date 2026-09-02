@@ -501,7 +501,7 @@ impl IdleState {
     }
 }
 
-#[cfg(all(test, feature = "loom"))]
+#[cfg(all(test, loom))]
 mod loom_tests {
     use std::sync::Arc;
 

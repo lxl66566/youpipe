@@ -37,10 +37,13 @@ bench = false
 crossbeam-utils = { version = "0.8.11", default-features = false }
 portable-atomic = { version = "1", default-features = false, optional = true }
 
-# Enables loom testing. This feature is permanently unstable and the API may
-# change at any time.
+# Loom model-checking: activated purely by the `--cfg loom` rustflag (the
+# ecosystem-standard switch, matching crossbeam / youpipe-st3), i.e.
+#   RUSTFLAGS="--cfg loom" cargo test --test loom
+# Non-optional so the flag alone is sufficient — no `--features` needed.
+# This feature is permanently unstable and the API may change at any time.
 [target.'cfg(loom)'.dependencies]
-loom = { version = "0.7", optional = true }
+loom = "0.7"
 
 [[bench]]
 name = "bench"

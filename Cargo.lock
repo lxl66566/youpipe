@@ -1222,6 +1222,7 @@ name = "youpipe-concurrent-queue"
 version = "2.5.0"
 dependencies = [
  "crossbeam-utils",
+ "loom",
 ]
 
 [[package]]

@@ -21,15 +21,8 @@ default = ["tokio-runtime"]
 # AsyncRuntime>` plumbing is kept generic so a future backend (a thread-per-core
 # runtime, monoio, …) slots in without touching the streaming code.
 tokio-runtime = ["dep:tokio"]
-# ── Concurrency-model testing of the pool's synchronization cores ──
-# Builds the sleep / latch / sleep-mask / waitgroup primitives on top of
-# loom's simulated atomics and locks, and enables the `#[cfg(feature =
-# "loom")]` model tests (`loom::model`). Run with:
-#   cargo test --features loom
-# Only the synchronization cores are modeled — the Registry spawns real OS
-# threads, which loom cannot simulate, so tests drive the primitives
-# directly with `loom::thread`.
-loom = ["dep:loom"]
+# (No `loom` feature: loom model-checking is driven by the `--cfg loom`
+# rustflag instead — see `[target.'cfg(loom)'.dependencies]` below.)
 # ── Optional permanent instrumentation (zero-cost when off) ──
 # `hotpath` is an optional dependency; when none of these features are enabled
 # the `#[cfg_attr(feature = "hotpath", hotpath::measure)]` probes are stripped at
@@ -43,11 +36,42 @@ hotpath       = ["dep:hotpath", "hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
 
+# ── Concurrency-model testing of the pool's synchronization cores ──
+# Loom is activated by the `--cfg loom` rustflag (the ecosystem-standard
+# approach, same as crossbeam / tokio / the vendored `youpipe-st3`), NOT by a
+# cargo feature:
+#
+#   RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
+#
+# Why a rustflag rather than a feature: a feature is part of the public
+# semver surface and gets unified across the dependency graph, so an
+# unrelated downstream `--features loom` (or a future optional dep named
+# `loom`) would silently rebuild youpipe's sync primitives on loom's
+# simulated atomics in production. A `--cfg` only exists for the explicit
+# command line that sets it. The flag also applies uniformly to youpipe and
+# any dependency that follows the same convention (the vendored
+# youpipe-concurrent-queue tests already use `cfg(loom)`).
+#
+# NOTE: setting RUSTFLAGS replaces the `[build] rustflags` from
+# `.cargo/config.toml` (`-C opt-level=3 -C panic=unwind`), which only matter
+# for release/bench builds — test builds are unaffected.
+#
+# Only the synchronization cores are modeled — the Registry spawns real OS
+# threads, which loom cannot simulate, so tests drive the primitives
+# directly with `loom::thread`. Regular (real-thread) unit tests cannot run
+# on simulated primitives, hence the `-- loom_tests` filter.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+# `loom` is set via `RUSTFLAGS="--cfg loom"` (see above), not a feature, so
+# register it here to keep `unexpected_cfgs` silent.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dependencies]
 concurrent-queue = { package = "youpipe-concurrent-queue", path = "vendor/youpipe-concurrent-queue" }
 crossfire        = "3.1"
 hotpath          = { version = "0.19", optional = true }
-loom             = { version = "0.7", optional = true }
 parking_lot      = "0.12"
 st3              = { package = "youpipe-st3", path = "vendor/youpipe-st3" }
 tokio            = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
