@@ -2,6 +2,11 @@
 use std::{future::Future, sync::OnceLock};
 use std::{marker::PhantomData, num::NonZeroUsize, sync::Arc};
 
+#[cfg(feature = "tokio-runtime")]
+use crate::handoff::{
+    AsyncReceiver, AsyncRecvItem, MpscAsyncReceiver, async_channel, mpsc_async_channel,
+    sync_async_channel,
+};
 use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
@@ -10,16 +15,8 @@ use crate::{
         channel::channel, mpsc_channel,
     },
     runtime::{AsyncRuntime, DefaultRuntime},
-    state::{FenceBarrier, FenceMode, run_ordered_collect},
+    state::{FenceBarrier, FenceMode, ReorderBuffer, run_ordered_collect},
     sync::CancellationToken,
-};
-#[cfg(feature = "tokio-runtime")]
-use crate::{
-    handoff::{
-        AsyncReceiver, AsyncRecvItem, MpscAsyncReceiver, async_channel, mpsc_async_channel,
-        sync_async_channel,
-    },
-    state::ReorderBuffer,
 };
 
 // ── Streaming pipeline (chainable, data-first) ──
@@ -2098,6 +2095,12 @@ where
 
     /// Shared execution core: spawn the chain, feed the items, and hand the
     /// final receiver to a [`Terminal`] sink.
+    // The only fallible path is the async-pool acquisition (`ctx
+    // .acquire_async()`), which exists solely under `tokio-runtime`; without
+    // that feature every branch is infallible and the `Result` looks like a
+    // needless wrap. The signature stays fallible for the shared public API
+    // (`try_run` returns `io::Result`).
+    #[cfg_attr(not(feature = "tokio-runtime"), allow(clippy::unnecessary_wraps))]
     fn try_exec<T: Terminal<O>>(self, terminal: T) -> std::io::Result<T::Out> {
         let n = self.items.len();
         if n == 0 {

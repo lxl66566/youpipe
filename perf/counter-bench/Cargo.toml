@@ -31,11 +31,9 @@ harness = false
 name    = "perf_events"
 
 [dependencies]
-# NOTE: default-features = true, not `false` — the no-default-features build
-# of youpipe is currently broken (stream.rs:1938, `ReorderBuffer` import
-# missing with tokio-runtime off; `cargo check --no-default-features` fails
-# on a clean tree). Flip back once that's fixed; this bench is sync-only.
-youpipe = { path = "../..", default-features = true }
+# Sync-only bench: no tokio-runtime needed (verified: builds and benches fine
+# without it now that the no-default-features build is fixed).
+youpipe = { path = "../..", default-features = false }
 
 [dev-dependencies]
 criterion               = "0.8"
