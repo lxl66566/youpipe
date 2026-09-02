@@ -1027,6 +1027,31 @@ approximate under load because its per-thread batch queue drops events):
   cascade of parked workers); the rest of the wall is worker wake latency —
   see the rejected cost-adaptive chunk experiment in §4.
 
+### Final criterion verdict (2026-09 round, clean 4-pass interleaved A/B)
+
+Baseline = `9b31fb0` (crates.io st3 0.4 / concurrent-queue 2.5) vs this
+branch (vendored forks + pool-job feeder), median of two passes per side,
+`taskset 1-31` both sides:
+
+- **stream_pipeline** 1 K: ordered −13.5 %, unordered −13.4 %,
+  multi_stage_2 −13.9 % (pool-job feeder + injector backoff)
+- **stream_pipeline** 100 K: ordered −8.8 %, unordered −6.3 %;
+  with_fence/100 K −5.7 %
+- sync_lightweight cold/100 K −5.3 %; sync_for_each 100 K −6.8 %;
+  sync_cpu_heavy sequential/10-100 K −1.6…−5.4 %
+- everything else (CPU fused vs rayon, unbalanced, io_async, oversubscribe)
+  within ±2 % noise; **no regression beyond noise**
+
+Methodology notes learned the hard way, both worth repeating: (1) a
+full-group criterion pass has ±10 % inter-run variance on the stream family
+(each iteration runs a pool-wide wake cascade); verdicts for that family
+need isolated alternating runs (`--sample-size 20`, base/new/base/new) —
+those confirm every stream win above; (2) `target/criterion` accumulates
+`base/`/`change/`/saved-baseline subdirectories from earlier rounds — a diff
+script must read **only** `new/estimates.json` or it silently compares
+against stale runs (this produced phantom 2-4× "regressions" on the 100 K
+sync benches that vanished on re-measurement).
+
 ---
 
 ## 10. Extending the System
