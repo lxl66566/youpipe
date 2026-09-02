@@ -110,63 +110,55 @@ let r: Vec<usize> = scope(|s| {
 
 ## Performance
 
-7945HX 32-core Linux. See [`docs/benchmarks.md`](docs/benchmarks.md).
+Cross-library comparison against rayon, tokio, `futures::stream`, and
+hand-written `std::thread` pipelines: seven workloads (balanced/skewed CPU,
+async/blocking IO, mixed sync+async, and two realistic three-stage pipelines,
+including HTTP over a loopback mock server). 32-core AMD (Zen) Linux, 31
+pinned cores, 5 interleaved rounds per measurement (ABCABC order, median).
+Simulated IO is pure sleeps — nothing touches the disk. Methodology and full
+data: [docs/benchmarks.md](docs/benchmarks.md#horizontal-cross-library-comparison-2026-09).
 
-fused `pipe()` — CPU-heavy (100 iters/item, warm input):
+<p align="center">
+  <img src="docs/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">
+</p>
+<p align="center">
+  <img src="docs/assets/bench-io.svg" alt="IO pipelines: youpipe vs tokio vs futures">
+</p>
+<p align="center">
+  <img src="docs/assets/bench-real.svg" alt="Mixed sync + async pipelines: youpipe vs tokio vs futures vs rayon">
+</p>
 
-| Size | youpipe | rayon  |
-| ---- | ------- | ------ |
-| 1K   | 62 µs   | 37 µs  |
-| 10K  | 64 µs   | 70 µs  |
-| 100K | 105 µs  | 145 µs |
+Highlights (median wall time, youpipe vs the strongest hand-written
+alternative; per-iteration time, setup excluded):
 
-fused `pipe()` — lightweight `x+1` (warm input):
+- **CPU, balanced (fused `pipe()`)** — youpipe wins at 10K–100K items (−16 %
+  vs rayon at 100K); rayon wins at 1K (fixed setup cost, ~20 µs) and 1M (~8
+  %, its fork-join runs inline on the calling thread). All three are 2.5–5×
+  faster than hand-rolled equal-chunk threading.
+- **CPU, skewed (10 % of items cost 1000×)** — `Workload::Unbalanced` +
+  work stealing matches rayon (0.26 vs 0.26 ms @ 100K) and is 3× faster than
+  equal-chunk threading, which strands the slow items in a few threads.
+- **Async IO (512 in flight, 1/8 ms tail)** — statistically tied with tokio
+  and `futures::stream` (within ~2 %): youpipe rides the same tokio runtime.
+- **Blocking IO** — with a 512-thread oversubscribed pool youpipe matches
+  `spawn_blocking` (8.65 vs 8.85 ms @ 500); at the default 32 threads it is
+  wait-bound (34 ms). Blocking stages need oversubscription — see
+  [Advanced usage](#advanced-usage).
+- **Mixed sync CPU + async IO** — 10.9 vs 13.4 ms @ 2K items (−19 % vs a
+  hand-written tokio channel chain); `futures::stream` edges youpipe out at
+  the low end by running the CPU stage inline on runtime workers.
+- **Realistic doc pipeline (fetch → parse → save, heavy-tailed sizes)** —
+  14.1 vs 17.2 ms @ 4K docs: −18 % vs hand-written tokio, 9.8× vs rayon
+  (whose pool stalls on the blocking IO).
+- **Realistic web pipeline (HTTP GET → parse → aggregate)** — 22.9 vs 27.7 ms
+  @ 2K requests: −17 % vs tokio, −23 % vs futures.
 
-| Size | youpipe | rayon  |
-| ---- | ------- | ------ |
-| 10K  | 63 µs   | 67 µs  |
-| 100K | 79 µs   | 104 µs |
-| 1M   | 516 µs  | 265 µs |
+Reproduce:
 
-fused `pipe()` — 3-stage chain (`x+1`, `x*3`, `x-2`):
-
-| Size | youpipe | rayon  |
-| ---- | ------- | ------ |
-| 10K  | 61 µs   | 67 µs  |
-| 100K | 82 µs   | 101 µs |
-
-fused `try_map().try_collect()` — fallible `Result` chain (warm input):
-
-| Size | youpipe | rayon |
-| ---- | ------- | ----- |
-| 10K  | 64 µs   | 66 µs |
-| 100K | 85 µs   | 98 µs |
-
-streaming `stream()` — single sync stage (`cpu_work`, 100 iters/item):
-
-| Size | youpipe | tokio spawn_blocking |
-| ---- | ------- | -------------------- |
-| 1K   | 0.72 ms | 2.46 ms              |
-| 10K  | 8.8 ms  | 23.5 ms              |
-| 100K | 88.6 ms | 236 ms               |
-
-Pure async IO (`tokio::time::sleep`, ~1 ms latency, 90/10 tail, 500 items):
-
-| Topology                               | Time    |
-| -------------------------------------- | ------- |
-| youpipe: async IO (`.stage_async`)     | 9.65 ms |
-| tokio: native async                    | 9.30 ms |
-| youpipe: blocking IO (`.stage`)        | 33.1 ms |
-| youpipe: blocking IO (oversub 512 thr) | 19.5 ms |
-| tokio: spawn_blocking                  | 8.83 ms |
-
-Mixed CPU + IO (two stages, 500 items):
-
-| Topology                        | Time    |
-| ------------------------------- | ------- |
-| youpipe: sync CPU + async IO    | 9.97 ms |
-| tokio: mixed spawn_blocking     | 10.1 ms |
-| youpipe: sync CPU + blocking IO | 60.0 ms |
+```sh
+cargo bench --bench horizontal -- --rounds 5
+python3 perf/plot-horizontal.py   # JSON → SVG, no plotting dependencies
+```
 
 ## Advanced usage
 

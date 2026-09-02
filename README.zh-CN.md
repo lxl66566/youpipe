@@ -85,63 +85,50 @@ let r: Vec<usize> = scope(|s| {
 
 ## 性能
 
-7945HX 32-Core Linux，详见 [`docs/benchmarks.md`](docs/benchmarks.md)。
+横向库对比（youpipe vs rayon vs tokio vs `futures::stream` vs 手写
+`std::thread` pipeline）：七类负载（均衡/倾斜 CPU、异步/阻塞 IO、混合
+sync+async，以及两个真实的三阶段 pipeline，含本地 mock server 上的 HTTP）。
+32 核 AMD (Zen) Linux，taskset 固定 31 核，每组测量 5 个交叠轮次（ABCABC
+顺序，取中位数）。模拟 IO 全部为 sleep，不碰磁盘。方法论与完整数据见
+[`docs/benchmarks.md`](docs/benchmarks.md#horizontal-cross-library-comparison-2026-09)。
 
-fused `pipe()` —— CPU 密集型操作（每元素 100 次迭代，热输入）：
+<p align="center">
+  <img src="docs/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">
+</p>
+<p align="center">
+  <img src="docs/assets/bench-io.svg" alt="IO pipelines: youpipe vs tokio vs futures">
+</p>
+<p align="center">
+  <img src="docs/assets/bench-real.svg" alt="Mixed sync + async pipelines: youpipe vs tokio vs futures vs rayon">
+</p>
 
-| 规模 | youpipe | rayon  |
-| ---- | ------- | ------ |
-| 1K   | 62 µs   | 37 µs  |
-| 10K  | 64 µs   | 70 µs  |
-| 100K | 105 µs  | 145 µs |
+要点（中位数耗时；youpipe 对比最强手写基线；仅计工作负载本身，不含数据准备）：
 
-fused `pipe()` —— 轻量操作 `x+1`（热输入）：
+- **CPU 均衡（fused `pipe()`）** —— 10K–100K 区间领先（100K 时比 rayon 快
+  16%）；1K（固定启动开销 ~20 µs）与 1M（rayon 的 fork-join 内联在调用线程上
+  执行）由 rayon 领先。三方都比手写等分块线程快 2.5–5×。
+- **CPU 倾斜（10% 元素成本 1000×）** —— `Workload::Unbalanced` + work
+  stealing 与 rayon 打平（100K 时 0.26 vs 0.26 ms），比等分块手写线程快 3×
+  （后者会让慢元素搁浅在个别线程）。
+- **异步 IO（并发 512，1/8 ms 尾延迟）** —— 与 tokio、`futures::stream`
+  统计打平（±2%）：youpipe 底层复用同一个 tokio 运行时。
+- **阻塞 IO** —— 512 线程过订阅池下 youpipe 与 `spawn_blocking` 打平（500 项
+  8.65 vs 8.85 ms）；默认 32 线程时受等待限制（34 ms）。阻塞 stage 需要过订阅
+  配置，见[深入用法](#深入用法)。
+- **混合 sync CPU + async IO** —— 2K 项 10.9 vs 13.4 ms（比手写 tokio
+  channel 链快 19%）；`futures::stream` 在低端略快于 youpipe（CPU 直接内联在
+  runtime worker 上执行，没有 stage 边界）。
+- **真实文档 pipeline（fetch → parse → save，重尾尺寸）** —— 4K 文档 14.1 vs
+  17.2 ms：比手写 tokio 快 18%，比 rayon 快 9.8×（后者的线程池被阻塞 IO 拖死）。
+- **真实 web pipeline（HTTP GET → parse → aggregate）** —— 2K 请求 22.9 vs
+  27.7 ms：比 tokio 快 17%，比 futures 快 23%。
 
-| 规模 | youpipe | rayon  |
-| ---- | ------- | ------ |
-| 10K  | 63 µs   | 67 µs  |
-| 100K | 79 µs   | 104 µs |
-| 1M   | 516 µs  | 265 µs |
+复现：
 
-fused `pipe()` —— 3 轮轻量操作 (`x+1`, `x*3`, `x-2`)：
-
-| 规模 | youpipe | rayon  |
-| ---- | ------- | ------ |
-| 10K  | 61 µs   | 67 µs  |
-| 100K | 82 µs   | 101 µs |
-
-fused `try_map().try_collect()` —— fallible `Result` 链（热输入）：
-
-| 规模 | youpipe | rayon |
-| ---- | ------- | ----- |
-| 10K  | 64 µs   | 66 µs |
-| 100K | 85 µs   | 98 µs |
-
-流式 `stream()` —— 单个同步阶段（`cpu_work`，每元素 100 次迭代）：
-
-| 规模 | youpipe | tokio spawn_blocking |
-| ---- | ------- | -------------------- |
-| 1K   | 0.72 ms | 2.46 ms              |
-| 10K  | 8.8 ms  | 23.5 ms              |
-| 100K | 88.6 ms | 236 ms               |
-
-纯异步 IO（`tokio::time::sleep`，~1 ms 延迟，90/10 尾部，500 项）：
-
-| 拓扑                                | 耗时    |
-| ----------------------------------- | ------- |
-| youpipe：异步 IO（`.stage_async`）  | 9.65 ms |
-| tokio：原生异步                     | 9.30 ms |
-| youpipe：阻塞 IO（`.stage`）        | 33.1 ms |
-| youpipe：阻塞 IO（过订阅 512 线程） | 19.5 ms |
-| tokio：spawn_blocking               | 8.83 ms |
-
-CPU + IO 混合（两阶段，500 项）：
-
-| 拓扑                        | 耗时    |
-| --------------------------- | ------- |
-| youpipe：同步 CPU + 异步 IO | 9.97 ms |
-| tokio：混合 spawn_blocking  | 10.1 ms |
-| youpipe：同步 CPU + 阻塞 IO | 60.0 ms |
+```sh
+cargo bench --bench horizontal -- --rounds 5
+python3 perf/plot-horizontal.py   # JSON → SVG，绘图零依赖
+```
 
 ## 深入用法
 

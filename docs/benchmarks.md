@@ -324,6 +324,105 @@ numbers for that family are meaningless on this machine.
 The vendored queue's loom suite also has a runtime trap: without upstream's
 CI setting `LOOM_MAX_PREEMPTIONS=2`, the `spsc`/`spsc_force` models run for
 an hour+ without completing; with it the whole suite finishes in seconds.
+## Horizontal cross-library comparison (2026-09)
+
+`benches/horizontal.rs` answers the "what should I pick for my workload?"
+question across the ecosystem — youpipe, rayon, tokio, `futures::stream`,
+and hand-written `std::thread` baselines — over seven representative
+scenarios, and exports JSON that `perf/plot-horizontal.py` renders into the
+README's SVG charts (hand-written SVG, zero plotting dependencies). The
+source data for the published charts is committed at
+`perf/horizontal/results.json`.
+
+```sh
+cargo bench --bench horizontal -- --rounds 5      # ~6 min incl. build
+python3 perf/plot-horizontal.py                   # perf/horizontal/results.json → docs/assets/*.svg
+```
+
+### Methodology
+
+- **Interleaved rounds, ABCABC not AABBCC.** Every round runs every
+  (scenario, batch, library) once; odd rounds reverse the library order to
+  cancel position bias. Verdicts are the median across rounds — the same
+  drift-cancelling logic as `perf/bench-suite`, applied inside a single
+  process (one tokio runtime + one `TokioPool` handle shared by everything;
+  per-iteration runtime construction would dominate small batches).
+- **Per-iteration timing, setup excluded.** Each job times only the workload
+  (`Instant` around the run); input rebuild / cache-warming (`warm_clone`,
+  same rationale as `sync_vs_rayon`) happens outside the timed region.
+  Results are black-boxed so LLVM cannot DCE the map chains.
+- **Simulated IO never touches the disk.** Async waits use
+  `tokio::time::sleep`, blocking waits `thread::sleep` (1 ms / 8 ms tail).
+  The realistic web scenario speaks HTTP/1.1 over a **loopback Unix-socket
+  mock server** with server-side latency control — UDS rather than TCP
+  because short-lived TCP connections pile up tens of thousands of
+  client-side TIME_WAIT sockets across rounds and eventually exhaust the
+  ephemeral port range; UDS has no TIME_WAIT.
+- **In-flight caps must be aligned within a scenario.** This one silently
+  flipped two verdicts by ~2× in the first draft: youpipe's
+  `io_concurrency` (256/512) capped concurrent IO while the tokio baseline
+  spawned one task per item (effectively unbounded). With the cap left low,
+  the doc pipeline scored youpipe 35 ms vs tokio 17 ms; raising youpipe to
+  4096 (above the largest batch, i.e. "unbounded" like spawn-per-item)
+  reversed it to 14 ms vs 17 ms — the original gap was queueing behind the
+  concurrency cap, not framework overhead. Rule: `io_async` compares the
+  *finite-cap* regime (all three at 512), `mixed/real_doc/real_web` compare
+  the *unbounded* regime (all three effectively unlimited). Fairness is a
+  property of the scenario, not of each library's default.
+- Machine: 32-core AMD (Zen) Linux, bench pinned to cores 1–31
+  (`taskset -c 1-31`, core 0 left to OS/IRQ housekeeping), 5 rounds ×
+  700 ms measurement, ~2-8 % cross-round spread on most cells.
+
+### Results (median ms per iteration, 5 interleaved rounds)
+
+| Scenario | n | Best | Runner-up | Rest |
+| --- | --- | --- | --- | --- |
+| cpu_balanced | 1K | rayon 0.037 | youpipe 0.058 | std threads 0.548 |
+| cpu_balanced | 10K | youpipe 0.058 | rayon 0.062 | std threads 0.568 |
+| cpu_balanced | 100K | youpipe 0.098 | rayon 0.123 | std threads 0.760 |
+| cpu_balanced | 1M | rayon 0.469 | youpipe 0.513 | std threads 2.73 |
+| cpu_unbalanced | 10K | youpipe (default) 0.071 | youpipe (Unbalanced) 0.074 | rayon 0.079, std 0.574 |
+| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.258 | rayon 0.259 | youpipe (default) 0.269, std 0.800 |
+| io_async | 500 | futures 9.12 | tokio 9.45 | youpipe 9.57 |
+| io_async | 2000 | futures 17.6 | youpipe 18.2 | tokio 18.5 |
+| io_async | 5000 | futures 34.0 | youpipe 34.8 | tokio 35.5 |
+| io_blocking | 500 | youpipe (512 thr) 8.65 | tokio 8.85 | std 16.9, youpipe (32 thr) 34.1 |
+| io_blocking | 2000 | youpipe (512 thr) 12.6 | tokio 12.7 | std 47.8, youpipe (32 thr) 122 |
+| mixed_cpu_io | 500 | futures 9.14 | youpipe 9.68 | tokio 10.6 |
+| mixed_cpu_io | 2000 | futures 9.32 | youpipe 10.9 | tokio 13.4 |
+| real_doc | 1000 | tokio 10.8 | youpipe 11.2 | rayon 38.0 |
+| real_doc | 4000 | youpipe 14.1 | tokio 17.2 | rayon 137 |
+| real_web | 500 | youpipe 12.0 | tokio 12.8 | futures 13.1 |
+| real_web | 2000 | youpipe 22.9 | tokio 27.7 | futures 29.7 |
+
+### Reading the results
+
+- **Balanced CPU** is a tale of three regimes: rayon wins 1K (fixed setup,
+  its caller-inline fork-join) and 1M (the fused leaf is so cheap the
+  off-pool driver's wait shows — same story as the lightweight 1M row
+  above), youpipe wins the 10K–100K middle. Equal-chunk hand-threading is
+  2.5–5× behind everywhere: 32 spawns per call, and no stealing.
+- **Skewed CPU**: with `Workload::Unbalanced` youpipe ties rayon at 100K and
+  both are ~3× ahead of static chunking, which strands the 10 % heavy items
+  in whichever chunks they landed in. At 10K youpipe's adaptive oversplit
+  already handles the skew (the `Unbalanced` knob adds nothing at that size).
+- **Async IO is a tie** — youpipe multiplexes over the same tokio runtime,
+  and at 512 in flight the sleep dominates; the residual ~2 % is channel
+  handoff. `futures::stream` is the lightest async *combinator* stack (no
+  stage boundaries), which also explains its mixed_cpu_io lead: it runs the
+  CPU stage inline on runtime workers. That is fine at 100 ns/item CPU, and
+  the reason youpipe exists is everything it can't do there: fences,
+  cancellation, ordered output, dedicated CPU-pool isolation, backpressure
+  across *stages* rather than futures.
+- **Blocking IO is a configuration story**: correctly oversubscribed, youpipe
+  ≈ tokio `spawn_blocking` (same 512 threads); at the default 32 threads the
+  waits serialize (122 ms @ 2K). The chart keeps that failure visible on
+  purpose — blocking stages must size the pool, not the framework.
+- **Realistic pipelines** are where the streaming engine pays off: 3-stage
+  sync+async chains beat hand-written tokio channel plumbing by 17-18 % at
+  the larger batches (fewer tasks, pooled scheduling, mixed-mode channels)
+  and beat rayon by ~10× once IO blocks its workers.
+
 ## Perf-event counter measurement (`perf/counter-bench`)
 
 `perf/counter-bench` runs the same bench code under Linux perf hardware
