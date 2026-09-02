@@ -1,0 +1,44 @@
+# Perf-event counter benchmarks (Linux only): criterion driven by hardware
+# performance counters instead of wall-clock time, using the standalone
+# criterion-perf-counters crate (../criterion-perf-counters — a maintained
+# fork of criterion-perf-events; kept as a sibling directory because it is
+# meant for independent publication, see its Cargo.toml).
+#
+# A standalone crate rather than a root `benches/` target on purpose:
+#   * `dev-dependencies` cannot be optional (cargo rejects
+#     `optional = true` there), so a root bench would compile perfcnt — and
+#     its nom 4 dependency, which carries a future-incompat warning — on
+#     every `cargo bench` of the main suite, even when unused.
+#   * perf/ is the established home for methodology tooling
+#     (bench-suite/, hotpath-profile/, file-encrypt-bench/).
+#
+# Usage:
+#   cargo bench --manifest-path perf/counter-bench/Cargo.toml --bench perf_events
+#   PERF_EVENT=cycles    cargo bench --manifest-path perf/counter-bench/Cargo.toml
+#   PERF_EVENT=walltime  cargo bench --manifest-path perf/counter-bench/Cargo.toml
+#
+# See the "perf-event counters" section in docs/benchmarks.md for what the
+# counters are good for (and what they are not).
+[package]
+name         = "counter-bench"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+publish      = false
+
+[[bench]]
+harness = false
+name    = "perf_events"
+
+[dependencies]
+# NOTE: default-features = true, not `false` — the no-default-features build
+# of youpipe is currently broken (stream.rs:1938, `ReorderBuffer` import
+# missing with tokio-runtime off; `cargo check --no-default-features` fails
+# on a clean tree). Flip back once that's fixed; this bench is sync-only.
+youpipe = { path = "../..", default-features = true }
+
+[dev-dependencies]
+criterion               = "0.8"
+rayon                   = "1"
+criterion-perf-counters = { path = "../../criterion-perf-counters" }
+perfcnt                 = "0.8"

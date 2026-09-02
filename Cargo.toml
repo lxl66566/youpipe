@@ -9,7 +9,7 @@ repository   = "https://github.com/lxl66566/youpipe"
 license      = "Apache-2.0"
 keywords     = ["concurrency", "map-reduce", "parallel", "pipeline", "work-stealing"]
 categories   = ["concurrency"]
-exclude      = ["/.github", "/.opencode", "/.vscode", "/AGENTS.md", "/docs", "/perf"]
+exclude      = ["/.github", "/.opencode", "/.vscode", "/AGENTS.md", "/docs", "/perf", "/criterion-perf-counters"]
 
 # Examples that exercise `.stage_async` / `.with_async_pool` — only buildable
 # when the tokio runtime is enabled.

@@ -1,0 +1,33 @@
+# Fork of criterion-perf-events v0.4.0
+# (https://github.com/criterion-rs/criterion-perf-events), maintained
+# independently and intended for crates.io. Changes on top of upstream:
+#
+#   * criterion ^0.8 (upstream is unmaintained since 2023-05 and pinned to
+#     criterion ^0.4, which Cargo cannot unify with the 0.8 line; the
+#     `Measurement`/`ValueFormatter` trait shapes are unchanged, so this was
+#     a version bump plus the two API gaps below)
+#   * process-wide per-thread counters: upstream opens a single counter on
+#     the calling thread, so for any workload that runs on other threads
+#     (thread pools, async runtimes) it measures only the coordinator. This
+#     fork opens one counter per task in /proc/self/task (lazily, rescanned
+#     at most every 100 ms) and sums user-space counts across all of them.
+#   * `Throughput::Bits` / `Throughput::ElementsAndBytes` match arms
+#     (criterion 0.8 added both variants; upstream matches no longer
+#     compile) and an `event_name` field so reports say "instructions"
+#     instead of a hardcoded "cycles".
+[package]
+name         = "criterion-perf-counters"
+version      = "0.5.0"
+edition      = "2021"
+rust-version = "1.85"
+authors      = ["Jens Breitbart <jbreitbart@gmail.com>"]
+description  = "Criterion.rs measurement plugin for Linux perf events: process-wide per-thread hardware counters (instructions, cycles, cache misses, ...) as a drop-in alternative to wall-clock time"
+readme       = "README.md"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/lxl66566/criterion-perf-counters"
+keywords     = ["benchmark", "criterion", "perf", "profiling", "linux"]
+categories   = ["development-tools::profiling", "os::linux-apis"]
+
+[dependencies]
+criterion = "0.8"
+perfcnt   = "0.8"
