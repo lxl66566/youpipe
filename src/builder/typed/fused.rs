@@ -1659,10 +1659,13 @@ impl<S, I, O> Pipe<S, I, O> {
     /// calls — important for tight loops where per-call pool construction
     /// (~ms) would dominate.
     ///
+    /// (Pool sizes like 128 fit blocking-IO oversubscription; kept small
+    /// here so the example also runs under miri's single emulated worker.)
+    ///
     /// ```rust
     /// use youpipe::{pipe, ComputePool};
     ///
-    /// let pool = ComputePool::new(128);
+    /// let pool = ComputePool::new(4);
     /// let result: Vec<i32> = pipe(0..100)
     ///     .with_compute_pool(pool)
     ///     .map(|x: i32| x + 1)
@@ -1728,7 +1731,9 @@ impl<S, I, O> Pipe<S, I, O> {
     /// use youpipe::{pipe, ComputePool};
     ///
     /// // Pre-create once; clone is cheap (Arc + one atomic).
-    /// let pool = ComputePool::new(128);
+    /// // (Size 4 keeps the example runnable under miri; real blocking-IO
+    /// // pools want 128+ threads.)
+    /// let pool = ComputePool::new(4);
     /// for batch in std::iter::repeat_with(|| vec![0u64; 1000]).take(20) {
     ///     pipe(batch)
     ///         .with_compute_pool(pool.clone())

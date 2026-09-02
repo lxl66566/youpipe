@@ -1408,10 +1408,15 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// be created once and reused across many `run()` calls — important for
     /// tight loops where per-call pool construction (~ms) would dominate.
     ///
+    /// (Pool sizes like 128 fit blocking-IO oversubscription; kept small
+    /// here so the example also runs under miri — the streaming design
+    /// schedules `workers + 1 feeder` blocking jobs, which must stay within
+    /// the pool size.)
+    ///
     /// ```rust
     /// use youpipe::{stream, ComputePool};
     ///
-    /// let pool = ComputePool::new(128);
+    /// let pool = ComputePool::new(4);
     /// let result = stream(0..100)
     ///     .with_compute_pool(pool)
     ///     .stage(|x: u64| x + 1)
