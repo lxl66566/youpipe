@@ -1067,6 +1067,35 @@ script must read **only** `new/estimates.json` or it silently compares
 against stale runs (this produced phantom 2-4× "regressions" on the 100 K
 sync benches that vanished on re-measurement).
 
+### Round 2 verdict (2026-09-02: lazy reorder, fence recycling, `push_n`)
+
+Three further optimizations (see §6/§7 and the vendored-queue notes in §5),
+A/B'd with isolated alternating runs (3 rounds, median) against the round-1
+tip:
+
+- ordered stream 100 K **−21.7 %** (lazy slot array: zero allocation, zero
+  init, zero cache traffic for in-order streams), with_fence 100 K **−23 %**
+  (batch-allocation recycling); 10 K sizes −2…−3 %
+- `push_n` segment reservation: cpu_heavy fused dispatch −0.5…−2.6 %,
+  sync_lightweight/try_collect −1…−2 %
+- **no regression anywhere** — including the four 100 K fused benches that
+  a full-group pass flagged at +80…+290 %
+
+That last point is a third measurement trap, bigger than both above: the
+full-group `sync_vs_rayon` pass can collapse the 100 K (800 KB-input)
+benches by 2-3× *regardless of code version* — the unmodified baseline
+binary reproduces the same collapse minutes later, and the pure-rayon
+control bench (`mixed_load/rayon_par_iter`, which shares none of youpipe's
+code) swings +5.2 % in-group vs +1.2 % isolated. The 1 M (8 MB-input) sizes
+stay clean at ±1 %, so the mechanism is the 800 KB-mmap-regime allocation
+path interacting with whole-group sequence state, not code. **Verdicts for
+the 100 K fused family must come from isolated alternating runs**; in-group
+numbers for that family are meaningless on this machine.
+
+The vendored queue's loom suite also has a runtime trap: without upstream's
+CI setting `LOOM_MAX_PREEMPTIONS=2`, the `spsc`/`spsc_force` models run for
+an hour+ without completing; with it the whole suite finishes in seconds.
+
 ---
 
 ## 10. Extending the System
