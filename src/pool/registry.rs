@@ -152,13 +152,13 @@ impl Registry {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn inject_batch(&self, job_refs: impl ExactSizeIterator<Item = JobRef>) {
         let queue_was_empty = self.injected_jobs.is_empty();
-        let mut count = 0u32;
-        for job_ref in job_refs {
-            let _ = self.injected_jobs.push(job_ref);
-            count += 1;
-        }
+        // `push_n` reserves the whole batch with one tail CAS per block
+        // segment (≤ 31 slots) instead of one contended CAS per job — the
+        // batch is `num_threads-1 ≤ BLOCK_CAP` jobs, so this is a single CAS
+        // in the common case.
+        let count = self.injected_jobs.push_n(job_refs);
         if count > 0 {
-            self.sleep.new_injected_jobs(count, queue_was_empty);
+            self.sleep.new_injected_jobs(count as u32, queue_was_empty);
         }
     }
 

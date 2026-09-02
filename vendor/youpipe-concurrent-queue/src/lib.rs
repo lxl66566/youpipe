@@ -202,6 +202,70 @@ impl<T> ConcurrentQueue<T> {
         }
     }
 
+    /// Pushes a batch of items, returning the number of items written.
+    ///
+    /// On the unbounded queue this reserves the tail range with one CAS per
+    /// block segment instead of one CAS per item (see
+    /// [`Unbounded::push_n`](crate::ConcurrentQueue::push_n)); the other
+    /// variants fall back to per-item `push`. Fewer than all items are written
+    /// only if the queue was closed mid-batch (the unwritten values are
+    /// dropped — use `push` for item-granular error handling).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use concurrent_queue::ConcurrentQueue;
+    ///
+    /// let q = ConcurrentQueue::<i32>::unbounded();
+    /// assert_eq!(q.push_n([1, 2, 3]), 3);
+    /// assert_eq!(q.pop(), Ok(1));
+    /// assert_eq!(q.pop(), Ok(2));
+    /// assert_eq!(q.pop(), Ok(3));
+    /// ```
+    pub fn push_n<I>(&self, values: I) -> usize
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let mut iter = values.into_iter();
+        let mut written = 0usize;
+        match &self.0 {
+            Inner::Single(q) => {
+                // No segment-reservation structure to exploit; fall back to
+                // per-item push and count successes until the first error.
+                for _ in 0..iter.len() {
+                    // SAFETY: the loop runs exactly `iter.len()` times.
+                    let value = unsafe { iter.next().unwrap_unchecked() };
+                    match q.push(value) {
+                        Ok(()) => written += 1,
+                        // Cannot hand the value back through this API; drop
+                        // it like the unwritten iterator items.
+                        Err(crate::PushError::Full(v)) | Err(crate::PushError::Closed(v)) => {
+                            drop(v);
+                            break;
+                        }
+                    }
+                }
+                written
+            }
+            Inner::Bounded(q) => {
+                for _ in 0..iter.len() {
+                    // SAFETY: the loop runs exactly `iter.len()` times.
+                    let value = unsafe { iter.next().unwrap_unchecked() };
+                    match q.push(value) {
+                        Ok(()) => written += 1,
+                        Err(crate::PushError::Full(v)) | Err(crate::PushError::Closed(v)) => {
+                            drop(v);
+                            break;
+                        }
+                    }
+                }
+                written
+            }
+            Inner::Unbounded(q) => q.push_n(iter),
+        }
+    }
+
     /// Push an element into the queue, potentially displacing another element.
     ///
     /// Attempts to push an element into the queue. If the queue is full, one item from the

@@ -275,6 +275,146 @@ impl<T> Unbounded<T> {
         }
     }
 
+    /// Pushes a batch of items with one tail CAS per block segment.
+    ///
+    /// Whereas [`push`](Self::push) performs a `compare_exchange` on the tail
+    /// index for every item, `push_n` reserves a contiguous run of `n` slots
+    /// with a single CAS (`n` capped at the current block's remaining space,
+    /// i.e. at most `BLOCK_CAP`), then fills the reserved slots with plain
+    /// stores. For callers that inject whole batches at once this removes the
+    /// per-item serialization of `lock cmpxchg` on the shared tail cache line
+    /// (N contended RMWs → N/BLOCK_CAP + 1).
+    ///
+    /// Segment semantics are identical to `push`: a successful CAS owns
+    /// `[tail, tail+n)`; values become visible to consumers via per-slot
+    /// `WRITE` flags set with `Release` ordering; when a segment exactly fills
+    /// a block the caller installs and links the next block exactly like
+    /// `push` does at the block boundary.
+    ///
+    /// If the queue is closed before a segment is reserved, no further items
+    /// are written (values still inside the iterator are dropped) — this is
+    /// the batch analogue of `push` returning `PushError::Closed`, except that
+    /// already-written segments remain readable by consumers. Returns the
+    /// number of items actually written.
+    ///
+    /// Unlike `push`, a concurrent `close()` between segments cannot hand the
+    /// unwritten values back to the caller (a partially consumed iterator
+    /// cannot be reconstructed); use per-item `push` if item-granular recovery
+    /// is required.
+    pub fn push_n<I>(&self, values: I) -> usize
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let mut iter = values.into_iter();
+        let len = iter.len();
+        if len == 0 {
+            return 0;
+        }
+
+        let mut tail = self.tail.index.load(Ordering::Acquire);
+        let mut block = self.tail.block.load(Ordering::Acquire);
+        let mut next_block: Option<Box<Block<T>>> = None;
+        let backoff = Backoff::new();
+        let mut written = 0usize;
+
+        loop {
+            // Check if the queue is closed.
+            if tail & MARK_BIT != 0 {
+                // SAFETY (iterator contract): nothing pulled, nothing to
+                // return — the iterator drops the unwritten values.
+                return written;
+            }
+
+            // Calculate the offset of the index into the block.
+            let offset = (tail >> SHIFT) % LAP;
+
+            // If we reached the end of the block, wait until the next one is
+            // installed by the thread that filled the previous slot.
+            if offset == BLOCK_CAP {
+                backoff.snooze();
+                tail = self.tail.index.load(Ordering::Acquire);
+                block = self.tail.block.load(Ordering::Acquire);
+                continue;
+            }
+
+            // If this segment is going to fill the block, allocate the next
+            // one in advance so the wait for other threads is as short as
+            // possible (mirrors `push`).
+            let n = (BLOCK_CAP - offset).min(len - written);
+            if offset + n == BLOCK_CAP && next_block.is_none() {
+                next_block = Some(Block::<T>::new());
+            }
+
+            // If this is the first push into the queue, allocate the first
+            // block and install it.
+            if block.is_null() {
+                let new = Box::into_raw(Block::<T>::new());
+
+                if self
+                    .tail
+                    .block
+                    .compare_exchange(block, new, Ordering::Release, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    self.head.block.store(new, Ordering::Release);
+                    block = new;
+                } else {
+                    next_block = unsafe { Some(Box::from_raw(new)) };
+                    tail = self.tail.index.load(Ordering::Acquire);
+                    block = self.tail.block.load(Ordering::Acquire);
+                    continue;
+                }
+            }
+
+            // Try reserving the whole segment in one CAS.
+            let new_tail = tail + (n << SHIFT);
+            match self.tail.index.compare_exchange_weak(
+                tail,
+                new_tail,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => unsafe {
+                    // Fill the reserved slots. SAFETY: the CAS granted
+                    // exclusive ownership of `[offset, offset+n)` in `block`,
+                    // and `iter` holds at least `len - written ≥ n` items.
+                    for k in 0..n {
+                        debug_assert_eq!(iter.len(), len - written - k);
+                        let value = iter.next().unwrap_unchecked();
+                        let slot = (*block).slots.get_unchecked(offset + k);
+                        slot.value.with_mut(|slot| {
+                            slot.write(MaybeUninit::new(value));
+                        });
+                        slot.state.fetch_or(WRITE, Ordering::Release);
+                    }
+                    written += n;
+
+                    // If the segment filled the block, install the next one.
+                    if offset + n == BLOCK_CAP {
+                        let next = Box::into_raw(next_block.take().unwrap());
+                        self.tail.block.store(next, Ordering::Release);
+                        self.tail.index.fetch_add(1 << SHIFT, Ordering::Release);
+                        (*block).next.store(next, Ordering::Release);
+                        block = next;
+                        tail = new_tail + (1 << SHIFT);
+                    } else {
+                        tail = new_tail;
+                    }
+
+                    if written == len {
+                        return written;
+                    }
+                },
+                Err(t) => {
+                    backoff.spin();
+                    tail = t;
+                    block = self.tail.block.load(Ordering::Acquire);
+                }
+            }
+        }
+    }
+
     /// Pops an item from the queue.
     pub fn pop(&self) -> Result<T, PopError> {
         let mut head = self.head.index.load(Ordering::Acquire);

@@ -305,3 +305,34 @@ fn spsc_force() {
         handle.join().unwrap();
     });
 }
+
+#[test]
+fn spsc_push_n() {
+    // Only the unbounded queue has the segment-reserving `push_n`; model it
+    // against a concurrent consumer so the CAS loop, slot fills and the
+    // consumer's WRITE-flag spins are all explored. Uses an `Arc` to share
+    // the queue with the loom thread (loom threads require 'static data).
+    loom::model(|| {
+        use loom::sync::Arc;
+
+        let q = Arc::new(ConcurrentQueue::<usize>::unbounded());
+        let limit = 4usize;
+
+        let producer = Arc::clone(&q);
+        let handle = thread::spawn(move || {
+            // Split the pushes across two batches to exercise the "partial
+            // segment then continue" path of the reservation loop.
+            assert_eq!(producer.push_n(0..2usize), 2);
+            assert_eq!(producer.push_n(2..limit), limit - 2);
+        });
+        handle.join().unwrap();
+        q.close();
+
+        let mut recv_values = vec![];
+        while let Ok(value) = q.pop() {
+            recv_values.push(value);
+        }
+        recv_values.sort_unstable();
+        assert_eq!(recv_values, (0..limit).collect::<Vec<_>>());
+    });
+}
