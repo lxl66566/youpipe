@@ -14,7 +14,7 @@ temperature: 0
 - 单测、集成测试需要"少而精"，不要对过于简单的部分写太多单测，易错部分要多写。benchmark 要确保公平。
 - 不要删除代码中运行逻辑相关的关键注释
 - 使用简体中文进行交流；在代码中使用英文注释
-- 进行失败的尝试后，需要将经验记录到代码注释里；架构更新，记录到 docs/ARCHITECTURE.md。如果代码发生较大变化，经验/架构已过时，则需要删除对应记录。
+- 进行失败的尝试后，需要将经验记录到代码注释里；架构更新，记录到 docs/ 下对应主题文档（索引见 docs/README.md）。如果代码发生较大变化，经验/架构已过时，则需要删除对应记录。
 - 修改需要遵循原子化提交；提交前必须过测试、clippy，并确认无性能回归。
 
 ## 项目目标
@@ -29,7 +29,7 @@ temperature: 0
 
 ### 具体实现
 
-详情请参考 docs/ARCHITECTURE.md。
+详情请参考 docs/README.md 索引。
 
 - CPU 负载任务：rayon 架构在各种 balanced/unbalanced 负载下的综合表现都很好，这里直接采用 rayon 的调度器核心，详见 `src/pool/`。
   - 不希望引入 crossbeam_deque 库，因为 crossbeam_epoch 不兼容 miri。目前使用 st3 + concurrent-queue 实现工作窃取和 injector 队列。

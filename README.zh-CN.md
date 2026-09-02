@@ -83,7 +83,7 @@ let r: Vec<usize> = scope(|s| {
 
 ## 性能
 
-7945HX 32-Core Linux，详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#9-performance-benchmarks)。
+7945HX 32-Core Linux，详见 [`docs/benchmarks.md`](docs/benchmarks.md)。
 
 fused `pipe()` —— CPU 密集型操作（每元素 100 次迭代，热输入）：
 
@@ -195,7 +195,7 @@ let r = (0..1000).stream()
 
 ## 工作原理
 
-见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+见 [`docs/README.md`](docs/README.md)。
 
 ## 第三方声明
 

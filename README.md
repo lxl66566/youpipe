@@ -108,7 +108,7 @@ let r: Vec<usize> = scope(|s| {
 
 ## Performance
 
-7945HX 32-core Linux. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#9-performance-benchmarks).
+7945HX 32-core Linux. See [`docs/benchmarks.md`](docs/benchmarks.md).
 
 fused `pipe()` — CPU-heavy (100 iters/item, warm input):
 
@@ -223,7 +223,7 @@ cannot be built; use `.try_run()` to surface that as a `Result`.
 
 ## How it works
 
-see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+see [`docs/README.md`](docs/README.md).
 
 ## Attribution
 
