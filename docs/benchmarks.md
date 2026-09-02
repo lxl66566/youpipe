@@ -406,12 +406,12 @@ python3 perf/plot-horizontal.py                   # perf/horizontal/results.json
   both are ~3× ahead of static chunking, which strands the 10 % heavy items
   in whichever chunks they landed in. At 10K youpipe's adaptive oversplit
   already handles the skew (the `Unbalanced` knob adds nothing at that size).
-- **Async IO is a tie** — youpipe multiplexes over the same tokio runtime,
-  and at 512 in flight the sleep dominates; the residual ~2 % is channel
-  handoff. `futures::stream` is the lightest async *combinator* stack (no
-  stage boundaries), which also explains its mixed_cpu_io lead: it runs the
-  CPU stage inline on runtime workers. That is fine at 100 ns/item CPU, and
-  the reason youpipe exists is everything it can't do there: fences,
+- **Async IO is a near-tie** — youpipe multiplexes over the same tokio
+  runtime: ±2 % vs tokio (crossing ahead at ≥2K items as channel throughput
+  stops mattering), 2–5 % behind `futures::stream`, the lightest async
+  *combinator* stack. futures' mixed_cpu_io lead has the same cause: it runs
+  the CPU stage inline on runtime workers. That is fine at 100 ns/item CPU,
+  and the reason youpipe exists is everything it can't do there: fences,
   cancellation, ordered output, dedicated CPU-pool isolation, backpressure
   across *stages* rather than futures.
 - **Blocking IO is a configuration story**: correctly oversubscribed, youpipe
@@ -419,7 +419,7 @@ python3 perf/plot-horizontal.py                   # perf/horizontal/results.json
   waits serialize (122 ms @ 2K). The chart keeps that failure visible on
   purpose — blocking stages must size the pool, not the framework.
 - **Realistic pipelines** are where the streaming engine pays off: 3-stage
-  sync+async chains beat hand-written tokio channel plumbing by 17-18 % at
+  sync+async chains beat hand-written tokio channel plumbing by 17-19 % at
   the larger batches (fewer tasks, pooled scheduling, mixed-mode channels)
   and beat rayon by ~10× once IO blocks its workers.
 

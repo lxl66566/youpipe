@@ -105,13 +105,14 @@ sync+async，以及两个真实的三阶段 pipeline，含本地 mock server 上
 要点（中位数耗时；youpipe 对比最强手写基线；仅计工作负载本身，不含数据准备）：
 
 - **CPU 均衡（fused `pipe()`）** —— 10K–100K 区间领先（100K 时比 rayon 快
-  16%）；1K（固定启动开销 ~20 µs）与 1M（rayon 的 fork-join 内联在调用线程上
-  执行）由 rayon 领先。三方都比手写等分块线程快 2.5–5×。
+  20%）；1K（固定启动开销 ~20 µs）与 1M（rayon 的 fork-join 内联在调用线程上
+  执行，慢 ~9%）由 rayon 领先。三方都比手写等分块线程快 2.5–5×。
 - **CPU 倾斜（10% 元素成本 1000×）** —— `Workload::Unbalanced` + work
   stealing 与 rayon 打平（100K 时 0.26 vs 0.26 ms），比等分块手写线程快 3×
   （后者会让慢元素搁浅在个别线程）。
-- **异步 IO（并发 512，1/8 ms 尾延迟）** —— 与 tokio、`futures::stream`
-  统计打平（±2%）：youpipe 底层复用同一个 tokio 运行时。
+- **异步 IO（并发 512，1/8 ms 尾延迟）** —— 与异步基线打平：±2% 对 tokio
+  （≥2K 项时反超），落后更轻的 `futures::stream` 组合子栈 2–5%。youpipe
+  底层复用同一个 tokio 运行时。
 - **阻塞 IO** —— 512 线程过订阅池下 youpipe 与 `spawn_blocking` 打平（500 项
   8.65 vs 8.85 ms）；默认 32 线程时受等待限制（34 ms）。阻塞 stage 需要过订阅
   配置，见[深入用法](#深入用法)。
