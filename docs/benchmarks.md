@@ -324,3 +324,49 @@ numbers for that family are meaningless on this machine.
 The vendored queue's loom suite also has a runtime trap: without upstream's
 CI setting `LOOM_MAX_PREEMPTIONS=2`, the `spsc`/`spsc_force` models run for
 an hour+ without completing; with it the whole suite finishes in seconds.
+## Perf-event counter measurement (`perf/counter-bench`)
+
+`perf/counter-bench` runs the same bench code under Linux perf hardware
+counters (instructions / cycles / ref-cycles / cache-misses / …) instead of
+wall time, via the standalone `criterion-perf-counters` crate — a maintained
+fork of criterion-perf-events re-targeted at criterion 0.8 and extended with
+process-wide per-thread counters (upstream counts the main thread only,
+which for a pool library measures the coordinator and misses the workers).
+Threads that spawn and exit inside one measurement window are invisible, so
+channel benches can't use it; plain `b.iter` only (`BatchSize::PerIteration`
+windows multiply the per-window `4 × n_threads` counter syscalls by the
+iteration count and inflate fast benches).
+
+```sh
+cargo bench --manifest-path perf/counter-bench/Cargo.toml --bench perf_events
+PERF_EVENT=ref-cycles cargo bench --manifest-path perf/counter-bench/Cargo.toml
+perf/counter-bench/run-drift-exp.sh   # N runs per event + drift summary table
+```
+
+Drift experiment (2026-09, 3 runs × 20 samples per kind, taskset 1-31) —
+cross-run CV of run means / criterion's within-run CV:
+
+| kind         | sequential 100K | youpipe cpu_heavy 100K | rayon cpu_heavy 100K | youpipe light 10K | rayon light 10K |
+| ------------ | --------------- | ---------------------- | -------------------- | ----------------- | --------------- |
+| walltime     | 0.13 %          | 0.47 %                 | 1.20 %               | 0.96 %            | 1.39 %          |
+| instructions | **0.00 %**      | 0.79 %                 | 3.32 %               | 1.02 %            | 1.46 %          |
+| cycles       | 0.03 %          | 1.24 %                 | 0.78 %               | 1.72 %            | 1.32 %          |
+| ref-cycles   | 0.06 %          | 0.61 %                 | 1.58 %               | 3.87 %            | 0.87 %          |
+| cache-misses | 20 % (≈200)     | 0.76 %                 | 0.61 %               | 0.73 %            | 0.48 %          |
+
+Verdict:
+
+- Deterministic instruction streams reproduce exactly (CV 0.00 % vs walltime
+  0.13 %) — a counter run is the cheapest "this change should touch nothing"
+  check.
+- Pool-bench drift is scheduling, not measurement: counters do not replace
+  the interleaved-A/B methodology for throughput verdicts (rayon cpu_heavy
+  instructions CV 3.3 % > walltime 1.2 %).
+- Their payoff is work metrics wall time cannot express: instr/elem
+  (cpu_heavy/100K: youpipe 120.5 vs rayon 136.6) and cycles/elem (youpipe
+  82, IPC 1.47, vs rayon 179, IPC 0.76); cache-misses reproduces at
+  0.5-0.8 % CV for real-traffic benches — a stable memory-behavior signal.
+- Counter traps: cycles track wall time under frequency boost (stable here
+  only because the governor pins frequency); cache-misses is meaningless
+  when the absolute count is tiny; no counter is uniformly most stable
+  (ref-cycles was worst for youpipe lightweight).
