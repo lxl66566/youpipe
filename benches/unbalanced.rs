@@ -93,6 +93,14 @@ fn generate_skewed_io_workload(size: usize) -> Vec<(u64, u64)> {
 
 /// Generate a log-uniform workload: task costs are uniformly distributed
 /// on a log scale from min to max. This ensures fair, deterministic spread.
+// The usize→f64 and f64→u32 conversions are inherently lossy but bounded:
+// `size` is a bench batch size (≪ 2^53), and the exp() result is clamped
+// into [min_iters, max_iters] right after the cast.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn generate_log_uniform_workload(size: usize) -> Vec<(u64, u32)> {
     let min_iters: u32 = 5;
     let max_iters: u32 = 5000; // 1000x spread
@@ -430,8 +438,8 @@ fn bench_fused_oversubscribe(c: &mut Criterion) {
 
     let ncpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
 
-    for size in [200, 1000] {
-        group.throughput(Throughput::Elements(size as u64));
+    for size in [200u64, 1000] {
+        group.throughput(Throughput::Elements(size));
 
         // Baseline: global pool (num_cpus threads).
         group.bench_function(BenchmarkId::new("fused_global", size), |b| {
@@ -440,14 +448,14 @@ fn bench_fused_oversubscribe(c: &mut Criterion) {
                 let s = sum.clone();
                 pipe(0..size)
                     .with_workload(Workload::Unbalanced)
-                    .for_each(move |i: i32| {
+                    .for_each(move |i: u64| {
                         let micros = if i % 10 == 0 {
                             2000
                         } else {
                             100
                         };
-                        std::thread::sleep(std::time::Duration::from_micros(micros as u64));
-                        s.fetch_add(i as u64, std::sync::atomic::Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_micros(micros));
+                        s.fetch_add(i, std::sync::atomic::Ordering::Relaxed);
                     });
                 std::hint::black_box(sum.load(std::sync::atomic::Ordering::Relaxed));
             });
@@ -462,14 +470,14 @@ fn bench_fused_oversubscribe(c: &mut Criterion) {
                 pipe(0..size)
                     .with_compute_pool(pool.clone())
                     .with_workload(Workload::Unbalanced)
-                    .for_each(move |i: i32| {
+                    .for_each(move |i: u64| {
                         let micros = if i % 10 == 0 {
                             2000
                         } else {
                             100
                         };
-                        std::thread::sleep(std::time::Duration::from_micros(micros as u64));
-                        s.fetch_add(i as u64, std::sync::atomic::Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_micros(micros));
+                        s.fetch_add(i, std::sync::atomic::Ordering::Relaxed);
                     });
                 std::hint::black_box(sum.load(std::sync::atomic::Ordering::Relaxed));
             });
@@ -484,14 +492,14 @@ fn bench_fused_oversubscribe(c: &mut Criterion) {
                 pipe(0..size)
                     .with_oversubscribe(2)
                     .with_workload(Workload::Unbalanced)
-                    .for_each(move |i: i32| {
+                    .for_each(move |i: u64| {
                         let micros = if i % 10 == 0 {
                             2000
                         } else {
                             100
                         };
-                        std::thread::sleep(std::time::Duration::from_micros(micros as u64));
-                        s.fetch_add(i as u64, std::sync::atomic::Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_micros(micros));
+                        s.fetch_add(i, std::sync::atomic::Ordering::Relaxed);
                     });
                 std::hint::black_box(sum.load(std::sync::atomic::Ordering::Relaxed));
             });
@@ -506,14 +514,14 @@ fn bench_fused_oversubscribe(c: &mut Criterion) {
                 pipe(0..size)
                     .with_compute_pool(pool.clone())
                     .with_workload(Workload::Unbalanced)
-                    .for_each(move |i: i32| {
+                    .for_each(move |i: u64| {
                         let micros = if i % 10 == 0 {
                             2000
                         } else {
                             100
                         };
-                        std::thread::sleep(std::time::Duration::from_micros(micros as u64));
-                        s.fetch_add(i as u64, std::sync::atomic::Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_micros(micros));
+                        s.fetch_add(i, std::sync::atomic::Ordering::Relaxed);
                     });
                 std::hint::black_box(sum.load(std::sync::atomic::Ordering::Relaxed));
             });
@@ -524,14 +532,14 @@ fn bench_fused_oversubscribe(c: &mut Criterion) {
             b.iter(|| {
                 let sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let s = sum.clone();
-                (0..size).into_par_iter().for_each(move |i: i32| {
+                (0..size).into_par_iter().for_each(move |i: u64| {
                     let micros = if i % 10 == 0 {
                         2000
                     } else {
                         100
                     };
-                    std::thread::sleep(std::time::Duration::from_micros(micros as u64));
-                    s.fetch_add(i as u64, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_micros(micros));
+                    s.fetch_add(i, std::sync::atomic::Ordering::Relaxed);
                 });
                 std::hint::black_box(sum.load(std::sync::atomic::Ordering::Relaxed));
             });

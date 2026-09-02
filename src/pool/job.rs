@@ -23,6 +23,10 @@ pub(crate) enum JobResult<T> {
 /// `execute` may be called from a different thread than the one which
 /// scheduled the job, so the implementer must ensure appropriate `Send`/`Sync`.
 pub(crate) trait Job {
+    /// # Safety
+    ///
+    /// `this` must point to a valid, unexecuted instance of `Self` that stays
+    /// alive for the whole call, and must be executed exactly once.
     unsafe fn execute(this: *const ());
 }
 
@@ -57,6 +61,10 @@ impl JobRef {
         (self.pointer as usize, self.execute_fn as usize)
     }
 
+    /// # Safety
+    ///
+    /// Same contract as [`Job::execute`]: `self` must be a valid, unexecuted
+    /// job whose data is still alive; executed exactly once.
     #[inline]
     pub(crate) unsafe fn execute(self) {
         unsafe { (self.execute_fn)(self.pointer) };
@@ -93,14 +101,26 @@ where
         }
     }
 
+    /// # Safety
+    ///
+    /// `self` (the whole `StackJob`, latch included) must remain alive and
+    /// unmutated until the returned `JobRef` is executed exactly once.
     pub(crate) unsafe fn as_job_ref(&self) -> JobRef {
         unsafe { JobRef::new(self) }
     }
 
+    /// # Safety
+    ///
+    /// The job must never have been scheduled: no concurrent `execute` may run
+    /// or be pending, otherwise the closure is consumed twice.
     pub(crate) unsafe fn run_inline(self, stolen: bool) -> R {
         self.func.into_inner().unwrap()(stolen)
     }
 
+    /// # Safety
+    ///
+    /// The job must have been executed exactly once (latch set), so the result
+    /// slot is populated and no other thread can still access it.
     pub(crate) unsafe fn into_result(self) -> R {
         self.result.into_inner().into_return_value()
     }

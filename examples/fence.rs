@@ -63,7 +63,7 @@ impl StageTrace {
 /// 1000-item pass takes tens of ms — comfortably above the fence batch time
 /// so the Chunked vs Barrier contrast shows up clearly in the timestamps.
 fn stage1(x: i32) -> i32 {
-    let mut r = x as u64;
+    let mut r = x;
     let iters = if x % 10 == 0 {
         2_000_000
     } else {
@@ -72,7 +72,7 @@ fn stage1(x: i32) -> i32 {
     for _ in 0..iters {
         r = r.wrapping_mul(7).wrapping_add(13);
     }
-    r as i32
+    r
 }
 
 /// Stage 2: light transform.
@@ -93,28 +93,35 @@ fn run_with(mode: FenceMode) -> (Vec<i32>, [StageTrace; 3]) {
 
     // Wrap each stage so it records the first-arrival time. The original
     // computation runs unchanged inside the wrapper. Each stage closure owns
-    // its own clone of the trace handles (`Arc`-backed, cheap).
+    // its own clone of the trace handles (`Arc`-backed, cheap), scoped to the
+    // stage block it feeds.
     let t0 = Instant::now();
-    let trace0 = traces[0].clone();
-    let trace1 = traces[1].clone();
-    let trace2 = traces[2].clone();
 
     // Two fences: between stage 1↔2 and stage 2↔3 — independent boundaries.
     let result = items
         .stream()
-        .stage(move |x: i32| {
-            trace0.mark(t0.elapsed());
-            stage1(x)
+        .stage({
+            let trace = traces[0].clone();
+            move |x: i32| {
+                trace.mark(t0.elapsed());
+                stage1(x)
+            }
         })
         .fence(mode)
-        .stage(move |x: i32| {
-            trace1.mark(t0.elapsed());
-            stage2(x)
+        .stage({
+            let trace = traces[1].clone();
+            move |x: i32| {
+                trace.mark(t0.elapsed());
+                stage2(x)
+            }
         })
         .fence(mode)
-        .stage(move |x: i32| {
-            trace2.mark(t0.elapsed());
-            stage3(x)
+        .stage({
+            let trace = traces[2].clone();
+            move |x: i32| {
+                trace.mark(t0.elapsed());
+                stage3(x)
+            }
         })
         .ordered()
         .run();

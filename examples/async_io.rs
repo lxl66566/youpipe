@@ -119,12 +119,8 @@ fn main() {
         "Async IO over {SIZE} items (skewed 1ms / 8ms tail, {} items agree)",
         yp_sorted.len()
     );
-    println!(
-        "  youpipe stage_async: {yp_elapsed:>10.3?}   (M:N, default io_concurrency=128)"
-    );
-    println!(
-        "  tokio  spawn:        {tokio_elapsed:>10.3?}   (async ceiling, 1 task/item)"
-    );
+    println!("  youpipe stage_async: {yp_elapsed:>10.3?}   (M:N, default io_concurrency=128)");
+    println!("  tokio  spawn:        {tokio_elapsed:>10.3?}   (async ceiling, 1 task/item)");
     println!();
     println!("Both run async tasks on a tokio runtime, so both yield the OS");
     println!("thread while waiting. youpipe adds a feeder→consumer channel");

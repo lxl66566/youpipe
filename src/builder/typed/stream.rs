@@ -2374,10 +2374,9 @@ mod tests {
     /// `join`) and is a no-op for the inline variant.
     #[test]
     fn test_feeder_finish_resumes_payload() {
-        let slot: FeederPanicSlot = std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(
-            "feeder boom",
-        )
-            as Box<dyn std::any::Any + Send>)));
+        let slot: FeederPanicSlot = Arc::new(std::sync::Mutex::new(Some(
+            Box::new("feeder boom") as Box<dyn std::any::Any + Send>
+        )));
         let result = std::panic::catch_unwind(move || Feeder::Pool(slot).finish());
         let payload = result.expect_err("stored payload must be resumed");
         assert_eq!(payload.downcast_ref::<&str>().copied(), Some("feeder boom"));

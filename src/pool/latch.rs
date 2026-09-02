@@ -216,6 +216,12 @@ impl OnceLatch {
     }
 
     /// Set the latch and wake the specific worker if it was sleeping.
+    ///
+    /// # Safety
+    ///
+    /// `this` must point to a valid `OnceLatch` that is set exactly once, and
+    /// must outlive the waiter's wake-up path (the waiter only reads state
+    /// before returning from `wait_until`).
     #[inline]
     pub(crate) unsafe fn set_and_tickle_one(
         this: *const Self,

@@ -97,6 +97,12 @@ where
 
 /// If A panics, we still must wait for B to complete (it may hold references
 /// into our stack frame).
+///
+/// # Safety
+///
+/// Same contract as [`join_on`]: `worker_thread` must be the current thread's
+/// `WorkerThread`, and `job_b_latch` must belong to a job still owning its
+/// stack frame until this returns.
 #[cold]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 unsafe fn join_recover_from_panic(

@@ -48,7 +48,7 @@ fn test_scope_empty() {
 fn test_scope_mutate_external() {
     let data: Vec<i32> = vec![10, 20, 30];
     let doubled: Vec<i32> =
-        youpipe::scope(|s| s.pipe(0..3i32).map(|i: i32| data[i as usize] * 2).collect());
+        youpipe::scope(|s| s.pipe(0..3usize).map(|i: usize| data[i] * 2).collect());
     assert_eq!(doubled, vec![20, 40, 60]);
 }
 
@@ -83,15 +83,13 @@ fn test_scope_truly_non_static_borrow() {
 /// the table or `clone()` it per pipeline.
 #[test]
 fn test_scope_shared_lookup_across_pipelines() {
-    let table: Vec<u64> = (0..1000)
-        .map(|i| (i as u64).wrapping_mul(2654435761))
+    let table: Vec<u64> = (0..1000u64)
+        .map(|i| i.wrapping_mul(2_654_435_761))
         .collect();
     let (hits, sum) = youpipe::scope(|s| {
         let hits: usize = s
             .pipe(0..table.len())
-            .map(|i: usize| {
-                usize::from(table[i] % 2 == 0)
-            })
+            .map(|i: usize| usize::from(table[i] % 2 == 0))
             .collect()
             .into_iter()
             .sum();
@@ -103,9 +101,9 @@ fn test_scope_shared_lookup_across_pipelines() {
             .sum();
         (hits, sum)
     });
-    let expected_sum: u64 = (0..1000).map(|i| (i as u64).wrapping_mul(2654435761)).sum();
-    let expected_hits: usize = (0..1000)
-        .map(|i| (i as u64).wrapping_mul(2654435761))
+    let expected_sum: u64 = (0..1000u64).map(|i| i.wrapping_mul(2_654_435_761)).sum();
+    let expected_hits: usize = (0..1000u64)
+        .map(|i| i.wrapping_mul(2_654_435_761))
         .filter(|v| v % 2 == 0)
         .count();
     assert_eq!(hits, expected_hits);
@@ -181,15 +179,15 @@ fn test_scope_for_each_empty() {
 // for_each path is miri-validated by smaller tests.
 fn test_scope_for_each_parallel_large() {
     // Large enough to force the parallel par_for_each path.
-    let n: u64 = 80_000;
+    let n: usize = 80_000;
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
     youpipe::scope(|scope| {
-        scope.pipe(0..n).for_each(move |_: u64| {
+        scope.pipe(0..n).for_each(move |_: usize| {
             c.fetch_add(1, Ordering::Relaxed);
         });
     });
-    assert_eq!(counter.load(Ordering::Relaxed), n as usize);
+    assert_eq!(counter.load(Ordering::Relaxed), n);
 }
 
 // ── ScopedPipe::pipe(&[T]) — borrow a slice without cloning T ──

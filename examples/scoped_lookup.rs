@@ -34,7 +34,7 @@ fn build_table() -> Vec<String> {
 /// length of the matched row.
 fn lookup(table: &[String], i: usize) -> usize {
     // Hash the index to spread load around the table.
-    let h = (i.wrapping_mul(2654435761)) % table.len();
+    let h = (i.wrapping_mul(2_654_435_761)) % table.len();
     table[h].len()
 }
 
@@ -74,15 +74,9 @@ fn main() {
 
     println!("Parallel lookup against {TABLE_SIZE}-row stack-local table, {LOOKUPS} lookups");
     println!("  checksum (all agree): {checksum}");
-    println!(
-        "  youpipe scope():  {yp_elapsed:>10.3?}   (borrows &table, no clone)"
-    );
-    println!(
-        "  rayon   par_iter: {rn_elapsed:>10.3?}   (borrows &table, no clone)"
-    );
-    println!(
-        "  std     iter():   {seq_elapsed:>10.3?}   (single-threaded baseline)"
-    );
+    println!("  youpipe scope():  {yp_elapsed:>10.3?}   (borrows &table, no clone)");
+    println!("  rayon   par_iter: {rn_elapsed:>10.3?}   (borrows &table, no clone)");
+    println!("  std     iter():   {seq_elapsed:>10.3?}   (single-threaded baseline)");
     println!();
     println!("Both youpipe and rayon let the parallel workers borrow a");
     println!("stack-local table. Without `scope`, you would have to either");

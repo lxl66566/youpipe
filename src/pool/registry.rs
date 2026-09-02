@@ -314,6 +314,11 @@ impl WorkerThread {
         WORKER_THREAD_STATE.get()
     }
 
+    /// # Safety
+    ///
+    /// Must be called at most once per thread, before any other TLS access,
+    /// with a pointer that stays valid until [`Self::current`] returns null
+    /// again (the worker's `Drop` nulls it).
     unsafe fn set_current(thread: *const WorkerThread) {
         WORKER_THREAD_STATE.with(|t| {
             debug_assert!(t.get().is_null());
@@ -336,6 +341,12 @@ impl WorkerThread {
         self.index
     }
 
+    /// Push a job onto the local deque (overflow spills to the injector).
+    ///
+    /// # Safety
+    ///
+    /// Must only be called by the thread that owns this `WorkerThread` (TLS
+    /// contract): `self.worker` is a single-producer deque.
     #[inline]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) unsafe fn push(&self, job: JobRef) {
@@ -373,6 +384,12 @@ impl WorkerThread {
     }
 
     /// Wait until `latch` is set, executing stolen work in the meantime.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be a pool worker owning this `WorkerThread` (the
+    /// wait loop dereferences the TLS pointer and runs arbitrary jobs), and
+    /// `latch` must outlive the wait.
     #[inline]
     pub(crate) unsafe fn wait_until(&self, latch: &CoreLatch) {
         if !latch.probe() {
@@ -380,6 +397,10 @@ impl WorkerThread {
         }
     }
 
+    /// # Safety
+    ///
+    /// Same contract as [`Self::wait_until`]; additionally `latch` must not be
+    /// deallocated while this thread runs stolen jobs.
     #[cold]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     unsafe fn wait_until_cold(&self, latch: &CoreLatch) {
@@ -411,6 +432,11 @@ impl WorkerThread {
         mem::forget(abort_guard);
     }
 
+    /// # Safety
+    ///
+    /// Same contract as [`Self::wait_until`]: current thread must own this
+    /// `WorkerThread`. The terminate latch is registry-owned and lives as long
+    /// as the registry.
     unsafe fn wait_until_out_of_work(&self) {
         let index = self.index;
         let registry = &self.registry;
@@ -440,6 +466,10 @@ impl WorkerThread {
             .or_else(|| self.steal())
     }
 
+    /// # Safety
+    ///
+    /// Same contract as [`JobRef::execute`](super::job::JobRef::execute): the
+    /// job must be valid, alive, and executed exactly once.
     #[inline]
     pub(crate) unsafe fn execute(job: JobRef) {
         unsafe { job.execute() };
@@ -498,6 +528,12 @@ impl Drop for WorkerThread {
 }
 
 /// Main loop for a worker thread. Allocated on the worker's stack.
+///
+/// # Safety
+///
+/// Must be called exactly once, at the bottom of a freshly spawned worker
+/// thread, with `worker`/`registry` matching the thread's lifetime: the
+/// function pins `WorkerThread` in TLS by pointer and only clears it on exit.
 unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usize) {
     let worker_thread = WorkerThread {
         worker,

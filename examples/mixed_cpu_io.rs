@@ -131,12 +131,8 @@ fn main() {
         "Mixed CPU + async IO over {SIZE} skewed items ({} results agree)",
         yp_sorted.len()
     );
-    println!(
-        "  youpipe stage+stage_async: {yp_elapsed:>10.3?}   (CPU+IO overlap, M:N)"
-    );
-    println!(
-        "  tokio  spawn_blocking x2:  {tokio_elapsed:>10.3?}   (all-blocking baseline)"
-    );
+    println!("  youpipe stage+stage_async: {yp_elapsed:>10.3?}   (CPU+IO overlap, M:N)");
+    println!("  tokio  spawn_blocking x2:  {tokio_elapsed:>10.3?}   (all-blocking baseline)");
     println!();
     println!("youpipe's mixed pipeline overlaps CPU and IO: the IO side starts");
     println!("consuming the moment the first CPU item is ready. The tokio");

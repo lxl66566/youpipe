@@ -98,18 +98,12 @@ fn main() {
         yp_b[0],
         yp_b[SIZE - 1]
     );
-    println!(
-        "  youpipe pipe() Balanced:    {yp_balanced_elapsed:>10.3?}   (4× oversplit)"
-    );
+    println!("  youpipe pipe() Balanced:    {yp_balanced_elapsed:>10.3?}   (4× oversplit)");
     println!(
         "  youpipe pipe() Unbalanced:  {yp_unbal_elapsed:>10.3?}   (8× oversplit, finer stealing)"
     );
-    println!(
-        "  rayon   par_iter:           {rn_elapsed:>10.3?}   (work-stealing baseline)"
-    );
-    println!(
-        "  std     iter():             {seq_elapsed:>10.3?}   (single-threaded baseline)"
-    );
+    println!("  rayon   par_iter:           {rn_elapsed:>10.3?}   (work-stealing baseline)");
+    println!("  std     iter():             {seq_elapsed:>10.3?}   (single-threaded baseline)");
     println!();
     println!("Both youpipe and rayon use recursive `join`-based splitting that");
     println!("produces more leaves than threads. Idle workers steal unstarted");

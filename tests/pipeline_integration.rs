@@ -130,9 +130,9 @@ fn test_try_map_parallel_large() {
         .map(|x: i32| x + 1)
         .try_collect()
         .unwrap();
-    assert_eq!(result.len(), n as usize);
+    assert_eq!(result.len(), usize::try_from(n).unwrap());
     assert_eq!(result[0], 1);
-    assert_eq!(result[n as usize - 1], (n - 1) * 3 + 1);
+    assert_eq!(result[usize::try_from(n).unwrap() - 1], (n - 1) * 3 + 1);
 }
 
 #[test]
@@ -227,21 +227,21 @@ fn test_stream_with_fence_full_barrier() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn test_stream_fence_large_input_no_deadlock() {
-    let n: usize = 5_000; // well above the default 256-slot channel buffer
+    let n: i32 = 5_000; // well above the default 256-slot channel buffer
 
     // Chunked, unordered.
-    let items: Vec<i32> = (0..n as i32).collect();
+    let items: Vec<i32> = (0..n).collect();
     let mut r = stream(items)
         .stage(|x: i32| x + 1)
         .fence(FenceMode::Chunked(NonZeroUsize::new(64).unwrap()))
         .stage(|x: i32| x * 3)
         .run();
     r.sort_unstable();
-    let expected: Vec<i32> = (0..n as i32).map(|x| (x + 1) * 3).collect();
+    let expected: Vec<i32> = (0..n).map(|x| (x + 1) * 3).collect();
     assert_eq!(r, expected);
 
     // Barrier, ordered — the exact shape that hung the bench.
-    let items: Vec<i32> = (0..n as i32).collect();
+    let items: Vec<i32> = (0..n).collect();
     let r = stream(items)
         .stage(|x: i32| x + 1)
         .fence(FenceMode::Barrier)
@@ -443,7 +443,7 @@ fn test_sync_to_async_does_not_stall_tokio_driver() {
     let result = res_rx
         .recv_timeout(Duration::from_secs(30))
         .expect("pipeline deadlocked — tokio worker stalled by a blocking op");
-    assert_eq!(result.len(), n as usize);
+    assert_eq!(result.len(), usize::try_from(n).unwrap());
 
     // Keep the runtime alive until both observations land.
     drop(rt);
@@ -693,8 +693,8 @@ fn test_for_each_basic() {
     // Single-stage for_each: equivalent to rayon's par_iter().for_each().
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
-    pipe(0..1000u64).for_each(move |x: u64| {
-        c.fetch_add(x as usize, Ordering::Relaxed);
+    pipe(0..1000usize).for_each(move |x: usize| {
+        c.fetch_add(x, Ordering::Relaxed);
     });
     let expected: usize = (0..1000).map(|x: usize| x).sum();
     assert_eq!(counter.load(Ordering::Relaxed), expected);
@@ -705,15 +705,13 @@ fn test_for_each_chained_map() {
     // Multi-stage chain ending in for_each: fuses map+map into one closure.
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
-    pipe(0..500i32)
-        .map(|x: i32| x + 1)
-        .map(|x: i32| x * 2)
-        .for_each(move |x: i32| {
-            c.fetch_xor(x as usize, Ordering::Relaxed);
+    pipe(0..500usize)
+        .map(|x: usize| x + 1)
+        .map(|x: usize| x * 2)
+        .for_each(move |x: usize| {
+            c.fetch_xor(x, Ordering::Relaxed);
         });
-    let expected: usize = (0..500)
-        .map(|x: i32| (x + 1) * 2)
-        .fold(0, |a, b| a ^ (b as usize));
+    let expected: usize = (0..500).map(|x: usize| (x + 1) * 2).fold(0, |a, b| a ^ b);
     assert_eq!(counter.load(Ordering::Relaxed), expected);
 }
 
@@ -753,17 +751,17 @@ fn test_for_each_single() {
 fn test_for_each_parallel_large() {
     // Large enough to exceed the serial threshold and exercise the parallel
     // par_for_each path (MAY_FILTER == false → pure leaf).
-    let n: u64 = if cfg!(miri) {
+    let n: usize = if cfg!(miri) {
         2_000
     } else {
         50_000
     };
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
-    pipe(0..n).for_each(move |_x: u64| {
+    pipe(0..n).for_each(move |_x: usize| {
         c.fetch_add(1, Ordering::Relaxed);
     });
-    assert_eq!(counter.load(Ordering::Relaxed), n as usize);
+    assert_eq!(counter.load(Ordering::Relaxed), n);
 }
 
 #[test]
@@ -872,8 +870,7 @@ fn test_for_each_unbalanced_workload() {
     // for_each (no slot-validity assumptions violated).
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
-    use youpipe::Workload;
-    let n: i32 = if cfg!(miri) {
+    let n: usize = if cfg!(miri) {
         1_000
     } else {
         10_000
@@ -883,7 +880,7 @@ fn test_for_each_unbalanced_workload() {
         .for_each(move |_| {
             c.fetch_add(1, Ordering::Relaxed);
         });
-    assert_eq!(counter.load(Ordering::Relaxed), n as usize);
+    assert_eq!(counter.load(Ordering::Relaxed), n);
 }
 
 #[test]
@@ -943,9 +940,7 @@ fn test_workload_custom_correctness() {
     let expected: Vec<u64> = (0..10_000).map(|x| x * 3 + 1).collect();
     for factor in [1usize, 2, 7, 16, 32] {
         let r: Vec<u64> = pipe(0..10_000)
-            .with_workload(Workload::Custom(
-                NonZeroUsize::new(factor).unwrap(),
-            ))
+            .with_workload(Workload::Custom(NonZeroUsize::new(factor).unwrap()))
             .map(|x: u64| x * 3 + 1)
             .collect();
         assert_eq!(r, expected, "factor {factor} diverged");

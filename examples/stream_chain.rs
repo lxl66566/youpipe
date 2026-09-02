@@ -81,12 +81,8 @@ fn main() {
         "2-stage CPU pipeline over {SIZE} items (sorted outputs agree, {} items)",
         yp_sorted.len()
     );
-    println!(
-        "  youpipe  stream(): {yp_elapsed:>10.3?}   (channels between stages, overlapping)"
-    );
-    println!(
-        "  tokio   spawn_blocking: {tokio_elapsed:>10.3?}   (one task per item, per stage)"
-    );
+    println!("  youpipe  stream(): {yp_elapsed:>10.3?}   (channels between stages, overlapping)");
+    println!("  tokio   spawn_blocking: {tokio_elapsed:>10.3?}   (one task per item, per stage)");
     println!();
     println!("youpipe's streaming pipeline keeps both stages' worker pools");
     println!("running concurrently — stage 2 starts consuming the moment stage");

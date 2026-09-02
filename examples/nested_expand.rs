@@ -15,7 +15,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 use youpipe::prelude::*;
 
-const N_INPUTS: usize = 1000;
+const N_INPUTS: i32 = 1000;
 
 /// Expand each `i` into a vec of 5 integers: `[i*10, i*10+1, ..., i*10+4]`.
 fn expand(i: i32) -> Vec<i32> {
@@ -29,7 +29,7 @@ fn postprocess(x: i32) -> i32 {
 }
 
 fn main() {
-    let inputs: Vec<i32> = (0..N_INPUTS as i32).collect();
+    let inputs: Vec<i32> = (0..N_INPUTS).collect();
 
     // ── youpipe: stream().expand().stage().run() ──
     // Unordered — items arrive in completion order. (Ordered mode assumes a
@@ -73,15 +73,9 @@ fn main() {
         "1-to-5 expand + postprocess, {N_INPUTS} inputs → {} items",
         yp_result.len()
     );
-    println!(
-        "  youpipe stream().expand().stage():  {yp_elapsed:>10.3?}"
-    );
-    println!(
-        "  rayon   par_iter().flat_map().map(): {rn_elapsed:>10.3?}"
-    );
-    println!(
-        "  std     iter().flat_map().map():    {seq_elapsed:>10.3?}"
-    );
+    println!("  youpipe stream().expand().stage():  {yp_elapsed:>10.3?}");
+    println!("  rayon   par_iter().flat_map().map(): {rn_elapsed:>10.3?}");
+    println!("  std     iter().flat_map().map():    {seq_elapsed:>10.3?}");
     println!();
     println!("First few outputs: {:?}", &yp_result[..10]);
 }
