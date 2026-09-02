@@ -22,6 +22,10 @@ struct Slot<T> {
 /// must size the buffer to at least the maximum out-of-order window. The
 /// streaming collectors clamp the window to `[1 Ki, 1 Mi]` slots, which is
 /// ample for realistic worker counts.
+///
+/// The slot array is allocated lazily on the first out-of-order arrival: an
+/// in-order stream (the common case) never touches it, so constructing the
+/// buffer costs nothing beyond two integers and an empty `Vec`.
 pub struct ReorderBuffer<T> {
     slots: Vec<Slot<T>>,
     next_expected: u64,
@@ -33,18 +37,28 @@ impl<T> ReorderBuffer<T> {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.max(1).next_power_of_two();
-        let slots = (0..cap)
-            .map(|_| Slot {
-                seq: 0,
-                occupied: false,
-                item: MaybeUninit::uninit(),
-            })
-            .collect();
         Self {
-            slots,
+            // Lazy: `ensure_slots` materializes the array on the first
+            // out-of-order arrival. In-order streams pay zero allocation
+            // (and zero zero-init of up to 1 Mi slots).
+            slots: Vec::new(),
             next_expected: 0,
             len: 0,
             mask: cap - 1,
+        }
+    }
+
+    /// Materialize the slot array on first use. Must be called before any
+    /// slot access; guarded by `len == 0 ⇒ slots untouched` in the fast path.
+    fn ensure_slots(&mut self) {
+        if self.slots.is_empty() {
+            self.slots = (0..=self.mask)
+                .map(|_| Slot {
+                    seq: 0,
+                    occupied: false,
+                    item: MaybeUninit::uninit(),
+                })
+                .collect();
         }
     }
 
@@ -60,28 +74,28 @@ impl<T> ReorderBuffer<T> {
     /// value. At 100 k+ items that allocation churn dominated the ordered
     /// collector's cost; this sink variant eliminates it.
     pub fn insert_into(&mut self, seq: u64, item: T, sink: &mut Vec<T>) {
+        // Fast path: the item is exactly the next expected one and nothing is
+        // buffered. `len == 0` implies every slot is unoccupied (each occupied
+        // slot is counted by `len`), so this scalar guard subsumes the old
+        // defensive `!slots[idx].occupied` array read — and with the lazy
+        // slot array an in-order stream never allocates or touches it at
+        // all: one compare, one push, one increment. Nothing can be flushable
+        // (`len == 0`), so the flush call is skipped too.
+        if seq == self.next_expected && self.len == 0 {
+            sink.push(item);
+            self.next_expected += 1;
+            return;
+        }
+        self.ensure_slots();
         // `seq as usize` is safe across all pointer widths: the subsequent
         // `& self.mask` only keeps the low log2(capacity) bits, so truncation
         // on 32-bit targets is harmless (capacity is always < 2³²).
         #[allow(clippy::cast_possible_truncation)]
         let idx = (seq as usize) & self.mask;
-        // Fast path: the item is exactly the next expected one and its slot
-        // is not aliased by an outstanding older item — push straight to the
-        // sink and advance, skipping the slot write + read-back (3 stores +
-        // 2 loads + len bookkeeping) of the buffering path. In the in-order
-        // steady state (the common case for ordered streams under light
-        // load imbalance) this is the whole cost of re-sequencing.
-        //
-        // The `!occupied` guard is defensive: under the capacity contract
-        // (§ type-level doc) the slot for `next_expected` can only be
-        // occupied by a duplicate/aliased seq, which the slow path below
-        // handles.
-        if seq == self.next_expected && !self.slots[idx].occupied {
-            sink.push(item);
-            self.next_expected += 1;
-            self.flush_ready_into(sink);
-            return;
-        }
+        // Slow path: the item must be buffered (out-of-order arrival, or an
+        // in-order arrival while earlier gaps are still buffered — the slot
+        // write + read-back here is the 3 stores + 2 loads + len bookkeeping
+        // the fast path avoids).
         let slot = &mut self.slots[idx];
         if slot.occupied {
             // Capacity precondition violated: a different seq aliases this
@@ -115,6 +129,12 @@ impl<T> ReorderBuffer<T> {
     }
 
     fn flush_ready_into(&mut self, sink: &mut Vec<T>) {
+        // `len == 0` ⇒ no occupied slots ⇒ the loop below would break on its
+        // first iteration anyway. Also keeps the lazy `slots` array (empty
+        // `Vec`) safely unindexed.
+        if self.len == 0 {
+            return;
+        }
         loop {
             // See `insert_into` for why truncation is harmless.
             #[allow(clippy::cast_possible_truncation)]
@@ -260,5 +280,43 @@ mod tests {
         assert_eq!(buf.insert(3, 30), Vec::new());
         assert_eq!(buf.insert(1, 10), Vec::new());
         assert!(buf.len() <= 2);
+    }
+
+    /// The slot array stays unallocated while arrivals are in order: the
+    /// whole reorder machinery is two integers and an empty `Vec`.
+    #[test]
+    fn test_lazy_slots_in_order() {
+        let mut buf = ReorderBuffer::<i32>::new(1 << 20);
+        let mut out = Vec::new();
+        for i in 0..1000u64 {
+            buf.insert_into(i, i32::try_from(i).unwrap(), &mut out);
+            assert!(buf.slots.is_empty(), "in-order arrival must not allocate");
+        }
+        assert_eq!(out.len(), 1000);
+        assert_eq!(buf.next_expected(), 1000);
+        assert!(buf.is_empty());
+    }
+
+    /// The first out-of-order arrival materializes the slot array once, and
+    /// re-sequencing still works after subsequent in-order arrivals.
+    #[test]
+    fn test_lazy_slots_allocated_once_on_reorder() {
+        let mut buf = ReorderBuffer::<i32>::new(16);
+        let mut out = Vec::new();
+        for i in 0..50u64 {
+            buf.insert_into(i, i32::try_from(i).unwrap(), &mut out);
+        }
+        assert!(buf.slots.is_empty());
+        buf.insert_into(52, 520, &mut out); // out of order → allocate
+        let cap = buf.slots.len();
+        assert!(cap >= 16);
+        buf.insert_into(50, 500, &mut out); // fills the gap
+        buf.insert_into(51, 510, &mut out); // flushes 50..=52
+        assert_eq!(buf.slots.len(), cap, "no reallocation on later reorders");
+        buf.insert_into(53, 530, &mut out); // in-order again (len == 0 fast path)
+        assert_eq!(
+            out.iter().copied().skip(50).collect::<Vec<_>>(),
+            vec![500, 510, 520, 530]
+        );
     }
 }
