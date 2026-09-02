@@ -5,10 +5,7 @@
 //! indirection. `THREADS_BITS` is sized (9 on 64-bit, 8 on 32-bit) so the
 //! entire mask fits in one cache line, and `SleepMask` lives inside the
 //! `Arc<Registry>` allocation right next to the hot atomic `counters`.
-//!
-//! For the common case (≤64 workers) only `words[0]` is ever touched, and it
-//! typically shares a cache line with `counters`, so the wake path is
-//! cache-hot with zero indirection.
+//! For the common case (≤64 workers) only `words[0]` is ever touched.
 //!
 //! # Historical note
 //!

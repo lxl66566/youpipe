@@ -803,16 +803,14 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// caller did not attach one via [`StreamPipe::with_async_pool`].
     ///
     /// Without this cache every `acquire_async()` call (one per async stage
-    /// plus one per sync→async bridge) would build a *fresh* runtime —
-    /// each costing ~ms — silently wrecking small workloads. The cache keeps
-    /// the "no config needed" default path fast: a single runtime is built on
-    /// first use and dropped at the end of `run()`.
+    /// plus one per sync→async bridge) would build a *fresh* runtime (~ms
+    /// each), silently wrecking small workloads. One runtime is built on
+    /// first use and reused for the whole `run()`.
     ///
     /// Stored as `io::Result` (not just the pool) so a construction failure
     /// is reported identically to every caller — `OnceLock::get_or_init`
-    /// runs the initializer exactly once and hands back the same outcome to
-    /// every subsequent `acquire_async()` call. (`OnceLock::get_or_try_init`
-    /// would be the natural fit but is still unstable as of 1.85.)
+    /// runs the initializer exactly once. (`OnceLock::get_or_try_init` would
+    /// be the natural fit but is still unstable as of 1.85.)
     #[cfg(feature = "tokio-runtime")]
     pub(crate) cached_pool: OnceLock<std::io::Result<R>>,
     /// Carries the backend type `R` even when no backend feature is enabled
@@ -959,10 +957,9 @@ where
         Self: Sized,
     {
         // Terminal sync stage: output goes to the sole collector, so use the
-        // lighter MPSC ring buffer (store-based dequeue, no mutex waker
-        // registry). Previous stages still use MPMC (`prev.spawn`, not
-        // `prev.spawn_single`) — their output feeds multiple workers in this
-        // stage, so multi-consumer channels are required there.
+        // lighter MPSC ring buffer (see `spawn_single` trait doc). Previous
+        // stages still use MPMC (`prev.spawn`, not `prev.spawn_single`) —
+        // their output feeds multiple workers in this stage.
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
@@ -985,16 +982,11 @@ where
         ctx: &StreamCtx<'_, R>,
     ) -> AsyncReceiver<(u64, M)> {
         // Direct sync→async handoff: ComputePool workers write the mixed-mode
-        // `SyncSender` directly — no bridge thread. The workers are OS threads,
-        // so blocking on `send` under backpressure simply parks the worker
-        // (correct), and crossfire's internal waker hands off to the async
-        // consumer draining the same `mpmc::Array`. One channel, zero
-        // forwarding hops vs the default impl's spawn-then-bridge.
-        //
-        // This is the load-bearing optimisation: a chain like
-        // `stream(..).stage(cpu).stage_async(io)` previously paid for a
-        // dedicated OS thread forwarding each item sync→mixed-mode; now the
-        // CPU stage's workers ARE the mixed-mode producers.
+        // `SyncSender` directly — no bridge thread (see `spawn_for_async`
+        // trait doc for why this is correct and load-bearing: chains like
+        // `stream(..).stage(cpu).stage_async(io)` previously paid a dedicated
+        // forwarding OS thread per item; now the CPU stage's workers ARE the
+        // mixed-mode producers).
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
@@ -1338,13 +1330,10 @@ where
 
 /// Like [`spawn_async_consumers_body`] but produces an MPSC output channel
 /// ([`MpscAsyncReceiver`]) instead of MPMC — the right shape when this is the
-/// terminal async stage and the collector is the sole consumer of the output.
-///
-/// The receiver end uses `store`-based dequeue (no `lock cmpxchg`) and a
-/// lock-free waker registry, eliminating the dominant per-item CAS cost that
-/// the MPMC ring buffer pays on every `recv`. The sender side stays async
-/// (`MpscAsyncSender::send().await`) because the producers are tokio tasks,
-/// not OS threads — a blocking send would stall the runtime worker.
+/// terminal async stage and the collector is the sole consumer of the output
+/// (same MPSC-vs-MPMC rationale as [`StageSpawn::spawn_single`]). The sender
+/// side stays async (`MpscAsyncSender::send().await`): the producers are
+/// runtime tasks, not OS threads — a blocking send would stall the worker.
 ///
 /// Invoked by [`AsyncStage::spawn_single`] via [`StageSpawn::spawn_single`].
 #[cfg(feature = "tokio-runtime")]
@@ -1460,30 +1449,21 @@ where
             // NOTE(perf): this bridge task is NOT redundant — do not try to
             // remove it by having consumers clone `prev_async_rx` directly.
             //
-            // Attempted in the `try(perfopt)` recorded below: replace this
-            // arm with `prev_async_rx` (consumers clone it N ways and pull
-            // directly, eliminating one tokio task + one bounded channel per
-            // item). Measured result on `io_async_pure` (sample-size 30,
-            // measurement-time 5, vs the readme_20260627_v3 baseline):
+            // Attempted: consumers clone the upstream receiver and pull
+            // directly, eliminating one task + one bounded channel per item.
+            // Measured on `io_async_pure` (sample-size 30, vs the
+            // readme_20260627_v3 baseline): youpipe_async/200 +0.50 %,
+            // /500 +0.82 % (both p ≈ 0.03–0.04) — consistently a regression.
+            // Hypothesis: with the bridge, it is the sole registered waker on
+            // `prev_async_rx`, so each produced item wakes exactly one task.
+            // Without it, all `concurrency` consumer clones register wakers on
+            // the same `MAsyncRx` (`crossfire::mpmc` uses `RegistryMulti`), so
+            // one item can spuriously wake several consumers — all but one
+            // poll an empty queue, re-register, return `Pending`. That
+            // scheduler churn outweighs the saved hop at `io_concurrency ≥ 64`.
             //
-            //   youpipe_async/200  +0.50%  (p = 0.04, flagged noise threshold)
-            //   youpipe_async/500  +0.82%  (p = 0.03, flagged noise threshold)
-            //
-            // Both point estimates were *positive* (regression) — the
-            // simplification is consistently slower, not faster. The
-            // hypothesis: with the bridge in place the bridge task is the
-            // sole registered waker on `prev_async_rx`, so each item the
-            // upstream produces wakes exactly one task. Without the bridge,
-            // all `concurrency` consumer clones register wakers on the same
-            // `MAsyncRx` (`crossfire::mpmc` uses `RegistryMulti`), so a
-            // single produced item can spuriously wake several consumers —
-            // all but one then poll an empty queue, re-register, and return
-            // `Pending`. That extra scheduler churn outweighs the saved
-            // channel hop at `io_concurrency ≥ 64`.
-            //
-            // The bridge is therefore load-bearing: it's a 1-task funnel
-            // that converts the MPMC upstream into a single-waker source for
-            // the consumer fan-out. Keep it.
+            // The bridge is a load-bearing 1-task funnel converting the MPMC
+            // upstream into a single-waker source. Keep it.
             let (a_in_tx, a_in_rx) = async_channel::<(u64, Prev::Out)>(buffer);
             let pool = ctx.acquire_async().expect("failed to build async runtime");
             pool.spawn(async move {
@@ -1736,11 +1716,9 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     ///
     /// # Scope — one boundary, not the whole stream
     ///
-    /// A fence controls exactly **one** adjacent stage transition — the
-    /// boundary between whatever precedes it and whatever follows it. It does
-    /// *not* impose a barrier across the entire pipeline. Each `.fence()`
-    /// call is an independent boundary, so a chain may insert as many as the
-    /// topology needs:
+    /// A fence controls exactly **one** adjacent stage transition — between
+    /// whatever precedes it and whatever follows it; it never affects other
+    /// boundaries. A chain may insert as many as the topology needs:
     ///
     /// ```text
     /// stream(..)
@@ -1752,9 +1730,6 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     ///     .stage(s4)
     ///     .run();
     /// ```
-    ///
-    /// This keeps the chain composable: each `.fence()` is local to its
-    /// position, never affecting upstream or downstream boundaries.
     ///
     /// # Modes
     ///
@@ -2293,21 +2268,19 @@ where
 /// # Burst-drain strategy (unordered path)
 ///
 /// When multiple items land in the channel before the collector loops back
-/// (the common case once the first wave of async consumers wakes from their
-/// sleeps — tokio's coarse timer wheel batches same-duration timeouts into
-/// the same tick), a pure `while let Ok(..) = rx.recv().await` pays one
-/// waker-register / waker-wake round-trip per item even though every item
-/// after the first is already queued. The unordered path therefore drains
-/// in two phases per burst:
+/// (common once the first wave of async consumers wakes — tokio's coarse
+/// timer wheel batches same-duration timeouts into one tick), a pure
+/// `while let Ok(..) = rx.recv().await` pays one waker-register/wake
+/// round-trip per item even though every item after the first is already
+/// queued. The unordered path therefore drains in two phases per burst:
 ///
-///   1. Spin `try_recv` until `Empty` — no `await`, no waker registration, just non-blocking pops
-///      at ~atomic-op cost.
-///   2. When the queue is drained but the channel is still open, `recv().await` exactly once to
-///      register a waker and yield until the next item lands. Then loop back to step 1.
+///   1. Spin `try_recv` until `Empty` — no `await`, no waker registration.
+///   2. When drained but still open, `recv().await` exactly once to register a waker; then loop
+///      back to step 1.
 ///
-/// This converts the per-item `await` cost into a per-burst `await` cost.
-/// For `io_async_pure` at size 500 (~450 items completing in the same ~1 ms
-/// timer tick) the savings is measurable.
+/// This converts per-item `await` cost into per-burst cost — measurable for
+/// `io_async_pure` at size 500 (~450 items completing in the same ~1 ms
+/// timer tick).
 #[cfg(feature = "tokio-runtime")]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn collect_async<R, T>(rx: R, ordered: bool, n: usize) -> Vec<T>

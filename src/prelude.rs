@@ -38,11 +38,8 @@ pub use crate::{
 /// and produce identical types — pick whichever style reads better at the
 /// call site.
 ///
-/// Not user-implementable: the blanket impl over `IntoIterator` already
-/// covers every valid source, and a hand-written impl would either duplicate
-/// that coverage or break the `IntoIterator` contract. There is no super-trait
-/// gate only because there is nothing to gate — users gain nothing by
-/// implementing this trait themselves.
+/// Not user-implementable: the blanket impl below already covers every
+/// `IntoIterator`; a hand-written impl could only duplicate it.
 pub trait IterExt: IntoIterator + Sized {
     /// Build a fused CPU pipeline. Equivalent to [`pipe`](crate::pipe).
     ///
@@ -73,8 +70,6 @@ pub trait IterExt: IntoIterator + Sized {
     }
 }
 
-// Blanket impl: every `IntoIterator` is a youpipe source. Deliberately not
-// sealed behind a private super-trait — there is nothing the caller could
-// gain by implementing `IterExt` for a non-`IntoIterator` type that the
-// blanket impl doesn't already cover.
+// Blanket impl: every `IntoIterator` is a youpipe source. Not sealed — there
+// is nothing to gain by implementing `IterExt` outside this crate.
 impl<I: IntoIterator> IterExt for I {}

@@ -91,8 +91,8 @@ pub trait FusedStage<T> {
 
     /// Whether `apply` may return `None` for an input it received (i.e. the
     /// stage chain contains a `Filter`). When `false`, the index-based collect
-    /// fast path can assume every output slot it visits is init, which makes
-    /// panic cleanup trivially sound (no per-slot validity tracking).
+    /// fast path can assume every output slot it visits is init, making panic
+    /// cleanup trivially sound (no per-slot validity tracking).
     const MAY_FILTER: bool = false;
 
     /// Apply the full fused chain. `Filter` stages may return `None`.

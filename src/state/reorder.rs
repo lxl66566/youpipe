@@ -63,39 +63,34 @@ impl<T> ReorderBuffer<T> {
     }
 
     /// Insert `item` tagged with `seq`, writing any newly-contiguous run of
-    /// items directly into `sink` without allocating a temporary `Vec`.
+    /// items directly into `sink` — the zero-allocation hot path used by the
+    /// streaming ordered collectors.
     ///
-    /// This is the zero-allocation hot path used by the streaming ordered
-    /// collectors: each item arriving in order produces exactly one
-    /// `sink.push(item)` with no per-item heap traffic. Contrast with
-    /// [`insert`](Self::insert), which returns a fresh `Vec<T>` per call — in
-    /// the in-order steady state that returned `Vec` has length 1, so the
-    /// collector pays a `malloc` + `free` per item purely to move a single
-    /// value. At 100 k+ items that allocation churn dominated the ordered
-    /// collector's cost; this sink variant eliminates it.
+    /// The `sink` out-parameter avoids the per-call `Vec` of [`insert`]: in the
+    /// in-order steady state that returned `Vec` has length 1, so callers paid
+    /// a `malloc` + `free` per item purely to move one value — at 100 k+ items
+    /// that churn dominated the ordered collector's cost.
     pub fn insert_into(&mut self, seq: u64, item: T, sink: &mut Vec<T>) {
-        // Fast path: the item is exactly the next expected one and nothing is
-        // buffered. `len == 0` implies every slot is unoccupied (each occupied
-        // slot is counted by `len`), so this scalar guard subsumes the old
-        // defensive `!slots[idx].occupied` array read — and with the lazy
-        // slot array an in-order stream never allocates or touches it at
-        // all: one compare, one push, one increment. Nothing can be flushable
-        // (`len == 0`), so the flush call is skipped too.
+        // Fast path: item is exactly next expected and nothing is buffered.
+        // `len == 0` implies every slot is unoccupied (occupied slots are
+        // counted by `len`), so this scalar guard subsumes a defensive
+        // `!slots[idx].occupied` read — and with the lazy slot array an
+        // in-order stream never allocates it at all. Nothing can be flushable,
+        // so the flush pass is skipped too.
         if seq == self.next_expected && self.len == 0 {
             sink.push(item);
             self.next_expected += 1;
             return;
         }
         self.ensure_slots();
-        // `seq as usize` is safe across all pointer widths: the subsequent
-        // `& self.mask` only keeps the low log2(capacity) bits, so truncation
-        // on 32-bit targets is harmless (capacity is always < 2³²).
+        // `seq as usize` is safe across pointer widths: `& self.mask` only
+        // keeps the low log2(capacity) bits, so truncation on 32-bit targets
+        // is harmless (capacity is always < 2³²).
         #[allow(clippy::cast_possible_truncation)]
         let idx = (seq as usize) & self.mask;
-        // Slow path: the item must be buffered (out-of-order arrival, or an
-        // in-order arrival while earlier gaps are still buffered — the slot
-        // write + read-back here is the 3 stores + 2 loads + len bookkeeping
-        // the fast path avoids).
+        // Slow path: out-of-order arrival, or in-order arrival while gaps are
+        // still buffered (the slot write + read-back is the 3 stores + 2 loads
+        // + len bookkeeping the fast path avoids).
         let slot = &mut self.slots[idx];
         if slot.occupied {
             // Capacity precondition violated: a different seq aliases this
@@ -117,9 +112,8 @@ impl<T> ReorderBuffer<T> {
 
     /// Insert `item` and return any newly-contiguous run as a `Vec`.
     ///
-    /// Convenience wrapper around [`insert_into`](Self::insert_into) for
-    /// callers that prefer a returned `Vec` over an out-parameter (e.g.
-    /// tests). Prefer `insert_into` on hot paths to avoid the per-call
+    /// Convenience wrapper around [`insert_into`](Self::insert_into) (e.g.
+    /// tests); prefer `insert_into` on hot paths to avoid the per-call
     /// allocation.
     pub fn insert(&mut self, seq: u64, item: T) -> Vec<T> {
         let mut ready = Vec::new();

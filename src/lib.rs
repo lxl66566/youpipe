@@ -30,12 +30,11 @@
 
 // ── Compile-time guard: `panic = "abort"` disables panic safety ──
 //
-// youpipe's pool/join machinery (LeafGuard / ForEachGuard cleanup of partial
-// slot state, `halt_unwinding` / `resume_unwind` propagation, `AbortIfPanic`
-// guards) relies on unwinding. Under `panic = "abort"` every `catch_unwind` is
-// a no-op: a panic inside any pool worker aborts the whole process instead of
-// propagating to the caller — a failing item kills the process rather than
-// erroring the pipeline.
+// The pool/join machinery (LeafGuard / ForEachGuard cleanup of partial slot
+// state, `halt_unwinding` / `resume_unwind` propagation, `AbortIfPanic` guards)
+// relies on unwinding. Under `panic = "abort"` every `catch_unwind` is a no-op:
+// a panic inside any pool worker aborts the whole process instead of
+// propagating to the caller.
 //
 // This `cfg` is accurate inside the library compilation, unlike build-script
 // env vars (`CARGO_CFG_PANIC` mirrors the build-script's own panic strategy,

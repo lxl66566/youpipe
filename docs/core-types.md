@@ -192,13 +192,10 @@ impl<S, I, O> Pipe<S, I, O> {
 `.try_collect()` dispatches on `S::MAY_FILTER`:
 
 - **`MAY_FILTER == false`** — the index-based fast path (`par_index_try_collect`),
-  mirroring `collect()`'s zero-allocation strategy but with `RangeTryOp` /
+  mirroring `collect()`'s zero-allocation strategy and hybrid flat/tree dispatch
+  (via the `TryStrategy` impl of `HybridStrategy`) but with `RangeTryOp` /
   `FusedTryOp` wrappers that short-circuit on `Err`. Each leaf's `TryLeafGuard`
   cleans up partial output on both panic (unwind) and error (explicit) paths.
-  Off-pool callers take the same hybrid flat/tree dispatch as `collect` /
-  `for_each` (via the `TryStrategy` impl of `HybridStrategy` — see the
-  type-erased `ErasedStrategy` note under "Hybrid dispatch"): `num_threads`
-  broad chunks injected in one `inject_batch`, every worker busy at t≈0.
   The first `Err(e)` lands in the shared failure slot (first writer wins;
   a panic outranks it, mirroring the tree path's unwind-through-match
   semantics). Measured (criterion, 32-core): −48 % @ 10 k, −17 % @ 100 k vs
@@ -227,16 +224,13 @@ each result. This is the structural fix for pure-side-effect pipelines: a
 buffer + `n` writes for data nobody reads.
 
 **Hybrid dispatch.** `par_for_each` shares the exact same
-`hybrid_dispatch` machinery as `collect` — `num_threads` broad top-level
-chunks injected in one `inject_batch`, every worker busy at t≈0, each chunk
-recursing via the tree for distributed stealing. The only two differences
-from `collect` (no output buffer, no per-chunk panic cleanup) are abstracted
-behind the `SinkStrategy` impl of the `HybridStrategy` trait, so the
-chunk-layout / inject / `CountLatch::wait_spin` / panic-funnel code is
-written once and shared with `try_collect`'s `TryStrategy` too (no vtable
-cost — see the `ErasedStrategy` note). When reached
-from a worker of the *same* pool (nested `scope`), the hybrid `CountLatch`
-park would deadlock, so it falls back to the single-tree `par_for_each_rec`.
+`hybrid_dispatch` machinery as `collect` via the `SinkStrategy` impl of the
+`HybridStrategy` trait — chunk-layout / inject / `CountLatch::wait_spin` /
+panic-funnel code is written once and shared with `try_collect`'s
+`TryStrategy` too (no vtable cost — see the `ErasedStrategy` note under
+`collect`). When reached from a worker of the *same* pool (nested `scope`),
+the hybrid `CountLatch` park would deadlock, so it falls back to the
+single-tree `par_for_each_rec`.
 
 Panic safety is the input-tail mirror of `LeafGuard`: each leaf's
 `ForEachGuard` drops `input[pos+1..]` on unwind (item `pos` was consumed by
@@ -293,9 +287,8 @@ pipe(files)
 
 The pool is **transient** — created at `.collect()` / `.for_each()` time and
 dropped when the terminal returns. For repeated calls in a tight loop,
-pre-create the pool and use `.with_compute_pool(pool.clone())` instead (clone
-is cheap: `Arc` + one atomic). If both are set, `with_compute_pool` takes
-precedence.
+pre-create the pool and use `.with_compute_pool(pool.clone())` instead. If
+both are set, `with_compute_pool` takes precedence.
 
 **Do not** use oversubscription for pure-CPU workloads — extra threads beyond
 the core count only add context-switch overhead and cache thrashing (measured

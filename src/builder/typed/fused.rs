@@ -257,7 +257,7 @@ where
     // `.collect()` case): inject `num_threads` broad top-level chunks into the
     // global injector so every worker grabs one immediately — no fork/join
     // ramp-up. Each chunk then recurses via the tree (distributed deques +
-    // stealing). See the "flat dispatch" post-mortem above for why pure flat
+    // stealing). See the "flat dispatch" post-mortem below for why pure flat
     // was a wash; hybrid keeps its small/medium-N win (parallel ramp-up) while
     // avoiding its large-N regression (only `num_threads` items through the
     // injector, not `N`).
@@ -341,9 +341,7 @@ where
 // written once as [`hybrid_dispatch`]. The strategy crosses into the
 // dispatcher behind the type-erased [`ErasedStrategy`] boundary (see its doc
 // for why — tl;dr: monomorphizing the dispatcher per strategy measurably
-// regressed the untouched collect path via codegen layout shifts), so the
-// dispatcher compiles once per `T`; the per-item leaf loops stay inside the
-// monomorphized strategy methods.
+// regressed the untouched collect path via codegen layout shifts).
 
 /// How a hybrid-dispatched chunk (or the driver chunk) can fail.
 ///
@@ -398,15 +396,9 @@ enum TryFailure<E> {
 /// leaf runner (for driver-inline participation), and the successful-chunk
 /// failure cleanup.
 ///
-/// The strategy is handed to [`hybrid_dispatch`] behind the type-erased
-/// [`ErasedStrategy`] boundary (three fn pointers + a context pointer), so the
-/// dispatcher and its `ChunkJob` compile exactly once per `T` instead of once
-/// per terminal. The indirect calls happen once per chunk (~`num_threads` per
-/// run), far off the per-item hot path — and keeping the dispatcher
-/// non-generic measurably matters: adding a third monomorphized instantiation
-/// for `try_collect` shifted codegen layout enough to regress the *untouched*
-/// collect path +16…30 % at 10k–100k (measured; this project is acutely
-/// layout-sensitive — see the `codegen-units = 1` note in `Cargo.toml`).
+/// Handed to [`hybrid_dispatch`] behind the type-erased [`ErasedStrategy`]
+/// boundary — see [`ErasedStrategy`] for why the dispatcher must stay
+/// non-generic.
 trait HybridStrategy<T>: Sync {
     /// What a failed chunk produces. Must be `Any + Send` so the erased
     /// boundary can box it into [`ErasedFailure::Op`] and the caller can
@@ -459,6 +451,13 @@ type ErasedRunChunk<T> =
 /// the fn pointers know the concrete type and cast it back. Non-capturing
 /// closures coerce to `unsafe fn` pointers, so each strategy pays one
 /// trampoline that boxes failures into [`ErasedFailure`].
+///
+/// Keeping the dispatcher non-generic matters: the indirect calls happen once
+/// per chunk (~`num_threads` per run), far off the per-item hot path, while
+/// monomorphizing per terminal measurably regressed the *untouched* collect
+/// path +16…30 % at 10k–100k via codegen layout shifts (measured; this
+/// project is acutely layout-sensitive — see the `codegen-units = 1` note in
+/// `Cargo.toml`).
 // Manual impls: derived ones would add undesired `T: Copy` bounds — the
 // phantom `T` only appears in fn-pointer signatures.
 impl<T> Clone for ErasedStrategy<T> {
@@ -750,16 +749,10 @@ where
 
 /// Hybrid top-level dispatcher. Splits `[0, n)` into `num_chunks` contiguous
 /// ranges. Chunk 0 is run **inline on the driver thread** (mirrors rayon's
-/// off-pool path where the calling thread participates); chunks 1..num_chunks
-/// are injected as `ChunkJob`s and the driver blocks until all complete.
-///
-/// Running one chunk on the driver saves 1 injector push and reduces the
-/// condvar wake cascade by 1 (the `new_injected_jobs` logic wakes
-/// `min(num_chunks - awake_but_idle, sleepers)` workers — one fewer chunk
-/// means one fewer wakee). The driver's chunk overlaps the pool's inject +
-/// processing, so it never adds to wall time. The driver never serializes
-/// more than `1/num_chunks` of the batch — the same fraction one pool worker
-/// would handle.
+/// off-pool path where the calling thread participates; see the inline comment
+/// in the body for the ramp-up/wake-cascade rationale); chunks
+/// 1..num_chunks are injected as `ChunkJob`s and the driver blocks until all
+/// complete.
 ///
 /// Returns `Err(first_failure)` if any chunk (driver or pool) failed (after
 /// the strategy has cleaned up the successful chunks' per-chunk resources so
@@ -1066,7 +1059,7 @@ where
     // Hybrid dispatch from outside the pool (the common `.for_each()` case):
     // inject `num_threads` broad top-level chunks so every worker is busy at
     // t≈0 with no fork/join ramp-up — the same structural win `par_index_collect`
-    // gets via `CollectStrategy`. See the "flat dispatch" post-mortem above for
+    // gets via `CollectStrategy`. See the "flat dispatch" post-mortem below for
     // why pure flat was a wash; hybrid keeps the small/medium-N ramp-up win
     // while each chunk recurses via the tree (distributed deques + stealing),
     // avoiding the single-injector MPMC contention that sank pure flat at large
@@ -1372,7 +1365,8 @@ where
 // chunks (low injector contention, no ramp-up) and let each chunk recurse via
 // the tree (distributed deques + stealing).
 //
-// `par_index_collect_hybrid` below implements exactly this.
+// `hybrid_dispatch` (above, driven by the per-terminal strategies) implements
+// exactly this.
 // A/B vs the single-tree baseline (32-core, sample-size 30, measurement-time
 // 5):
 //

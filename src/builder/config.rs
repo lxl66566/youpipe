@@ -6,15 +6,14 @@
 /// **wall-clock time** each item takes relative to its siblings within a single
 /// `pipe(..).collect()` / `for_each()` run:
 ///
-/// - `Balanced` — items cost roughly the same. The fork/join tree needs little stealing slack, so
-///   oversplit is adaptive (`1` for small batches, `4` for large). This is the right default for
-///   the vast majority of workloads.
-/// - `Unbalanced` — a few items are far slower than the rest (skewed tail). The tree always uses
-///   `8×` oversplit so an idle worker can steal a slow sibling's remaining leaves, shrinking tail
-///   latency.
+/// - `Balanced` — items cost roughly the same. Little stealing slack is needed, so oversplit is
+///   adaptive (`1` for small batches, `4` for large). Right default for the vast majority of
+///   workloads.
+/// - `Unbalanced` — a few items are far slower than the rest (skewed tail). Always `8×` oversplit
+///   so an idle worker can steal a slow sibling's remaining leaves, shrinking tail latency.
 /// - `Custom(factor)` — pick the oversplit factor yourself. `Custom(1)` is the coarsest tree (one
 ///   leaf per worker, minimal dispatch overhead); `Custom(16)` is very fine-grained stealing for
-///   extreme skew. Values in the `4..=16` range are the useful envelope on large machines.
+///   extreme skew. The useful envelope on large machines is roughly `4..=16`.
 ///
 /// # Oversplit vs oversubscribe
 ///
@@ -33,18 +32,13 @@
 /// raise `compute_workers` or the stage's `StageOptions::workers`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Workload {
-    /// Per-item cost is roughly uniform. Adaptive oversplit (`1` for small
-    /// batches, `4` for large). The right choice for most workloads.
+    /// Adaptive oversplit (see above). Right choice for most workloads.
     #[default]
     Balanced,
-    /// Per-item cost is skewed (expensive tail). Always `8×` oversplit for
-    /// finer-grained work stealing. Costs more dispatch overhead per batch, so
-    /// only opt in when the tail is genuinely uneven.
+    /// Always `8×` oversplit. Costs more dispatch overhead per batch, so only
+    /// opt in when the tail is genuinely uneven.
     Unbalanced,
-    /// Pin the oversplit factor to `factor` regardless of batch size — full
-    /// manual control for benchmarking or when you know your skew profile
-    /// better than the adaptive heuristic. `NonZeroUsize::new(n).unwrap()`
-    /// reads better than it sounds; `factor.get() == 1` disables oversplit.
+    /// Manual oversplit factor, independent of batch size.
     Custom(std::num::NonZeroUsize),
 }
 

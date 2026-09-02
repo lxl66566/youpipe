@@ -193,30 +193,19 @@ pub(crate) struct Sleep {
     counters: AtomicCounters,
     /// Bitmask of currently-sleeping workers (bit `i` set iff worker `i` is
     /// parked in `condvar.wait`). Lets `wake_any_threads` jump directly to
-    /// sleeping workers instead of doing a rotating linear scan that locks
-    /// every awake worker's `is_blocked` mutex along the way.
+    /// sleeping workers instead of a rotating linear scan that locks every
+    /// awake worker's `is_blocked` mutex along the way — under fork/join
+    /// load with 32 workers, that scan drove p99 `work_found` to ~100 µs.
     ///
-    /// Under the fork/join `join` pattern, when most workers are awake and
-    /// scanning, each `work_found`/`new_internal_jobs` wake attempt used to
-    /// scan several awake workers (each lock is ~70 ns L3 hit uncontended),
-    /// and under contention the p99 `work_found` reached ~100 µs as 32
-    /// workers piled on the same victim mutex. The mask collapses the scan
-    /// to exactly the set bits, so awake workers are never touched.
+    /// Racy by design (see `SleepMask`): a stale set bit costs one redundant
+    /// lock attempt; a stale clear bit causes a missed wake, recovered by the
+    /// JEC retry loop (sleepers re-check `jobs_counter` before parking).
     ///
-    /// The mask is racy by design (set in `sleep()` under the worker's own
-    /// mutex, cleared in `wake_specific_thread` under the same mutex); a stale
-    /// set bit just causes one redundant lock attempt that returns `false`.
-    /// A stale clear bit just causes a missed wake, which is recovered by
-    /// the existing JEC/`increment_jobs_event_counter_if` retry loop
-    /// (sleepers re-check `jobs_counter` before parking).
-    ///
-    /// `CachePadded` isolates the mask on its own cache line(s). Without it,
-    /// `words[0]` shares a line with `counters` — every `set`/`clear`
-    /// (`fetch_or`/`fetch_and`) bounces the line and invalidates the hot
-    /// counter read path (every idle round does `counters.load`). A/B
-    /// measured (5-round, youpipe/rayon ratio to cancel system bias):
-    /// without padding, `sync_cpu_heavy` and `try_collect` regressed +3-5 %
-    /// on 1 k–100 k batches; with padding the regression disappears.
+    /// `CachePadded` isolates the mask from `counters`: without it, every
+    /// `set`/`clear` bounces the shared line and invalidates the hot counter
+    /// read path (every idle round does `counters.load`). A/B measured:
+    /// `sync_cpu_heavy` and `try_collect` regressed +3-5 % at 1 k–100 k
+    /// batches without padding.
     sleeping_mask: CachePadded<SleepMask>,
 }
 

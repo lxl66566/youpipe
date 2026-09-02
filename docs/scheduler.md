@@ -57,17 +57,18 @@ their hot paths can be tuned in-tree without waiting on upstream releases:
   dispatcher's `num_threads−1 ≤ 31` chunk-job CASes into one per dispatch
   (−0.5…−2.6 % on the cpu_heavy fused path); the streaming `submit_batch`
   benefits identically. The review also records what was tried and rejected —
-  e.g. replacing concurrent-queue with crossbeam-queue wholesale regressed the
-  stream dispatch path 4–7 % (per-item `inject` punishes SegQueue's SeqCst-CAS
-  push + per-31-items block churn), and x86 `lock not` SeqCst fences are a
+  e.g. x86 `lock not` SeqCst fences are a
   ~8–10 % pessimization on modern LLVM (it already lowers `fence(SeqCst)` to
   `lock or`).
 
   Why not crossbeam-queue directly: its `SegQueue::push` is a SeqCst CAS with
   block allocation every `LAP − 1` (31) items, and the pool's stream-dispatch
   path does exactly one high-frequency `inject` per task — the exact regime
-  where concurrent-queue's design wins. The forks keep concurrent-queue's
-  push/pop shape and backfill the waiting-strategy gap instead.
+  where concurrent-queue's design wins (replacing concurrent-queue with
+  crossbeam-queue wholesale regressed the stream dispatch path 4–7 %, per-item
+  `inject` punishing SegQueue's SeqCst-CAS push + per-31-items block churn).
+  The forks keep concurrent-queue's push/pop shape and backfill the
+  waiting-strategy gap instead.
 
 `crossfire` stays a normal crates.io dependency (nothing left to squeeze).
 The rename (`youpipe-*`) exists purely to prevent version confusion with the

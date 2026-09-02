@@ -103,13 +103,13 @@ impl<'env> PipelineScope<'env> {
 /// (same design as [`crate::Pipe`]), so type-changing maps like
 /// `i32 -> String` compile.
 ///
-/// Unlike the previous `ScopedPipeline` (which required `T: 'static`,
-/// pre-allocating `parallelism` chunks, and serialising results through
-/// `Arc<Vec<Mutex<Vec<T>>>>`), this version:
+/// Unlike the previous `ScopedPipeline` (`T: 'static`, pre-allocated
+/// `parallelism` chunks, results serialised through `Arc<Vec<Mutex<Vec<T>>>>`),
+/// this version:
 ///
 /// - has no `'static` bound on `T` or the closure,
 /// - is **data-first** (items are passed to `pipe(items)`, not to `.collect()`),
-/// - fuses `.map`/`.filter`/ at compile time (lazy chain),
+/// - fuses `.map`/`.filter` at compile time (lazy chain),
 /// - drives `.collect()` through the same recursive work-stealing `par_index_collect` core as the
 ///   top-level [`crate::Pipe`].
 pub struct ScopedPipe<'env, S = Identity, I = (), O = ()> {
@@ -488,8 +488,8 @@ where
     /// # use std::sync::{Arc, atomic::{AtomicI32, Ordering}};
     /// # use youpipe::scope;
     /// let table: Vec<i32> = (0..10).collect();
-    /// // `for_each` takes `Fn + Sync` (matches rayon): accumulate via
-    /// // atomics, not `&mut` capture. `&table` borrows — no clone of i32.
+    /// // `for_each` takes `Fn + Sync` (matches rayon): accumulate via atomics,
+    /// // not `&mut` capture. `&table` borrows — no clone of i32.
     /// let sum = Arc::new(AtomicI32::new(0));
     /// let s = sum.clone();
     /// scope(|scope| {

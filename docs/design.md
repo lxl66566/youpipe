@@ -7,8 +7,8 @@
 youpipe's public API is **data-first**: items enter the pipeline at the front
 (`pipe(items)` / `stream(items)` / `scope(|s| s.pipe(items))`), stages chain via
 builder methods, and a single terminal call (`.collect()` / `.run()`) executes
-the whole chain. This mirrors the mental model of `iter().map().collect()` —
-data flows left-to-right, never "define the pipeline, then feed data at the end".
+the whole chain — mirroring `iter().map().collect()`, not "define the pipeline,
+then feed data at the end".
 
 ### Compile-Time Pipeline Fusion
 
@@ -42,10 +42,8 @@ The `scope()` API allows closures to borrow stack-local variables without `'stat
 Async stages (`stage_async`) run on a pluggable [`AsyncRuntime`] backend.
 **tokio is the only concrete backend today** (`tokio-runtime` feature, the
 default; [`TokioPool`] wraps a `tokio::runtime::Handle`), but the runtime is
-abstracted so the streaming code never calls tokio APIs directly —
-`pool.spawn(fut)` / `pool.block_on(fut)` replaced the old `tokio::spawn` /
-`Handle::enter` calls. A future non-tokio backend (a thread-per-core runtime,
-monoio, …) slots in as one more `AsyncRuntime` impl without touching
+abstracted so the streaming code never calls tokio APIs directly. A future
+non-tokio backend slots in as one more `AsyncRuntime` impl without touching
 `stream.rs`.
 
 `StreamPipe<S, I, O, R: AsyncRuntime = DefaultRuntime>` is generic over the
@@ -55,18 +53,16 @@ abstraction is free for them. Callers attach a managed runtime via
 `.with_async_pool` (changing `R` to the pool's type) or let the pipeline build
 a transient one per `run()` call.
 
-The `enter()` guard was dropped entirely — `Handle::spawn` is explicit (needs
-no TLS current-runtime context), and a future backend whose context mechanism
-has no RAII guard would not have been representable alongside it. The channel
-layer (`crossfire`) keeps sync and async stages decoupled from the executor.
+The old `Handle::enter` TLS guard was dropped entirely: `Handle::spawn` needs
+no current-runtime context, and a future backend whose context mechanism has no
+RAII guard would not have been representable alongside it. The channel layer
+(`crossfire`) keeps sync and async stages decoupled from the executor.
 
-> **Note on `block_on`'s `!Send` bound.** `collect_async` borrows crossfire's
-> MPSC async receiver (`!Sync`), so its future is `!Send`; the trait's
-> `block_on` therefore deliberately omits `F: Send`. tokio's `Handle::block_on`
-> runs the future inline on the calling thread and has no `Send` bound, so the
-> abstraction matches. A future backend that wanted to drive `block_on` on
-> another thread would have to reconcile this with the `!Send` collector
-> future.
+> **`block_on`'s `!Send` bound.** `collect_async` borrows crossfire's MPSC async
+> receiver (`!Sync`), so its future is `!Send`; `block_on` therefore deliberately
+> omits `F: Send` (tokio's `Handle::block_on` runs inline on the calling thread
+> and matches). A backend driving `block_on` on another thread would have to
+> reconcile this with the `!Send` collector future.
 
 ---
 
@@ -104,9 +100,7 @@ src/
 │   ├── pipeline_scope.rs # scope(), PipelineScope, ScopedPipe (work-stealing, 'env closures)
 │   └── mod.rs
 ├── sync/             # Synchronization primitives
-│   ├── cancel.rs     # CancellationToken (Arc<AtomicBool>)
-│   ├── sys.rs        # Miri-transparent Mutex/Condvar (parking_lot ↔ std)
-│   └── mod.rs
+│   └── cancel.rs     # CancellationToken (Arc<AtomicBool>)
 ├── pool/             # Rayon-style work-stealing scheduler core
 │   ├── registry.rs   # Registry, WorkerThread, find_work, steal
 │   ├── sleep.rs      # AtomicCounters sleep/wake governance
@@ -116,7 +110,9 @@ src/
 │   ├── join.rs       # fork-join
 │   ├── unwind.rs     # AbortIfPanic, halt/resume_unwinding
 │   └── mod.rs
-└── util.rs           # CachePadded<T>
+└── util/             # Shared utilities
+    ├── cache_padded.rs # CachePadded<T>
+    └── sys.rs          # Miri/loom-transparent Mutex/Condvar/atomics shims
 ```
 
 ---

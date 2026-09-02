@@ -37,11 +37,11 @@ and `mpsc_async_channel` (`MpscAsyncSender` + `MpscAsyncReceiver` — both
 ends async, used when async-stage consumer tasks feed the sole async
 collector). The `StageSpawn` trait gains a `spawn_single` method that
 creates the terminal stage's output channel as MPSC instead of MPMC;
-`StreamPipe::try_run` calls `spawn_single` for the terminal path —
-covering sync stages, fence links, expand, and `AsyncStage` (whose
-`spawn_single` override routes the consumer fan-out into an
-`mpsc_async_channel`). Intermediate stage channels remain MPMC (their
-receivers are shared across multiple worker threads via `clone`).
+`StreamPipe::try_run` calls `spawn_single` for the terminal path — covering
+sync stages, fence links, expand, and `AsyncStage` (whose `spawn_single`
+override builds the output channel as `mpsc_async_channel`). Intermediate
+stage channels remain MPMC (their receivers are shared across multiple
+worker threads via `clone`).
 
 The collector itself is generic over a `RecvItem` (sync) or `AsyncRecvItem`
 (async) trait, so `collect_sync` / `collect_async` drain either the MPMC or

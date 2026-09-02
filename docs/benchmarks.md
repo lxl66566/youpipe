@@ -144,10 +144,9 @@ stealing. The hybrid alone measured −6.5 % @ 10 k and −6.7 % @ 100 k.
 | 100K | ~77 µs         | ~120 µs        | ~105 µs |
 | 1M   | ~540 µs        | ~4.23 ms       | ~273 µs |
 
-Warm-input lightweight improved ~1.9 ms (pre-`Slots`) → ~730 µs (after `Slots`)
-→ ~390 µs (slice view) → ~570 µs (after perf-config + sleeping-bitmask wake +
-notify-outside-lock) → **~516 µs after hybrid flat/tree dispatch** (which alone
-shaved −9.6 % / −55 µs by eliminating fork/join ramp-up). The 1 M case still
+Warm-input lightweight went ~1.9 ms (pre-`Slots`) → ~390 µs (slice view) →
+**~516 µs** (perf-config + sleeping-bitmask wake + hybrid flat/tree dispatch,
+which alone shaved −9.6 % by eliminating fork/join ramp-up). The 1 M case still
 trails rayon because the leaf work itself is so cheap (~0.12 ns/item) that the
 off-pool spin/mutex wait + per-chunk tree fixed cost dominate; at 10 k and
 100 k youpipe beats rayon because the leaf amortises the overhead better.
@@ -171,22 +170,17 @@ buffer and writing at known indices instead of the `Vec`-merge fallback.
 | 10K  | ~183 µs            | ~203 µs          |
 | 100K | ~1.54 ms           | ~1.49 ms         |
 
-`for_each` was the last fused terminal still on the single-tree path — it
-never went through `hybrid_dispatch`'s `inject_batch` +
-`CountLatch::wait_spin` pattern, so it paid the full fork/join ramp-up cost.
-Porting it to the shared `hybrid_dispatch` (via the `SinkStrategy` impl of
+`for_each` was the last fused terminal still on the single-tree path. Porting
+it to the shared `hybrid_dispatch` (via the `SinkStrategy` impl of
 `HybridStrategy`) measured **−8.7 % @ 1K, −7.2 % @ 10K, −5.0 % @ 100K** vs the
 prior tree-only `par_for_each`. At 10K youpipe now beats rayon; the 1K case
 still trails because the off-pool driver blocks instead of participating the
 way rayon's `par_iter` runs inline on the caller (a known remaining gap —
-see the "off-pool driver blocks" note under "CPU-Heavy `pipe()` vs rayon"
-above). A subsequent change consolidated all `num_threads` chunk
-jobs into a single `Box<[ChunkJob]>` (1 heap allocation instead of N+1),
-which shaved a further **~3 % @ 1K–10K** by eliminating the per-chunk
-malloc/free overhead. An attempt to instead inject a single root job (rayon's
+see the note under "CPU-Heavy `pipe()` vs rayon" above). Consolidating all
+`num_threads` chunk jobs into a single `Box<[ChunkJob]>` shaved a further
+**~3 % @ 1K–10K**. An attempt to instead inject a single root job (rayon's
 `join`-unfold pattern) **regressed** — the work-stealing ramp-up cost exceeded
-the per-chunk savings on youpipe's scheduler, so the hybrid chunk strategy was
-kept.
+the per-chunk savings, so the hybrid chunk strategy was kept.
 
 ### Mixed Load — `stream()` vs `tokio::spawn_blocking` (`mixed_load`)
 
@@ -249,7 +243,7 @@ blocking IO, `.stage_async()` remains the recommended tool.
 and at size 500 edges out `tokio_mixed_blocking` by ~150 µs: the async path
 overlaps the CPU and IO stages on separate pools, whereas the all-blocking path
 splits one compute pool between two blocking stages. At size 200 the fixed
-per-run setup cost (feeder thread, channel allocation, runtime entry) is a
+per-run setup cost (feeder, channel allocation, runtime entry) is a
 larger fraction of the ~9 ms total, so tokio's simpler spawn-per-item model
 still leads there.
 

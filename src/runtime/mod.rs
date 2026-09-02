@@ -6,16 +6,14 @@
 //!
 //! # Why a trait, not tokio directly
 //!
-//! youpipe originally called tokio APIs directly (`tokio::spawn`,
-//! `Handle::block_on`). Introducing a narrow trait lets the streaming code
-//! describe only what it needs (spawn a fire-and-forget task; block on the
-//! collector future) and keeps the concrete executor choice out of the
-//! streaming machinery. The runtime is touched only at **per-run**
-//! stage-assembly time (spawn `io_concurrency` consumer tasks) and once at
-//! collection (`block_on`), never in the per-item hot path, so the
-//! abstraction is cost-free in steady state — and it opens the door to a
-//! future non-tokio backend (e.g. a thread-per-core runtime, monoio) without
-//! touching `stream.rs`.
+//! youpipe originally called tokio APIs directly. The narrow trait describes
+//! only what the streaming code needs (spawn a fire-and-forget task; block on
+//! the collector future) and keeps the concrete executor out of the streaming
+//! machinery. The runtime is touched only at per-run stage-assembly time and
+//! once at collection (`block_on`), never in the per-item hot path, so the
+//! abstraction is cost-free in steady state — and opens the door to a future
+//! non-tokio backend (e.g. thread-per-core, monoio) without touching
+//! `stream.rs`.
 //!
 //! # Generic over the backend
 //!

@@ -88,13 +88,11 @@ pub fn async_channel<T: Send + Unpin + 'static>(
 /// Create a bounded *mixed-mode* MPMC channel: a blocking sync sender paired
 /// with an async receiver over the same underlying queue.
 ///
-/// This is the right primitive for a sync→async bridge: the producer side can
-/// call the naturally blocking [`SyncSender::send`] (letting crossfire's
-/// internal waker park the producer thread until the async consumer drains an
-/// item), instead of `try_send` + `yield_now` busy-spinning on `Full`. The
-/// consumer side stays fully async (`AsyncReceiver::recv`). Both endpoints
-/// share one `mpmc::Array`, so there is no extra hop relative to
-/// [`async_channel`].
+/// The right primitive for a sync→async bridge: the producer calls the
+/// naturally blocking [`SyncSender::send`] (crossfire parks it until the async
+/// consumer drains an item) instead of `try_send` + `yield_now` busy-spinning
+/// on `Full`; the consumer stays fully async. Both endpoints share one
+/// `mpmc::Array` — no extra hop relative to [`async_channel`].
 #[must_use]
 pub fn sync_async_channel<T: Send + Unpin + 'static>(
     capacity: usize,
@@ -157,9 +155,8 @@ impl<T: Send + Unpin + 'static> Clone for AsyncReceiver<T> {
 // ring-buffer CAS dominates per-item cost; switching the collector channel
 // (always single-consumer) to MPSC eliminates that CAS on every collected item.
 
-/// Multi-producer, single-consumer blocking sender. Same send semantics as
-/// [`SyncSender`] but paired with a [`MpscReceiver`] that uses a lighter
-/// ring-buffer algorithm.
+/// Multi-producer, single-consumer blocking sender. Send semantics as
+/// [`SyncSender`]; see [`mpsc_channel`] for why the MPSC backing is lighter.
 pub struct MpscSender<T: Send + 'static> {
     tx: crossfire::MTx<mpsc::Array<T>>,
 }
@@ -172,10 +169,8 @@ pub struct MpscReceiver<T: Send + 'static> {
 
 /// Create a bounded MPSC (multi-producer, single-consumer) channel.
 ///
-/// Prefer this over [`channel`] when there is exactly one consumer — the
-/// receiver uses `store`-based dequeue (no `lock cmpxchg`) and a lock-free
-/// waker registry, eliminating the dominant per-item CAS cost that the MPMC
-/// ring buffer pays on every `recv`.
+/// Prefer this over [`channel`] when there is exactly one consumer — see the
+/// MPSC section comment above for the profiled rationale.
 #[must_use]
 pub fn mpsc_channel<T: Send + 'static>(capacity: usize) -> (MpscSender<T>, MpscReceiver<T>) {
     let (tx, rx) = mpsc::bounded_blocking::<T>(capacity);
@@ -250,13 +245,8 @@ pub fn mpsc_sync_async_channel<T: Send + Unpin + 'static>(
     (MpscSender { tx }, MpscAsyncReceiver { rx })
 }
 
-/// Multi-producer, single-consumer async sender. Same send semantics as
-/// [`AsyncSender`] but paired with a [`MpscAsyncReceiver`] that uses a lighter
-/// ring-buffer algorithm.
-///
-/// Used by async-stage consumer tasks whose output is drained by the sole
-/// async collector — the recv side avoids the MPMC `lock cmpxchg` on every
-/// collected item.
+/// Multi-producer, single-consumer async sender. Send semantics as
+/// [`AsyncSender`]; pairs with [`MpscAsyncReceiver`] (see [`mpsc_async_channel`]).
 pub struct MpscAsyncSender<T: Send + Unpin + 'static> {
     tx: crossfire::MAsyncTx<mpsc::Array<T>>,
 }
@@ -286,9 +276,7 @@ impl<T: Send + Unpin + 'static> Clone for MpscAsyncSender<T> {
 /// receiver over the same queue.
 ///
 /// Use this when async-stage consumer tasks feed the sole async collector —
-/// the recv side uses `store`-based dequeue (no `lock cmpxchg`) and a
-/// lock-free `WeakCell` waker registry, eliminating the dominant per-item CAS
-/// cost that the MPMC ring buffer pays on every `recv`.
+/// the recv side avoids the per-item MPMC CAS (see the MPSC section comment).
 #[must_use]
 pub fn mpsc_async_channel<T: Send + Unpin + 'static>(
     capacity: usize,

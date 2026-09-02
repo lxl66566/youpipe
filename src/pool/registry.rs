@@ -26,9 +26,9 @@ use super::{
 };
 
 /// Capacity of each worker's local (LIFO) deque. Rounded up to a power of two
-/// by `st3`. When the local queue saturates, overflow spills into the global
-/// injector — the same design used by the tokio scheduler, which keeps the hot
-/// local queue bounded and cache-friendly.
+/// by `st3`. When saturated, overflow spills into the global injector (tokio's
+/// strategy): the hot local queue stays bounded and cache-friendly, no work is
+/// dropped.
 const LOCAL_DEQUE_CAPACITY: usize = 256;
 
 // ── Registry ──
@@ -37,18 +37,15 @@ pub(crate) struct Registry {
     thread_infos: Vec<ThreadInfo>,
     sleep: Sleep,
     /// Global injector queue for jobs coming from outside the pool or
-    /// overflowing a worker's local deque.
+    /// overflowing a worker's local deque. Unbounded, so overflow never drops
+    /// work.
     ///
-    /// A lock-free, epoch-free MPMC queue (`concurrent_queue`) — the same
-    /// block-based algorithm crossbeam's `Injector` used (WRITE/READ/DESTROY
-    /// slot flags + direct `Box::from_raw` reclamation), but in a crate that
-    /// does **not** pull in `crossbeam-epoch` (the source of the Miri UB that
-    /// prompted the st3 migration). Its empty `pop` is 2 Acquire loads + a
-    /// SeqCst fence with no CAS, which is cheaper on this 99%-empty hot
-    /// path than a `Mutex<VecDeque>` *plus* a hand-maintained `AtomicUsize`
-    /// length counter (measured: the extra `fetch_add`/`fetch_sub` on every
-    /// push/pop costs more than it saves). Unbounded, so local-queue
-    /// overflow never drops work.
+    /// `concurrent_queue` (not crossbeam): same block-based MPMC algorithm but
+    /// without `crossbeam-epoch` (the source of the Miri UB that prompted the
+    /// st3 migration). Its empty `pop` is 2 Acquire loads + a SeqCst fence, no
+    /// CAS — cheap enough on this 99%-empty hot path that a hand-maintained
+    /// `AtomicUsize` length counter is a measured regression (its per-op
+    /// `fetch_add`/`fetch_sub` bounces a cache line).
     injected_jobs: concurrent_queue::ConcurrentQueue<JobRef>,
 
     // When this reaches 0, all work on this registry must be complete. The
@@ -170,11 +167,7 @@ impl Registry {
     }
 
     fn pop_injected_job(&self) -> Option<JobRef> {
-        // `ConcurrentQueue::pop`'s empty path is 2 Acquire loads + a SeqCst
-        // fence with no CAS — cheap enough that no separate length fast-path is
-        // warranted (verified: a hand-maintained `AtomicUsize` length was
-        // measurably slower, since its per-push/per-pop `fetch_add`/`fetch_sub`
-        // bounce a cache line on every operation).
+        // No separate length fast-path needed: see `injected_jobs` doc.
         self.injected_jobs.pop().ok()
     }
 
@@ -355,9 +348,7 @@ impl WorkerThread {
             Ok(()) => {
                 self.registry.sleep.new_internal_jobs(1, queue_was_empty);
             },
-            // Local deque is full (256 slots): spill into the global injector.
-            // This is the tokio overflow strategy — keeps the local queue
-            // bounded and cache-friendly without dropping work.
+            // Local deque full → spill to the injector (see LOCAL_DEQUE_CAPACITY).
             Err(overflow) => self.registry.inject(overflow),
         }
     }
@@ -485,13 +476,12 @@ impl WorkerThread {
             return None;
         }
 
-        // Scan all victims each call. Unlike uniform async task pools, our
-        // work arrives via divide-and-conquer `join`, so at any instant only a
-        // few victims hold (large) sub-trees. Bounding the probe (e.g. to 4)
-        // measurably *slows* work discovery — the latency of missing the
-        // victim-with-work across rounds outweighs the empty-steal coherence
-        // traffic, which is anyway parallelized across cores. So we keep the
-        // classic rayon-style full randomized scan.
+        // Full randomized scan of all victims (rayon-style). Our work arrives
+        // via divide-and-conquer `join`, so at any instant only a few victims
+        // hold (large) sub-trees; bounding the probe (e.g. to 4) measurably
+        // *slows* work discovery — missing the victim-with-work across rounds
+        // costs more than the empty-steal coherence traffic, which is anyway
+        // parallelized across cores.
         loop {
             let mut retry = false;
             let start = self.rng.next_usize(num_threads);
