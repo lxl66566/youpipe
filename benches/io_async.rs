@@ -15,6 +15,8 @@
 //!   `run_mixed_async` (sync CPU + async IO) vs the all-blocking
 //!   `run_multi_stage` vs tokio.
 
+mod common;
+
 use std::{hint::black_box as bb, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -84,7 +86,6 @@ fn num_cpus() -> usize {
 
 fn bench_pure_io_async(c: &mut Criterion) {
     let mut group = c.benchmark_group("io_async_pure");
-    group.sample_size(10);
     for size in [200_usize, 500] {
         let tasks = skewed_io(size);
         group.throughput(Throughput::Elements(size as u64));
@@ -201,7 +202,6 @@ fn bench_pure_io_async(c: &mut Criterion) {
 
 fn bench_mixed_cpu_io(c: &mut Criterion) {
     let mut group = c.benchmark_group("io_async_mixed");
-    group.sample_size(10);
     for size in [200_usize, 500] {
         let items: Vec<((u64, u32), Duration)> = skewed_cpu(size)
             .into_iter()
@@ -290,5 +290,9 @@ fn bench_mixed_cpu_io(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_pure_io_async, bench_mixed_cpu_io);
+criterion_group! {
+    name = benches;
+    config = common::criterion();
+    targets = bench_pure_io_async, bench_mixed_cpu_io
+}
 criterion_main!(benches);

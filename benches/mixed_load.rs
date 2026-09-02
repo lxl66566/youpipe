@@ -1,3 +1,5 @@
+mod common;
+
 use std::hint::black_box as bb;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -28,9 +30,11 @@ fn warm_clone(src: &[u64]) -> Vec<u64> {
 
 fn bench_mixed_load(c: &mut Criterion) {
     let mut group = c.benchmark_group("mixed_load");
-    // 1K → 10K → 100K: aligned with `async_vs_tokio` so the streaming-CPU
-    // story reads off one consistent size axis across both benches.
-    for size in [1_000usize, 10_000, 100_000] {
+    // 1K / 100K anchors, aligned with `async_vs_tokio` so the streaming-CPU
+    // story reads off one consistent size axis across both benches. This
+    // group doubles as the pure-rayon control (`rayon_par_iter` touches none
+    // of youpipe's code) for detecting environment drift in full-suite runs.
+    for size in [1_000usize, 100_000] {
         let data: Vec<u64> = (0..size as u64).collect();
 
         group.throughput(Throughput::Elements(size as u64));
@@ -83,5 +87,9 @@ fn bench_mixed_load(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_mixed_load);
+criterion_group! {
+    name = benches;
+    config = common::criterion();
+    targets = bench_mixed_load
+}
 criterion_main!(benches);

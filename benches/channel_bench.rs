@@ -1,3 +1,5 @@
+mod common;
+
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -83,5 +85,9 @@ fn bench_channels(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_channels);
+criterion_group! {
+    name = benches;
+    config = common::criterion();
+    targets = bench_channels
+}
 criterion_main!(benches);

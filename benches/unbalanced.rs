@@ -1,3 +1,5 @@
+mod common;
+
 use std::hint::black_box as bb;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -102,11 +104,11 @@ fn generate_log_uniform_workload(size: usize) -> Vec<(u64, u32)> {
 
 fn bench_cpu_unbalanced_skewed(c: &mut Criterion) {
     let mut group = c.benchmark_group("cpu_unbalanced_skewed");
-    for size in [200, 1000, 5000] {
+    // 200 / 5000 anchors: tail-dominated vs work-contention regime.
+    for size in [200, 5000] {
         let tasks = generate_skewed_workload(size);
 
         group.throughput(Throughput::Elements(size as u64));
-        group.sample_size(10);
 
         group.bench_with_input(
             BenchmarkId::new("youpipe_par_map", size),
@@ -155,11 +157,11 @@ fn bench_cpu_unbalanced_skewed(c: &mut Criterion) {
 
 fn bench_cpu_unbalanced_log_uniform(c: &mut Criterion) {
     let mut group = c.benchmark_group("cpu_unbalanced_log_uniform");
-    for size in [200, 1000, 5000] {
+    // 200 / 5000 anchors (same policy as the skewed group).
+    for size in [200, 5000] {
         let tasks = generate_log_uniform_workload(size);
 
         group.throughput(Throughput::Elements(size as u64));
-        group.sample_size(10);
 
         group.bench_with_input(
             BenchmarkId::new("youpipe_par_map", size),
@@ -198,11 +200,11 @@ fn bench_cpu_unbalanced_log_uniform(c: &mut Criterion) {
 
 fn bench_cpu_unbalanced_stream(c: &mut Criterion) {
     let mut group = c.benchmark_group("cpu_unbalanced_stream");
-    for size in [200, 1000, 5000] {
+    // 200 / 5000 anchors (same policy as the skewed group).
+    for size in [200, 5000] {
         let tasks = generate_skewed_workload(size);
 
         group.throughput(Throughput::Elements(size as u64));
-        group.sample_size(10);
 
         group.bench_with_input(
             BenchmarkId::new("youpipe_stream_unordered", size),
@@ -267,11 +269,12 @@ fn bench_cpu_unbalanced_stream(c: &mut Criterion) {
 
 fn bench_io_unbalanced(c: &mut Criterion) {
     let mut group = c.benchmark_group("io_unbalanced");
-    for size in [100, 500, 1000] {
+    // 100 / 1000 anchors (500 midpoint dropped — the sleep-bound regime
+    // scales linearly, the midpoint adds ~10 s of wall time per variant).
+    for size in [100, 1000] {
         let tasks = generate_skewed_io_workload(size);
 
         group.throughput(Throughput::Elements(size as u64));
-        group.sample_size(10);
 
         group.bench_with_input(
             BenchmarkId::new("youpipe_stream_unordered", size),
@@ -350,7 +353,6 @@ fn bench_io_unbalanced(c: &mut Criterion) {
 
 fn bench_mixed_unbalanced(c: &mut Criterion) {
     let mut group = c.benchmark_group("mixed_cpu_io_unbalanced");
-    group.sample_size(10);
     for size in [200, 1000] {
         let half = size / 2;
         let cpu_tasks = generate_skewed_workload(half);
@@ -417,7 +419,6 @@ fn bench_mixed_unbalanced(c: &mut Criterion) {
 
 fn bench_fused_oversubscribe(c: &mut Criterion) {
     let mut group = c.benchmark_group("fused_oversubscribe");
-    group.sample_size(10);
 
     let ncpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
 
@@ -511,13 +512,15 @@ fn bench_fused_oversubscribe(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_cpu_unbalanced_skewed,
-    bench_cpu_unbalanced_log_uniform,
-    bench_cpu_unbalanced_stream,
-    bench_io_unbalanced,
-    bench_mixed_unbalanced,
-    bench_fused_oversubscribe,
-);
+criterion_group! {
+    name = benches;
+    config = common::criterion();
+    targets =
+        bench_cpu_unbalanced_skewed,
+        bench_cpu_unbalanced_log_uniform,
+        bench_cpu_unbalanced_stream,
+        bench_io_unbalanced,
+        bench_mixed_unbalanced,
+        bench_fused_oversubscribe
+}
 criterion_main!(benches);

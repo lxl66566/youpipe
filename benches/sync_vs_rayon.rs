@@ -1,3 +1,5 @@
+mod common;
+
 use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -37,7 +39,10 @@ fn warm_clone(src: &[u64]) -> Vec<u64> {
 
 fn bench_par_map_vs_rayon(c: &mut Criterion) {
     let mut group = c.benchmark_group("sync_cpu_heavy");
-    for size in [1_000, 10_000, 100_000] {
+    // 1K / 100K anchors: setup-dominated vs steady-state. The 10K midpoint
+    // interpolates monotonically between them and was dropped to keep the
+    // full suite fast (see benches/common/mod.rs).
+    for size in [1_000, 100_000] {
         let data: Vec<u64> = (0..size).collect();
 
         group.throughput(Throughput::Elements(size));
@@ -133,7 +138,12 @@ fn bench_pipeline_fusion(c: &mut Criterion) {
 
 fn bench_lightweight_work(c: &mut Criterion) {
     let mut group = c.benchmark_group("sync_lightweight");
-    for size in [10_000, 100_000, 1_000_000] {
+    // 10K / 1M anchors: hot-cache vs memory-bandwidth-bound. The 100K
+    // midpoint sits in the page-cache/malloc regime that is most sensitive
+    // to whole-group sequence artifacts (see the "100K measurement trap"
+    // section in docs/benchmarks.md) and is covered by the isolated A/B
+    // scripts instead.
+    for size in [10_000, 1_000_000] {
         let data: Vec<u64> = (0..size).collect();
 
         group.throughput(Throughput::Elements(size));
@@ -235,7 +245,9 @@ fn bench_for_each_vs_rayon(c: &mut Criterion) {
     // dispatch machinery (no output buffer allocation / writes) and documents
     // the ramp-up win from sharing `hybrid_dispatch` with the collect path.
     let mut group = c.benchmark_group("sync_for_each");
-    for size in [1_000, 10_000, 100_000] {
+    // 1K / 100K anchors (10K midpoint dropped, same policy as
+    // `bench_par_map_vs_rayon`).
+    for size in [1_000, 100_000] {
         let data: Vec<u64> = (0..size).collect();
 
         group.throughput(Throughput::Elements(size));
@@ -281,12 +293,14 @@ fn bench_for_each_vs_rayon(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_par_map_vs_rayon,
-    bench_pipeline_fusion,
-    bench_lightweight_work,
-    bench_try_collect,
-    bench_for_each_vs_rayon
-);
+criterion_group! {
+    name = benches;
+    config = common::criterion();
+    targets =
+        bench_par_map_vs_rayon,
+        bench_pipeline_fusion,
+        bench_lightweight_work,
+        bench_try_collect,
+        bench_for_each_vs_rayon
+}
 criterion_main!(benches);

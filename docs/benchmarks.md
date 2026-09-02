@@ -3,15 +3,71 @@
 > [← Documentation index](README.md)
 
 > All numbers below are from a 32-core AMD (Zen) Linux machine, `criterion`
-> `--sample-size 30 --measurement-time 5`. Methodology note: `pipe()` takes
-> ownership of the input, so a benchmark iteration must rebuild the input
-> (`warm_clone`). glibc's large `memcpy` uses non-temporal stores that bypass
-> the cache, so a naïve `data.clone()` arrives **cold-from-RAM** — measuring
-> allocator/memory latency rather than the framework. The `sync_vs_rayon` bench
-> therefore warms the input in the (untimed) setup so the timed region is a
-> fair, like-for-like comparison with rayon's warm `par_iter` borrow. A
+> `--sample-size 30 --measurement-time 5` (the historical full-treatment
+> config; see below). Methodology note: `pipe()` takes ownership of the
+> input, so a benchmark iteration must rebuild the input (`warm_clone`).
+> glibc's large `memcpy` uses non-temporal stores that bypass the cache, so
+> a naïve `data.clone()` arrives **cold-from-RAM** — measuring
+> allocator/memory latency rather than the framework. The `sync_vs_rayon`
+> bench therefore warms the input in the (untimed) setup so the timed region
+> is a fair, like-for-like comparison with rayon's warm `par_iter` borrow. A
 > `_cold` variant is kept for the lightweight group to document the one-shot
 > cold-memory cost.
+
+## Suite budget (quick config)
+
+A full-suite pass with criterion's defaults costs >1 h. All bench targets
+now share `benches/common/mod.rs`, which defaults to the verdict-proven
+interleaved-A/B regime — **20 samples, 1 s warm-up, 2 s measurement**
+(~3.5 s per bench id, full suite ≈ 10 min including compile) — and shrinks
+each group's size axis to its two anchors (the dropped midpoints
+interpolate monotonically; see the group comments for specifics). Every
+knob is env-overridable without code edits, and the override applies to
+both sides of any A/B equally, so fairness is preserved:
+
+```sh
+# full-treatment config for a single deep-dive bench
+BENCH_SAMPLE_SIZE=100 BENCH_WARMUP_MS=3000 BENCH_MEASUREMENT_MS=5000 \
+    cargo bench --bench sync_vs_rayon -- youpipe_par_map/1000
+```
+
+For A/B verdicts use `perf/bench-suite` (interleaved rounds, CPU pinning,
+median-of-rounds comparison) rather than back-to-back full-group passes —
+the stream family has ±10 % inter-run drift and the 100 K fused family is
+subject to the whole-group measurement trap documented at the bottom of
+this file.
+
+## Interleaved A/B tooling (`perf/bench-suite`)
+
+`bench_ab.sh` materializes each side (git worktree, or `wt` for a snapshot
+of the working tree), then runs interleaved rounds — every round runs every
+side, and odd rounds reverse the side order to cancel position bias. Every
+bench process is pinned via `taskset` (default: cores `1..N-1`, keeping
+core 0 for OS/IRQ housekeeping), the criterion sampling budget is forced
+through CLI flags so both sides measure identically even across historical
+revisions with different in-file defaults, and each (round, side) gets its
+own `CRITERION_HOME` so aggregation only ever reads fresh
+`new/estimates.json` files. `compare.py` reduces each id to the median of
+its per-round medians and calls a delta "stable" only when it exceeds the
+observed round-to-round spread with every round leaning the same way.
+
+```sh
+# full two-sided A/B, 3 interleaved rounds (both sides build once)
+perf/bench-suite/bench_ab.sh -a base=9b31fb0 -b new=HEAD
+
+# drift-sensitive families: isolated per-id interleaving, extra rounds
+perf/bench-suite/bench_ab.sh -a base -b wt -r 5 --per-id \
+    'stream_pipeline/single_stage_ordered' 'with_fence'
+
+# three-way: rounds interleave A,B,C (label=rev syntax)
+perf/bench-suite/bench_ab.sh -a old=HEAD~2 -b mid=HEAD~1 -c wt
+
+python3 perf/bench-suite/compare.py target/bench-ab/run-<ts>   # verdict
+```
+
+Appending `-r N` to the same outdir later adds rounds (the worktrees and
+their builds are reused); cleanup is
+`rm -rf <outdir> && git worktree prune`.
 
 ### CPU-Heavy `pipe()` vs rayon (`sync_cpu_heavy`, 100 iters/item, warm input)
 

@@ -1,3 +1,5 @@
+mod common;
+
 use std::{hint::black_box as bb, num::NonZeroUsize};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -25,10 +27,11 @@ fn warm_clone(src: &[u64]) -> Vec<u64> {
 
 fn bench_stream_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("stream_pipeline");
-    // 1K → 10K → 100K: spans the setup-dominated to channel-bandwidth-bound
-    // regime. Above 100K the channel handoff cost is fully amortised and the
-    // numbers stop surfacing new information, so 100K is the upper anchor.
-    for size in [1_000, 10_000, 100_000] {
+    // 1K / 100K anchors: spans the setup-dominated to channel-bandwidth-bound
+    // regime (the 10K midpoint interpolates and was dropped to keep the full
+    // suite fast). Above 100K the channel handoff cost is fully amortised and
+    // the numbers stop surfacing new information.
+    for size in [1_000, 100_000] {
         let data: Vec<u64> = (0..size).collect();
 
         group.throughput(Throughput::Elements(size));
@@ -98,7 +101,10 @@ fn bench_tokio_spawn_blocking(c: &mut Criterion) {
     let mut group = c.benchmark_group("tokio_spawn_blocking");
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    for size in [1_000, 10_000, 100_000] {
+    // Single anchor at 1K: this group only documents tokio's per-spawn
+    // overhead ceiling; the same comparison (on identical data, against
+    // rayon) lives in `mixed_load`, which is the group A/B verdicts use.
+    for size in [1_000] {
         group.throughput(Throughput::Elements(size as u64));
         group.bench_function(BenchmarkId::new("spawn_blocking_cpu", size), |b| {
             b.iter(|| {
@@ -117,5 +123,9 @@ fn bench_tokio_spawn_blocking(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_stream_pipeline, bench_tokio_spawn_blocking);
+criterion_group! {
+    name = benches;
+    config = common::criterion();
+    targets = bench_stream_pipeline, bench_tokio_spawn_blocking
+}
 criterion_main!(benches);
