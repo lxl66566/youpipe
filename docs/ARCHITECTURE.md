@@ -584,7 +584,15 @@ their hot paths can be tuned in-tree without waiting on upstream releases:
   SegQueue block allocation (all-zero bytes are a valid block; skips the
   per-slot const-array copy and the memset for fresh pages), and a
   `needs_drop` guard that skips `Bounded`'s per-slot drop sweep for
-  destructor-free `T`. The review also records what was tried and rejected —
+  destructor-free `T`. Additionally `Unbounded::push_n` (exposed as
+  `ConcurrentQueue::push_n`, per-item fallback on the other variants)
+  reserves a contiguous run of up to 31 tail slots with **one** CAS and fills
+  it with plain stores — segment semantics identical to `push` (WRITE-flag
+  `Release` publication, block-boundary install order, closed check before
+  each reservation). `Registry::inject_batch` uses it, collapsing the fused
+  dispatcher's `num_threads−1 ≤ 31` chunk-job CASes into one per dispatch
+  (−0.5…−2.6 % on the cpu_heavy fused path); the streaming `submit_batch`
+  benefits identically. The review also records what was tried and rejected —
   e.g. replacing concurrent-queue with crossbeam-queue wholesale regressed the
   stream dispatch path 4–7 % (per-item `inject` punishes SegQueue's SeqCst-CAS
   push + per-31-items block churn), and x86 `lock not` SeqCst fences are a
@@ -724,6 +732,11 @@ Counter barrier: `add(n)` increments, `done()` decrements, `wait()` blocks until
 
 Capacity contract: because of the bitmask mapping, the number of simultaneously outstanding (un-flushed) items must stay below the slot count or two distinct `seq`s alias the same slot and the older item is dropped. Callers size the buffer to at least the maximum out-of-order window; the streaming collectors clamp it to `[1 Ki, 1 Mi]` slots.
 
+Two allocation-level optimizations keep the in-order steady state (the common case) at "one compare, one push, one increment":
+
+- **Scalar fast-path guard** — `seq == next_expected && len == 0` replaces the defensive `!slots[idx].occupied` array read: each occupied slot is counted by `len`, so `len == 0` implies the slot is free. A `len == 0` head check in `flush_ready_into` skips the (unflushable) scan.
+- **Lazy slot array** — the up-to-1 Mi-slot array is materialized by `ensure_slots()` on the first out-of-order arrival only. Previously every ordered run paid an eager allocation + per-slot init (128 Ki slots ≈ 2 MB for a 100 K-item stream) plus two cache-hostile array touches per item, all dead work when arrivals are in order. Measured −21.7 % on `stream_pipeline/single_stage_ordered/100 K`.
+
 ---
 
 ## 7. Fence Barrier (`state/fence.rs` + `StreamPipe::fence`)
@@ -740,6 +753,8 @@ Data flow:
 3. Stage2 workers pull from `fenced_rx` → process → send to `out_tx`
 
 Stage completion is signalled purely by channel disconnect (all sender clones dropped) — no `WaitGroup` is needed. Eager draining is essential: it prevents stage 1 from blocking on a full `mid` channel, which previously deadlocked when `items.len()` exceeded the channel buffer.
+
+Batch-allocation recycling: `push` hands each full chunk to the forwarder via `mem::take`, which historically dropped the allocation and regrew the next batch from capacity 0 (`log2(k)` reallocs per batch). `FenceBarrier::reuse` lets the forwarder return the drained `Vec`; the next flush swaps it in, so the steady state is zero allocator traffic per batch (−23 % on `stream_pipeline/with_fence/100 K`).
 
 ---
 

@@ -158,6 +158,9 @@ impl Registry {
         // in the common case.
         let count = self.injected_jobs.push_n(job_refs);
         if count > 0 {
+            // The batch is bounded by the chunk-job count (num_threads), so
+            // truncation cannot occur on realistic pool sizes.
+            #[allow(clippy::cast_possible_truncation)]
             self.sleep.new_injected_jobs(count as u32, queue_was_empty);
         }
     }
