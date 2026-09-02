@@ -311,12 +311,16 @@ fn forward_fenced<M, Tx>(
         if cancel_active(cancel) {
             return;
         }
-        if let Some(batch) = fence.push(item) {
-            for it in batch {
+        if let Some(mut batch) = fence.push(item) {
+            // Drain in place so the allocation survives and can be recycled
+            // by the barrier — steady state is zero allocator traffic per
+            // batch (see `FenceBarrier::reuse`).
+            for it in batch.drain(..) {
                 if fenced_tx.send(it).is_err() {
                     return;
                 }
             }
+            fence.reuse(batch);
         }
     }
     // Normal drain (mid_rx closed): flush remaining buffered items. This path
