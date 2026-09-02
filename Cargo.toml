@@ -49,6 +49,13 @@ harness           = false
 name              = "io_async"
 required-features = ["tokio-runtime"]
 
+# Horizontal cross-library comparison (youpipe vs rayon vs tokio vs futures vs
+# std threads), JSON-exporting, self-interleaved. See perf/plot-horizontal.py.
+[[bench]]
+harness           = false
+name              = "horizontal"
+required-features = ["tokio-runtime"]
+
 [dependencies]
 concurrent-queue = { package = "youpipe-concurrent-queue", path = "vendor/youpipe-concurrent-queue" }
 crossfire        = "3.1"
@@ -60,8 +67,9 @@ tokio            = { version = "1", features = ["macros", "rt-multi-thread", "sy
 [dev-dependencies]
 criterion         = "0.8"
 crossbeam-channel = "0.5"
+futures           = "0.3"
 rayon             = "1"
-tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
+tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time", "net", "io-util"] }
 
 # ── Concurrency-model testing of the pool's synchronization cores ──
 # Loom is activated by the `--cfg loom` rustflag (the ecosystem-standard
