@@ -337,6 +337,10 @@ fn test_async_then_sync_via_bridge() {
 
 #[cfg(feature = "tokio-runtime")]
 #[test]
+// Wall-clock assertion (heartbeat gap < 40 ms) — meaningless under miri's
+// ~1000x interpreted slowdown; the no-stall property is checked by the
+// non-miri run.
+#[cfg_attr(miri, ignore)]
 fn test_sync_to_async_does_not_stall_tokio_driver() {
     // Regression guard for the "async driver + blocking worker" anti-pattern.
     //
@@ -428,6 +432,10 @@ fn test_sync_to_async_does_not_stall_tokio_driver() {
 }
 
 #[test]
+// Wall-clock assertions (elapsed < 500 ms, heartbeat gap < 40 ms) cannot
+// hold under miri's ~1000x interpreted slowdown; the logic assertions of
+// both tests are exercised by the non-miri run.
+#[cfg_attr(miri, ignore)]
 fn test_fence_cancellation_aborts_early() {
     // The fence forwarder checks the cancellation token. In Barrier mode it
     // buffers all upstream items before forwarding any — without the cancel
@@ -823,6 +831,10 @@ fn test_for_each_unbalanced_workload() {
 }
 
 #[test]
+// 4 threads x 20k iterations x 1k cpu_heavy items ≈ 10^9+ interpreted ops —
+// days under miri. The spin/latch race this guards against is covered by
+// the loom models (`latch.rs` loom_tests) and this test under real threads.
+#[cfg_attr(miri, ignore)]
 fn test_hybrid_dispatch_spin_wait_stress() {
     // Regression guard for `CountLatch::wait_spin` (off-pool hybrid driver).
     //
