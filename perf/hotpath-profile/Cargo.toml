@@ -1,10 +1,10 @@
 [package]
-description  = "One-shot profiling driver for youpipe's work-stealing pool via the hotpath feature"
-edition      = "2024"
 name         = "hotpath-profile"
-publish      = false
-rust-version = "1.85"
 version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+description  = "One-shot profiling driver for youpipe's work-stealing pool via the hotpath feature"
+publish      = false
 
 [dependencies]
 # The `hotpath` feature turns youpipe's permanent `#[cfg_attr(feature = "hotpath",

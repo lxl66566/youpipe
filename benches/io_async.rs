@@ -9,11 +9,10 @@
 //! its thread and caps concurrency at the thread count.
 //!
 //! Groups:
-//! * `io_async_pure` — single IO stage. Compares youpipe `run_async` (M:N) vs
-//!   blocking approaches vs tokio-native async.
-//! * `io_async_mixed` — CPU stage (sync) -> IO stage. Compares youpipe
-//!   `run_mixed_async` (sync CPU + async IO) vs the all-blocking
-//!   `run_multi_stage` vs tokio.
+//! * `io_async_pure` — single IO stage. Compares youpipe `run_async` (M:N) vs blocking approaches
+//!   vs tokio-native async.
+//! * `io_async_mixed` — CPU stage (sync) -> IO stage. Compares youpipe `run_mixed_async` (sync CPU
+//!   + async IO) vs the all-blocking `run_multi_stage` vs tokio.
 
 mod common;
 
@@ -60,7 +59,11 @@ fn skewed_io(size: usize) -> Vec<(u64, Duration)> {
     let tail = Duration::from_millis(BASE_MS * 8);
     (0..size)
         .map(|i| {
-            let dur = if i % 10 == 0 { tail } else { base };
+            let dur = if i % 10 == 0 {
+                tail
+            } else {
+                base
+            };
             (i as u64, dur)
         })
         .collect()
@@ -72,7 +75,11 @@ fn skewed_cpu(size: usize) -> Vec<(u64, u32)> {
     let max_iters: u32 = 5000;
     (0..size)
         .map(|i| {
-            let iters = if i % 10 == 0 { max_iters } else { min_iters };
+            let iters = if i % 10 == 0 {
+                max_iters
+            } else {
+                min_iters
+            };
             (i as u64, iters)
         })
         .collect()

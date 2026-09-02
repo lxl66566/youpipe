@@ -7,13 +7,17 @@
 //! use youpipe::pipe;
 //!
 //! // Data-first fused pipeline
-//! let results: Vec<i32> = pipe(0..1000)
-//!     .map(|x| x * 2)
-//!     .collect();
+//! let results: Vec<i32> = pipe(0..1000).map(|x| x * 2).collect();
 //!
 //! // Fallible chain (short-circuits on first Err)
 //! let results: Result<Vec<i32>, &str> = pipe(0..100)
-//!     .try_map(|x| if x == 50 { Err("bad") } else { Ok(x * 2) })
+//!     .try_map(|x| {
+//!         if x == 50 {
+//!             Err("bad")
+//!         } else {
+//!             Ok(x * 2)
+//!         }
+//!     })
 //!     .try_collect();
 //! ```
 
@@ -43,11 +47,11 @@ const _: () = {
     #[deprecated(
         since = "0.4.0",
         note = "youpipe is compiled with `panic = \"abort\"`; any panic inside a pool worker will \
-                abort the whole process instead of propagating to the caller. The \
-                LeafGuard / ForEachGuard panic-safety paths never run under abort. To restore \
-                panic propagation, force `panic = \"unwind\"` for youpipe via a \
-                `.cargo/config.toml` override: `[build] rustflags = [\"-C\", \"panic=unwind\"]`. \
-                See youpipe's own `.cargo/config.toml` for the worked example."
+                abort the whole process instead of propagating to the caller. The LeafGuard / \
+                ForEachGuard panic-safety paths never run under abort. To restore panic \
+                propagation, force `panic = \"unwind\"` for youpipe via a `.cargo/config.toml` \
+                override: `[build] rustflags = [\"-C\", \"panic=unwind\"]`. See youpipe's own \
+                `.cargo/config.toml` for the worked example."
     )]
     const PANIC_ABORT_DISABLES_SAFETY: () = ();
     const _: () = PANIC_ABORT_DISABLES_SAFETY;

@@ -50,7 +50,11 @@ async fn async_io(x: u64, dur: Duration) -> u64 {
 fn skewed(size: usize) -> Vec<((u64, u32), Duration)> {
     let cpu: Vec<(u64, u32)> = (0..size)
         .map(|i| {
-            let iters = if i % 10 == 0 { 5000 } else { 5 };
+            let iters = if i % 10 == 0 {
+                5000
+            } else {
+                5
+            };
             (i as u64, iters)
         })
         .collect();
@@ -128,12 +132,10 @@ fn main() {
         yp_sorted.len()
     );
     println!(
-        "  youpipe stage+stage_async: {:>10.3?}   (CPU+IO overlap, M:N)",
-        yp_elapsed
+        "  youpipe stage+stage_async: {yp_elapsed:>10.3?}   (CPU+IO overlap, M:N)"
     );
     println!(
-        "  tokio  spawn_blocking x2:  {:>10.3?}   (all-blocking baseline)",
-        tokio_elapsed
+        "  tokio  spawn_blocking x2:  {tokio_elapsed:>10.3?}   (all-blocking baseline)"
     );
     println!();
     println!("youpipe's mixed pipeline overlaps CPU and IO: the IO side starts");

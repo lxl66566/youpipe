@@ -75,16 +75,13 @@ fn main() {
     println!("Parallel lookup against {TABLE_SIZE}-row stack-local table, {LOOKUPS} lookups");
     println!("  checksum (all agree): {checksum}");
     println!(
-        "  youpipe scope():  {:>10.3?}   (borrows &table, no clone)",
-        yp_elapsed
+        "  youpipe scope():  {yp_elapsed:>10.3?}   (borrows &table, no clone)"
     );
     println!(
-        "  rayon   par_iter: {:>10.3?}   (borrows &table, no clone)",
-        rn_elapsed
+        "  rayon   par_iter: {rn_elapsed:>10.3?}   (borrows &table, no clone)"
     );
     println!(
-        "  std     iter():   {:>10.3?}   (single-threaded baseline)",
-        seq_elapsed
+        "  std     iter():   {seq_elapsed:>10.3?}   (single-threaded baseline)"
     );
     println!();
     println!("Both youpipe and rayon let the parallel workers borrow a");

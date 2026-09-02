@@ -27,9 +27,8 @@
 //!
 //! # Backends
 //!
-//! - [`TokioPool`] (`tokio-runtime`, the default): wraps a
-//!   `tokio::runtime::Handle`. The runtime's M:N work-stealing scheduler
-//!   multiplexes many tasks over `n` OS threads.
+//! - [`TokioPool`] (`tokio-runtime`, the default): wraps a `tokio::runtime::Handle`. The runtime's
+//!   M:N work-stealing scheduler multiplexes many tasks over `n` OS threads.
 
 use std::{future::Future, pin::Pin};
 
@@ -109,8 +108,8 @@ pub struct NoRuntime;
 impl AsyncRuntime for NoRuntime {
     fn build_default(_workers: usize) -> std::io::Result<Self> {
         panic!(
-            "NoRuntime::build_default: no async runtime backend is enabled. \
-             Enable the `tokio-runtime` feature on youpipe."
+            "NoRuntime::build_default: no async runtime backend is enabled. Enable the \
+             `tokio-runtime` feature on youpipe."
         );
     }
 

@@ -125,9 +125,11 @@ pub trait FusedStage<T> {
 
 impl<T> FusedStage<T> for Identity {
     type Output = T;
+
     fn apply(&self, item: T) -> Option<T> {
         Some(item)
     }
+
     #[inline]
     fn apply_pure(&self, item: T) -> T {
         item
@@ -140,10 +142,13 @@ where
     F: Fn(Prev::Output) -> O,
 {
     type Output = O;
+
     const MAY_FILTER: bool = Prev::MAY_FILTER;
+
     fn apply(&self, item: I) -> Option<O> {
         self.prev.apply(item).map(|v| (self.f)(v))
     }
+
     #[inline]
     fn apply_pure(&self, item: I) -> O {
         let v = self.prev.apply_pure(item);
@@ -157,8 +162,10 @@ where
     F: Fn(&Prev::Output) -> bool,
 {
     type Output = Prev::Output;
+
     // A filter can drop items, so the fast path cannot assume all slots init.
     const MAY_FILTER: bool = true;
+
     fn apply(&self, item: I) -> Option<Prev::Output> {
         self.prev.apply(item).filter(|v| (self.f)(v))
     }
@@ -181,6 +188,7 @@ where
     S::Output: Send,
 {
     type Out = S::Output;
+
     #[inline]
     fn apply(&self, item: T) -> S::Output {
         self.0.apply_pure(item)
@@ -213,8 +221,9 @@ where
     S::Output: Send,
     S::Error: Send,
 {
-    type Out = S::Output;
     type Error = S::Error;
+    type Out = S::Output;
+
     #[inline]
     fn try_apply(&self, item: T) -> Result<S::Output, S::Error> {
         // SAFETY: `FusedTryOp` is only constructed when `MAY_FILTER == false`,
@@ -301,8 +310,8 @@ pub trait FusedTryStage<T> {
 }
 
 impl<T> FusedTryStage<T> for Identity {
-    type Output = T;
     type Error = std::convert::Infallible;
+    type Output = T;
 
     #[inline]
     fn try_apply(&self, item: T) -> Result<Option<T>, std::convert::Infallible> {
@@ -315,8 +324,9 @@ where
     Prev: FusedTryStage<I, Error = E>,
     F: Fn(Prev::Output) -> O,
 {
-    type Output = O;
     type Error = E;
+    type Output = O;
+
     const MAY_FILTER: bool = Prev::MAY_FILTER;
 
     #[inline]
@@ -333,8 +343,9 @@ where
     Prev: FusedTryStage<I, Error = E>,
     F: Fn(&Prev::Output) -> bool,
 {
-    type Output = Prev::Output;
     type Error = E;
+    type Output = Prev::Output;
+
     const MAY_FILTER: bool = true;
 
     #[inline]
@@ -346,7 +357,7 @@ where
                 } else {
                     Ok(None)
                 }
-            }
+            },
             None => Ok(None),
         }
     }
@@ -357,8 +368,9 @@ where
     Prev: FusedTryStage<I, Error = E>,
     F: Fn(Prev::Output) -> Result<O, E>,
 {
-    type Output = O;
     type Error = E;
+    type Output = O;
+
     const MAY_FILTER: bool = Prev::MAY_FILTER;
 
     #[inline]
@@ -367,7 +379,7 @@ where
             Some(v) => {
                 let out = (self.f)(v)?;
                 Ok(Some(out))
-            }
+            },
             None => Ok(None),
         }
     }
@@ -395,8 +407,9 @@ impl<S, T, E> FusedTryStage<T> for InfallibleChain<S, E>
 where
     S: FusedStage<T>,
 {
-    type Output = S::Output;
     type Error = E;
+    type Output = S::Output;
+
     const MAY_FILTER: bool = S::MAY_FILTER;
 
     #[inline]
@@ -428,8 +441,9 @@ where
     Prev: FusedTryStage<I, Error = E1>,
     F: Fn(E1) -> E2,
 {
-    type Output = Prev::Output;
     type Error = E2;
+    type Output = Prev::Output;
+
     const MAY_FILTER: bool = Prev::MAY_FILTER;
 
     #[inline]

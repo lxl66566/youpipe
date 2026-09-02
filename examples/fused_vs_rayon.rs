@@ -63,16 +63,13 @@ fn main() {
         yp_result[SIZE - 1]
     );
     println!(
-        "  youpipe  pipe():  {:>10.3?}   (fused, single closure per worker)",
-        yp_elapsed
+        "  youpipe  pipe():  {yp_elapsed:>10.3?}   (fused, single closure per worker)"
     );
     println!(
-        "  rayon    par_iter: {:>10.3?}   (fused, single closure per worker)",
-        rn_elapsed
+        "  rayon    par_iter: {rn_elapsed:>10.3?}   (fused, single closure per worker)"
     );
     println!(
-        "  std      iter():   {:>10.3?}   (single-threaded baseline)",
-        seq_elapsed
+        "  std      iter():   {seq_elapsed:>10.3?}   (single-threaded baseline)"
     );
     println!();
     println!("Both youpipe and rayon fuse the chain at compile time — the");

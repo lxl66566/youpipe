@@ -103,8 +103,7 @@ impl<T> ReorderBuffer<T> {
             // doc for the capacity contract.
             debug_assert_ne!(
                 slot.seq, seq,
-                "duplicate seq {seq} — ReorderBuffer is single-item-per-seq; \
-                 use without `expand`"
+                "duplicate seq {seq} — ReorderBuffer is single-item-per-seq; use without `expand`"
             );
             unsafe { slot.item.assume_init_drop() };
             self.len -= 1;
@@ -314,9 +313,8 @@ mod tests {
         buf.insert_into(51, 510, &mut out); // flushes 50..=52
         assert_eq!(buf.slots.len(), cap, "no reallocation on later reorders");
         buf.insert_into(53, 530, &mut out); // in-order again (len == 0 fast path)
-        assert_eq!(
-            out.iter().copied().skip(50).collect::<Vec<_>>(),
-            vec![500, 510, 520, 530]
-        );
+        assert_eq!(out.iter().copied().skip(50).collect::<Vec<_>>(), vec![
+            500, 510, 520, 530
+        ]);
     }
 }

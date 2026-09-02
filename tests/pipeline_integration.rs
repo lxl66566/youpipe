@@ -13,7 +13,11 @@ fn cpu_heavy(x: u64) -> u64 {
     // Miri: the arithmetic depth is irrelevant to memory safety — scale the
     // inner loop down ~50× so the ~30 tests using this helper stay fast
     // under the interpreter (same closure/dispatch paths per item).
-    let iters: u32 = if cfg!(miri) { 4 } else { 200 };
+    let iters: u32 = if cfg!(miri) {
+        4
+    } else {
+        200
+    };
     for _ in 0..iters {
         r = r.wrapping_mul(31).wrapping_add(17);
     }
@@ -36,7 +40,7 @@ fn test_par_map_correctness() {
 #[test]
 fn test_par_map_empty() {
     let result = pipe(Vec::<u64>::new()).map(|x: u64| x + 1).collect();
-    assert!(result.is_empty());
+    assert_eq!(result, [] as [u64; 0]);
 }
 
 #[test]
@@ -116,7 +120,11 @@ fn test_try_map_parallel_large() {
     // exercise the index-based parallel fast path (MAY_FILTER == false).
     // Miri: threshold is num_threads*64 and miri's pool is 1 worker, so 2K
     // items still exceed it at ~40x.
-    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let n: i32 = if cfg!(miri) {
+        2_000
+    } else {
+        50_000
+    };
     let result = pipe(0..n)
         .try_map(|x: i32| -> Result<i32, &str> { Ok(x.wrapping_mul(3)) })
         .map(|x: i32| x + 1)
@@ -130,7 +138,11 @@ fn test_try_map_parallel_large() {
 #[test]
 fn test_try_map_parallel_error_short_circuits() {
     // Error in the parallel path (index-based fast path) must propagate.
-    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let n: i32 = if cfg!(miri) {
+        2_000
+    } else {
+        50_000
+    };
     let err_at = n * 3 / 5;
     let result = pipe(0..n)
         .try_map(move |x: i32| -> Result<i32, String> {
@@ -422,9 +434,8 @@ fn test_sync_to_async_does_not_stall_tokio_driver() {
         .expect("heartbeat never finished — tokio worker stalled by a blocking op");
     assert!(
         max_gap < Duration::from_millis(40),
-        "tokio driver stalled under sync→async backpressure: max heartbeat gap \
-         {max_gap:?} (expected ~5 ms) — a blocking send is likely running on \
-         the tokio worker"
+        "tokio driver stalled under sync→async backpressure: max heartbeat gap {max_gap:?} \
+         (expected ~5 ms) — a blocking send is likely running on the tokio worker"
     );
 
     // Weak guarantee: the pipeline completed at all — no deadlock from a
@@ -525,7 +536,11 @@ fn test_large_dataset() {
     // Miri: scaled down 50× — the point is crossing the multi-chunk split
     // thresholds, not the absolute size, and 2K items already spans several
     // chunks across the (single) emulated worker.
-    let n: usize = if cfg!(miri) { 2_000 } else { 100_000 };
+    let n: usize = if cfg!(miri) {
+        2_000
+    } else {
+        100_000
+    };
     let items: Vec<u64> = (0..n as u64).collect();
     let result = pipe(items).map(|x: u64| x.wrapping_add(1)).collect();
     assert_eq!(result.len(), n);
@@ -577,7 +592,7 @@ fn test_prelude_pipe_matches_free_function() {
 fn test_prelude_stream_matches_free_function() {
     use youpipe::prelude::IterExt;
 
-    let mut free = youpipe::stream(0..50).stage(|x: i32| x + 1).run();
+    let mut free = stream(0..50).stage(|x: i32| x + 1).run();
     free.sort_unstable();
     let mut method = (0..50).stream().stage(|x: i32| x + 1).run();
     method.sort_unstable();
@@ -611,14 +626,16 @@ fn test_pipe_panic_propagates_parallel() {
     // A panicking closure must propagate through the join tree and LeafGuard
     // cleanup, surfacing as a real panic on the collecting thread.
     // Miri: scaled 25x (still >  the 1-thread serial threshold of 64).
-    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let n: i32 = if cfg!(miri) {
+        2_000
+    } else {
+        50_000
+    };
     let boom_at = n / 2;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let _: Vec<i32> = pipe(0..n)
             .map(move |x| {
-                if x == boom_at {
-                    panic!("boom at {x}");
-                }
+                assert!(x != boom_at, "boom at {x}");
                 x + 1
             })
             .collect();
@@ -637,9 +654,7 @@ fn test_pipe_panic_propagates_serial() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _: Vec<i32> = pipe(0..100i32)
             .map(|x| {
-                if x == 50 {
-                    panic!("serial boom");
-                }
+                assert!(x != 50, "serial boom");
                 x + 1
             })
             .collect();
@@ -652,14 +667,16 @@ fn test_try_collect_panic_propagates() {
     // Panic inside try_collect's fast path (index-based): the TryLeafGuard
     // must clean up partial output slots before the panic propagates.
     // Miri: scaled 25x (still > the 1-thread serial threshold of 64).
-    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let n: i32 = if cfg!(miri) {
+        2_000
+    } else {
+        50_000
+    };
     let panic_at = n / 2;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _: Result<Vec<i32>, &'static str> = pipe(0..n)
             .try_map(move |x| -> Result<i32, &'static str> {
-                if x == panic_at {
-                    panic!("try boom");
-                }
+                assert!(x != panic_at, "try boom");
                 Ok(x + 1)
             })
             .try_collect();
@@ -736,7 +753,11 @@ fn test_for_each_single() {
 fn test_for_each_parallel_large() {
     // Large enough to exceed the serial threshold and exercise the parallel
     // par_for_each path (MAY_FILTER == false → pure leaf).
-    let n: u64 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let n: u64 = if cfg!(miri) {
+        2_000
+    } else {
+        50_000
+    };
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
     pipe(0..n).for_each(move |_x: u64| {
@@ -748,7 +769,11 @@ fn test_for_each_parallel_large() {
 #[test]
 fn test_for_each_parallel_filter_large() {
     // Large parallel path with MAY_FILTER == true (filter branch).
-    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let n: i32 = if cfg!(miri) {
+        2_000
+    } else {
+        50_000
+    };
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
     pipe(0..n).filter(|x: &i32| *x % 3 == 0).for_each(move |_| {
@@ -762,13 +787,15 @@ fn test_for_each_parallel_filter_large() {
 fn test_for_each_panic_propagates_parallel() {
     // Large batch → parallel par_for_each path. Panic in f must surface.
     // Miri: scaled 25x (still > the 1-thread serial threshold of 64).
-    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let n: i32 = if cfg!(miri) {
+        2_000
+    } else {
+        50_000
+    };
     let boom_at = n / 2;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         pipe(0..n).for_each(move |x| {
-            if x == boom_at {
-                panic!("for_each boom at {x}");
-            }
+            assert!(x != boom_at, "for_each boom at {x}");
         });
     }));
     assert!(result.is_err());
@@ -782,9 +809,7 @@ fn test_for_each_panic_propagates_serial() {
     // Small batch → serial fallback inside for_each.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         pipe(0..100i32).for_each(|x| {
-            if x == 50 {
-                panic!("serial for_each boom");
-            }
+            assert!(x != 50, "serial for_each boom");
         });
     }));
     assert!(result.is_err());
@@ -809,7 +834,11 @@ fn test_for_each_panic_drops_unread_items() {
     let c = counter.clone();
     // Miri: scaled 25x — drop accounting is per-item and exact, so the
     // smaller batch proves the same LeakGuard property far cheaper.
-    let n: i32 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let n: i32 = if cfg!(miri) {
+        2_000
+    } else {
+        50_000
+    };
     let items: Vec<DropCounter> = (0..n)
         .map(|i| DropCounter {
             counter: c.clone(),
@@ -822,9 +851,7 @@ fn test_for_each_panic_drops_unread_items() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Parallel path (large batch). Panic mid-batch.
         pipe(items).for_each(move |d: DropCounter| {
-            if d.val == panic_at {
-                panic!("mid-batch drop boom");
-            }
+            assert!(d.val != panic_at, "mid-batch drop boom");
         });
     }));
     assert!(result.is_err());
@@ -846,7 +873,11 @@ fn test_for_each_unbalanced_workload() {
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
     use youpipe::Workload;
-    let n: i32 = if cfg!(miri) { 1_000 } else { 10_000 };
+    let n: i32 = if cfg!(miri) {
+        1_000
+    } else {
+        10_000
+    };
     pipe(0..n)
         .with_workload(Workload::Unbalanced)
         .for_each(move |_| {
@@ -875,8 +906,16 @@ fn test_hybrid_dispatch_spin_wait_stress() {
     // `cpu_heavy` per item keeps each batch's parallel work inside the spin
     // envelope (~tens of µs), so this exercises the spin fast path, not the
     // condvar fallback.
-    const ITERS: usize = if cfg!(miri) { 100 } else { 20_000 };
-    const N: usize = if cfg!(miri) { 200 } else { 1_000 };
+    const ITERS: usize = if cfg!(miri) {
+        100
+    } else {
+        20_000
+    };
+    const N: usize = if cfg!(miri) {
+        200
+    } else {
+        1_000
+    };
     let data: Vec<u64> = (0..N as u64).collect();
     std::thread::scope(|s| {
         for _ in 0..4 {
@@ -905,7 +944,7 @@ fn test_workload_custom_correctness() {
     for factor in [1usize, 2, 7, 16, 32] {
         let r: Vec<u64> = pipe(0..10_000)
             .with_workload(Workload::Custom(
-                std::num::NonZeroUsize::new(factor).unwrap(),
+                NonZeroUsize::new(factor).unwrap(),
             ))
             .map(|x: u64| x * 3 + 1)
             .collect();
@@ -916,7 +955,7 @@ fn test_workload_custom_correctness() {
 #[test]
 fn test_workload_custom_try_collect() {
     let r: Result<Vec<u64>, &str> = pipe(0..1_000)
-        .with_workload(Workload::Custom(std::num::NonZeroUsize::new(4).unwrap()))
+        .with_workload(Workload::Custom(NonZeroUsize::new(4).unwrap()))
         .try_map(|x: u64| Ok(x + 1))
         .try_collect();
     assert_eq!(r.unwrap(), (1..=1_000).collect::<Vec<_>>());
@@ -1069,7 +1108,11 @@ fn test_stage_budget_explicit_deduction() {
 fn test_stream_for_each_unordered_sees_all_items() {
     // miri: single emulated pool worker — keep n within the default feeder
     // buffer (256) so the feeder stays on the inline path (see prelude doc).
-    let n: u64 = if cfg!(miri) { 100 } else { 1_000 };
+    let n: u64 = if cfg!(miri) {
+        100
+    } else {
+        1_000
+    };
     let mut total = 0u64;
     stream(0..n).stage(|x| x * 2).for_each(|x| total += x);
     assert_eq!(total, (0..n).map(|x| x * 2).sum::<u64>());

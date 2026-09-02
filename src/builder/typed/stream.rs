@@ -78,7 +78,7 @@ fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
 /// Caught panic payload from a pool-submitted feeder job, re-raised on the
 /// calling thread by [`Feeder::finish`] (preserving the panic-propagation
 /// semantics of the old feeder thread's `join`).
-type FeederPanicSlot = std::sync::Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
+type FeederPanicSlot = Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
 
 /// Handle returned by [`feed_items`]: either an inline push (already done,
 /// nothing to reap) or a feeder job running on the compute pool.
@@ -151,8 +151,8 @@ fn feed_items<I: Send + 'static>(
         }
         Feeder::Inline
     } else {
-        let slot: FeederPanicSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let job_slot = std::sync::Arc::clone(&slot);
+        let slot: FeederPanicSlot = Arc::new(std::sync::Mutex::new(None));
+        let job_slot = Arc::clone(&slot);
         pool.submit(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 for (seq, item) in items.into_iter().enumerate() {
@@ -350,7 +350,8 @@ fn forward_fenced<M, Tx>(
 ///
 /// // Heavy CPU stage gets 8 workers, light one divides the rest; the async
 /// // stage runs 512 concurrent IO tasks with a deep buffer.
-/// let r: Vec<u64> = (0..1000).stream()
+/// let r: Vec<u64> = (0..1000)
+///     .stream()
 ///     .stage_with(StageOptions::new().workers(8), |x: u64| crunch(x))
 ///     .stage(|x: u64| x + 1)
 ///     .stage_async_with(
@@ -702,7 +703,7 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
                         }
                     }
                 });
-            }
+            },
             FinalRx::Async(r) => {
                 // async output → mixed-mode: `block_on` the async receiver on
                 // a dedicated OS thread (mirrors `bridge_async_to_sync`, but
@@ -723,12 +724,12 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
                         }
                     });
                 });
-            }
+            },
             FinalRx::SyncSingle(_) | FinalRx::AsyncSingle(_) => {
                 unreachable!(
                     "spawn_for_async calls self.spawn() which never returns Single variants"
                 )
-            }
+            },
         }
         a_rx
     }
@@ -762,13 +763,13 @@ fn finalize_prev_rx<T: Send + Unpin + 'static, R: AsyncRuntime>(
         FinalRx::Sync(r) => r,
         FinalRx::SyncSingle(_) => {
             unreachable!("prev.spawn() never returns SyncSingle")
-        }
+        },
         #[cfg(feature = "tokio-runtime")]
         FinalRx::Async(r) => bridge_async_to_sync::<_, R>(r, ctx),
         #[cfg(feature = "tokio-runtime")]
         FinalRx::AsyncSingle(_) => {
             unreachable!("prev.spawn() never returns AsyncSingle")
-        }
+        },
     }
 }
 
@@ -865,12 +866,11 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
 
     /// Acquire an async runtime for this run.
     ///
-    /// - If the caller attached a pool via `with_async_pool`, hand back a cheap
-    ///   clone (the backend's `Clone` is `Arc`/`Handle`-refcounted).
-    /// - Otherwise build one lazily on first call via
-    ///   [`AsyncRuntime::build_default`] and cache it in
-    ///   [`StreamCtx::cached_pool`] so subsequent calls in the same `run()`
-    ///   reuse the same runtime instead of paying the construction cost again.
+    /// - If the caller attached a pool via `with_async_pool`, hand back a cheap clone (the
+    ///   backend's `Clone` is `Arc`/`Handle`-refcounted).
+    /// - Otherwise build one lazily on first call via [`AsyncRuntime::build_default`] and cache it
+    ///   in [`StreamCtx::cached_pool`] so subsequent calls in the same `run()` reuse the same
+    ///   runtime instead of paying the construction cost again.
     #[cfg(feature = "tokio-runtime")]
     pub fn acquire_async(&self) -> std::io::Result<R> {
         if let Some(p) = &self.async_pool {
@@ -895,15 +895,19 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
 // StreamStart: identity spawn — returns rx unchanged.
 impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
     type Out = I;
+
     fn spawn<R: AsyncRuntime>(self, rx: Receiver<(u64, I)>, _ctx: &StreamCtx<'_, R>) -> FinalRx<I> {
         FinalRx::Sync(rx)
     }
+
     fn stage_budget(&self) -> StageBudget {
         StageBudget::default()
     }
+
     fn first_consumer_is_async(&self) -> Option<bool> {
         None
     }
+
     #[cfg(feature = "tokio-runtime")]
     fn spawn_async_feeder<R: AsyncRuntime>(
         self,
@@ -1448,10 +1452,10 @@ where
                 }
             });
             a_in_rx
-        }
+        },
         FinalRx::SyncSingle(_) => {
             unreachable!("spawn_async_feeder path never produces SyncSingle")
-        }
+        },
         FinalRx::Async(prev_async_rx) => {
             // NOTE(perf): this bridge task is NOT redundant — do not try to
             // remove it by having consumers clone `prev_async_rx` directly.
@@ -1493,11 +1497,11 @@ where
                 }
             });
             a_in_rx
-        }
+        },
         #[cfg(feature = "tokio-runtime")]
         FinalRx::AsyncSingle(_) => {
             unreachable!("spawn_async_feeder path never produces AsyncSingle")
-        }
+        },
     };
     FinalRx::Async(spawn_async_consumers_body::<F, Prev::Out, M, Fut, R>(
         f, a_in_rx, opts, ctx,
@@ -1578,7 +1582,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// the pool size.)
     ///
     /// ```rust
-    /// use youpipe::{stream, ComputePool};
+    /// use youpipe::{ComputePool, stream};
     ///
     /// let pool = ComputePool::new(4);
     /// let result = stream(0..100)
@@ -1648,7 +1652,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// [`Self::stage`] with per-stage tuning — see [`StageOptions`].
     ///
     /// ```rust
-    /// use youpipe::{stream, StageOptions};
+    /// use youpipe::{StageOptions, stream};
     ///
     /// // Heavy parse stage pinned to 4 workers; later stages divide the rest.
     /// let result: Vec<i32> = stream(0..100)
@@ -1754,10 +1758,10 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     ///
     /// # Modes
     ///
-    /// - [`FenceMode::Barrier`] fully drains the upstream before downstream
-    ///   starts (hard isolation; max peak memory, no staging overlap).
-    /// - [`FenceMode::Chunked`] releases batches as soon as they form so the
-    ///   two sides overlap — the right default for mixed CPU/IO loads.
+    /// - [`FenceMode::Barrier`] fully drains the upstream before downstream starts (hard isolation;
+    ///   max peak memory, no staging overlap).
+    /// - [`FenceMode::Chunked`] releases batches as soon as they form so the two sides overlap —
+    ///   the right default for mixed CPU/IO loads.
     pub fn fence(self, mode: FenceMode) -> StreamPipe<FenceLink<S>, I, O, R> {
         StreamPipe {
             items: self.items,
@@ -1931,7 +1935,7 @@ where
         }
     }
     let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
-    let mut buffer = crate::state::ReorderBuffer::new(capacity);
+    let mut buffer = ReorderBuffer::new(capacity);
     let mut batch: Vec<T> = Vec::new();
     loop {
         loop {
@@ -1941,14 +1945,14 @@ where
                     for item in batch.drain(..) {
                         f(item);
                     }
-                }
+                },
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Closed) => {
                     for item in buffer.flush_remaining() {
                         f(item);
                     }
                     return;
-                }
+                },
             }
         }
         if let Ok((seq, item)) = rx.recv() {
@@ -1991,7 +1995,7 @@ where
         }
     }
     let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
-    let mut buffer = crate::state::ReorderBuffer::new(capacity);
+    let mut buffer = ReorderBuffer::new(capacity);
     let mut batch: Vec<T> = Vec::new();
     loop {
         loop {
@@ -2001,14 +2005,14 @@ where
                     for item in batch.drain(..) {
                         f(item);
                     }
-                }
+                },
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Closed) => {
                     for item in buffer.flush_remaining() {
                         f(item);
                     }
                     return;
-                }
+                },
             }
         }
         if let Ok((seq, item)) = rx.recv().await {
@@ -2102,7 +2106,8 @@ where
     /// // Equivalent to `.run()` for sync chains — the Result matters when
     /// // the chain contains `.stage_async(..)` and runtime construction
     /// // might fail.
-    /// let r: Vec<i32> = (0..100).stream()
+    /// let r: Vec<i32> = (0..100)
+    ///     .stream()
     ///     .stage(|x: i32| x + 1)
     ///     .try_run()
     ///     .expect("try_run on sync chain never fails");
@@ -2128,10 +2133,9 @@ where
         // silently drops data. Reject the combination loudly instead.
         assert!(
             !(self.ordered && self.stages.has_expand()),
-            "`.ordered()` is incompatible with `.expand()`: expand fan-out \
-             shares the parent sequence number, which the ReorderBuffer \
-             cannot re-sequence. Drop `.ordered()` (completion order is still \
-             correct) or replace `expand` with a 1:1 `stage`."
+            "`.ordered()` is incompatible with `.expand()`: expand fan-out shares the parent \
+             sequence number, which the ReorderBuffer cannot re-sequence. Drop `.ordered()` \
+             (completion order is still correct) or replace `expand` with a 1:1 `stage`."
         );
         let Self {
             items,
@@ -2224,12 +2228,12 @@ where
             FinalRx::Async(rx) => {
                 let pool = ctx.acquire_async()?;
                 pool.block_on(terminal.drain_async(rx, ordered, n))
-            }
+            },
             #[cfg(feature = "tokio-runtime")]
             FinalRx::AsyncSingle(rx) => {
                 let pool = ctx.acquire_async()?;
                 pool.block_on(terminal.drain_async(rx, ordered, n))
-            }
+            },
         };
 
         feeder.finish();
@@ -2296,11 +2300,10 @@ where
 /// after the first is already queued. The unordered path therefore drains
 /// in two phases per burst:
 ///
-///   1. Spin `try_recv` until `Empty` — no `await`, no waker registration, just
-///      non-blocking pops at ~atomic-op cost.
-///   2. When the queue is drained but the channel is still open, `recv().await`
-///      exactly once to register a waker and yield until the next item lands.
-///      Then loop back to step 1.
+///   1. Spin `try_recv` until `Empty` — no `await`, no waker registration, just non-blocking pops
+///      at ~atomic-op cost.
+///   2. When the queue is drained but the channel is still open, `recv().await` exactly once to
+///      register a waker and yield until the next item lands. Then loop back to step 1.
 ///
 /// This converts the per-item `await` cost into a per-burst `await` cost.
 /// For `io_async_pure` at size 500 (~450 items completing in the same ~1 ms
@@ -2350,7 +2353,7 @@ where
                 Err(TryRecvError::Closed) => {
                     results.extend(buffer.flush_remaining());
                     return results;
-                }
+                },
             }
         }
         if let Ok((seq, o)) = rx.recv().await {

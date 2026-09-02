@@ -25,10 +25,10 @@ fn main() {
         .pipe()
         .try_map(|s: &str| s.parse::<i32>().map_err(|_| ParseError::NotANumber))
         .try_map(|n| {
-            if !(0..=50).contains(&n) {
-                Err(ParseError::OutOfRange)
-            } else {
+            if (0..=50).contains(&n) {
                 Ok(n * n)
+            } else {
+                Err(ParseError::OutOfRange)
             }
         })
         .map(|n| format!("n²={n}"))

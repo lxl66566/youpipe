@@ -221,6 +221,7 @@ impl<T: Send + 'static> RecvItem<T> for MpscReceiver<T> {
     fn recv(&self) -> Result<T, ChannelError> {
         MpscReceiver::recv(self)
     }
+
     #[inline]
     fn try_recv(&self) -> Result<T, TryRecvError> {
         MpscReceiver::try_recv(self)
@@ -349,6 +350,7 @@ impl<T: Send + 'static> RecvItem<T> for SyncReceiver<T> {
     fn recv(&self) -> Result<T, ChannelError> {
         SyncReceiver::recv(self)
     }
+
     #[inline]
     fn try_recv(&self) -> Result<T, TryRecvError> {
         SyncReceiver::try_recv(self)
@@ -371,6 +373,7 @@ impl<T: Send + Unpin + 'static> AsyncRecvItem<T> for AsyncReceiver<T> {
     async fn recv(&self) -> Result<T, ChannelError> {
         AsyncReceiver::recv(self).await
     }
+
     #[inline]
     fn try_recv(&self) -> Result<T, TryRecvError> {
         AsyncReceiver::try_recv(self)
@@ -382,6 +385,7 @@ impl<T: Send + Unpin + 'static> AsyncRecvItem<T> for MpscAsyncReceiver<T> {
     async fn recv(&self) -> Result<T, ChannelError> {
         MpscAsyncReceiver::recv(self).await
     }
+
     #[inline]
     fn try_recv(&self) -> Result<T, TryRecvError> {
         MpscAsyncReceiver::try_recv(self)

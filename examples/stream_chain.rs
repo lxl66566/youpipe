@@ -82,12 +82,10 @@ fn main() {
         yp_sorted.len()
     );
     println!(
-        "  youpipe  stream(): {:>10.3?}   (channels between stages, overlapping)",
-        yp_elapsed
+        "  youpipe  stream(): {yp_elapsed:>10.3?}   (channels between stages, overlapping)"
     );
     println!(
-        "  tokio   spawn_blocking: {:>10.3?}   (one task per item, per stage)",
-        tokio_elapsed
+        "  tokio   spawn_blocking: {tokio_elapsed:>10.3?}   (one task per item, per stage)"
     );
     println!();
     println!("youpipe's streaming pipeline keeps both stages' worker pools");

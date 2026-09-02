@@ -41,7 +41,7 @@ fn test_scope_chained_map() {
 #[test]
 fn test_scope_empty() {
     let result = youpipe::scope(|s| s.pipe(Vec::<i32>::new()).map(|x: i32| x * 2).collect());
-    assert!(result.is_empty());
+    assert_eq!(result, [] as [i32; 0]);
 }
 
 #[test]
@@ -89,7 +89,9 @@ fn test_scope_shared_lookup_across_pipelines() {
     let (hits, sum) = youpipe::scope(|s| {
         let hits: usize = s
             .pipe(0..table.len())
-            .map(|i: usize| if table[i] % 2 == 0 { 1usize } else { 0 })
+            .map(|i: usize| {
+                usize::from(table[i] % 2 == 0)
+            })
             .collect()
             .into_iter()
             .sum();
@@ -315,9 +317,7 @@ fn test_scope_for_each_panic_propagates_parallel() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         youpipe::scope(|scope| {
             scope.pipe(items).for_each(|d: DropCounter| {
-                if d.val == 25_000 {
-                    panic!("scoped for_each boom");
-                }
+                assert!(d.val != 25_000, "scoped for_each boom");
             });
         });
     }));

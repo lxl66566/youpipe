@@ -32,8 +32,8 @@ type PanicPayload = Box<dyn Any + Send>;
 //
 // Three sources of a compute pool, checked in priority order:
 //   1. `with_compute_pool(pool)` — explicit, always wins.
-//   2. `with_oversubscribe(factor)` — a hint that creates a transient pool
-//      sized to `factor × num_cpus` at execution time.
+//   2. `with_oversubscribe(factor)` — a hint that creates a transient pool sized to `factor ×
+//      num_cpus` at execution time.
 //   3. Neither → the global pool (one thread per core).
 //
 // The transient pool from (2) is owned by `ExecPool::Owned` and lives on the
@@ -125,18 +125,18 @@ where
             // filters), so [mid, end) is fully init and safe to drop.
             unsafe { output.drop_range(mid, end) };
             Err(p)
-        }
+        },
         (Ok(()), Err(p)) => {
             unsafe { output.drop_range(start, mid) };
             Err(p)
-        }
+        },
         (Err(p), Err(_)) => {
             unsafe {
                 output.drop_range(start, mid);
                 output.drop_range(mid, end);
             }
             Err(p)
-        }
+        },
     }
 }
 
@@ -199,10 +199,10 @@ where
             unsafe {
                 let i = self.written;
                 for j in 0..i {
-                    std::ptr::drop_in_place(self.out_ptr.add(j));
+                    ptr::drop_in_place(self.out_ptr.add(j));
                 }
                 for j in (i + 1)..self.n {
-                    std::ptr::drop_in_place(self.in_ptr.add(j).cast_mut());
+                    ptr::drop_in_place(self.in_ptr.add(j).cast_mut());
                 }
             }
         }
@@ -224,9 +224,9 @@ where
     while g.written < n {
         let i = g.written;
         // SAFETY: disjoint index; slot i is init (input) / uninit (output).
-        let item = unsafe { std::ptr::read(in_ptr.add(i)) };
+        let item = unsafe { ptr::read(in_ptr.add(i)) };
         let out = op.apply(item);
-        unsafe { std::ptr::write(out_ptr.add(i), out) };
+        unsafe { ptr::write(out_ptr.add(i), out) };
         g.written = i + 1;
     }
 
@@ -330,14 +330,12 @@ where
 // `CountLatch::wait_spin`, shared failure-slot funnel) is identical for every
 // terminal. The strategies differ only in:
 //
-//   1. The recursive chunk driver — `par_index_rec` writes to a shared output
-//      `Slots<R>` (`collect`); `par_for_each_rec` is sink-only (`for_each`);
-//      `par_index_try_rec` short-circuits into a shared error slot
-//      (`try_collect`'s no-filter fast path).
-//   2. The failure cleanup — `collect`/`try_collect` must drop successful
-//      chunks' output ranges so the caller can free the buffers; `for_each` has
-//      nothing to clean (the failed chunk's `ForEachGuard` already dropped its
-//      own unread input tail).
+//   1. The recursive chunk driver — `par_index_rec` writes to a shared output `Slots<R>`
+//      (`collect`); `par_for_each_rec` is sink-only (`for_each`); `par_index_try_rec`
+//      short-circuits into a shared error slot (`try_collect`'s no-filter fast path).
+//   2. The failure cleanup — `collect`/`try_collect` must drop successful chunks' output ranges so
+//      the caller can free the buffers; `for_each` has nothing to clean (the failed chunk's
+//      `ForEachGuard` already dropped its own unread input tail).
 //
 // [`HybridStrategy`] abstracts exactly those differences so the dispatcher is
 // written once as [`hybrid_dispatch`]. The strategy crosses into the
@@ -378,9 +376,9 @@ impl ErasedFailure {
                 // First failure wins — except a late panic, which displaces an
                 // earlier recorded op failure.
                 *slot = Some(f);
-            }
+            },
             // First failure wins otherwise.
-            (Some(_), _) => {}
+            (Some(_), _) => {},
         }
     }
 }
@@ -621,15 +619,13 @@ where
 /// into the shared [`TryFailure`] slot instead of a panic-only slot.
 ///
 /// Range resolution on each failure kind:
-/// - `Ok(())` chunk — output range fully init; the driver drops it via
-///   `cleanup_success_chunk` when some other chunk failed.
-/// - `Err(e)` chunk — `par_index_try_rec`'s leaf/internal-node cleanup has
-///   already dropped every live output slot and consumed every input slot in
-///   the chunk's range, so nothing remains to clean (mirrors the panicked chunk
-///   of the infallible strategies).
-/// - Panicking chunk — unwinds through the recursion (leaf guard cleans its own
-///   partial range; sibling ranges may leak, same documented behaviour as the
-///   single-tree path).
+/// - `Ok(())` chunk — output range fully init; the driver drops it via `cleanup_success_chunk` when
+///   some other chunk failed.
+/// - `Err(e)` chunk — `par_index_try_rec`'s leaf/internal-node cleanup has already dropped every
+///   live output slot and consumed every input slot in the chunk's range, so nothing remains to
+///   clean (mirrors the panicked chunk of the infallible strategies).
+/// - Panicking chunk — unwinds through the recursion (leaf guard cleans its own partial range;
+///   sibling ranges may leak, same documented behaviour as the single-tree path).
 struct TryStrategy<'a, R, E, OP> {
     output: &'a Slots<R>,
     op: &'a OP,
@@ -1026,7 +1022,7 @@ where
             unsafe {
                 let in_live = self.input.as_ptr();
                 for j in (self.pos + 1)..self.input.len() {
-                    std::ptr::drop_in_place(in_live.add(j).cast_mut());
+                    ptr::drop_in_place(in_live.add(j).cast_mut());
                 }
             }
         }
@@ -1041,7 +1037,7 @@ where
         let i = g.pos;
         // SAFETY: disjoint index; slot i is init (input). The read moves the
         // item out of the slot, leaving it uninit — never re-read.
-        let item = unsafe { std::ptr::read(in_ptr.add(i)) };
+        let item = unsafe { ptr::read(in_ptr.add(i)) };
         op.consume(item);
         g.pos = i + 1;
     }
@@ -1102,12 +1098,12 @@ where
             // Recursion already dropped every live (unread) input slot.
             drop(input);
             resume_panic(f);
-        }
+        },
         None => {
             // All input slots consumed (read → uninit): dropping the box just
             // frees memory, no per-slot drops.
             drop(input);
-        }
+        },
     }
 }
 
@@ -1162,18 +1158,18 @@ where
             // filters), so [mid, end) is fully init and safe to drop.
             unsafe { output.drop_range(mid, end) };
             Err(e)
-        }
+        },
         (Ok(()), Err(e)) => {
             unsafe { output.drop_range(start, mid) };
             Err(e)
-        }
+        },
         (Err(e), Err(_)) => {
             unsafe {
                 output.drop_range(start, mid);
                 output.drop_range(mid, end);
             }
             Err(e)
-        }
+        },
     }
 }
 
@@ -1211,10 +1207,10 @@ where
             unsafe {
                 let i = self.written;
                 for j in 0..i {
-                    std::ptr::drop_in_place(self.out_ptr.add(j));
+                    ptr::drop_in_place(self.out_ptr.add(j));
                 }
                 for j in (i + 1)..self.n {
-                    std::ptr::drop_in_place(self.in_ptr.add(j).cast_mut());
+                    ptr::drop_in_place(self.in_ptr.add(j).cast_mut());
                 }
             }
         }
@@ -1236,27 +1232,27 @@ where
     while g.written < n {
         let i = g.written;
         // SAFETY: disjoint index; slot i is init (input) / uninit (output).
-        let item = unsafe { std::ptr::read(in_ptr.add(i)) };
+        let item = unsafe { ptr::read(in_ptr.add(i)) };
         match op.try_apply(item) {
             Ok(out) => {
-                unsafe { std::ptr::write(out_ptr.add(i), out) };
+                unsafe { ptr::write(out_ptr.add(i), out) };
                 g.written = i + 1;
-            }
+            },
             Err(e) => {
                 // Error path: run the same cleanup the guard would do on
                 // panic, then disarm (forget) so Drop doesn't double-clean.
                 // Item `i` was consumed by `try_apply` and is gone.
                 unsafe {
                     for j in 0..i {
-                        std::ptr::drop_in_place(out_ptr.add(j));
+                        ptr::drop_in_place(out_ptr.add(j));
                     }
                     for j in (i + 1)..n {
-                        std::ptr::drop_in_place(in_ptr.add(j).cast_mut());
+                        ptr::drop_in_place(in_ptr.add(j).cast_mut());
                     }
                 }
                 std::mem::forget(g);
                 return Err(e);
-            }
+            },
         }
     }
 
@@ -1326,24 +1322,23 @@ where
         None => {
             drop(input);
             Ok(output.into_vec())
-        }
+        },
         Some(TryFailure::Error(e)) => {
             // Recursion already dropped every live output slot.
             drop(input);
             drop(output);
             Err(e)
-        }
+        },
         Some(TryFailure::Panic(p)) => {
             // Mirrors the single-tree path: a panic unwinds past the buffer
             // management (init slots may leak, documented above).
             drop(input);
             drop(output);
             panic::resume_unwind(p);
-        }
+        },
     }
 }
 
-//
 // Hypothesis (from hotpath): ~60% of stolen `join` B-jobs force the origin
 // worker into `wait_until_cold`, so a *flat* dispatcher — N disjoint leaf-jobs
 // injected at once into the pool's global queue, each writing its own output
@@ -1492,7 +1487,7 @@ fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize
             } else {
                 BALANCED_OVERSPLIT
             }
-        }
+        },
         Workload::Unbalanced => 8,
         Workload::Custom(factor) => factor.get(),
     }
@@ -1568,7 +1563,7 @@ where
         (Ok(mut l), Ok(r)) => {
             l.extend(r);
             Ok(l)
-        }
+        },
         (Err(e), _) | (_, Err(e)) => Err(e),
     }
 }
@@ -1678,7 +1673,7 @@ impl<S, I, O> Pipe<S, I, O> {
     /// here so the example also runs under miri's single emulated worker.)
     ///
     /// ```rust
-    /// use youpipe::{pipe, ComputePool};
+    /// use youpipe::{ComputePool, pipe};
     ///
     /// let pool = ComputePool::new(4);
     /// let result: Vec<i32> = pipe(0..100)
@@ -1743,7 +1738,7 @@ impl<S, I, O> Pipe<S, I, O> {
     /// [`Pipe::with_compute_pool`]:
     ///
     /// ```rust
-    /// use youpipe::{pipe, ComputePool};
+    /// use youpipe::{ComputePool, pipe};
     ///
     /// // Pre-create once; clone is cheap (Arc + one atomic).
     /// // (Size 4 keeps the example runnable under miri; real blocking-IO
@@ -1768,12 +1763,10 @@ impl<S, I, O> Pipe<S, I, O> {
     /// // Each item does blocking IO (file read + crypto + write).
     /// // factor = 2 → 2× num_cpus threads fill IO-stall gaps with CPU work.
     /// let files: Vec<String> = (0..100).map(|i| format!("file{i}")).collect();
-    /// pipe(files)
-    ///     .with_oversubscribe(2)
-    ///     .for_each(|f: String| {
-    ///         // read(&f) → encrypt → write(out)
-    ///         let _ = f;
-    ///     });
+    /// pipe(files).with_oversubscribe(2).for_each(|f: String| {
+    ///     // read(&f) → encrypt → write(out)
+    ///     let _ = f;
+    /// });
     /// ```
     #[must_use]
     pub fn with_oversubscribe(mut self, factor: usize) -> Self {
@@ -2414,8 +2407,7 @@ mod tests {
         // (32 threads) would show 20+.
         assert!(
             max <= 4,
-            "expected ≤4 concurrent on a 2-thread pool, got {max} — \
-             custom pool not used?"
+            "expected ≤4 concurrent on a 2-thread pool, got {max} — custom pool not used?"
         );
     }
 
@@ -2470,8 +2462,8 @@ mod tests {
         // be 20+.
         assert!(
             max <= 2,
-            "expected ≤2 concurrent on 1-thread pool, got {max} — \
-             oversubscribe factor overrode the explicit pool?"
+            "expected ≤2 concurrent on 1-thread pool, got {max} — oversubscribe factor overrode \
+             the explicit pool?"
         );
     }
 

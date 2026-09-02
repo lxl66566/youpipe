@@ -113,7 +113,7 @@ impl Registry {
 
     /// Opaque identity for this registry.
     pub(crate) fn id(&self) -> usize {
-        std::ptr::from_ref::<Self>(self) as usize
+        ptr::from_ref::<Self>(self) as usize
     }
 
     pub(crate) fn num_threads(&self) -> usize {
@@ -278,7 +278,7 @@ static GLOBAL_REGISTRY: OnceLock<Arc<Registry>> = OnceLock::new();
 
 pub(crate) fn global_registry() -> &'static Arc<Registry> {
     GLOBAL_REGISTRY.get_or_init(|| {
-        let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        let cpus = thread::available_parallelism().map_or(4, std::num::NonZero::get);
         let registry = Registry::new(cpus);
         registry.wait_until_primed();
         registry
@@ -343,7 +343,7 @@ impl WorkerThread {
         match self.worker.push(job) {
             Ok(()) => {
                 self.registry.sleep.new_internal_jobs(1, queue_was_empty);
-            }
+            },
             // Local deque is full (256 slots): spill into the global injector.
             // This is the tokio overflow strategy — keeps the local queue
             // bounded and cache-friendly without dropping work.
@@ -478,7 +478,7 @@ impl WorkerThread {
                         Err(StealError::Busy) => {
                             retry = true;
                             None
-                        }
+                        },
                     }
                 });
             if job.is_some() || !retry {
@@ -510,7 +510,7 @@ unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usiz
     let worker_thread_ref: &WorkerThread = &worker_thread;
     // SAFETY: `worker_thread_ref` outlives main_loop (it IS the stack frame).
     // The raw pointer in TLS is valid until we null it on drop.
-    unsafe { WorkerThread::set_current(std::ptr::from_ref(worker_thread_ref)) };
+    unsafe { WorkerThread::set_current(ptr::from_ref(worker_thread_ref)) };
 
     let registry = worker_thread_ref.registry();
     // Signal that we're ready.

@@ -26,9 +26,13 @@ fn test_compute_pool_shared() {
             let mut sum = 0u64;
             // Miri: the inner arithmetic depth is irrelevant to the pool
             // machinery under test — shrink it 50x.
-            let inner: u32 = if cfg!(miri) { 20 } else { 1_000 };
+            let inner: u32 = if cfg!(miri) {
+                20
+            } else {
+                1_000
+            };
             for j in 0..inner {
-                sum = sum.wrapping_add(j as u64);
+                sum = sum.wrapping_add(u64::from(j));
             }
             tx.send((i, sum)).unwrap();
         });
@@ -46,7 +50,11 @@ fn test_compute_pool_many_small_tasks() {
     // Miri: 10k submit/wait cycles over the injector + steal path take tens
     // of interpreted minutes; 500 exercises every queue/steal/latch path
     // (the pool has 4 emulated workers) in seconds.
-    let total = if cfg!(miri) { 500 } else { 10_000 };
+    let total = if cfg!(miri) {
+        500
+    } else {
+        10_000
+    };
     wg.add(total);
     for _ in 0..total {
         let counter = counter.clone();

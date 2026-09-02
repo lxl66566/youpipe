@@ -68,8 +68,10 @@ impl<'env> PipelineScope<'env> {
     ///         t.fetch_add(f.len(), Ordering::Relaxed);
     ///     });
     /// });
-    /// assert_eq!(total_len.load(Ordering::Relaxed),
-    ///            files.iter().map(String::len).sum::<usize>());
+    /// assert_eq!(
+    ///     total_len.load(Ordering::Relaxed),
+    ///     files.iter().map(String::len).sum::<usize>()
+    /// );
     /// ```
     ///
     /// For zero input allocation, pass indices instead:
@@ -106,11 +108,10 @@ impl<'env> PipelineScope<'env> {
 /// `Arc<Vec<Mutex<Vec<T>>>>`), this version:
 ///
 /// - has no `'static` bound on `T` or the closure,
-/// - is **data-first** (items are passed to `pipe(items)`, not to
-///   `.collect()`),
+/// - is **data-first** (items are passed to `pipe(items)`, not to `.collect()`),
 /// - fuses `.map`/`.filter`/ at compile time (lazy chain),
-/// - drives `.collect()` through the same recursive work-stealing
-///   `par_index_collect` core as the top-level [`crate::Pipe`].
+/// - drives `.collect()` through the same recursive work-stealing `par_index_collect` core as the
+///   top-level [`crate::Pipe`].
 pub struct ScopedPipe<'env, S = Identity, I = (), O = ()> {
     items: Vec<I>,
     stages: S,
@@ -241,7 +242,13 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
     /// // Borrows `limit` from the enclosing scope inside a fallible chain.
     /// let r: Result<Vec<i32>, &str> = scope(|s| {
     ///     s.pipe(0..100)
-    ///         .try_map(|x: i32| if x > limit { Err("too big") } else { Ok(x * 2) })
+    ///         .try_map(|x: i32| {
+    ///             if x > limit {
+    ///                 Err("too big")
+    ///             } else {
+    ///                 Ok(x * 2)
+    ///             }
+    ///         })
     ///         .try_collect()
     /// });
     /// assert_eq!(r.unwrap_err(), "too big");

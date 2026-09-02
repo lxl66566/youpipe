@@ -1,16 +1,16 @@
 [package]
-description  = "Real-world mixed CPU/IO benchmark: read skewed-size files, AES-256-GCM encrypt, write back. Compares youpipe (tuned streaming) vs rayon vs tokio."
-edition      = "2024"
 name         = "file-encrypt-bench"
-publish      = false
-rust-version = "1.85"
 version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+description  = "Real-world mixed CPU/IO benchmark: read skewed-size files, AES-256-GCM encrypt, write back. Compares youpipe (tuned streaming) vs rayon vs tokio."
+publish      = false
 
 [dependencies]
 aes-gcm   = "0.10"
 getrandom = "0.2"
 rayon     = "1"
-tokio     = { version = "1", features = ["rt-multi-thread", "fs"] }
+tokio     = { version = "1", features = ["fs", "rt-multi-thread"] }
 youpipe   = { path = "../..", default-features = true }
 zstd      = "0.13"
 

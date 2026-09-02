@@ -366,7 +366,7 @@ impl CountLatch {
             } => {
                 debug_assert!(registry.num_threads() > *worker_index);
                 Registry::wait_until_worker(latch);
-            }
+            },
             CountLatchKind::Blocking { latch } => latch.wait(),
         }
     }
@@ -422,7 +422,7 @@ impl CountLatch {
                 // while it waits, which is strictly better than spinning.
                 debug_assert!(registry.num_threads() > *worker_index);
                 Registry::wait_until_worker(latch);
-            }
+            },
             CountLatchKind::Blocking { latch } => {
                 // Tier 1: tight spin (PAUSE on x86). Each iteration is ~10–40 ns;
                 // this budget covers ~100–150 µs, enough to catch any batch whose
@@ -442,7 +442,7 @@ impl CountLatch {
                 // notify — releasing the core. Either way the mutex serializes
                 // us against the setter's in-flight latch access.
                 latch.wait();
-            }
+            },
         }
     }
 }
@@ -479,7 +479,7 @@ impl Latch for CountLatch {
                         if CoreLatch::set(latch) {
                             registry.notify_worker_latch_is_set(worker_index);
                         }
-                    }
+                    },
                     CountLatchKind::Blocking { latch } => LockLatch::set(latch),
                 }
             }
@@ -506,6 +506,7 @@ unsafe impl<L: Sync> Sync for LatchRef<'_, L> {}
 
 impl<L> Deref for LatchRef<'_, L> {
     type Target = L;
+
     fn deref(&self) -> &L {
         // SAFETY: while &self exists, the inner latch is alive.
         unsafe { &*self.inner }

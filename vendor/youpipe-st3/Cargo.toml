@@ -12,7 +12,7 @@
 # release; the lib target keeps the name `st3` so call sites don't churn.
 [package]
 name         = "youpipe-st3"
-version      = "0.4.1"
+version      = "0.5.0"
 authors      = ["Serge Barral <serge.barral@asynchronics.com>"]
 edition      = "2021"
 rust-version = "1.60"
@@ -23,42 +23,42 @@ description  = """
 A very fast lock-free, bounded, work-stealing LIFO queue (youpipe fork).
 """
 categories   = ["concurrency", "data-structures"]
-keywords     = ["queue", "stack", "bounded", "lock-free", "work-stealing"]
+keywords     = ["bounded", "lock-free", "queue", "stack", "work-stealing"]
 autotests    = false
 autobenches  = false
 
 [lib]
 name = "st3"
 
-[dependencies]
-crossbeam-utils = { version = "0.8.14", default-features = false }
-
-[dev-dependencies]
-criterion       = "0.5"
-oorandom        = "11.1"
-crossbeam-deque = "0.8"
-num_cpus        = "1.13"
-
-[target.'cfg(st3_loom)'.dev-dependencies]
-loom = "0.7"
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(st3_loom)'] }
+[[test]]
+name = "integration"
+path = "tests/tests.rs"
 
 [[bench]]
-name   = "benchmark"
-path   = "benches/benchmark.rs"
 harness = false
+name    = "benchmark"
+path    = "benches/benchmark.rs"
 
 [[bench]]
-name   = "micro"
-path   = "benches/micro.rs"
 harness = false
+name    = "micro"
+path    = "benches/micro.rs"
 
 # NOTE: the upstream `[profile.bench]` pin (codegen-units=1, lto=true) is
 # dropped here — profile settings in a dependency manifest are ignored by
 # cargo; youpipe's root config governs.
 
-[[test]]
-name = "integration"
-path = "tests/tests.rs"
+[dependencies]
+crossbeam-utils = { version = "0.8.14", default-features = false }
+
+[dev-dependencies]
+criterion       = "0.5"
+crossbeam-deque = "0.8"
+num_cpus        = "1.13"
+oorandom        = "11.1"
+
+[target."cfg(st3_loom)".dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(st3_loom)"] }

@@ -1,105 +1,25 @@
 [package]
-categories   = ["concurrency"]
-description  = "High-performance data-first pipelines with fused CPU stages and streaming async IO"
-edition      = "2024"
-exclude      = ["/docs", "/.github", "/AGENTS.md", "/.opencode", "/.vscode", "/perf"]
-keywords     = ["parallel", "pipeline", "concurrency", "map-reduce", "work-stealing"]
-license      = "Apache-2.0"
 name         = "youpipe"
+version      = "0.5.0"
+edition      = "2024"
+rust-version = "1.85"
+description  = "High-performance data-first pipelines with fused CPU stages and streaming async IO"
 readme       = "README.md"
 repository   = "https://github.com/lxl66566/youpipe"
-rust-version = "1.85"
-version      = "0.4.0"
+license      = "Apache-2.0"
+keywords     = ["concurrency", "map-reduce", "parallel", "pipeline", "work-stealing"]
+categories   = ["concurrency"]
+exclude      = ["/.github", "/.opencode", "/.vscode", "/AGENTS.md", "/docs", "/perf"]
 
-[features]
-default = ["tokio-runtime"]
-# ── Async runtime backend for streaming `.stage_async(..)` stages ──
-# The fused CPU path (`pipe` / `scope`) is fully sync and needs no backend.
-#
-# The runtime is abstracted behind `AsyncRuntime` (see `src/runtime/`): tokio
-# is the only concrete backend today, but the trait + `StreamPipe<.., R:
-# AsyncRuntime>` plumbing is kept generic so a future backend (a thread-per-core
-# runtime, monoio, …) slots in without touching the streaming code.
-tokio-runtime = ["dep:tokio"]
-# (No `loom` feature: loom model-checking is driven by the `--cfg loom`
-# rustflag instead — see `[target.'cfg(loom)'.dependencies]` below.)
-# ── Optional permanent instrumentation (zero-cost when off) ──
-# `hotpath` is an optional dependency; when none of these features are enabled
-# the `#[cfg_attr(feature = "hotpath", hotpath::measure)]` probes are stripped at
-# parse time and the crate is not compiled into the build at all — production
-# builds pay nothing. Flip the feature on to turn the probes into real
-# per-function timing/alloc/CPU profiling without re-running `perf`.
-#
-# NOTE: youpipe's `hotpath` feature must forward to `hotpath/hotpath`, otherwise
-# the hotpath crate stays in its `lib_off` mode where every macro is a no-op.
-hotpath       = ["dep:hotpath", "hotpath/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
+# Examples that exercise `.stage_async` / `.with_async_pool` — only buildable
+# when the tokio runtime is enabled.
+[[example]]
+name              = "async_io"
+required-features = ["tokio-runtime"]
 
-# ── Concurrency-model testing of the pool's synchronization cores ──
-# Loom is activated by the `--cfg loom` rustflag (the ecosystem-standard
-# approach, same as crossbeam / tokio / the vendored `youpipe-st3`), NOT by a
-# cargo feature:
-#
-#   RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
-#
-# Why a rustflag rather than a feature: a feature is part of the public
-# semver surface and gets unified across the dependency graph, so an
-# unrelated downstream `--features loom` (or a future optional dep named
-# `loom`) would silently rebuild youpipe's sync primitives on loom's
-# simulated atomics in production. A `--cfg` only exists for the explicit
-# command line that sets it. The flag also applies uniformly to youpipe and
-# any dependency that follows the same convention (the vendored
-# youpipe-concurrent-queue tests already use `cfg(loom)`).
-#
-# NOTE: setting RUSTFLAGS replaces the `[build] rustflags` from
-# `.cargo/config.toml` (`-C opt-level=3 -C panic=unwind`), which only matter
-# for release/bench builds — test builds are unaffected.
-#
-# Only the synchronization cores are modeled — the Registry spawns real OS
-# threads, which loom cannot simulate, so tests drive the primitives
-# directly with `loom::thread`. Regular (real-thread) unit tests cannot run
-# on simulated primitives, hence the `-- loom_tests` filter.
-[target.'cfg(loom)'.dependencies]
-loom = "0.7"
-
-[lints.rust]
-# `loom` is set via `RUSTFLAGS="--cfg loom"` (see above), not a feature, so
-# register it here to keep `unexpected_cfgs` silent.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
-
-[dependencies]
-concurrent-queue = { package = "youpipe-concurrent-queue", path = "vendor/youpipe-concurrent-queue" }
-crossfire        = "3.1"
-hotpath          = { version = "0.19", optional = true }
-parking_lot      = "0.12"
-st3              = { package = "youpipe-st3", path = "vendor/youpipe-st3" }
-tokio            = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
-
-[dev-dependencies]
-criterion         = "0.8"
-crossbeam-channel = "0.5"
-rayon             = "1"
-tokio             = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
-
-# Single codegen unit for release builds. A project whose value proposition is
-# per-item throughput cannot tolerate the code-layout lottery that
-# `codegen-units = 16` (the Cargo default) triggers: an unrelated edit
-# elsewhere in the crate shifts LLVM's codegen-unit partitioning, which
-# reshuffles the hot-path instruction layout, which silently regresses the
-# leaf loop's auto-vectorization. We measured this directly while deleting an
-# unused `runtime/` module (no behaviour change, ~18% regression at
-# sync_cpu_heavy/100k that vanished the moment the code was reinstated).
-# `codegen-units = 1` makes such phantom regressions impossible at the cost of
-# slower release builds — the standard trade-off for perf-first crates
-# (rayon, crossbeam, etc. all do the same).
-[profile.release]
-codegen-units = 1
-
-# Same rationale as `[profile.release]`, applied to the criterion bench
-# profile so A/B runs can't be distorted by the code-layout lottery either.
-[profile.bench]
-codegen-units = 1
+[[example]]
+name              = "mixed_cpu_io"
+required-features = ["tokio-runtime"]
 
 [[bench]]
 harness = false
@@ -129,12 +49,103 @@ harness           = false
 name              = "io_async"
 required-features = ["tokio-runtime"]
 
-# Examples that exercise `.stage_async` / `.with_async_pool` — only buildable
-# when the tokio runtime is enabled.
-[[example]]
-name              = "async_io"
-required-features = ["tokio-runtime"]
+[dependencies]
+concurrent-queue = { package = "youpipe-concurrent-queue", path = "vendor/youpipe-concurrent-queue" }
+crossfire        = "3.1"
+hotpath          = { version = "0.24", optional = true }
+parking_lot      = "0.12"
+st3              = { package = "youpipe-st3", path = "vendor/youpipe-st3" }
+tokio            = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"], optional = true }
 
-[[example]]
-name              = "mixed_cpu_io"
-required-features = ["tokio-runtime"]
+[dev-dependencies]
+criterion         = "0.8"
+crossbeam-channel = "0.5"
+rayon             = "1"
+tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
+
+# ── Concurrency-model testing of the pool's synchronization cores ──
+# Loom is activated by the `--cfg loom` rustflag (the ecosystem-standard
+# approach, same as crossbeam / tokio / the vendored `youpipe-st3`), NOT by a
+# cargo feature:
+#
+#   RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
+#
+# Why a rustflag rather than a feature: a feature is part of the public
+# semver surface and gets unified across the dependency graph, so an
+# unrelated downstream `--features loom` (or a future optional dep named
+# `loom`) would silently rebuild youpipe's sync primitives on loom's
+# simulated atomics in production. A `--cfg` only exists for the explicit
+# command line that sets it. The flag also applies uniformly to youpipe and
+# any dependency that follows the same convention (the vendored
+# youpipe-concurrent-queue tests already use `cfg(loom)`).
+#
+# NOTE: setting RUSTFLAGS replaces the `[build] rustflags` from
+# `.cargo/config.toml` (`-C opt-level=3 -C panic=unwind`), which only matter
+# for release/bench builds — test builds are unaffected.
+#
+# Only the synchronization cores are modeled — the Registry spawns real OS
+# threads, which loom cannot simulate, so tests drive the primitives
+# directly with `loom::thread`. Regular (real-thread) unit tests cannot run
+# on simulated primitives, hence the `-- loom_tests` filter.
+[target."cfg(loom)".dependencies]
+loom = "0.7"
+
+[features]
+default       = ["tokio-runtime"]
+# (No `loom` feature: loom model-checking is driven by the `--cfg loom`
+# rustflag instead — see `[target.'cfg(loom)'.dependencies]` below.)
+# ── Optional permanent instrumentation (zero-cost when off) ──
+# `hotpath` is an optional dependency; when none of these features are enabled
+# the `#[cfg_attr(feature = "hotpath", hotpath::measure)]` probes are stripped at
+# parse time and the crate is not compiled into the build at all — production
+# builds pay nothing. Flip the feature on to turn the probes into real
+# per-function timing/alloc/CPU profiling without re-running `perf`.
+#
+# NOTE: youpipe's `hotpath` feature must forward to `hotpath/hotpath`, otherwise
+# the hotpath crate stays in its `lib_off` mode where every macro is a no-op.
+hotpath       = ["dep:hotpath", "hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
+# ── Async runtime backend for streaming `.stage_async(..)` stages ──
+# The fused CPU path (`pipe` / `scope`) is fully sync and needs no backend.
+#
+# The runtime is abstracted behind `AsyncRuntime` (see `src/runtime/`): tokio
+# is the only concrete backend today, but the trait + `StreamPipe<.., R:
+# AsyncRuntime>` plumbing is kept generic so a future backend (a thread-per-core
+# runtime, monoio, …) slots in without touching the streaming code.
+tokio-runtime = ["dep:tokio"]
+
+[lints.clippy]
+all                     = { level = "warn", priority = -1 }
+cargo                   = { level = "warn", priority = -1 }
+doc_markdown            = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+multiple_crate_versions = "allow"
+pedantic                = { level = "warn", priority = -1 }
+wildcard_imports        = "allow"
+
+[lints.rust]
+# `loom` is set via `RUSTFLAGS="--cfg loom"` (see above), not a feature
+unexpected_cfgs       = { level = "warn", check-cfg = ["cfg(loom)"] }
+unsafe_code           = "allow"
+unused_qualifications = "warn"
+
+# Same rationale as `[profile.release]`, applied to the criterion bench
+# profile so A/B runs can't be distorted by the code-layout lottery either.
+[profile.bench]
+codegen-units = 1
+
+# Single codegen unit for release builds. A project whose value proposition is
+# per-item throughput cannot tolerate the code-layout lottery that
+# `codegen-units = 16` (the Cargo default) triggers: an unrelated edit
+# elsewhere in the crate shifts LLVM's codegen-unit partitioning, which
+# reshuffles the hot-path instruction layout, which silently regresses the
+# leaf loop's auto-vectorization. We measured this directly while deleting an
+# unused `runtime/` module (no behaviour change, ~18% regression at
+# sync_cpu_heavy/100k that vanished the moment the code was reinstated).
+# `codegen-units = 1` makes such phantom regressions impossible at the cost of
+# slower release builds — the standard trade-off for perf-first crates
+# (rayon, crossbeam, etc. all do the same).
+[profile.release]
+codegen-units = 1

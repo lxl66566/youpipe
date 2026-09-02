@@ -9,6 +9,7 @@ pub(crate) struct CachePadded<T>(pub(crate) T);
 
 impl<T> std::ops::Deref for CachePadded<T> {
     type Target = T;
+
     #[inline]
     fn deref(&self) -> &T {
         &self.0

@@ -51,11 +51,11 @@ pub trait IterExt: IntoIterator + Sized {
     /// let r: Vec<i32> = (0..10).pipe().map(|x| x + 1).collect();
     /// assert_eq!(r, (1..=10).collect::<Vec<_>>());
     /// ```
-    fn pipe(self) -> crate::Pipe<crate::Identity, Self::Item, Self::Item>
+    fn pipe(self) -> Pipe<Identity, Self::Item, Self::Item>
     where
         Self::Item: Send + 'static,
     {
-        crate::pipe(self)
+        pipe(self)
     }
 
     /// Build a streaming pipeline. Equivalent to [`stream`](crate::stream).
@@ -65,11 +65,11 @@ pub trait IterExt: IntoIterator + Sized {
     /// let r: Vec<i32> = (0..10).stream().stage(|x: i32| x + 1).run();
     /// assert_eq!(r.len(), 10);
     /// ```
-    fn stream(self) -> crate::StreamPipe<crate::StreamStart, Self::Item, Self::Item>
+    fn stream(self) -> StreamPipe<StreamStart, Self::Item, Self::Item>
     where
         Self::Item: Send + Unpin + 'static,
     {
-        crate::stream(self)
+        stream(self)
     }
 }
 

@@ -64,7 +64,11 @@ fn skewed_io(size: usize) -> Vec<(u64, Duration)> {
     let tail = Duration::from_millis(BASE_MS * 8);
     (0..size)
         .map(|i| {
-            let dur = if i % 10 == 0 { tail } else { base };
+            let dur = if i % 10 == 0 {
+                tail
+            } else {
+                base
+            };
             (i as u64, dur)
         })
         .collect()
@@ -116,12 +120,10 @@ fn main() {
         yp_sorted.len()
     );
     println!(
-        "  youpipe stage_async: {:>10.3?}   (M:N, default io_concurrency=128)",
-        yp_elapsed
+        "  youpipe stage_async: {yp_elapsed:>10.3?}   (M:N, default io_concurrency=128)"
     );
     println!(
-        "  tokio  spawn:        {:>10.3?}   (async ceiling, 1 task/item)",
-        tokio_elapsed
+        "  tokio  spawn:        {tokio_elapsed:>10.3?}   (async ceiling, 1 task/item)"
     );
     println!();
     println!("Both run async tasks on a tokio runtime, so both yield the OS");

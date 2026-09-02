@@ -74,16 +74,13 @@ fn main() {
         yp_result.len()
     );
     println!(
-        "  youpipe stream().expand().stage():  {:>10.3?}",
-        yp_elapsed
+        "  youpipe stream().expand().stage():  {yp_elapsed:>10.3?}"
     );
     println!(
-        "  rayon   par_iter().flat_map().map(): {:>10.3?}",
-        rn_elapsed
+        "  rayon   par_iter().flat_map().map(): {rn_elapsed:>10.3?}"
     );
     println!(
-        "  std     iter().flat_map().map():    {:>10.3?}",
-        seq_elapsed
+        "  std     iter().flat_map().map():    {seq_elapsed:>10.3?}"
     );
     println!();
     println!("First few outputs: {:?}", &yp_result[..10]);

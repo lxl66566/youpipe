@@ -14,52 +14,52 @@
 # alias in youpipe's Cargo.toml.
 [package]
 name         = "youpipe-concurrent-queue"
-version      = "2.5.0"
+version      = "0.5.0"
 authors      = [
-    "Stjepan Glavina <stjepang@gmail.com>",
-    "Taiki Endo <te316e89@gmail.com>",
-    "John Nunley <dev@notgull.net>"
+  "Stjepan Glavina <stjepang@gmail.com>",
+  "Taiki Endo <te316e89@gmail.com>",
+  "John Nunley <dev@notgull.net>"
 ]
 edition      = "2021"
 rust-version = "1.60"
 description  = "Concurrent multi-producer multi-consumer queue (youpipe fork)"
 license      = "Apache-2.0 OR MIT"
 repository   = "https://github.com/smol-rs/concurrent-queue"
-keywords     = ["channel", "mpmc", "spsc", "spmc", "mpsc"]
+keywords     = ["channel", "mpmc", "mpsc", "spmc", "spsc"]
 categories   = ["concurrency"]
 exclude      = ["/.*"]
 
 [lib]
-name = "concurrent_queue"
 bench = false
+name  = "concurrent_queue"
+
+[[bench]]
+harness = false
+name    = "bench"
 
 [dependencies]
 crossbeam-utils = { version = "0.8.11", default-features = false }
 portable-atomic = { version = "1", default-features = false, optional = true }
+
+[dev-dependencies]
+criterion     = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+easy-parallel = "3.1.0"
+fastrand      = "2.0.0"
 
 # Loom model-checking: activated purely by the `--cfg loom` rustflag (the
 # ecosystem-standard switch, matching crossbeam / youpipe-st3), i.e.
 #   RUSTFLAGS="--cfg loom" cargo test --test loom
 # Non-optional so the flag alone is sufficient — no `--features` needed.
 # This feature is permanently unstable and the API may change at any time.
-[target.'cfg(loom)'.dependencies]
+[target."cfg(loom)".dependencies]
 loom = "0.7"
-
-[[bench]]
-name = "bench"
-harness = false
-
-[dev-dependencies]
-criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-easy-parallel = "3.1.0"
-fastrand = "2.0.0"
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
-
 [features]
 default = ["std"]
-std = ["crossbeam-utils/std"]
+std     = ["crossbeam-utils/std"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

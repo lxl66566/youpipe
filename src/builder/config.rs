@@ -6,16 +6,15 @@
 /// **wall-clock time** each item takes relative to its siblings within a single
 /// `pipe(..).collect()` / `for_each()` run:
 ///
-/// - `Balanced` — items cost roughly the same. The fork/join tree needs little
-///   stealing slack, so oversplit is adaptive (`1` for small batches, `4` for
-///   large). This is the right default for the vast majority of workloads.
-/// - `Unbalanced` — a few items are far slower than the rest (skewed tail). The
-///   tree always uses `8×` oversplit so an idle worker can steal a slow
-///   sibling's remaining leaves, shrinking tail latency.
-/// - `Custom(factor)` — pick the oversplit factor yourself. `Custom(1)` is the
-///   coarsest tree (one leaf per worker, minimal dispatch overhead);
-///   `Custom(16)` is very fine-grained stealing for extreme skew. Values in the
-///   `4..=16` range are the useful envelope on large machines.
+/// - `Balanced` — items cost roughly the same. The fork/join tree needs little stealing slack, so
+///   oversplit is adaptive (`1` for small batches, `4` for large). This is the right default for
+///   the vast majority of workloads.
+/// - `Unbalanced` — a few items are far slower than the rest (skewed tail). The tree always uses
+///   `8×` oversplit so an idle worker can steal a slow sibling's remaining leaves, shrinking tail
+///   latency.
+/// - `Custom(factor)` — pick the oversplit factor yourself. `Custom(1)` is the coarsest tree (one
+///   leaf per worker, minimal dispatch overhead); `Custom(16)` is very fine-grained stealing for
+///   extreme skew. Values in the `4..=16` range are the useful envelope on large machines.
 ///
 /// # Oversplit vs oversubscribe
 ///

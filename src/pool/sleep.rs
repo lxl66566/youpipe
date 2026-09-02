@@ -189,7 +189,7 @@ impl Counters {
 
 pub(crate) struct Sleep {
     /// Per-worker sleep state.
-    worker_sleep_states: Vec<crate::util::CachePadded<WorkerSleepState>>,
+    worker_sleep_states: Vec<CachePadded<WorkerSleepState>>,
     counters: AtomicCounters,
     /// Bitmask of currently-sleeping workers (bit `i` set iff worker `i` is
     /// parked in `condvar.wait`). Lets `wake_any_threads` jump directly to
@@ -516,12 +516,11 @@ mod loom_tests {
     ///   poster:  queue.store(1) → new_injected_jobs(1, true) → wake_specific
     ///
     /// Invariants checked by model exhaustion:
-    ///   * liveness — the sleeper always returns (no lost wake: the mask bit is
-    ///     pre-published under the `is_blocked` mutex, and the final
-    ///     `has_injected_jobs` check catches a poster that ran before the
-    ///     sleeper registered itself);
-    ///   * no leak of sleeping state — `sleeping_threads` returns to 0 and the
-    ///     sleeping mask bit is cleared on every path.
+    ///   * liveness — the sleeper always returns (no lost wake: the mask bit is pre-published under
+    ///     the `is_blocked` mutex, and the final `has_injected_jobs` check catches a poster that
+    ///     ran before the sleeper registered itself);
+    ///   * no leak of sleeping state — `sleeping_threads` returns to 0 and the sleeping mask bit is
+    ///     cleared on every path.
     #[test]
     fn sleeper_is_woken_by_injected_jobs() {
         loom::model(|| {

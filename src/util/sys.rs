@@ -76,6 +76,7 @@ mod loom_shim {
 
     impl<'a, T: ?Sized> Deref for MutexGuard<'a, T> {
         type Target = T;
+
         #[inline]
         fn deref(&self) -> &T {
             self.0.as_ref().expect("guard moved into condvar wait")
@@ -203,6 +204,7 @@ mod shim {
 
     impl<T: ?Sized> std::ops::Deref for MutexGuard<'_, T> {
         type Target = T;
+
         #[inline]
         fn deref(&self) -> &Self::Target {
             &self.0
@@ -276,7 +278,7 @@ mod shim {
                 Err(e) => {
                     let (g, r) = e.into_inner();
                     (g, r)
-                }
+                },
             };
             // SAFETY: see `wait` method-level comment.
             unsafe { std::ptr::write(&mut guard.0, returned) };

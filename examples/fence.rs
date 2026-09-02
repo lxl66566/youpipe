@@ -3,13 +3,12 @@
 //!
 //! This example demonstrates three things:
 //!
-//! 1. **Two independent fences in one chain.** A fence between stage 1↔2 and
-//!    another between stage 2↔3 — they don't interfere.
-//! 2. **`FenceMode::Chunked(k)` overlaps stages.** Stage 2 starts consuming the
-//!    moment the first batch of `k` items clears the fence, long before stage 1
-//!    finishes. Visible via per-stage "first item seen" timestamps.
-//! 3. **`FenceMode::Barrier` is a hard cut.** Stage 2 sees nothing until stage
-//!    1 is fully drained.
+//! 1. **Two independent fences in one chain.** A fence between stage 1↔2 and another between stage
+//!    2↔3 — they don't interfere.
+//! 2. **`FenceMode::Chunked(k)` overlaps stages.** Stage 2 starts consuming the moment the first
+//!    batch of `k` items clears the fence, long before stage 1 finishes. Visible via per-stage
+//!    "first item seen" timestamps.
+//! 3. **`FenceMode::Barrier` is a hard cut.** Stage 2 sees nothing until stage 1 is fully drained.
 //!
 //! ```text
 //! cargo run --example fence
@@ -65,7 +64,11 @@ impl StageTrace {
 /// so the Chunked vs Barrier contrast shows up clearly in the timestamps.
 fn stage1(x: i32) -> i32 {
     let mut r = x as u64;
-    let iters = if x % 10 == 0 { 2_000_000 } else { 2_000 };
+    let iters = if x % 10 == 0 {
+        2_000_000
+    } else {
+        2_000
+    };
     for _ in 0..iters {
         r = r.wrapping_mul(7).wrapping_add(13);
     }

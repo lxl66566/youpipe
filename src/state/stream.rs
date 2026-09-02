@@ -47,7 +47,7 @@ where
                 Err(TryRecvError::Closed) => {
                     results.extend(buffer.flush_remaining());
                     return results;
-                }
+                },
             }
         }
         // Queue drained but the channel may still be open — block for one.

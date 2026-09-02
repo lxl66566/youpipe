@@ -34,7 +34,11 @@ fn cpu_work(x: u64, iters: u32) -> u64 {
 fn skewed(size: usize) -> Vec<(u64, u32)> {
     (0..size)
         .map(|i| {
-            let iters = if i % 10 == 0 { 5000 } else { 5 };
+            let iters = if i % 10 == 0 {
+                5000
+            } else {
+                5
+            };
             (i as u64, iters)
         })
         .collect()
@@ -95,20 +99,16 @@ fn main() {
         yp_b[SIZE - 1]
     );
     println!(
-        "  youpipe pipe() Balanced:    {:>10.3?}   (4× oversplit)",
-        yp_balanced_elapsed
+        "  youpipe pipe() Balanced:    {yp_balanced_elapsed:>10.3?}   (4× oversplit)"
     );
     println!(
-        "  youpipe pipe() Unbalanced:  {:>10.3?}   (8× oversplit, finer stealing)",
-        yp_unbal_elapsed
+        "  youpipe pipe() Unbalanced:  {yp_unbal_elapsed:>10.3?}   (8× oversplit, finer stealing)"
     );
     println!(
-        "  rayon   par_iter:           {:>10.3?}   (work-stealing baseline)",
-        rn_elapsed
+        "  rayon   par_iter:           {rn_elapsed:>10.3?}   (work-stealing baseline)"
     );
     println!(
-        "  std     iter():             {:>10.3?}   (single-threaded baseline)",
-        seq_elapsed
+        "  std     iter():             {seq_elapsed:>10.3?}   (single-threaded baseline)"
     );
     println!();
     println!("Both youpipe and rayon use recursive `join`-based splitting that");
