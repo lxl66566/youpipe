@@ -2,6 +2,14 @@
 
 > [← Documentation index](README.md)
 
+Canonical runners (they reap stale miri processes, apply per-binary
+timeouts and the required flag combinations):
+
+```sh
+perf/verify/miri.sh            # lib + all integration binaries
+perf/verify/loom.sh            # youpipe models + vendored queue models
+```
+
 The `util/sys` module provides a unified `Mutex`/`Condvar`/atomics API via
 `cfg`:
 
@@ -62,6 +70,18 @@ release and silently skips wakes. A `debug_assert` now catches it.
 under loom to keep the model's state space small; the budget's only
 synchronization role (the final mutex acquire) is exercised either way.
 `CachePadded` drops its alignment under loom (no cache lines in the model).
+
+### Miri workload scaling (`cfg!(miri)`)
+
+Miri interprets ~1000× slower than native, so the integration tests scale
+their heavy workloads down under `cfg!(miri)` instead of being skipped:
+the same dispatch/queue/latch code paths run with fewer repetitions (e.g.
+`cpu_heavy` 200 → 4 iterations, 50K-item batches → 2K — still far above
+miri's 1-worker serial threshold of 64 items). Only tests whose
+*assertions* are wall-clock based (`Instant`/heartbeat-gap) or that require
+real multi-worker concurrency (fence-over-large-input, which deadlocks on
+miri's single emulated worker) remain `#[cfg_attr(miri, ignore)]`d, with
+the reason documented at each site.
 
 ### Build-profile guard (`lib.rs`)
 
