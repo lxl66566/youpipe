@@ -120,7 +120,9 @@ def _decorate(ax, unit: str, logy: bool = False) -> None:
 
 
 def _legend(ax, ncols: int) -> None:
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.10), ncols=ncols,
+    # -0.16 keeps the row clear of the "batch size" xlabel (constrained
+    # layout reserves the extra room by shrinking the axes).
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncols=ncols,
               frameon=False, fontsize=8.2, handlelength=1.3,
               columnspacing=1.1, handletextpad=0.45, borderaxespad=0)
 
