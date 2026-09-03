@@ -113,6 +113,37 @@ is). The real wins were:
 
 Together these shaved ~5–8 % off 1K–10K `collect` batches.
 
+#### Driver work-assist via reserve chunks (2026-09; kept, no measurable win)
+
+The residual 1K gap after all of the above is the wake cascade — parked
+workers take µs-scale to wake, and the slowest-to-wake worker gates the
+batch tail. The hybrid dispatcher now withholds one tail chunk from the
+injector (`ASSIST_RESERVE_CHUNKS`) and the off-pool driver executes it from
+its wait loop (`CountLatch::wait_spin_assist`) — the natural extension of
+driver-inline chunk 0. A/B (3+2 interleaved rounds): **no measurable
+wall-time change at reserve 1 or 4** — under back-to-back benchmark loops
+most workers stay ready, so the rescue only pays off when workers are
+absent (pinned by `test_hybrid_driver_assists_when_workers_busy`). Kept at
+the conservative 1 for that liveness property. Three earlier variants were
+**rejected with lessons** (all recorded at the `hybrid_dispatch` reserve
+block):
+
+1. *claim-flag* — driver claims an injected chunk while its `JobRef` stays
+   queued; the worker's no-op `execute` then races the driver's frame
+   teardown → use-after-free (caught by the panic-propagation tests as a
+   misaligned deref). `counter == 0` must imply every injected `JobRef` was
+   fully consumed — the teardown's safety invariant.
+2. *pop-and-execute anything* — foreign injector jobs are not guaranteed to
+   run on an arbitrary thread (`in_worker_cold`'s `StackJob` asserts on the
+   worker TLS); executing one unwinds straight through the driver frame,
+   skipping the latch wait.
+3. *pop + identity check + re-queue foreign* — re-queueing reorders the
+   injector's FIFO, which stream pipelines depend on (feeder submitted
+   before its resident stage-worker jobs); a feeder pushed behind them
+   starves while every worker parks on an empty channel recv → whole-pool
+   deadlock, reproduced under the parallel test suite and by
+   `tests/hybrid_assist.rs`.
+
 An earlier version silently routed small batches to a serial loop to win this
 benchmark, but that was deceptive (the API promises parallelism) and
 catastrophic for expensive per-item work (file IO, crypto) whose small batches
@@ -369,20 +400,33 @@ python3 perf/plot-horizontal.py                   # perf/horizontal/results.json
   *finite-cap* regime (all three at 512), `mixed/real_doc/real_web` compare
   the *unbounded* regime (all three effectively unlimited). Fairness is a
   property of the scenario, not of each library's default.
+- **Input lifecycle must be aligned within a CPU scenario** (2026-09 fix).
+  youpipe's `pipe(v)` takes ownership: each timed iteration consumes a fresh
+  `warm_clone` and frees the input buffer *inside* the timed region, paying
+  the clone's cache thrash right before the clock starts. rayon's idiomatic
+  `data.par_iter()` borrows the same warm buffer every iteration — nothing
+  freed in-region, no clone thrash — an asymmetric advantage that grew with
+  batch size (at 1 M, the 8 MB clone+free cycle is worth ~35 % of the
+  batch). The primary `rayon` row now consumes a fresh `warm_clone` via
+  `into_par_iter()` (like-for-like memory behavior); a `rayon (borrowed)`
+  row keeps the idiomatic call so the chart shows both readings. The
+  distinction matters: under the aligned lifecycle rayon's 100 K–1 M
+  numbers rise 50–60 % (it, too, pays the fresh-input costs), while
+  youpipe's stay put — those costs were always in its baseline.
 - Machine: 32-core AMD (Zen) Linux, bench pinned to cores 1–31
   (`taskset -c 1-31`, core 0 left to OS/IRQ housekeeping), 5 rounds ×
   700 ms measurement, ~2-8 % cross-round spread on most cells.
 
-### Results (median ms per iteration, 5 interleaved rounds)
+### Results (median ms per iteration, 5 interleaved rounds; cpu_balanced 9)
 
 | Scenario | n | Best | Runner-up | Rest |
 | --- | --- | --- | --- | --- |
-| cpu_balanced | 1K | rayon 0.037 | youpipe 0.058 | std threads 0.548 |
-| cpu_balanced | 10K | youpipe 0.058 | rayon 0.062 | std threads 0.568 |
-| cpu_balanced | 100K | youpipe 0.098 | rayon 0.123 | std threads 0.760 |
-| cpu_balanced | 1M | rayon 0.469 | youpipe 0.513 | std threads 2.73 |
-| cpu_unbalanced | 10K | youpipe (default) 0.071 | youpipe (Unbalanced) 0.074 | rayon 0.079, std 0.574 |
-| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.258 | rayon 0.259 | youpipe (default) 0.269, std 0.800 |
+| cpu_balanced | 1K | rayon (borrowed) 0.038 | rayon 0.040 | youpipe 0.057, std threads 0.545 |
+| cpu_balanced | 10K | youpipe 0.060 | rayon (borrowed) 0.062 | rayon 0.063, std threads 0.562 |
+| cpu_balanced | 100K | youpipe 0.114 | rayon (borrowed) 0.122 | rayon 0.187, std threads 0.736 |
+| cpu_balanced | 1M | rayon (borrowed) 0.473 | rayon 0.557 | youpipe 0.672, std threads 2.80 |
+| cpu_unbalanced | 10K | youpipe (Unbalanced) 0.073 | youpipe (default) 0.079 | rayon (borrowed) 0.079, rayon 0.081, std 0.568 |
+| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.254 | rayon (borrowed) 0.272 | youpipe (default) 0.258, rayon 0.315, std 0.781 |
 | io_async | 500 | futures 9.12 | tokio 9.45 | youpipe 9.57 |
 | io_async | 2000 | futures 17.6 | youpipe 18.2 | tokio 18.5 |
 | io_async | 5000 | futures 34.0 | youpipe 34.8 | tokio 35.5 |
@@ -397,15 +441,21 @@ python3 perf/plot-horizontal.py                   # perf/horizontal/results.json
 
 ### Reading the results
 
-- **Balanced CPU** is a tale of three regimes: rayon wins 1K (fixed setup,
-  its caller-inline fork-join) and 1M (the fused leaf is so cheap the
-  off-pool driver's wait shows — same story as the lightweight 1M row
-  above), youpipe wins the 10K–100K middle. Equal-chunk hand-threading is
-  2.5–5× behind everywhere: 32 spawns per call, and no stealing.
-- **Skewed CPU**: with `Workload::Unbalanced` youpipe ties rayon at 100K and
-  both are ~3× ahead of static chunking, which strands the 10 % heavy items
-  in whichever chunks they landed in. At 10K youpipe's adaptive oversplit
-  already handles the skew (the `Unbalanced` knob adds nothing at that size).
+- **Balanced CPU, two rayon readings** (`rayon` = fresh-input lifecycle
+  aligned with youpipe's ownership API; `rayon (borrowed)` = idiomatic
+  borrow): rayon wins 1K on both (fixed setup, its caller-inline fork-join);
+  youpipe wins the 10K–100K middle on both, widest at 100K (−39 % vs
+  aligned rayon, −7 % vs borrowed). At 1M rayon wins both readings — the
+  fused leaf is so cheap the batch is bandwidth-bound and youpipe's 1 M rows
+  show ±25 % round-to-round drift (9-round median; the documented
+  large-batch measurement trap), while rayon's borrowed baseline sits at
+  ~470 µs with ±3 %. Equal-chunk hand-threading is 5–10× behind everywhere:
+  32 spawns per call, and no stealing.
+- **Skewed CPU**: with `Workload::Unbalanced` youpipe beats both rayon
+  readings at 100K (0.254 vs 0.272/0.315 ms) and both are ~3× ahead of
+  static chunking, which strands the 10 % heavy items in whichever chunks
+  they landed in. At 10K youpipe's adaptive oversplit already handles the
+  skew (the `Unbalanced` knob adds nothing at that size).
 - **Async IO is a near-tie** — youpipe multiplexes over the same tokio
   runtime: ±2 % vs tokio (crossing ahead at ≥2K items as channel throughput
   stops mattering), 2–5 % behind `futures::stream`, the lightest async

@@ -131,13 +131,16 @@ data: [docs/benchmarks.md](docs/benchmarks.md#horizontal-cross-library-compariso
 Highlights (median wall time, youpipe vs the strongest hand-written
 alternative; per-iteration time, setup excluded):
 
-- **CPU, balanced (fused `pipe()`)** — youpipe wins at 10K–100K items (−20 %
-  vs rayon at 100K); rayon wins at 1K (fixed setup cost, ~20 µs) and 1M (~9
-  %, its fork-join runs inline on the calling thread). All three are 2.5–5×
-  faster than hand-rolled equal-chunk threading.
+- **CPU, balanced (fused `pipe()`)** — youpipe wins at 10K–100K items
+  (−7 % vs borrowed rayon at 100K, −39 % under the same fresh-input
+  lifecycle); rayon wins at 1K (fixed setup cost, ~20 µs) and 1M (its
+  fork-join runs inline on the calling thread; the 1M batch is
+  bandwidth-bound). All three are 5–10× faster than hand-rolled equal-chunk
+  threading.
 - **CPU, skewed (10 % of items cost 1000×)** — `Workload::Unbalanced` +
-  work stealing matches rayon (0.26 vs 0.26 ms @ 100K) and is 3× faster than
-  equal-chunk threading, which strands the slow items in a few threads.
+  work stealing beats rayon at 100K (0.254 vs 0.272 ms) and is 3× faster
+  than equal-chunk threading, which strands the slow items in a few
+  threads.
 - **Async IO (512 in flight, 1/8 ms tail)** — tied with the async baselines:
   ±2 % vs tokio (crossing ahead at ≥2K items), 2–5 % behind the lighter
   `futures::stream` combinator stack. youpipe rides the same tokio runtime.

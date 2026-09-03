@@ -34,6 +34,7 @@ LIB_STYLE: dict[str, dict] = {
     "youpipe (32 thr)":     {"color": "#5eead4", "width": 2.2, "dash": None},
     "youpipe (512 thr)":    {"color": "#0d9488", "width": 2.8, "dash": None},
     "rayon":                {"color": "#ea580c", "width": 2.0, "dash": None},
+    "rayon (borrowed)":     {"color": "#f59e0b", "width": 2.0, "dash": "5 4"},
     "tokio":                {"color": "#4f46e5", "width": 2.0, "dash": None},
     "futures":              {"color": "#16a34a", "width": 2.0, "dash": None},
     "std threads":          {"color": "#94a3b8", "width": 2.0, "dash": None},

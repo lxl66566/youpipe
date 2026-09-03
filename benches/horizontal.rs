@@ -604,6 +604,33 @@ fn cpu_balanced() -> Scenario {
                         Box::new({
                             let data = data.clone();
                             move || {
+                                // Same input lifecycle as the youpipe job:
+                                // fresh warm clone (untimed) whose buffer is
+                                // consumed — and freed — inside the timed
+                                // region. `par_iter` borrows the same `data`
+                                // every iteration, so its timed region frees
+                                // nothing and its cache state never sees the
+                                // 8 MB clone thrash; `into_par_iter` matches
+                                // ownership costs like for like.
+                                let v = warm_clone(&data);
+                                let t = Instant::now();
+                                let r: Vec<u64> =
+                                    v.into_par_iter().map(|x| bb(cpu_work(x, 100))).collect();
+                                finish(r, t)
+                            }
+                        }) as Job,
+                    ),
+                    (
+                        "rayon (borrowed)",
+                        Box::new({
+                            let data = data.clone();
+                            move || {
+                                // rayon's natural API: borrow the warm input,
+                                // nothing freed inside the timed region. Kept
+                                // as a separate row so the chart shows both
+                                // readings: like-for-like memory lifecycle
+                                // (the `rayon` row) vs each library's most
+                                // idiomatic call (this row).
                                 let t = Instant::now();
                                 let r: Vec<u64> =
                                     data.par_iter().map(|&x| bb(cpu_work(x, 100))).collect();
@@ -669,6 +696,24 @@ fn cpu_unbalanced() -> Scenario {
                     ),
                     (
                         "rayon",
+                        Box::new({
+                            let data = data.clone();
+                            move || {
+                                // Same input lifecycle as the youpipe jobs
+                                // (fresh warm clone, freed inside the timed
+                                // region) — see cpu_balanced's rayon job.
+                                let v = warm_clone(&data);
+                                let t = Instant::now();
+                                let r: Vec<u64> = v
+                                    .into_par_iter()
+                                    .map(|(x, iters)| bb(cpu_work(x, iters)))
+                                    .collect();
+                                finish(r, t)
+                            }
+                        }) as Job,
+                    ),
+                    (
+                        "rayon (borrowed)",
                         Box::new({
                             let data = data.clone();
                             move || {
