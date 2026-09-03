@@ -4,10 +4,12 @@ use std::hint::black_box as bb;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rayon::prelude::*;
-use youpipe::{ComputePool, Workload, pipe, stream};
+use youpipe::{ComputePool, Workload, pipe, pipe_ref, stream};
 
-/// Clone `src` and warm it into cache so the measured time reflects framework
-/// overhead, not allocator/page-fault latency. See `sync_vs_rayon.rs`.
+/// The streaming engine takes ownership (no borrowed entry), so each iteration
+/// rebuilds the input in the (untimed) setup and pulls it into cache — a cold
+/// clone would measure allocator/memcpy latency instead of the framework
+/// (glibc's large memcpy uses non-temporal stores; see docs/benchmarks.md).
 fn warm_clone_tasks(src: &[(u64, u32)]) -> Vec<(u64, u32)> {
     let v: Vec<(u64, u32)> = src.to_vec();
     let mut acc = 0u64;
@@ -130,17 +132,13 @@ fn bench_cpu_unbalanced_skewed(c: &mut Criterion) {
             BenchmarkId::new("youpipe_par_map", size),
             &tasks,
             |b, tasks| {
-                b.iter_batched(
-                    || warm_clone_tasks(tasks),
-                    |v| {
-                        let r = pipe(v)
-                            .with_workload(Workload::Unbalanced)
-                            .map(|(x, iters)| bb(cpu_work_variable(x, iters)))
-                            .collect();
-                        bb(r)
-                    },
-                    BatchSize::PerIteration,
-                );
+                b.iter(|| {
+                    let r = pipe_ref(tasks)
+                        .with_workload(Workload::Unbalanced)
+                        .map(|&(x, iters)| bb(cpu_work_variable(x, iters)))
+                        .collect();
+                    bb(r)
+                });
             },
         );
 
@@ -183,17 +181,13 @@ fn bench_cpu_unbalanced_log_uniform(c: &mut Criterion) {
             BenchmarkId::new("youpipe_par_map", size),
             &tasks,
             |b, tasks| {
-                b.iter_batched(
-                    || warm_clone_tasks(tasks),
-                    |v| {
-                        let r = pipe(v)
-                            .with_workload(Workload::Unbalanced)
-                            .map(|(x, iters)| bb(cpu_work_variable(x, iters)))
-                            .collect();
-                        bb(r)
-                    },
-                    BatchSize::PerIteration,
-                );
+                b.iter(|| {
+                    let r = pipe_ref(tasks)
+                        .with_workload(Workload::Unbalanced)
+                        .map(|&(x, iters)| bb(cpu_work_variable(x, iters)))
+                        .collect();
+                    bb(r)
+                });
             },
         );
 

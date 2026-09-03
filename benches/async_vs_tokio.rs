@@ -13,8 +13,10 @@ fn cpu_work(x: u64) -> u64 {
     r
 }
 
-/// Clone `src` and warm it into cache so the measured time reflects framework
-/// overhead, not allocator/page-fault latency. See `sync_vs_rayon.rs`.
+/// The streaming engine takes ownership (no borrowed entry), so each iteration
+/// rebuilds the input in the (untimed) setup and pulls it into cache — a cold
+/// clone would measure allocator/memcpy latency instead of the framework
+/// (glibc's large memcpy uses non-temporal stores; see docs/benchmarks.md).
 fn warm_clone(src: &[u64]) -> Vec<u64> {
     let v: Vec<u64> = src.to_vec();
     let mut acc = 0u64;

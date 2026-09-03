@@ -14,10 +14,11 @@ fn cpu_work(x: u64) -> u64 {
     r
 }
 
-/// Clone `src` and warm it into cache. See `sync_vs_rayon.rs` for rationale:
-/// `stream()` takes ownership (needs a fresh Vec per iteration) whereas rayon
-/// borrows warm data — without warming, the fresh clone arrives cold-from-RAM
-/// and the measured time is dominated by allocator/page-fault latency.
+/// The streaming engine takes ownership (no borrowed entry), so each iteration
+/// rebuilds the input in the (untimed) setup and pulls it into cache — without
+/// warming the fresh clone arrives cold-from-RAM and the measured time is
+/// dominated by allocator/memory latency (glibc's large memcpy uses
+/// non-temporal stores; see docs/benchmarks.md).
 fn warm_clone(src: &[u64]) -> Vec<u64> {
     let v: Vec<u64> = src.to_vec();
     let mut acc = 0u64;

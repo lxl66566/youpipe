@@ -2,7 +2,7 @@ mod common;
 
 use std::hint::black_box;
 
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rayon::prelude::*;
 
 fn cpu_work(x: u64) -> u64 {
@@ -13,29 +13,11 @@ fn cpu_work(x: u64) -> u64 {
     r
 }
 
-/// Clone `src` and read every element once so the pages are faulted in AND the
-/// data is warm in cache. Used as the (untimed) `iter_batched` setup so that
-/// the timed region measures the framework's work, not allocator / page-fault /
-/// cold-memory noise.
-///
-/// This is what makes the comparison fair: `par_map` takes ownership (so each
-/// iteration needs a fresh `Vec`), whereas `rayon::par_iter` borrows reused
-/// data. Without warming, the fresh clone arrives cold-from-RAM (glibc's large
-/// memcpy uses non-temporal stores that bypass the cache) and the measured time
-/// is dominated by memory latency rather than the framework — a property of the
-/// allocator, not of youpipe.
-fn warm_clone(src: &[u64]) -> Vec<u64> {
-    let v: Vec<u64> = src.to_vec();
-    // Touch every element (cache-warming read) folded into a sink the optimizer
-    // cannot eliminate, so the clone's non-temporal-stored bytes are pulled back
-    // into cache before the timed region runs.
-    let mut acc = 0u64;
-    for x in &v {
-        acc = acc.wrapping_add(*x);
-    }
-    black_box(acc);
-    v
-}
+// Cross-library groups compare `pipe_ref(&data)` against rayon's `par_iter`:
+// both borrow the same warm slice, nothing is cloned or freed inside the
+// timed region — like-for-like without any input-lifecycle alignment hacks.
+// The `_cold` variant in `sync_lightweight` documents why the owned `pipe(v)`
+// caliber needs a cache-warming setup (see its comment).
 
 fn bench_par_map_vs_rayon(c: &mut Criterion) {
     let mut group = c.benchmark_group("sync_cpu_heavy");
@@ -50,11 +32,11 @@ fn bench_par_map_vs_rayon(c: &mut Criterion) {
             BenchmarkId::new("youpipe_par_map", size),
             &data,
             |b, data| {
-                b.iter_batched(
-                    || warm_clone(data),
-                    |v| black_box(youpipe::pipe(v).map(|x| black_box(cpu_work(x))).collect()),
-                    BatchSize::PerIteration,
-                );
+                b.iter(|| {
+                    let r: Vec<u64> =
+                        youpipe::pipe_ref(data).map(|&x| black_box(cpu_work(x))).collect();
+                    black_box(r)
+                });
             },
         );
 
@@ -89,19 +71,15 @@ fn bench_pipeline_fusion(c: &mut Criterion) {
             BenchmarkId::new("fused_3_stages", size),
             &data,
             |b, data| {
-                b.iter_batched(
-                    || warm_clone(data),
-                    |v| {
-                        black_box(
-                            youpipe::pipe(v)
-                                .map(|x: u64| x + 1)
-                                .map(|x: u64| x * 3)
-                                .map(|x: u64| x - 2)
-                                .collect(),
-                        )
-                    },
-                    BatchSize::PerIteration,
-                );
+                b.iter(|| {
+                    black_box(
+                        youpipe::pipe_ref(data)
+                            .map(|&x| x + 1u64)
+                            .map(|x| x * 3)
+                            .map(|x| x - 2)
+                            .collect(),
+                    )
+                });
             },
         );
 
@@ -147,32 +125,28 @@ fn bench_lightweight_work(c: &mut Criterion) {
         let data: Vec<u64> = (0..size).collect();
 
         group.throughput(Throughput::Elements(size));
-        // Warm-input variant: measures framework work in the steady-state
-        // (hot-loop) regime, comparable to rayon's warm borrow.
         group.bench_with_input(
-            BenchmarkId::new("youpipe_par_map_warm", size),
+            BenchmarkId::new("youpipe_par_map_borrowed", size),
             &data,
             |b, data| {
-                b.iter_batched(
-                    || warm_clone(data),
-                    |v| {
-                        black_box(
-                            youpipe::pipe(v)
-                                .map(|x| black_box(x.wrapping_add(1)))
-                                .collect(),
-                        )
-                    },
-                    BatchSize::PerIteration,
-                );
+                b.iter(|| {
+                    black_box(
+                        youpipe::pipe_ref(data)
+                            .map(|&x| black_box(x.wrapping_add(1)))
+                            .collect(),
+                    )
+                });
             },
         );
 
-        // Cold-input variant (fresh clone, no warming): documents the
-        // one-shot-from-cold-memory cost. Every framework pays cold-read
-        // latency here; this is not a like-for-like comparison with rayon's
-        // warm borrow below.
+        // Owned-input variant (fresh clone, no warming): documents the
+        // one-shot cost of the owning `pipe(v)` API. glibc's large `memcpy`
+        // uses non-temporal stores that bypass the cache, so the fresh clone
+        // arrives cold-from-RAM and the measured time is dominated by
+        // allocator/memory latency — a property of the input lifecycle, not
+        // of the engine. Not comparable to the borrowed rows above.
         group.bench_with_input(
-            BenchmarkId::new("youpipe_par_map_cold", size),
+            BenchmarkId::new("youpipe_par_map_owned_cold", size),
             &data,
             |b, data| {
                 b.iter(|| {
@@ -208,22 +182,18 @@ fn bench_try_collect(c: &mut Criterion) {
         // youpipe try_collect (success path — index-based fast path, MAY_FILTER ==
         // false)
         group.bench_with_input(
-            BenchmarkId::new("youpipe_try_map_warm", size),
+            BenchmarkId::new("youpipe_try_map", size),
             &data,
             |b, data| {
-                b.iter_batched(
-                    || warm_clone(data),
-                    |v| {
-                        black_box(
-                            youpipe::pipe(v)
-                                .try_map(|x: u64| -> Result<u64, &'static str> { Ok(x + 1) })
-                                .map(|x| x * 3)
-                                .try_collect()
-                                .unwrap(),
-                        )
-                    },
-                    BatchSize::PerIteration,
-                );
+                b.iter(|| {
+                    black_box(
+                        youpipe::pipe_ref(data)
+                            .try_map(|&x| -> Result<u64, &'static str> { Ok(x + 1) })
+                            .map(|x| x * 3)
+                            .try_collect()
+                            .unwrap(),
+                    )
+                });
             },
         );
 
@@ -240,10 +210,10 @@ fn bench_try_collect(c: &mut Criterion) {
 
 fn bench_for_each_vs_rayon(c: &mut Criterion) {
     // `for_each` exercises the sink-only hybrid dispatch path (`SinkStrategy`).
-    // Mirrors `bench_par_map_vs_rayon` / `bench_lightweight_work` but ends in
-    // `.for_each(..)` instead of `.collect()`, so the comparison isolates the
-    // dispatch machinery (no output buffer allocation / writes) and documents
-    // the ramp-up win from sharing `hybrid_dispatch` with the collect path.
+    // Mirrors `bench_par_map_vs_rayon` but ends in `.for_each(..)` instead of
+    // `.collect()`, so the comparison isolates the dispatch machinery (no
+    // output buffer allocation / writes) and documents the ramp-up win from
+    // sharing `hybrid_dispatch` with the collect path.
     let mut group = c.benchmark_group("sync_for_each");
     // 1K / 100K anchors (10K midpoint dropped, same policy as
     // `bench_par_map_vs_rayon`).
@@ -260,18 +230,14 @@ fn bench_for_each_vs_rayon(c: &mut Criterion) {
             BenchmarkId::new("youpipe_cpu_heavy", size),
             &data,
             |b, data| {
-                b.iter_batched(
-                    || warm_clone(data),
-                    |v| {
-                        let sink = sink.clone();
-                        youpipe::pipe(v)
-                            .map(|x| black_box(cpu_work(x)))
-                            .for_each(move |r| {
-                                sink.fetch_add(r, std::sync::atomic::Ordering::Relaxed);
-                            });
-                    },
-                    BatchSize::PerIteration,
-                );
+                b.iter(|| {
+                    let sink = sink.clone();
+                    youpipe::pipe_ref(data)
+                        .map(|&x| black_box(cpu_work(x)))
+                        .for_each(move |r| {
+                            sink.fetch_add(r, std::sync::atomic::Ordering::Relaxed);
+                        });
+                });
             },
         );
 

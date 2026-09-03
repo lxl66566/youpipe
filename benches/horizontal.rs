@@ -14,8 +14,9 @@
 //!   once, and odd rounds reverse the library order to cancel position bias. Verdicts use the
 //!   median across rounds.
 //! * **Per-iteration timing with setup excluded** — the closure times only the workload (`Instant`
-//!   around the run, input rebuild / warm-clone outside the timed region), same rationale as
-//!   `sync_vs_rayon`.
+//!   around the run), same rationale as `sync_vs_rayon`. CPU scenarios are borrowed-input on both
+//!   sides (`pipe_ref` vs `par_iter`): each library's idiomatic call over the same warm slice,
+//!   nothing cloned or freed inside the timed region.
 //! * **Shared runtimes** — one tokio runtime + `TokioPool` handle for the whole process;
 //!   per-iteration runtime construction (~ms) would dominate small batches and is not what a real
 //!   application does.
@@ -25,7 +26,7 @@
 //!
 //! ```sh
 //! cargo bench --bench horizontal -- --rounds 5 --out target/horizontal/results.json
-//! python3 perf/plot-horizontal.py target/horizontal/results.json
+//! uv run perf/plot-horizontal.py target/horizontal/results.json
 //! ```
 
 // Bench statistics accumulate counters into f64; the casts below lose at most
@@ -47,7 +48,7 @@ use std::{
 
 use futures::{future::join_all, prelude::*};
 use rayon::prelude::*;
-use youpipe::{ComputePool, PipelineConfig, TokioPool, Workload, pipe, pipe_ref, stream};
+use youpipe::{ComputePool, PipelineConfig, TokioPool, Workload, pipe_ref, stream};
 
 // ── CLI / harness knobs ──
 
@@ -166,23 +167,6 @@ fn blocking_io(x: u64, dur: Duration) -> u64 {
 async fn async_io(x: u64, dur: Duration) -> u64 {
     tokio::time::sleep(dur).await;
     x.wrapping_add(1)
-}
-
-/// Rebuild + cache-warm the input outside the timed region. youpipe's fused
-/// `pipe()` takes ownership while rayon/std borrow a warm `&[T]`; without
-/// warming, the fresh clone arrives cold-from-RAM and measures memcpy latency
-/// instead of the framework (see docs/benchmarks.md).
-fn warm_clone<T: Copy>(src: &[T]) -> Vec<T> {
-    let v = src.to_vec();
-    // Read the rebuilt buffer once to pull it into cache: the clone itself
-    // reads `src` but writes a fresh allocation, which arrives cold.
-    let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), size_of_val(&v[..])) };
-    let mut acc = 0u64;
-    for chunk in bytes.chunks_exact(8) {
-        acc = acc.wrapping_add(u64::from_le_bytes(chunk.try_into().unwrap()));
-    }
-    bb(acc);
-    v
 }
 
 /// ~90 % cheap items (5 iters), ~10 % heavy (5000 iters) — a 1000× spread.
@@ -578,7 +562,9 @@ fn build_scenarios() -> Vec<Scenario> {
 
 /// S1: balanced CPU-heavy map (100 iters/item ≈ 100 ns). The canonical
 /// parallel-map workload; the batch sweep shows how fixed scheduling overhead
-/// amortizes with data volume.
+/// amortizes with data volume. Borrowed input on every side (`pipe_ref` /
+/// `par_iter` / chunked borrows): each library's idiomatic call over the same
+/// warm slice.
 fn cpu_balanced() -> Scenario {
     let batches = [1_000usize, 10_000, 100_000, 1_000_000]
         .into_iter()
@@ -592,22 +578,6 @@ fn cpu_balanced() -> Scenario {
                         Box::new({
                             let data = data.clone();
                             move || {
-                                let v = warm_clone(&data);
-                                let t = Instant::now();
-                                let r: Vec<u64> = pipe(v).map(|x| bb(cpu_work(x, 100))).collect();
-                                finish(r, t)
-                            }
-                        }) as Job,
-                    ),
-                    (
-                        "youpipe (borrowed)",
-                        Box::new({
-                            let data = data.clone();
-                            move || {
-                                // youpipe's natural borrowed call — the
-                                // counterpart of the `rayon (borrowed)` row:
-                                // the warm input is read in place, nothing is
-                                // cloned or freed inside the timed region.
                                 let t = Instant::now();
                                 let r: Vec<u64> =
                                     pipe_ref(&data).map(|&x| bb(cpu_work(x, 100))).collect();
@@ -620,33 +590,6 @@ fn cpu_balanced() -> Scenario {
                         Box::new({
                             let data = data.clone();
                             move || {
-                                // Same input lifecycle as the youpipe job:
-                                // fresh warm clone (untimed) whose buffer is
-                                // consumed — and freed — inside the timed
-                                // region. `par_iter` borrows the same `data`
-                                // every iteration, so its timed region frees
-                                // nothing and its cache state never sees the
-                                // 8 MB clone thrash; `into_par_iter` matches
-                                // ownership costs like for like.
-                                let v = warm_clone(&data);
-                                let t = Instant::now();
-                                let r: Vec<u64> =
-                                    v.into_par_iter().map(|x| bb(cpu_work(x, 100))).collect();
-                                finish(r, t)
-                            }
-                        }) as Job,
-                    ),
-                    (
-                        "rayon (borrowed)",
-                        Box::new({
-                            let data = data.clone();
-                            move || {
-                                // rayon's natural API: borrow the warm input,
-                                // nothing freed inside the timed region. Kept
-                                // as a separate row so the chart shows both
-                                // readings: like-for-like memory lifecycle
-                                // (the `rayon` row) vs each library's most
-                                // idiomatic call (this row).
                                 let t = Instant::now();
                                 let r: Vec<u64> =
                                     data.par_iter().map(|&x| bb(cpu_work(x, 100))).collect();
@@ -674,6 +617,7 @@ fn cpu_balanced() -> Scenario {
 
 /// S2: skewed CPU cost — ~10 % of items are 1000× heavier. Equal-sized static
 /// chunks strand slow items in a few threads; work stealing rebalances.
+/// Borrowed input on every side, same caliber as `cpu_balanced`.
 fn cpu_unbalanced() -> Scenario {
     let batches = [10_000usize, 100_000]
         .into_iter()
@@ -687,37 +631,6 @@ fn cpu_unbalanced() -> Scenario {
                         Box::new({
                             let data = data.clone();
                             move || {
-                                let v = warm_clone(&data);
-                                let t = Instant::now();
-                                let r: Vec<u64> = pipe(v)
-                                    .with_workload(Workload::Unbalanced)
-                                    .map(|(x, iters)| bb(cpu_work(x, iters)))
-                                    .collect();
-                                finish(r, t)
-                            }
-                        }) as Job,
-                    ),
-                    (
-                        "youpipe (default)",
-                        Box::new({
-                            let data = data.clone();
-                            move || {
-                                let v = warm_clone(&data);
-                                let t = Instant::now();
-                                let r: Vec<u64> =
-                                    pipe(v).map(|(x, iters)| bb(cpu_work(x, iters))).collect();
-                                finish(r, t)
-                            }
-                        }) as Job,
-                    ),
-                    (
-                        "youpipe (borrowed)",
-                        Box::new({
-                            let data = data.clone();
-                            move || {
-                                // Borrowed + Unbalanced: same stealing-slack
-                                // config as the owned row, input read in place
-                                // — counterpart of the `rayon (borrowed)` row.
                                 let t = Instant::now();
                                 let r: Vec<u64> = pipe_ref(&data)
                                     .with_workload(Workload::Unbalanced)
@@ -728,25 +641,19 @@ fn cpu_unbalanced() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "rayon",
+                        "youpipe (default)",
                         Box::new({
                             let data = data.clone();
                             move || {
-                                // Same input lifecycle as the youpipe jobs
-                                // (fresh warm clone, freed inside the timed
-                                // region) — see cpu_balanced's rayon job.
-                                let v = warm_clone(&data);
                                 let t = Instant::now();
-                                let r: Vec<u64> = v
-                                    .into_par_iter()
-                                    .map(|(x, iters)| bb(cpu_work(x, iters)))
-                                    .collect();
+                                let r: Vec<u64> =
+                                    pipe_ref(&data).map(|&(x, iters)| bb(cpu_work(x, iters))).collect();
                                 finish(r, t)
                             }
                         }) as Job,
                     ),
                     (
-                        "rayon (borrowed)",
+                        "rayon",
                         Box::new({
                             let data = data.clone();
                             move || {
