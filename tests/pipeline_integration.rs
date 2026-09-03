@@ -78,6 +78,52 @@ fn test_pipeline_filter_map() {
     assert_eq!(r, expected);
 }
 
+/// A panicking owned filter chain must drop every input item exactly once:
+/// the leaf's `FilterGuard` drops the unread tail on unwind, items already
+/// moved through the chain drop with their (discarded) output `Vec`s, and the
+/// panicking item is gone with the panic. The output is unordered, so the
+/// range tree's per-chunk/leaf boundaries do not matter — only the accounting.
+#[test]
+fn test_owned_filter_panic_drop_accounting() {
+    struct DropCounter {
+        counter: Arc<AtomicUsize>,
+        val: u64,
+    }
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let n: u64 = if cfg!(miri) { 500 } else { 20_000 };
+    let counter = Arc::new(AtomicUsize::new(0));
+    let c = counter.clone();
+    let items: Vec<DropCounter> = (0..n)
+        .map(|i| DropCounter {
+            counter: c.clone(),
+            val: i,
+        })
+        .collect();
+    let panic_at = n / 3;
+
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let out: Vec<u64> = pipe(items)
+            .filter(|d: &DropCounter| d.val % 2 == 0)
+            .map(move |d: DropCounter| {
+                assert!(d.val != panic_at, "boom");
+                d.val
+            })
+            .collect();
+        let _ = out;
+    }));
+    assert!(r.is_err(), "panic must propagate through the filter tree");
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        n as usize,
+        "every input item must be dropped exactly once"
+    );
+}
+
 #[test]
 fn test_try_map_ok() {
     let result = pipe(0..100)

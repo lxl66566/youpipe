@@ -1558,36 +1558,149 @@ fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize
     }
 }
 
-/// Recursive merge-based collect for fused stages that may filter. Used only as
-/// the `MAY_FILTER == true` fallback; output cardinality is unknown up front so
-/// each leaf produces its own `Vec` and results are concatenated.
+// ── Filter-chain parallel collect ──
+//
+// Chains containing `Filter` cannot use the index-based core (output
+// cardinality is unknown up front), so each leaf produces its own `Vec` and
+// the tree concatenates. The ranges are disjoint indices into a shared
+// `Slots` input — the replacement for the old `Vec::split_off` merge, which
+// paid one allocation + memcpy per internal node.
+//
+// Filter chains deliberately stay on the single tree even for off-pool
+// callers (unlike the no-filter terminals' hybrid dispatch). A/B (2026-09,
+// 3 interleaved rounds, 32-core, the `sync_filter` bench): the hybrid
+// variant — `num_threads` chunks injected flat, each publishing its `Vec`
+// into a shared mutex slot, the driver sorting + concatenating after the
+// latch wait — measured a stable +6.5 % at 10 k and +3.3 % at 1 k (100 k:
+// noise). The tree concatenates level by level *in parallel* as workers
+// finish, while the hybrid funnels every chunk `Vec` through one mutex and
+// merges them all on the single driver thread; that structural merge cost
+// outweighs the ramp-up win for every batch size measured.
+
+/// Consume `input` sequentially, applying `stages` and collecting surviving
+/// outputs into a fresh `Vec`.
+///
+/// Panic safety: a `FilterGuard` drops the unread input tail on unwind — the
+/// input-half mirror of `LeafGuard` (there is no shared output buffer; the
+/// leaf's `Vec` drops naturally).
+fn filter_leaf<T, S>(input: &[T], stages: &S) -> Vec<S::Output>
+where
+    T: Send,
+    S: FusedStage<T>,
+{
+    /// RAII guard that drops the unread input tail on unwind — identical to
+    /// `ForEachGuard` (see `par_for_each_leaf`); the output half is elided
+    /// because the leaf's `Vec` drops itself.
+    struct FilterGuard<'a, T> {
+        input: &'a [T],
+        pos: usize,
+    }
+
+    impl<T> Drop for FilterGuard<'_, T> {
+        fn drop(&mut self) {
+            // SAFETY: `pos` reflects the consumed-iteration count at the
+            // unwind point. Items `..pos` were moved out (uninit); item `pos`
+            // was moved into `stages` and is gone; `input[pos+1..]` is still
+            // init and must be dropped.
+            unsafe {
+                let in_live = self.input.as_ptr();
+                for j in (self.pos + 1)..self.input.len() {
+                    ptr::drop_in_place(in_live.add(j).cast_mut());
+                }
+            }
+        }
+    }
+
+    let in_ptr = input.as_ptr();
+    let n = input.len();
+
+    let mut out = Vec::new();
+    let mut g = FilterGuard { input, pos: 0 };
+
+    while g.pos < n {
+        let i = g.pos;
+        // SAFETY: disjoint index; slot i is init. The read moves the item out
+        // of the slot, leaving it uninit — never re-read.
+        let item = unsafe { ptr::read(in_ptr.add(i)) };
+        if let Some(o) = stages.apply(item) {
+            out.push(o);
+        }
+        g.pos = i + 1;
+    }
+
+    // Success: disarm the cleanup Drop.
+    std::mem::forget(g);
+    out
+}
+
+/// Recursive range-based filter collect. Each leaf claims the disjoint range
+/// `[start, end)` and produces its own `Vec`; internal nodes concatenate.
+///
+/// On panic the unwinding side's guard drops its unread input tail and every
+/// partial `Vec` drops naturally, so internal nodes need no cleanup match
+/// (unlike the index-based core's shared output buffer).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn join_fused_collect<S, T>(
+fn par_filter_rec<T, S>(
     pool: &ComputePool,
-    mut items: Vec<T>,
+    input: &Slots<T>,
+    start: usize,
+    end: usize,
     stages: &S,
     splits_left: usize,
 ) -> Vec<S::Output>
 where
-    S: FusedStage<T> + Sync,
     T: Send,
+    S: FusedStage<T> + Sync,
     S::Output: Send,
 {
-    if splits_left == 0 || items.len() <= 1 {
-        return items
-            .into_iter()
-            .filter_map(|item| stages.apply(item))
-            .collect();
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: this leaf owns the disjoint range `[start, end)`
+        // exclusively; the slots are init.
+        let in_slice = unsafe { input.as_slice(start, end) };
+        return filter_leaf(in_slice, stages);
     }
-    let mid = items.len() / 2;
-    let right = items.split_off(mid);
-    let (left_r, right_r) = pool.join(
-        || join_fused_collect(pool, items, stages, splits_left - 1),
-        || join_fused_collect(pool, right, stages, splits_left - 1),
+    let mid = start + (end - start) / 2;
+    let (mut l, r) = pool.join(
+        || par_filter_rec(pool, input, start, mid, stages, splits_left - 1),
+        || par_filter_rec(pool, input, mid, end, stages, splits_left - 1),
     );
-    let mut result = left_r;
-    result.extend(right_r);
-    result
+    l.extend(r);
+    l
+}
+
+/// Drive the filter-chain collect over an owned batch with the single
+/// range-based tree. Off-pool callers enter the pool through the first
+/// `join`'s injection — the same entry the old `Vec::split_off` tree used
+/// (see the section comment for why filter chains do not take the hybrid
+/// dispatcher).
+///
+/// A/B vs the old `Vec::split_off` tree (5 interleaved rounds, 32-core,
+/// `sync_filter/youpipe_filter_map_owned`): 100 k −6…−9 % (stable — every
+/// round of the range tree beat every round of the split_off tree), 1 k/10 k
+/// within round spread (+1…+2 %, rounds interleave). The split_off merge paid
+/// one allocation + memcpy per internal node (~n·levels/2 item moves across
+/// the tree); the range tree moves each surviving item exactly once, into its
+/// leaf's `Vec`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn fused_filter_collect<T, S>(
+    items: Vec<T>,
+    stages: &S,
+    splits: usize,
+    pool: &ComputePool,
+) -> Vec<S::Output>
+where
+    T: Send,
+    S: FusedStage<T> + Sync,
+    S::Output: Send,
+{
+    let n = items.len();
+    debug_assert!(n > 0);
+    let input = Slots::from_vec(items);
+    let out = par_filter_rec(pool, &input, 0, n, stages, splits);
+    // Input fully consumed (every slot read → uninit): freeing just drops
+    // the buffer.
+    drop(input);
+    out
 }
 
 /// Recursive merge-based collect for fallible fused stages. Short-circuits on
@@ -1978,7 +2091,7 @@ where
         let splits = split_depth(n, num_threads, oversplit);
 
         if S::MAY_FILTER {
-            join_fused_collect(pool, items, &stages, splits)
+            fused_filter_collect(items, &stages, splits, pool)
         } else {
             let op = FusedOp(stages);
             par_index_collect(items, &op, splits, pool)
@@ -2963,7 +3076,7 @@ where
     let oversplit = workload_oversplit(n, num_threads, workload);
     let splits = split_depth(n, num_threads, oversplit);
     if S::MAY_FILTER {
-        join_fused_collect(pool, items, &stages, splits)
+        fused_filter_collect(items, &stages, splits, pool)
     } else {
         let op = FusedOp(stages);
         par_index_collect(items, &op, splits, pool)
