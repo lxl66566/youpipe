@@ -1491,7 +1491,7 @@ where
 /// honesty; the right long-term fix is to lower the cold-inject cost itself
 /// (hybrid dispatch + spin-then-park — see the flat-dispatch comment above),
 /// not to silently downgrade to serial.
-fn prefers_serial(n: usize, num_threads: usize, _workload: Workload) -> bool {
+fn prefers_serial(n: usize, num_threads: usize) -> bool {
     n <= 1 || num_threads <= 1
 }
 
@@ -1947,7 +1947,7 @@ where
         let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
         let pool = exec.as_pool();
         let num_threads = pool.num_workers();
-        if prefers_serial(n, num_threads, self.config.workload) {
+        if prefers_serial(n, num_threads) {
             // Trivial case (n == 1 or single-threaded pool): skip the pool
             // entirely. Dispatch on `MAY_FILTER` so the pure path matches a
             // hand-written `iter().map().collect()` — no `Option` wrapper.
@@ -2009,7 +2009,7 @@ where
         let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
         let pool = exec.as_pool();
         let num_threads = pool.num_workers();
-        if prefers_serial(n, num_threads, self.config.workload) {
+        if prefers_serial(n, num_threads) {
             // Trivial case (n == 1 or single-threaded pool): run inline, no
             // output buffer. Dispatch on `MAY_FILTER` to keep the pure path
             // branch-free.
@@ -2207,7 +2207,7 @@ where
         let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
         let pool = exec.as_pool();
         let num_threads = pool.num_workers();
-        if prefers_serial(n, num_threads, self.config.workload) {
+        if prefers_serial(n, num_threads) {
             let mut out = Vec::with_capacity(n);
             for item in items {
                 if let Some(o) = stages.try_apply(item)? {
@@ -2941,7 +2941,7 @@ where
         return Vec::new();
     }
     let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads, workload) {
+    if prefers_serial(n, num_threads) {
         if S::MAY_FILTER {
             return items
                 .into_iter()
@@ -2989,7 +2989,7 @@ pub(crate) fn fused_for_each_scoped<S, T, F>(
         return;
     }
     let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads, workload) {
+    if prefers_serial(n, num_threads) {
         if S::MAY_FILTER {
             for item in items {
                 if let Some(o) = stages.apply(item) {
@@ -3039,7 +3039,7 @@ where
         return Ok(Vec::new());
     }
     let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads, workload) {
+    if prefers_serial(n, num_threads) {
         let mut out = Vec::with_capacity(n);
         for item in items {
             if let Some(o) = stages.try_apply(item)? {
@@ -3083,7 +3083,7 @@ where
         return Vec::new();
     }
     let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads, workload) {
+    if prefers_serial(n, num_threads) {
         if S::MAY_FILTER {
             return input.iter().filter_map(|item| stages.apply(item)).collect();
         }
@@ -3118,7 +3118,7 @@ pub(super) fn fused_for_each_by_ref<'i, S, E, F>(
         return;
     }
     let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads, workload) {
+    if prefers_serial(n, num_threads) {
         if S::MAY_FILTER {
             for item in input {
                 if let Some(o) = stages.apply(item) {
@@ -3161,7 +3161,7 @@ where
         return Ok(Vec::new());
     }
     let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads, workload) {
+    if prefers_serial(n, num_threads) {
         let mut out = Vec::with_capacity(n);
         for item in input {
             if let Some(o) = stages.try_apply(item)? {
