@@ -11,8 +11,8 @@ use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
     handoff::{
-        MpscReceiver, Receiver, RecvItem, SendItem, SharedWaitGroup, SyncSender, TryRecvError,
-        channel::channel, mpsc_channel,
+        MpscReceiver, Receiver, RecvItem, SendItem, SyncSender, TryRecvError, channel::channel,
+        mpsc_channel,
     },
     runtime::{AsyncRuntime, DefaultRuntime},
     state::{FenceBarrier, FenceMode, ReorderBuffer, run_ordered_collect},
@@ -189,6 +189,13 @@ fn feed_items<I: Send + 'static>(
 /// unordered mode) because the cost is one `u64` per item — far below the
 /// channel handoff itself — and unifying the channels avoids separate
 /// ordered/unordered implementations per stage.
+///
+/// Termination is carried entirely by channel disconnect: the function drops
+/// its own endpoint clones, and each worker drops its clones when its recv
+/// loop ends — the downstream stage observes "no more items" when the last
+/// upstream sender goes away. No join handle is needed (workers are pool
+/// jobs); a former WaitGroup here was never awaited and only added per-stage
+/// atomics.
 #[allow(clippy::needless_pass_by_value)] // ownership transfer is intentional:
 // taking the endpoints by value ensures the caller cannot retain a clone that
 // would keep the channel open after the workers have finished.
@@ -199,15 +206,12 @@ fn spawn_stage<I, O, Tx>(
     parallelism: usize,
     cancel: Option<CancellationToken>,
     stage: impl Fn(I) -> O + Send + Sync + 'static,
-) -> SharedWaitGroup
-where
+) where
     I: Send + Unpin + 'static,
     O: Send + Unpin + 'static,
     Tx: SendItem<(u64, O)>,
 {
     let stage = Arc::new(stage);
-    let wg = SharedWaitGroup::new();
-    wg.add(parallelism);
     // Collect all worker closures and submit as a single batch. This reduces
     // injector-queue notification overhead from N SeqCst fences + N JEC
     // increments (one per `submit`) down to 1 (one `submit_batch`), which
@@ -218,7 +222,6 @@ where
             let stage = stage.clone();
             let rx = rx.clone();
             let tx = tx.clone();
-            let wg = wg.clone();
             let worker_cancel = cancel.clone();
             move || {
                 while let Ok((seq, item)) = rx.recv() {
@@ -230,14 +233,12 @@ where
                         break;
                     }
                 }
-                wg.done();
             }
         })
         .collect();
     pool.submit_batch(jobs);
     drop(rx);
     drop(tx);
-    wg
 }
 
 /// Like [`spawn_stage`] but expands each input into 1..N outputs via `expand`.
@@ -251,21 +252,17 @@ fn spawn_expand_stage<I, N, Tx>(
     parallelism: usize,
     cancel: Option<CancellationToken>,
     expand: impl Fn(I) -> Vec<N> + Send + Sync + 'static,
-) -> SharedWaitGroup
-where
+) where
     I: Send + Unpin + 'static,
     N: Send + Unpin + 'static,
     Tx: SendItem<(u64, N)>,
 {
     let expand = Arc::new(expand);
-    let wg = SharedWaitGroup::new();
-    wg.add(parallelism);
     let jobs: Vec<_> = (0..parallelism)
         .map(|_| {
             let expand = expand.clone();
             let rx = rx.clone();
             let tx = tx.clone();
-            let wg = wg.clone();
             let worker_cancel = cancel.clone();
             move || {
                 while let Ok((seq, item)) = rx.recv() {
@@ -278,14 +275,12 @@ where
                         }
                     }
                 }
-                wg.done();
             }
         })
         .collect();
     pool.submit_batch(jobs);
     drop(rx);
     drop(tx);
-    wg
 }
 
 /// Fence forwarder: drains `mid_rx` into a [`FenceBarrier`] and releases
@@ -956,7 +951,7 @@ where
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = channel::<(u64, M)>(buffer);
-        let _wg = spawn_stage(
+        spawn_stage(
             ctx.compute_pool(),
             mid_rx,
             out_tx,
@@ -983,7 +978,7 @@ where
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = mpsc_channel::<(u64, M)>(buffer);
-        let _wg = spawn_stage(
+        spawn_stage(
             ctx.compute_pool(),
             mid_rx,
             out_tx,
@@ -1010,7 +1005,7 @@ where
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = sync_async_channel::<(u64, M)>(buffer);
-        let _wg = spawn_stage(
+        spawn_stage(
             ctx.compute_pool(),
             mid_rx,
             out_tx,
@@ -1061,7 +1056,7 @@ where
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = channel::<(u64, N)>(buffer);
-        let _wg = spawn_expand_stage(
+        spawn_expand_stage(
             ctx.compute_pool(),
             mid_rx,
             out_tx,
@@ -1084,7 +1079,7 @@ where
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = mpsc_channel::<(u64, N)>(buffer);
-        let _wg = spawn_expand_stage(
+        spawn_expand_stage(
             ctx.compute_pool(),
             mid_rx,
             out_tx,
@@ -1107,7 +1102,7 @@ where
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = sync_async_channel::<(u64, N)>(buffer);
-        let _wg = spawn_expand_stage(
+        spawn_expand_stage(
             ctx.compute_pool(),
             mid_rx,
             out_tx,
