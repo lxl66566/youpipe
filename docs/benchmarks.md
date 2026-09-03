@@ -18,7 +18,7 @@
 ## Suite budget (quick config)
 
 A full-suite pass with criterion's defaults costs >1 h. All bench targets
-now share `benches/common/mod.rs`, which defaults to the verdict-proven
+now share `crates/youpipe/benches/common/mod.rs`, which defaults to the verdict-proven
 interleaved-A/B regime — **20 samples, 1 s warm-up, 2 s measurement**
 (~3.5 s per bench id, full suite ≈ 10 min including compile) — and shrinks
 each group's size axis to its two anchors (the dropped midpoints
@@ -142,13 +142,13 @@ block):
    before its resident stage-worker jobs); a feeder pushed behind them
    starves while every worker parks on an empty channel recv → whole-pool
    deadlock, reproduced under the parallel test suite and by
-   `tests/hybrid_assist.rs`.
+   `crates/youpipe/tests/hybrid_assist.rs`.
 
 An earlier version silently routed small batches to a serial loop to win this
 benchmark, but that was deceptive (the API promises parallelism) and
 catastrophic for expensive per-item work (file IO, crypto) whose small batches
 would be wrongly serialized. The heuristic was removed — see `prefers_serial`
-in `src/builder/typed/fused.rs`.
+in `crates/youpipe/src/builder/typed/fused.rs`.
 
 ### Pipeline Fusion (3 stages) vs rayon chain (`pipeline_fusion`, borrowed input)
 
@@ -361,7 +361,7 @@ CI setting `LOOM_MAX_PREEMPTIONS=2`, the `spsc`/`spsc_force` models run for
 an hour+ without completing; with it the whole suite finishes in seconds.
 ## Horizontal cross-library comparison (2026-09)
 
-`benches/horizontal.rs` answers the "what should I pick for my workload?"
+`crates/youpipe/benches/horizontal.rs` answers the "what should I pick for my workload?"
 question across the ecosystem — youpipe, rayon, tokio, `futures::stream`,
 and hand-written `std::thread` baselines — over seven representative
 scenarios, and exports JSON that `perf/plot-horizontal.py` renders into the

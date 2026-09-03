@@ -83,7 +83,7 @@ RAII guard would not have been representable alongside it. The channel layer
 ---
 
 ```
-src/
+crates/youpipe/src/
 ├── builder/          # Strongly-typed data-first API + compile-time fusion + StreamPipe
 │   ├── mod.rs        # Public re-exports
 │   ├── config.rs     # PipelineConfig, Workload enum

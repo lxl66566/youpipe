@@ -6,7 +6,7 @@ self-contained and cross-linked.
 
 | Document | Contents |
 | -------- | -------- |
-| [design.md](design.md) | Design philosophy (data-first API, compile-time fusion, streaming engine split, async-runtime abstraction, `scope` lifetimes), the `src/` module map, and the recipe for extending the system with new fused stages. |
+| [design.md](design.md) | Design philosophy (data-first API, compile-time fusion, streaming engine split, async-runtime abstraction, `scope` lifetimes), the `crates/youpipe/src/` module map, and the recipe for extending the system with new fused stages. |
 | [core-types.md](core-types.md) | The core types and execution paths: `Workload`, `Slots` zero-copy buffers, `Pipe` / `TryPipe` / `ScopedPipe` builders, `FusedStage` fusion traits, `collect` / `try_collect` / `for_each` dispatch (hybrid flat/tree), `StreamPipe` stage typestate, async-IO stages, and the feeder. |
 | [scheduler.md](scheduler.md) | The `ComputePool` work-stealing thread pool: injector + local deques + stealers architecture, sleep/wake governance, task submission flow, graceful shutdown, and the vendored `youpipe-st3` / `youpipe-concurrent-queue` forks (provenance, optimization lines, rejected alternatives). |
 | [streaming.md](streaming.md) | The streaming data plane: MPMC/MPSC channel selection (`crossfire` wrappers), `WaitGroup`, `ReorderBuffer` ordered-output restoration (lazy slot array, scalar fast path), and the `FenceBarrier` chunked/barrier isolation with batch-allocation recycling. |

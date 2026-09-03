@@ -261,5 +261,5 @@ see [`docs/README.md`](docs/README.md).
 
 ## Attribution
 
-The work-stealing scheduler in `src/pool/` is adapted from
+The work-stealing scheduler in `crates/youpipe/src/pool/` is adapted from
 [rayon-core](https://github.com/rayon-rs/rayon).

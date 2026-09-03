@@ -9,7 +9,7 @@ on relative paths while published builds resolve registry versions.
 
 | Crate | Directory | Published |
 | ----- | --------- | --------- |
-| `youpipe` | `/` (workspace root) | yes |
+| `youpipe` | `crates/youpipe` | yes |
 | `youpipe-sys` | `crates/youpipe-sys` | yes |
 | `youpipe-st3` | `crates/youpipe-st3` | yes (fork of upstream st3) |
 | `youpipe-concurrent-queue` | `crates/youpipe-concurrent-queue` | yes (fork of upstream concurrent-queue) |
@@ -25,8 +25,8 @@ Workspace-internal dependencies are declared with **both** a `path` and a
 `version`:
 
 ```toml
-youpipe-sys = { path = "crates/youpipe-sys", version = "0.5" }
-st3         = { package = "youpipe-st3", path = "crates/youpipe-st3", version = "0.5" }
+youpipe-sys = { path = "../youpipe-sys", version = "0.5" }
+st3         = { package = "youpipe-st3", path = "../youpipe-st3", version = "0.5" }
 ```
 
 * **In this repo** cargo always builds against the `path` — no registry
@@ -75,7 +75,8 @@ Checklist per release:
    together). The vendored forks pin their versions in their own manifests —
    bump those in the same commit.
 2. `cargo test --workspace && cargo clippy --workspace --all-targets`.
-3. `cargo package -p <crate> --list` for each crate: no stray files, the
-   root package's `exclude` keeps `crates/`, `perf/`, docs and tooling
-   out of the `youpipe` tarball.
+3. `cargo package -p <crate> --list` for each crate: no stray files. The
+   `youpipe` package directory is self-contained (`src/`, `benches/`,
+   `tests/`, `examples/`, README symlink), so docs/tooling can't leak into
+   the tarball; cargo dereferences the README symlink to a regular file.
 4. Publish in the order above.

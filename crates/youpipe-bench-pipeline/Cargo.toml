@@ -9,4 +9,4 @@ publish      = false
 [dependencies]
 rayon   = "1"
 tokio   = { version = "1", features = ["rt-multi-thread", "time"] }
-youpipe = { path = "../..", default-features = true }
+youpipe = { path = "../youpipe", default-features = true }

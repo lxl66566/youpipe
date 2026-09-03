@@ -12,4 +12,4 @@ publish      = false
 # `hotpath` must match youpipe's pinned version so the probes and the
 # `HotpathGuard` below share the same global state.
 hotpath = "0.24"
-youpipe = { path = "../..", features = ["hotpath"] }
+youpipe = { path = "../youpipe", features = ["hotpath"] }

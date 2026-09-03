@@ -32,7 +32,7 @@ name    = "perf_events"
 [dependencies]
 # Sync-only bench: no tokio-runtime needed (verified: builds and benches fine
 # without it now that the no-default-features build is fixed).
-youpipe = { path = "../..", default-features = false }
+youpipe = { path = "../youpipe", default-features = false }
 
 [dev-dependencies]
 criterion               = "0.8"

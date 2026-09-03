@@ -32,15 +32,15 @@ temperature: 0
 
 详情请参考 docs/README.md 索引。
 
-- Workspace 布局：根目录是 `youpipe` 主 crate，所有子 crate 都在 `crates/` 下——`youpipe-sys`（miri/loom 透明原语层，util 的 sys shims + CachePadded）、两个 fork（`youpipe-st3`、`youpipe-concurrent-queue`，原 vendor 目录）、`youpipe-criterion-perf-counters` 和 4 个 bench crate（均 `youpipe-` 命名，bench 均 `publish = false`）。`perf/` 只放非 crate 的方法论文档与脚本。workspace 内部依赖用 path+version 双声明：本地走 path，发布后走 crates.io 版本（见 docs/publishing.md）。
-  - `cargo build/test/clippy` 默认只覆盖根 crate + youpipe-sys（default-members）；fork 与 bench 用 `-p`/`--workspace` 显式选择。
+- Workspace 布局：根目录是 virtual workspace（只有清单与共享配置），`youpipe` 主 crate 在 `crates/youpipe`（含 src/benches/tests/examples），其余子 crate 也都在 `crates/` 下——`youpipe-sys`（miri/loom 透明原语层，util 的 sys shims + CachePadded）、两个 fork（`youpipe-st3`、`youpipe-concurrent-queue`，原 vendor 目录）、`youpipe-criterion-perf-counters` 和 4 个 bench crate（均 `youpipe-` 命名，bench 均 `publish = false`）。`perf/` 只放非 crate 的方法论文档与脚本。workspace 内部依赖用 path+version 双声明：本地走 path，发布后走 crates.io 版本（见 docs/publishing.md）。主 crate 的 README 用 symlink 指向仓库根 README（cargo package 会解引用）。
+  - `cargo build/test/clippy` 默认只覆盖 youpipe + youpipe-sys（default-members）；fork 与 bench 用 `-p`/`--workspace` 显式选择。
   - fork crate 的源码必须与 fork 仓库保持可 diff：不要手改（各目录的 rustfmt.toml 已 ignore）；clippy 警告用其自身清单的 `[lints]` 压制。
-- CPU 负载任务：rayon 架构在各种 balanced/unbalanced 负载下的综合表现都很好，这里直接采用 rayon 的调度器核心，详见 `src/pool/`。
+- CPU 负载任务：rayon 架构在各种 balanced/unbalanced 负载下的综合表现都很好，这里直接采用 rayon 的调度器核心，详见 `crates/youpipe/src/pool/`。
 - st3：每个池 worker 持有一个 `st3::lifo::Worker<JobRef>`，自己从 LIFO 端 push/pop，其他 worker 空闲时通过 Stealer::steal_and_pop 从 FIFO 端偷。（registry.rs）
 - concurrent-queue：全局 injector 队列（调度面），无界 MPMC FIFO（`SegQueue`），接收两类任务——池外 pool.submit 的注入、worker 本地 deque 满后的溢出。worker 找活的顺序是 本地 deque → injector → 偷同伴。（registry.rs）
   - 不希望引入 crossbeam_deque 库，因为 crossbeam-epoch 不兼容 miri。
   - crossbeam-queue 在当前项目架构下性能略差于 vendor 调优后的 concurrent-queue（经过实测）。
-- crossfire：stage 之间的数据通道（数据面），整个 src/handoff/channel.rs（约 400 行包装层）都建立在它上面。这是 pipeline 里 item 实际流动的 channel，和前两者的“任务调度”完全正交。
+- crossfire：stage 之间的数据通道（数据面），整个 crates/youpipe/src/handoff/channel.rs（约 400 行包装层）都建立在它上面。这是 pipeline 里 item 实际流动的 channel，和前两者的“任务调度”完全正交。
 
 ### 开发提示
 

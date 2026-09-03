@@ -12,7 +12,7 @@ cargo run --release --example <name>
 > against production-grade baselines (rayon, tokio).
 
 > Heavier standalone benchmarks (multi-strategy comparisons, real-disk IO) and
-> the `hotpath` profiling driver live under `../perf/`, separate from these
+> the `hotpath` profiling driver live under `../../perf/`, separate from these
 > didactic examples.
 
 ## Two equivalent API styles
@@ -165,7 +165,7 @@ and run once. For rigorous, repeatable measurements see:
 
   Run any of them with `cargo bench --bench <name>`.
 
-- `../perf/` — standalone application-level benchmark packages and the
+- `../../perf/` — standalone application-level benchmark packages and the
   `hotpath` profiling driver (not didactic; for maintainer/perf work).
 
   | Package | What it does |

@@ -224,5 +224,5 @@ let r = (0..1000).stream()
 
 ## 第三方声明
 
-`src/pool/` 中的工作窃取调度器改编自
+`crates/youpipe/src/pool/` 中的工作窃取调度器改编自
 [rayon-core](https://github.com/rayon-rs/rayon)。

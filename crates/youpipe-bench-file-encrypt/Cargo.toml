@@ -11,7 +11,7 @@ aes-gcm   = "0.10"
 getrandom = "0.2"
 rayon     = "1"
 tokio     = { version = "1", features = ["fs", "rt-multi-thread"] }
-youpipe   = { path = "../..", default-features = true }
+youpipe   = { path = "../youpipe", default-features = true }
 zstd      = "0.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]

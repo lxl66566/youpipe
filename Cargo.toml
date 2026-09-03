@@ -1,5 +1,7 @@
 [workspace]
+resolver = "2"
 members = [
+    "crates/youpipe",
     "crates/youpipe-sys",
     "crates/youpipe-st3",
     "crates/youpipe-concurrent-queue",
@@ -12,7 +14,7 @@ members = [
 # Plain `cargo build/test/clippy` at the root covers only the library crates;
 # the vendored forks and the perf benches are opt-in via `-p` / `--workspace`
 # (the perf benches pull heavyweight deps: aes-gcm, zstd, perfcnt, ...).
-default-members = [".", "crates/youpipe-sys"]
+default-members = ["crates/youpipe", "crates/youpipe-sys"]
 
 # Shared metadata for the youpipe-* crates developed in-tree (everything
 # lives under crates/). The vendored forks keep fully self-contained
@@ -41,149 +43,6 @@ unexpected_cfgs       = { level = "warn", check-cfg = ["cfg(loom)"] }
 unsafe_code           = "allow"
 unused_qualifications = "warn"
 
-[package]
-name         = "youpipe"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-description  = "High-performance data-first pipelines with fused CPU stages and streaming async IO"
-readme       = "README.md"
-repository.workspace = true
-license.workspace = true
-keywords     = ["concurrency", "map-reduce", "parallel", "pipeline", "work-stealing"]
-categories   = ["concurrency"]
-exclude      = [
-    "/.github",
-    "/.opencode",
-    "/.tombi.toml",
-    "/.vscode",
-    "/AGENTS.md",
-    "/crates",
-    "/docs",
-    "/perf",
-]
-
-# Examples that exercise `.stage_async` / `.with_async_pool` — only buildable
-# when the tokio runtime is enabled.
-[[example]]
-name              = "async_io"
-required-features = ["tokio-runtime"]
-
-[[example]]
-name              = "mixed_cpu_io"
-required-features = ["tokio-runtime"]
-
-[[bench]]
-harness = false
-name    = "sync_vs_rayon"
-
-[[bench]]
-harness           = false
-name              = "async_vs_tokio"
-required-features = ["tokio-runtime"]
-
-[[bench]]
-harness           = false
-name              = "mixed_load"
-required-features = ["tokio-runtime"]
-
-[[bench]]
-harness           = false
-name              = "unbalanced"
-required-features = ["tokio-runtime"]
-
-[[bench]]
-harness = false
-name    = "channel_bench"
-
-[[bench]]
-harness           = false
-name              = "io_async"
-required-features = ["tokio-runtime"]
-
-# Horizontal cross-library comparison (youpipe vs rayon vs tokio vs futures vs
-# std threads), JSON-exporting, self-interleaved. See perf/plot-horizontal.py.
-[[bench]]
-harness           = false
-name              = "horizontal"
-required-features = ["tokio-runtime"]
-
-[dependencies]
-# Workspace-internal path deps carry a `version` too: cargo builds against the
-# path in this repo, while the manifest published to crates.io drops the path
-# and resolves the registry crate at that requirement instead (must be
-# published first; `cargo publish` refuses to ship a mismatched pair).
-concurrent-queue = { package = "youpipe-concurrent-queue", path = "crates/youpipe-concurrent-queue", version = "0.5" }
-crossfire        = "3.1"
-hotpath          = { version = "0.24", optional = true }
-st3              = { package = "youpipe-st3", path = "crates/youpipe-st3", version = "0.5" }
-youpipe-sys      = { path = "crates/youpipe-sys", version = "0.5" }
-tokio            = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"], optional = true }
-
-[dev-dependencies]
-criterion         = "0.8"
-crossbeam-channel = "0.5"
-futures           = "0.3"
-rayon             = "1"
-tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time", "net", "io-util"] }
-
-# ── Concurrency-model testing of the pool's synchronization cores ──
-# Loom is activated by the `--cfg loom` rustflag (the ecosystem-standard
-# approach, same as crossbeam / tokio / the vendored `youpipe-st3`), NOT by a
-# cargo feature:
-#
-#   RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
-#
-# Why a rustflag rather than a feature: a feature is part of the public
-# semver surface and gets unified across the dependency graph, so an
-# unrelated downstream `--features loom` (or a future optional dep named
-# `loom`) would silently rebuild youpipe's sync primitives on loom's
-# simulated atomics in production. A `--cfg` only exists for the explicit
-# command line that sets it. The flag also applies uniformly to youpipe and
-# any dependency that follows the same convention (the vendored
-# youpipe-concurrent-queue tests already use `cfg(loom)`).
-#
-# NOTE: setting RUSTFLAGS replaces the `[build] rustflags` from
-# `.cargo/config.toml` (`-C opt-level=3 -C panic=unwind`), which only matter
-# for release/bench builds — test builds are unaffected.
-#
-# Only the synchronization cores are modeled — the Registry spawns real OS
-# threads, which loom cannot simulate, so tests drive the primitives
-# directly with `loom::thread`. Regular (real-thread) unit tests cannot run
-# on simulated primitives, hence the `-- loom_tests` filter.
-[target."cfg(loom)".dependencies]
-loom = "0.7"
-
-[features]
-default       = ["tokio-runtime"]
-# (No `loom` feature: loom model-checking is driven by the `--cfg loom`
-# rustflag instead — see `[target.'cfg(loom)'.dependencies]` below.)
-# ── Optional permanent instrumentation (zero-cost when off) ──
-# `hotpath` is an optional dependency; when none of these features are enabled
-# the `#[cfg_attr(feature = "hotpath", hotpath::measure)]` probes are stripped at
-# parse time and the crate is not compiled into the build at all — production
-# builds pay nothing. Flip the feature on to turn the probes into real
-# per-function timing/alloc/CPU profiling without re-running `perf`.
-#
-# NOTE: youpipe's `hotpath` feature must forward to `hotpath/hotpath`, otherwise
-# the hotpath crate stays in its `lib_off` mode where every macro is a no-op.
-hotpath       = ["dep:hotpath", "hotpath/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
-# ── Async runtime backend for streaming `.stage_async(..)` stages ──
-# The fused CPU path (`pipe` / `scope`) is fully sync and needs no backend.
-#
-# The runtime is abstracted behind `AsyncRuntime` (see `src/runtime/`): tokio
-# is the only concrete backend today, but the trait + `StreamPipe<.., R:
-# AsyncRuntime>` plumbing is kept generic so a future backend (a thread-per-core
-# runtime, monoio, …) slots in without touching the streaming code.
-tokio-runtime = ["dep:tokio"]
-
-[lints]
-workspace = true
-
-# Same rationale as `[profile.release]`, applied to the criterion bench
-# profile so A/B runs can't be distorted by the code-layout lottery either.
 [profile.bench]
 codegen-units = 1
 
