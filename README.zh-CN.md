@@ -36,8 +36,9 @@ let r: Vec<i32> = (0..1000).pipe().map(|x| x + 1).collect();
 | 非均衡的 CPU 负载         | `pipe(items).with_workload(Unbalanced)`              |
 | 自定义拆分粒度            | `pipe(items).with_workload(Workload::Custom(n))`     |
 | Cancellation、fence、展开 | `stream(items).with_cancel(..).fence(..).expand(..)` |
-| 借用栈上局部数据          | `scope(\|s\| s.pipe(..)....)`                        |
-| fallible + 借用           | `scope(\|s\| s.pipe(..).try_map(..).try_collect())`  |
+| 借用 slice、零拷贝        | `pipe_ref(&slice).map(\|&x\| ..)` —— 对应 rayon `par_iter` |
+| 借用栈上局部数据          | `pipe_ref(&data).map(\|x\| ..&local..)`（无需 scope）；非 slice 输入用 `scope(\|s\| s.pipe(items)..)` |
+| fallible + 借用           | `pipe_ref(&data).try_map(..).try_collect()`          |
 
 总工作量低于 ~10 µs 或单操作低于 ~100 ns 时，不建议使用 youpipe，并行设置开销无法收回成本。此时使用顺序 `iter().map().collect()` 更快。
 

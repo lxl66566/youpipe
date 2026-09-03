@@ -5,10 +5,22 @@
 ### Data-First
 
 youpipe's public API is **data-first**: items enter the pipeline at the front
-(`pipe(items)` / `stream(items)` / `scope(|s| s.pipe(items))`), stages chain via
-builder methods, and a single terminal call (`.collect()` / `.run()`) executes
-the whole chain — mirroring `iter().map().collect()`, not "define the pipeline,
-then feed data at the end".
+(`pipe(items)` / `pipe_ref(&items)` / `stream(items)` / `scope(|s| s.pipe(items))`),
+stages chain via builder methods, and a single terminal call (`.collect()` /
+`.run()`) executes the whole chain — mirroring `iter().map().collect()`, not
+"define the pipeline, then feed data at the end".
+
+**Two fused entry points, split by input shape** (mirroring rayon's
+`into_par_iter` vs `par_iter`):
+
+- `pipe(items)` — the *general* entry: any `IntoIterator` (ranges, generators,
+  owned `Vec`s). Takes ownership; closures receive `T`; element bound
+  `T: Send`.
+- `pipe_ref(&items)` — the *borrowed* entry: `&[T]` only. Reads in place;
+  closures receive `&T`; nothing is consumed, materialized, or freed; element
+  bound `T: Sync`. The natural shape for read-only transforms over existing
+  data (the dominant rayon `par_iter` use case) and the basis of the
+  like-for-like "idiomatic vs idiomatic" bench rows.
 
 ### Compile-Time Pipeline Fusion
 
@@ -36,6 +48,10 @@ section of [core-types.md](core-types.md#streampipe--streaming-multi-stage-pipel
 ### Non-`'static` Lifetime Support
 
 The `scope()` API allows closures to borrow stack-local variables without `'static` bounds. The `'env` lifetime is threaded through `ScopedPipe` and the underlying `fused_collect_scoped` drives the same `ComputePool::join` work-stealing core — whose `Registry::in_worker_cold` blocks the calling thread until every spawned sub-task finishes — guaranteeing borrowed references outlive the pool's access to them.
+
+`pipe_ref` gets the same property without `scope`: the `'a` input borrow brands
+every `PipeRef` closure, and the terminal blocks until every worker finishes —
+borrowed inputs and captured stack locals are both covered.
 
 ### Async runtime
 

@@ -407,12 +407,15 @@ python3 perf/plot-horizontal.py                   # perf/horizontal/results.json
   `data.par_iter()` borrows the same warm buffer every iteration — nothing
   freed in-region, no clone thrash — an asymmetric advantage that grew with
   batch size (at 1 M, the 8 MB clone+free cycle is worth ~35 % of the
-  batch). The primary `rayon` row now consumes a fresh `warm_clone` via
-  `into_par_iter()` (like-for-like memory behavior); a `rayon (borrowed)`
-  row keeps the idiomatic call so the chart shows both readings. The
-  distinction matters: under the aligned lifecycle rayon's 100 K–1 M
-  numbers rise 50–60 % (it, too, pays the fresh-input costs), while
-  youpipe's stay put — those costs were always in its baseline.
+  batch). The chart therefore shows **four readings**: the primary `rayon`
+  row consumes a fresh `warm_clone` via `into_par_iter()` (like-for-like
+  memory behavior vs the owned `pipe(v)`); `rayon (borrowed)` keeps the
+  idiomatic call; `youpipe` pays the owned lifecycle; `youpipe (borrowed)`
+  (`pipe_ref(&data)`, added 2026-09) is youpipe's idiomatic borrow — the
+  natural like-for-like pair of `rayon (borrowed)`. The distinction matters:
+  under the aligned lifecycle rayon's 100 K–1 M numbers rise 50–60 % (it,
+  too, pays the fresh-input costs), while youpipe's stay put — those costs
+  were always in its baseline.
 - Machine: 32-core AMD (Zen) Linux, bench pinned to cores 1–31
   (`taskset -c 1-31`, core 0 left to OS/IRQ housekeeping), 5 rounds ×
   700 ms measurement, ~2-8 % cross-round spread on most cells.
@@ -421,10 +424,10 @@ python3 perf/plot-horizontal.py                   # perf/horizontal/results.json
 
 | Scenario | n | Best | Runner-up | Rest |
 | --- | --- | --- | --- | --- |
-| cpu_balanced | 1K | rayon (borrowed) 0.038 | rayon 0.040 | youpipe 0.057, std threads 0.545 |
-| cpu_balanced | 10K | youpipe 0.060 | rayon (borrowed) 0.062 | rayon 0.063, std threads 0.562 |
-| cpu_balanced | 100K | youpipe 0.114 | rayon (borrowed) 0.122 | rayon 0.187, std threads 0.736 |
-| cpu_balanced | 1M | rayon (borrowed) 0.473 | rayon 0.557 | youpipe 0.672, std threads 2.80 |
+| cpu_balanced | 1K | rayon (borrowed) 0.038 | rayon 0.040 | youpipe 0.057 = youpipe (borrowed) 0.056*, std threads 0.545 |
+| cpu_balanced | 10K | youpipe 0.060 | youpipe (borrowed) 0.059* | rayon (borrowed) 0.062, rayon 0.063, std threads 0.562 |
+| cpu_balanced | 100K | youpipe (borrowed) 0.097* | youpipe 0.114 | rayon (borrowed) 0.122, rayon 0.187, std threads 0.736 |
+| cpu_balanced | 1M | rayon (borrowed) 0.473 | rayon 0.557 | youpipe (borrowed) 0.532*, youpipe 0.672, std threads 2.80 |
 | cpu_unbalanced | 10K | youpipe (Unbalanced) 0.073 | youpipe (default) 0.079 | rayon (borrowed) 0.079, rayon 0.081, std 0.568 |
 | cpu_unbalanced | 100K | youpipe (Unbalanced) 0.254 | rayon (borrowed) 0.272 | youpipe (default) 0.258, rayon 0.315, std 0.781 |
 | io_async | 500 | futures 9.12 | tokio 9.45 | youpipe 9.57 |
@@ -441,16 +444,24 @@ python3 perf/plot-horizontal.py                   # perf/horizontal/results.json
 
 ### Reading the results
 
-- **Balanced CPU, two rayon readings** (`rayon` = fresh-input lifecycle
-  aligned with youpipe's ownership API; `rayon (borrowed)` = idiomatic
-  borrow): rayon wins 1K on both (fixed setup, its caller-inline fork-join);
-  youpipe wins the 10K–100K middle on both, widest at 100K (−39 % vs
-  aligned rayon, −7 % vs borrowed). At 1M rayon wins both readings — the
-  fused leaf is so cheap the batch is bandwidth-bound and youpipe's 1 M rows
-  show ±25 % round-to-round drift (9-round median; the documented
-  large-batch measurement trap), while rayon's borrowed baseline sits at
-  ~470 µs with ±3 %. Equal-chunk hand-threading is 5–10× behind everywhere:
-  32 spawns per call, and no stealing.
+- **Balanced CPU, four readings** (`rayon` = fresh-input lifecycle aligned
+  with youpipe's ownership API; `rayon (borrowed)` = idiomatic borrow;
+  `youpipe` = owned; `youpipe (borrowed)` = `pipe_ref`, idiomatic borrow):
+  rayon wins 1K on both (fixed setup, its caller-inline fork-join); youpipe
+  wins the 10K–100K middle on every pairing, widest at 100K (−21 % for
+  borrowed-vs-borrowed, −39 % vs aligned rayon). At 1M rayon's borrowed row
+  wins (bandwidth-bound; ~470 µs, ±3 %), but `pipe_ref` closes most of the
+  owned row's gap (0.532 vs 0.672 ms) **and collapses the variance**: the
+  owned 1 M rows drift ±25 % round-to-round (fresh 8 MB clone + in-region
+  free; the documented large-batch measurement trap), while `pipe_ref`'s
+  spread is ±2.5 % ([518–543] µs over 5 rounds) — with nothing cloned or
+  freed in-region there is no allocator/system state to drift on. The
+  borrowed and owned youpipe rows otherwise sit on the same execution core
+  (all four 2026-09 re-run medians within noise), so the lifecycle caliber,
+  not the engine, is what separates them. Equal-chunk hand-threading is
+  5–10× behind everywhere: 32 spawns per call, and no stealing.
+  (* `youpipe (borrowed)` cells: separate 5-round run, 2026-09 `pipe_ref`
+  verification; other cells from the 9-round dataset.)
 - **Skewed CPU**: with `Workload::Unbalanced` youpipe beats both rayon
   readings at 100K (0.254 vs 0.272/0.315 ms) and both are ~3× ahead of
   static chunking, which strands the 10 % heavy items in whichever chunks

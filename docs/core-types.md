@@ -113,6 +113,39 @@ Type transition chain (`I₀` = initial input):
 closure bounds; `TryPipe<S, I, O, E>` adds the fixed error type `E` and exposes
 `.try_map()` / `.map_err()` for further fallible chaining.
 
+### `PipeRef<'a, S, T, O>` — Borrowed-Input Fused Pipeline
+
+`pipe_ref(&data)` builds the borrowed counterpart of rayon's
+`slice::par_iter()`: the input `&'a [T]` is read in place — never consumed,
+materialized into a `Vec<&T>`, or freed inside the terminal — and items flow
+through the chain as `&'a T` (closures destruct with `|&x|`).
+
+```rust
+pub fn pipe_ref<T: Sync>(items: &[T]) -> PipeRef<'_, Identity, T, &T>
+//                                              element type   ^ current output = item type
+```
+
+| vs `pipe(items)`          | `pipe(items)`                | `pipe_ref(&items)` |
+| ------------------------- | ---------------------------- | ------------------ |
+| input                     | any `IntoIterator`           | `&[T]`             |
+| item type in closures     | `T` (owned)                  | `&T` (borrowed)    |
+| freed inside terminal     | input buffer (consumed)      | nothing            |
+| element bound             | `T: Send` (items move)       | `T: Sync` (shared) |
+
+Dispatch is shared with the owned core: `hybrid_dispatch` is generic over an
+input handle (`IN = Slots<T>` owned, `IN = &'i [E]` borrowed — a reference *to*
+the slice, so `'i` rides through `HybridStrategy`/`ChunkJob` and satisfies the
+invariant `RangeOp<&'i E>` bound without transmutes). The borrowed leaves are
+`par_index_*_leaf_by_ref`; panic cleanup is structurally halved — a borrowed
+input is always init and never ours to drop, so only output-side guards remain
+(`RefLeafGuard` / `TryRefLeafGuard`; `for_each` has no guard at all).
+
+The `'a` borrow brands every closure, so closures may borrow additional
+stack-local data without `scope` — the terminal blocks until every worker is
+done (same soundness invariant as `ScopedPipe`). `TryPipeRef` is the fallible
+counterpart (`E: 'static`, same erased-failure-slot caveat as
+`ScopedTryPipe`).
+
 ### `FusedStage` / `FusedTryStage` Traits — Zero-Dispatch Execution
 
 ```rust

@@ -40,9 +40,9 @@ Pick the entry point by workload:
 | Unbalanced CPU workloads     | `pipe(items).with_workload(Unbalanced)`              |
 | Custom split granularity     | `pipe(items).with_workload(Workload::Custom(n))`     |
 | Cancellation, fences, expand | `stream(items).with_cancel(..).fence(..).expand(..)` |
-| Borrow stack-local data      | `scope(\|s\| s.pipe(..)....)`                        |
-| Fallible + borrow            | `scope(\|s\| s.pipe(..).try_map(..).try_collect())`  |
-| Borrow a slice, no clone     | `scope(\|s\| s.pipe(&slice).for_each(\|x\| ..))`     |
+| Borrow a slice, no clone     | `pipe_ref(&slice).map(\|&x\| ..)` — rayon `par_iter` counterpart, zero-copy |
+| Borrow stack-local data      | `pipe_ref(&data).map(\|x\| ..&local..)` (no scope needed), or `scope(\|s\| s.pipe(items)..)` for non-slice inputs |
+| Fallible + borrow            | `pipe_ref(&data).try_map(..).try_collect()`          |
 
 Below ~10 µs of total work or ~100 ns per item, youpipe is not recommended —
 the parallel setup overhead won't pay off. Sequential `iter().map().collect()`

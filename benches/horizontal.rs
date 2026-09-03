@@ -47,7 +47,7 @@ use std::{
 
 use futures::{future::join_all, prelude::*};
 use rayon::prelude::*;
-use youpipe::{ComputePool, PipelineConfig, TokioPool, Workload, pipe, stream};
+use youpipe::{ComputePool, PipelineConfig, TokioPool, Workload, pipe, pipe_ref, stream};
 
 // ── CLI / harness knobs ──
 
@@ -600,6 +600,22 @@ fn cpu_balanced() -> Scenario {
                         }) as Job,
                     ),
                     (
+                        "youpipe (borrowed)",
+                        Box::new({
+                            let data = data.clone();
+                            move || {
+                                // youpipe's natural borrowed call — the
+                                // counterpart of the `rayon (borrowed)` row:
+                                // the warm input is read in place, nothing is
+                                // cloned or freed inside the timed region.
+                                let t = Instant::now();
+                                let r: Vec<u64> =
+                                    pipe_ref(&data).map(|&x| bb(cpu_work(x, 100))).collect();
+                                finish(r, t)
+                            }
+                        }) as Job,
+                    ),
+                    (
                         "rayon",
                         Box::new({
                             let data = data.clone();
@@ -690,6 +706,23 @@ fn cpu_unbalanced() -> Scenario {
                                 let t = Instant::now();
                                 let r: Vec<u64> =
                                     pipe(v).map(|(x, iters)| bb(cpu_work(x, iters))).collect();
+                                finish(r, t)
+                            }
+                        }) as Job,
+                    ),
+                    (
+                        "youpipe (borrowed)",
+                        Box::new({
+                            let data = data.clone();
+                            move || {
+                                // Borrowed + Unbalanced: same stealing-slack
+                                // config as the owned row, input read in place
+                                // — counterpart of the `rayon (borrowed)` row.
+                                let t = Instant::now();
+                                let r: Vec<u64> = pipe_ref(&data)
+                                    .with_workload(Workload::Unbalanced)
+                                    .map(|&(x, iters)| bb(cpu_work(x, iters)))
+                                    .collect();
                                 finish(r, t)
                             }
                         }) as Job,
