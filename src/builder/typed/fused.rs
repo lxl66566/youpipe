@@ -399,7 +399,13 @@ enum TryFailure<E> {
 /// Handed to [`hybrid_dispatch`] behind the type-erased [`ErasedStrategy`]
 /// boundary — see [`ErasedStrategy`] for why the dispatcher must stay
 /// non-generic.
-trait HybridStrategy<T>: Sync {
+///
+/// Generic over the **input handle** `IN` (not the item type): the dispatcher
+/// only needs to hand chunks a shared view of the input buffer — owned runs
+/// use `IN = Slots<T>` (move-out semantics), borrowed runs use `IN = [E]`
+/// (shared-read semantics, `pipe_ref`). Item-type concerns live inside each
+/// strategy's `run_chunk`/`run_sequential`.
+trait HybridStrategy<IN: ?Sized>: Sync {
     /// What a failed chunk produces. Must be `Any + Send` so the erased
     /// boundary can box it into [`ErasedFailure::Op`] and the caller can
     /// downcast it back.
@@ -412,7 +418,7 @@ trait HybridStrategy<T>: Sync {
     fn run_chunk(
         &self,
         pool: &ComputePool,
-        input: &Slots<T>,
+        input: &IN,
         start: usize,
         end: usize,
         splits: usize,
@@ -421,14 +427,9 @@ trait HybridStrategy<T>: Sync {
     /// Run `[start, end)` sequentially on the current thread — no `pool.join`,
     /// no scheduling. Used by the off-pool driver to participate in the work:
     /// it processes one chunk inline while the pool handles the rest (mirrors
-    /// rayon's calling-thread participation). Panics propagate naturally to
-    /// the caller's `halt_unwinding`; op failures come back as `Err`.
-    fn run_sequential(
-        &self,
-        input: &Slots<T>,
-        start: usize,
-        end: usize,
-    ) -> Result<(), Self::Failure>;
+    /// rayon's calling-thread participation). Panics propagate naturally to the
+    /// caller's `halt_unwinding`; op failures come back as `Err`.
+    fn run_sequential(&self, input: &IN, start: usize, end: usize) -> Result<(), Self::Failure>;
 
     /// Drop resources held by a *successful* chunk when some other chunk
     /// failed, so the caller can free the shared buffers without leak or
@@ -442,8 +443,8 @@ trait HybridStrategy<T>: Sync {
 }
 
 /// Signature of [`HybridStrategy::run_chunk`] behind the erased boundary.
-type ErasedRunChunk<T> =
-    unsafe fn(*const (), &ComputePool, &Slots<T>, usize, usize, usize) -> Result<(), ErasedFailure>;
+type ErasedRunChunk<IN> =
+    unsafe fn(*const (), &ComputePool, &IN, usize, usize, usize) -> Result<(), ErasedFailure>;
 
 /// Type-erased [`HybridStrategy`] handle passed to [`hybrid_dispatch`].
 ///
@@ -458,30 +459,30 @@ type ErasedRunChunk<T> =
 /// path +16…30 % at 10k–100k via codegen layout shifts (measured; this
 /// project is acutely layout-sensitive — see the `codegen-units = 1` note in
 /// `Cargo.toml`).
-// Manual impls: derived ones would add undesired `T: Copy` bounds — the
-// phantom `T` only appears in fn-pointer signatures.
-impl<T> Clone for ErasedStrategy<T> {
+// Manual impls: derived ones would add undesired `IN: Copy` bounds — the
+// parameter only appears in fn-pointer signatures.
+impl<IN: ?Sized> Clone for ErasedStrategy<IN> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<T> Copy for ErasedStrategy<T> {}
+impl<IN: ?Sized> Copy for ErasedStrategy<IN> {}
 
-struct ErasedStrategy<T> {
+struct ErasedStrategy<IN: ?Sized> {
     ctx: *const (),
     /// SAFETY contracts mirror the `HybridStrategy` methods.
-    run_chunk: ErasedRunChunk<T>,
-    run_sequential: unsafe fn(*const (), &Slots<T>, usize, usize) -> Result<(), ErasedFailure>,
+    run_chunk: ErasedRunChunk<IN>,
+    run_sequential: unsafe fn(*const (), &IN, usize, usize) -> Result<(), ErasedFailure>,
     cleanup_success: unsafe fn(*const (), usize, usize),
 }
 
 // SAFETY: the fn pointers only ever dereference `ctx`, which points at a
 // `HybridStrategy` (whose impl requires `Sync`) that outlives the dispatch.
-unsafe impl<T> Sync for ErasedStrategy<T> {}
+unsafe impl<IN: ?Sized> Sync for ErasedStrategy<IN> {}
 
-impl<T, S> From<&S> for ErasedStrategy<T>
+impl<IN: ?Sized, S> From<&S> for ErasedStrategy<IN>
 where
-    S: HybridStrategy<T>,
+    S: HybridStrategy<IN>,
 {
     fn from(strategy: &S) -> Self {
         let ctx = ptr::from_ref(strategy).cast::<()>();
@@ -518,7 +519,7 @@ struct CollectStrategy<'a, R, OP> {
     op: &'a OP,
 }
 
-impl<T, R, OP> HybridStrategy<T> for CollectStrategy<'_, R, OP>
+impl<T, R, OP> HybridStrategy<Slots<T>> for CollectStrategy<'_, R, OP>
 where
     T: Send,
     R: Send,
@@ -572,7 +573,7 @@ struct SinkStrategy<'a, OP> {
     op: &'a OP,
 }
 
-impl<T, OP> HybridStrategy<T> for SinkStrategy<'_, OP>
+impl<T, OP> HybridStrategy<Slots<T>> for SinkStrategy<'_, OP>
 where
     T: Send,
     OP: SinkOp<T>,
@@ -631,7 +632,7 @@ struct TryStrategy<'a, R, E, OP> {
     _marker: PhantomData<fn(E)>,
 }
 
-impl<T, R, E, OP> HybridStrategy<T> for TryStrategy<'_, R, E, OP>
+impl<T, R, E, OP> HybridStrategy<Slots<T>> for TryStrategy<'_, R, E, OP>
 where
     T: Send,
     R: Send,
@@ -678,12 +679,13 @@ where
 /// One top-level chunk of a hybrid-dispatched parallel operation. Stored in a
 /// single contiguous `Box<[ChunkJob]>` shared by all chunks (not individually
 /// boxed); referenced by the injected `JobRef`. Carries raw pointers to the
-/// shared `Slots`/`ErasedStrategy`/`latch`/failure slot, which all live on the
-/// driver's stack frame — sound because the driver blocks on the `CountLatch`
+/// shared input view (`Slots` for owned runs, `[E]` for borrowed runs) /
+/// `ErasedStrategy` / `latch` / failure slot, which all live on the driver's
+/// stack frame — sound because the driver blocks on the `CountLatch`
 /// until every chunk has executed.
-struct ChunkJob<T> {
-    input: *const Slots<T>,
-    strategy: ErasedStrategy<T>,
+struct ChunkJob<IN: ?Sized> {
+    input: *const IN,
+    strategy: ErasedStrategy<IN>,
     start: usize,
     end: usize,
     splits: usize,
@@ -706,18 +708,15 @@ struct ChunkJob<T> {
 
 // SAFETY: the raw pointers reference data owned by the driver's stack frame;
 // the driver blocks on the CountLatch until every chunk finishes, so the
-// pointed-to data outlives every `execute` call. The shared `Slots`/`strategy`/
-// `pool`/`latch`/`fail_slot` are accessed from distinct workers but over
-// disjoint index ranges (`Slots`) or through `Sync` types (`ErasedStrategy:
-// Sync`, `ComputePool: Sync`, `CountLatch`, `Mutex`); each `ChunkJob` itself
-// is executed by exactly one thread (a pool worker or the off-pool driver —
-// whoever pops its `JobRef` from the injector).
-unsafe impl<T: Send> Send for ChunkJob<T> {}
+// pointed-to data outlives every `execute` call. The shared input view /
+// `strategy` / `pool` / `latch` / `fail_slot` are accessed from distinct
+// workers but over disjoint index ranges (`Slots` / `[E]`) or through `Sync`
+// types (`ErasedStrategy: Sync`, `ComputePool: Sync`, `CountLatch`, `Mutex`);
+// each `ChunkJob` itself is executed by exactly one thread (a pool worker or
+// the off-pool driver — whoever pops its `JobRef` from the injector).
+unsafe impl<IN: ?Sized + Sync> Send for ChunkJob<IN> {}
 
-impl<T> Job for ChunkJob<T>
-where
-    T: Send,
-{
+impl<IN: ?Sized + Sync> Job for ChunkJob<IN> {
     unsafe fn execute(this: *const ()) {
         unsafe {
             let this = &*this.cast::<Self>();
@@ -774,19 +773,20 @@ const ASSIST_RESERVE_CHUNKS: usize = 1;
 /// failure back to its concrete kind.
 ///
 /// Non-generic over the strategy (see [`ErasedStrategy`]) so this dispatcher
-/// and `ChunkJob` compile once per `T`, serving `.collect()`, `.for_each()`,
-/// and `.try_collect()` alike.
+/// and `ChunkJob` compile once per input handle `IN`, serving `.collect()`,
+/// `.for_each()`, and `.try_collect()` alike, for both owned (`Slots<T>`) and
+/// borrowed (`[E]`) input views.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn hybrid_dispatch<T>(
+fn hybrid_dispatch<IN>(
     pool: &ComputePool,
-    input: &Slots<T>,
-    strategy: &ErasedStrategy<T>,
+    input: &IN,
+    strategy: &ErasedStrategy<IN>,
     n: usize,
     splits: usize,
     num_threads: usize,
 ) -> Result<(), ErasedFailure>
 where
-    T: Send,
+    IN: ?Sized + Sync,
 {
     // One chunk per worker → instant parallel ramp-up. Round up the split
     // depth reduction so the per-chunk tree is shallower: total leaf count
@@ -855,7 +855,7 @@ where
     } else {
         (0, 0)
     };
-    let mut jobs_vec: Vec<ChunkJob<T>> = Vec::with_capacity(pool_chunks);
+    let mut jobs_vec: Vec<ChunkJob<IN>> = Vec::with_capacity(pool_chunks);
     let mut start = driver_end;
     for i in first_pool_chunk..num_chunks {
         let size = chunk + usize::from(i < rem);
@@ -874,7 +874,7 @@ where
         start = end;
     }
     debug_assert_eq!(start, n);
-    let jobs: Box<[ChunkJob<T>]> = jobs_vec.into_boxed_slice();
+    let jobs: Box<[ChunkJob<IN>]> = jobs_vec.into_boxed_slice();
     // The tail `reserve` jobs are driver-owned (never injected); only
     // `jobs[..injected_len]` get JobRefs.
     let injected_len = jobs.len() - reserve;
@@ -941,7 +941,7 @@ where
             // their sole executor, and its frame outlives the latch wait.
             // Runs the same `execute` a worker would (panic capture, failure
             // recording, latch decrement).
-            unsafe { <ChunkJob<T> as Job>::execute(ptr::from_ref(j).cast::<()>()) };
+            unsafe { <ChunkJob<IN> as Job>::execute(ptr::from_ref(j).cast::<()>()) };
             true
         };
         latch.wait_spin_assist(assist);
@@ -2232,6 +2232,686 @@ where
     }
 }
 
+// ── Borrowed-input parallel core (zero-materialization) ──
+//
+// `pipe_ref` drives the same hybrid flat/tree dispatch as the owned path, but
+// the input is a shared `&'i [E]` instead of an owned `Slots<E>`: items flow
+// through the stage chain as `&E`, the input buffer is never consumed, freed,
+// or materialized into a `Vec<&E>` — the borrowed counterpart of rayon's
+// `slice::par_iter()`.
+//
+// Lifetime plumbing: the dispatch input handle is `IN = &'i [E]` (a reference
+// TO the slice), so `'i` is carried in the type through `HybridStrategy` /
+// `ErasedStrategy` / `ChunkJob` — the trait methods' `&IN` parameter is
+// late-bound, and a bare `&[E]` would lose the association with the op's
+// `RangeOp<&'i E>` bound (trait parameters are invariant, so no lifetime
+// shortening would type-check).
+//
+// Bound shift vs the owned core: sharing `&[E]` across workers requires
+// `E: Sync` (owned moves items across threads, which requires `E: Send`).
+//
+// Panic-safety simplification is structural: a borrowed input is always init
+// and never ours to drop, so the input half of every cleanup guard
+// (`LeafGuard` / `TryLeafGuard`) and the whole `ForEachGuard` disappear —
+// only output slots need dropping on unwind.
+
+/// Borrowed-input leaf: process `input` sequentially, applying `op` to each
+/// `&E` and writing outputs by index. Counterpart of [`par_index_leaf`] with
+/// the `ptr::read` move-out replaced by a shared borrow — LLVM sees the same
+/// read-8B / compute / write-8B loop shape, so the vectorized code matches.
+///
+/// Panic safety: `RefLeafGuard` drops only the init `output[..written]` slots
+/// (a borrowed input is always init and never ours to drop).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_index_leaf_by_ref<'i, E, R, OP>(input: &'i [E], output: &mut [R], op: &OP)
+where
+    OP: RangeOp<&'i E, Out = R>,
+{
+    /// RAII guard that drops the partial **output** range on unwind; the
+    /// counterpart of `LeafGuard` with the input half elided. Raw pointers for
+    /// the same Tree Borrows reason as `LeafGuard` — see the comment there.
+    struct RefLeafGuard<R> {
+        out_ptr: *mut R,
+        written: usize,
+    }
+
+    impl<R> Drop for RefLeafGuard<R> {
+        fn drop(&mut self) {
+            // SAFETY: `written` reflects the completed-iteration count at the
+            // unwind point. `RangeOp` never filters, so `output[..written)` is
+            // fully init and must be dropped; the borrowed input needs
+            // nothing.
+            unsafe {
+                for j in 0..self.written {
+                    ptr::drop_in_place(self.out_ptr.add(j));
+                }
+            }
+        }
+    }
+
+    debug_assert_eq!(input.len(), output.len());
+
+    let in_ptr = input.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+    let n = input.len();
+
+    let mut g = RefLeafGuard {
+        out_ptr,
+        written: 0,
+    };
+
+    while g.written < n {
+        let i = g.written;
+        // SAFETY: disjoint index; the input slot is shared and read in place
+        // (no move-out, nothing becomes uninit).
+        let item = unsafe { &*in_ptr.add(i) };
+        let out = op.apply(item);
+        unsafe { ptr::write(out_ptr.add(i), out) };
+        g.written = i + 1;
+    }
+
+    // Success: disarm the cleanup Drop.
+    std::mem::forget(g);
+}
+
+/// Borrowed-input recursive index-based parallel fill — counterpart of
+/// [`par_index_rec`]. Each leaf claims a disjoint index range `[start, end)`;
+/// a panicking leaf's guard drops its own partial output range, internal
+/// nodes propagate the first `Err` and drop the completed sibling's output
+/// range. A borrowed input never needs cleanup.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_index_rec_by_ref<'i, E, R, OP>(
+    pool: &ComputePool,
+    input: &'i [E],
+    output: &Slots<R>,
+    start: usize,
+    end: usize,
+    op: &OP,
+    splits_left: usize,
+) -> Result<(), PanicPayload>
+where
+    E: Sync,
+    R: Send,
+    OP: RangeOp<&'i E, Out = R>,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: this leaf owns the disjoint range `[start, end)`
+        // exclusively. `input[start..end)` is shared and init;
+        // `output[start..end)` is uninit.
+        let in_slice = unsafe { input.get_unchecked(start..end) };
+        let out_slice = unsafe { output.as_mut_slice(start, end) };
+        par_index_leaf_by_ref(in_slice, out_slice, op);
+        return Ok(());
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = pool.join(
+        || par_index_rec_by_ref(pool, input, output, start, mid, op, splits_left - 1),
+        || par_index_rec_by_ref(pool, input, output, mid, end, op, splits_left - 1),
+    );
+    match (l, r) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(p), Ok(())) => {
+            // SAFETY: right sibling completed without filter (RangeOp never
+            // filters), so [mid, end) is fully init and safe to drop.
+            unsafe { output.drop_range(mid, end) };
+            Err(p)
+        },
+        (Ok(()), Err(p)) => {
+            unsafe { output.drop_range(start, mid) };
+            Err(p)
+        },
+        (Err(p), Err(_)) => {
+            unsafe {
+                output.drop_range(start, mid);
+                output.drop_range(mid, end);
+            }
+            Err(p)
+        },
+    }
+}
+
+/// Hybrid strategy for the borrowed-input `.collect()` — counterpart of
+/// [`CollectStrategy`] over the `&'i [E]` input handle.
+struct CollectByRefStrategy<'a, R, OP> {
+    output: &'a Slots<R>,
+    op: &'a OP,
+}
+
+impl<'i, E, R, OP> HybridStrategy<&'i [E]> for CollectByRefStrategy<'_, R, OP>
+where
+    E: Sync,
+    R: Send,
+    OP: RangeOp<&'i E, Out = R>,
+{
+    type Failure = PanicPayload;
+
+    #[inline]
+    fn run_chunk(
+        &self,
+        pool: &ComputePool,
+        input: &&'i [E],
+        start: usize,
+        end: usize,
+        splits: usize,
+    ) -> Result<(), PanicPayload> {
+        par_index_rec_by_ref(pool, input, self.output, start, end, self.op, splits)
+    }
+
+    #[inline]
+    fn run_sequential(
+        &self,
+        input: &&'i [E],
+        start: usize,
+        end: usize,
+    ) -> Result<(), PanicPayload> {
+        // SAFETY: disjoint range — the caller (driver or leaf) owns
+        // `[start, end)` exclusively. Input is shared + init; output uninit.
+        let in_slice = unsafe { input.get_unchecked(start..end) };
+        let out_slice = unsafe { self.output.as_mut_slice(start, end) };
+        par_index_leaf_by_ref(in_slice, out_slice, self.op);
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn cleanup_success_chunk(&self, start: usize, end: usize) {
+        // SAFETY: caller guarantees `run_chunk` returned `Ok(())` for
+        // `[start, end)`, so those output slots are fully init and safe to
+        // drop.
+        unsafe { self.output.drop_range(start, end) };
+    }
+}
+
+/// Drive `par_index_rec_by_ref` over a borrowed `&'i [E]` and convert the
+/// output buffer into a `Vec<R>`. Counterpart of [`par_index_collect`] — no
+/// input `Slots` is created (nothing to free on any path), the input is only
+/// read.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_index_collect_by_ref<'i, E, R, OP>(
+    input: &'i [E],
+    op: &OP,
+    splits: usize,
+    pool: &ComputePool,
+) -> Vec<R>
+where
+    E: Sync,
+    R: Send,
+    OP: RangeOp<&'i E, Out = R>,
+{
+    let n = input.len();
+    debug_assert!(n > 0);
+    let num_threads = pool.num_workers();
+    let output = Slots::<R>::uninit(n);
+
+    // Same hybrid dispatch as the owned path — see `par_index_collect`. A
+    // same-pool worker still falls back to the single tree (the hybrid
+    // `CountLatch` park would deadlock it).
+    let on_pool = pool.is_on_this_pool();
+    let result = if on_pool {
+        par_index_rec_by_ref(pool, input, &output, 0, n, op, splits)
+            .err()
+            .map(ErasedFailure::Panic)
+    } else {
+        let strategy = CollectByRefStrategy {
+            output: &output,
+            op,
+        };
+        // The dispatcher's input handle is the slice reference itself.
+        hybrid_dispatch(
+            pool,
+            &input,
+            &ErasedStrategy::from(&strategy),
+            n,
+            splits,
+            num_threads,
+        )
+        .err()
+    };
+    if let Some(f) = result {
+        // Recursion already dropped every live output slot; freeing the
+        // buffer is safe. The borrowed input needs nothing.
+        drop(output);
+        resume_panic(f);
+    }
+    output.into_vec()
+}
+
+/// Borrowed-input sink leaf — counterpart of [`par_for_each_leaf`] with **no
+/// cleanup guard at all**: the input is shared (never consumed) and no output
+/// exists, so a panic in `op` leaves nothing to clean in this leaf.
+fn par_for_each_leaf_by_ref<'i, E, OP>(input: &'i [E], op: &OP)
+where
+    OP: SinkOp<&'i E>,
+{
+    for item in input {
+        op.consume(item);
+    }
+}
+
+/// Borrowed-input recursive sink — counterpart of [`par_for_each_rec`]. A
+/// panicking leaf leaves no partial state, so siblings need no cleanup.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_for_each_rec_by_ref<'i, E, OP>(
+    pool: &ComputePool,
+    input: &'i [E],
+    start: usize,
+    end: usize,
+    op: &OP,
+    splits_left: usize,
+) -> Result<(), PanicPayload>
+where
+    E: Sync,
+    OP: SinkOp<&'i E>,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: this leaf owns the disjoint range `[start, end)`
+        // exclusively; the input slice is shared and init.
+        let in_slice = unsafe { input.get_unchecked(start..end) };
+        par_for_each_leaf_by_ref(in_slice, op);
+        return Ok(());
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = pool.join(
+        || par_for_each_rec_by_ref(pool, input, start, mid, op, splits_left - 1),
+        || par_for_each_rec_by_ref(pool, input, mid, end, op, splits_left - 1),
+    );
+    match (l, r) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(p), _) | (_, Err(p)) => Err(p),
+    }
+}
+
+/// Hybrid strategy for the borrowed-input `.for_each()` — counterpart of
+/// [`SinkStrategy`] over the `&'i [E]` input handle. Sink-only: no output
+/// buffer, nothing to clean on any path.
+struct SinkByRefStrategy<'a, OP> {
+    op: &'a OP,
+}
+
+impl<'i, E, OP> HybridStrategy<&'i [E]> for SinkByRefStrategy<'_, OP>
+where
+    E: Sync,
+    OP: SinkOp<&'i E>,
+{
+    type Failure = PanicPayload;
+
+    #[inline]
+    fn run_chunk(
+        &self,
+        pool: &ComputePool,
+        input: &&'i [E],
+        start: usize,
+        end: usize,
+        splits: usize,
+    ) -> Result<(), PanicPayload> {
+        par_for_each_rec_by_ref(pool, input, start, end, self.op, splits)
+    }
+
+    #[inline]
+    fn run_sequential(
+        &self,
+        input: &&'i [E],
+        start: usize,
+        end: usize,
+    ) -> Result<(), PanicPayload> {
+        // SAFETY: disjoint range — the caller (driver) owns `[start, end)`
+        // exclusively; the input slice is shared and init.
+        let in_slice = unsafe { input.get_unchecked(start..end) };
+        par_for_each_leaf_by_ref(in_slice, self.op);
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn cleanup_success_chunk(&self, _start: usize, _end: usize) {
+        // No-op: sink-only, nothing to clean (mirrors `SinkStrategy`).
+    }
+}
+
+/// Drive `par_for_each_rec_by_ref` over a borrowed `&'i [E]`. Counterpart of
+/// [`par_for_each`].
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_for_each_by_ref<'i, E, OP>(input: &'i [E], op: &OP, splits: usize, pool: &ComputePool)
+where
+    E: Sync,
+    OP: SinkOp<&'i E>,
+{
+    let n = input.len();
+    debug_assert!(n > 0);
+    let num_threads = pool.num_workers();
+
+    let on_pool = pool.is_on_this_pool();
+    let result = if on_pool {
+        par_for_each_rec_by_ref(pool, input, 0, n, op, splits)
+            .err()
+            .map(ErasedFailure::Panic)
+    } else {
+        let strategy = SinkByRefStrategy { op };
+        hybrid_dispatch(
+            pool,
+            &input,
+            &ErasedStrategy::from(&strategy),
+            n,
+            splits,
+            num_threads,
+        )
+        .err()
+    };
+    if let Some(f) = result {
+        resume_panic(f);
+    }
+}
+
+/// Borrowed-input fallible leaf — counterpart of [`par_index_try_leaf`] with
+/// the input half of every cleanup path elided (borrowed input is always
+/// init). On `Err`: drops `output[..written]`, disarms the guard, returns.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_index_try_leaf_by_ref<'i, E, R, F, OP>(
+    input: &'i [E],
+    output: &mut [R],
+    op: &OP,
+) -> Result<(), F>
+where
+    OP: RangeTryOp<&'i E, Out = R, Error = F>,
+{
+    /// RAII guard mirroring `RefLeafGuard` for the fallible leaf — drops the
+    /// init `output[..written]` slots on unwind only. Raw pointers for the
+    /// same Tree Borrows reason as `LeafGuard`.
+    struct TryRefLeafGuard<R> {
+        out_ptr: *mut R,
+        written: usize,
+    }
+
+    impl<R> Drop for TryRefLeafGuard<R> {
+        fn drop(&mut self) {
+            // SAFETY: `written` reflects completed iterations at the unwind
+            // point; the borrowed input needs nothing.
+            unsafe {
+                for j in 0..self.written {
+                    ptr::drop_in_place(self.out_ptr.add(j));
+                }
+            }
+        }
+    }
+
+    debug_assert_eq!(input.len(), output.len());
+
+    let in_ptr = input.as_ptr();
+    let out_ptr = output.as_mut_ptr();
+    let n = input.len();
+
+    let mut g = TryRefLeafGuard {
+        out_ptr,
+        written: 0,
+    };
+
+    while g.written < n {
+        let i = g.written;
+        // SAFETY: disjoint index; the input slot is shared and read in place.
+        let item = unsafe { &*in_ptr.add(i) };
+        match op.try_apply(item) {
+            Ok(out) => {
+                unsafe { ptr::write(out_ptr.add(i), out) };
+                g.written = i + 1;
+            },
+            Err(e) => {
+                // Error path: run the same output cleanup the guard would do
+                // on panic, then disarm (forget) so Drop doesn't double-clean.
+                unsafe {
+                    for j in 0..i {
+                        ptr::drop_in_place(out_ptr.add(j));
+                    }
+                }
+                std::mem::forget(g);
+                return Err(e);
+            },
+        }
+    }
+
+    // Success: disarm the cleanup Drop.
+    std::mem::forget(g);
+    Ok(())
+}
+
+/// Borrowed-input fallible recursion — counterpart of [`par_index_try_rec`].
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_index_try_rec_by_ref<'i, E, R, F, OP>(
+    pool: &ComputePool,
+    input: &'i [E],
+    output: &Slots<R>,
+    start: usize,
+    end: usize,
+    op: &OP,
+    splits_left: usize,
+) -> Result<(), F>
+where
+    E: Sync,
+    R: Send,
+    F: Send,
+    OP: RangeTryOp<&'i E, Out = R, Error = F>,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: this leaf owns the disjoint range `[start, end)`
+        // exclusively. Input shared + init; output uninit.
+        let in_slice = unsafe { input.get_unchecked(start..end) };
+        let out_slice = unsafe { output.as_mut_slice(start, end) };
+        par_index_try_leaf_by_ref(in_slice, out_slice, op)?;
+        return Ok(());
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = pool.join(
+        || par_index_try_rec_by_ref(pool, input, output, start, mid, op, splits_left - 1),
+        || par_index_try_rec_by_ref(pool, input, output, mid, end, op, splits_left - 1),
+    );
+    match (l, r) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) => {
+            // SAFETY: right sibling completed without filter, so [mid, end)
+            // is fully init and safe to drop.
+            unsafe { output.drop_range(mid, end) };
+            Err(e)
+        },
+        (Ok(()), Err(e)) => {
+            unsafe { output.drop_range(start, mid) };
+            Err(e)
+        },
+        (Err(e), Err(_)) => {
+            unsafe {
+                output.drop_range(start, mid);
+                output.drop_range(mid, end);
+            }
+            Err(e)
+        },
+    }
+}
+
+/// Hybrid strategy for the borrowed-input `.try_collect()` fast path —
+/// counterpart of [`TryStrategy`] over the `&'i [E]` input handle.
+struct TryByRefStrategy<'a, R, E, OP> {
+    output: &'a Slots<R>,
+    op: &'a OP,
+    _marker: PhantomData<fn(E)>,
+}
+
+impl<'i, E, R, F, OP> HybridStrategy<&'i [E]> for TryByRefStrategy<'_, R, F, OP>
+where
+    E: Sync,
+    R: Send,
+    F: Send + 'static,
+    OP: RangeTryOp<&'i E, Out = R, Error = F>,
+{
+    type Failure = TryFailure<F>;
+
+    #[inline]
+    fn run_chunk(
+        &self,
+        pool: &ComputePool,
+        input: &&'i [E],
+        start: usize,
+        end: usize,
+        splits: usize,
+    ) -> Result<(), TryFailure<F>> {
+        par_index_try_rec_by_ref(pool, input, self.output, start, end, self.op, splits)
+            .map_err(TryFailure::Error)
+    }
+
+    #[inline]
+    fn run_sequential(
+        &self,
+        input: &&'i [E],
+        start: usize,
+        end: usize,
+    ) -> Result<(), TryFailure<F>> {
+        // SAFETY: disjoint range — the caller (driver) owns `[start, end)`
+        // exclusively. Input shared + init; output uninit.
+        let in_slice = unsafe { input.get_unchecked(start..end) };
+        let out_slice = unsafe { self.output.as_mut_slice(start, end) };
+        par_index_try_leaf_by_ref(in_slice, out_slice, self.op).map_err(TryFailure::Error)
+    }
+
+    #[inline]
+    unsafe fn cleanup_success_chunk(&self, start: usize, end: usize) {
+        // SAFETY: caller guarantees the chunk returned `Ok(())`, so those
+        // output slots are fully init and safe to drop.
+        unsafe { self.output.drop_range(start, end) };
+    }
+}
+
+/// Drive `par_index_try_rec_by_ref` over a borrowed `&'i [E]`. Counterpart of
+/// [`par_index_try_collect`].
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_index_try_collect_by_ref<'i, E, R, F, OP>(
+    input: &'i [E],
+    op: &OP,
+    splits: usize,
+    pool: &ComputePool,
+) -> Result<Vec<R>, F>
+where
+    E: Sync,
+    R: Send,
+    F: Send + 'static,
+    OP: RangeTryOp<&'i E, Out = R, Error = F>,
+{
+    let n = input.len();
+    debug_assert!(n > 0);
+    let num_threads = pool.num_workers();
+    let output = Slots::<R>::uninit(n);
+
+    let on_pool = pool.is_on_this_pool();
+    let result = if on_pool {
+        par_index_try_rec_by_ref(pool, input, &output, 0, n, op, splits)
+            .map_err(TryFailure::Error)
+            .err()
+    } else {
+        let strategy = TryByRefStrategy {
+            output: &output,
+            op,
+            _marker: PhantomData,
+        };
+        hybrid_dispatch(
+            pool,
+            &input,
+            &ErasedStrategy::from(&strategy),
+            n,
+            splits,
+            num_threads,
+        )
+        .err()
+        .map(|f| match f {
+            ErasedFailure::Op(b) => match b.downcast::<TryFailure<F>>() {
+                Ok(tf) => *tf,
+                Err(_) => unreachable!("try strategy only records TryFailure<F>"),
+            },
+            ErasedFailure::Panic(p) => TryFailure::Panic(p),
+        })
+    };
+    match result {
+        None => Ok(output.into_vec()),
+        Some(TryFailure::Error(e)) => {
+            // Recursion already dropped every live output slot.
+            drop(output);
+            Err(e)
+        },
+        Some(TryFailure::Panic(p)) => {
+            // Mirrors the owned path: a panic unwinds past the buffer
+            // management (init slots may leak, documented there).
+            drop(output);
+            panic::resume_unwind(p);
+        },
+    }
+}
+
+/// Borrowed-input merge-based collect for fused stages that may filter —
+/// counterpart of [`join_fused_collect`] with `Vec::split_off` replaced by
+/// index ranges (no per-level reallocation; the input is shared).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn join_fused_collect_by_ref<'i, S, E>(
+    pool: &ComputePool,
+    input: &'i [E],
+    stages: &S,
+    start: usize,
+    end: usize,
+    splits_left: usize,
+) -> Vec<S::Output>
+where
+    S: FusedStage<&'i E> + Sync,
+    E: Sync,
+    S::Output: Send,
+{
+    if splits_left == 0 || end - start <= 1 {
+        return input[start..end]
+            .iter()
+            .filter_map(|item| stages.apply(item))
+            .collect();
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = pool.join(
+        || join_fused_collect_by_ref(pool, input, stages, start, mid, splits_left - 1),
+        || join_fused_collect_by_ref(pool, input, stages, mid, end, splits_left - 1),
+    );
+    let mut result = l;
+    result.extend(r);
+    result
+}
+
+/// Borrowed-input merge-based collect for fallible fused stages — counterpart
+/// of [`join_fused_try_collect`] over index ranges.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn join_fused_try_collect_by_ref<'i, S, E, F>(
+    pool: &ComputePool,
+    input: &'i [E],
+    stages: &S,
+    start: usize,
+    end: usize,
+    splits_left: usize,
+) -> Result<Vec<S::Output>, F>
+where
+    S: FusedTryStage<&'i E, Error = F> + Sync,
+    E: Sync,
+    S::Output: Send,
+    F: Send,
+{
+    if splits_left == 0 || end - start <= 1 {
+        let mut out = Vec::with_capacity(end - start);
+        for item in &input[start..end] {
+            if let Some(o) = stages.try_apply(item)? {
+                out.push(o);
+            }
+        }
+        return Ok(out);
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = pool.join(
+        || join_fused_try_collect_by_ref(pool, input, stages, start, mid, splits_left - 1),
+        || join_fused_try_collect_by_ref(pool, input, stages, mid, end, splits_left - 1),
+    );
+    match (l, r) {
+        (Ok(mut l), Ok(r)) => {
+            l.extend(r);
+            Ok(l)
+        },
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    }
+}
+
 // ── pub(crate) scoped entry point ──
 
 /// `pub(crate)` entry point for scoped pipelines. Identical dispatch logic to
@@ -2375,6 +3055,128 @@ where
     } else {
         let op = FusedTryOp(stages);
         par_index_try_collect(items, &op, splits, pool)
+    }
+}
+
+// ── pub(super) borrowed-input entry points ──
+//
+// Driven by `crate::builder::PipeRef` (`pipe_ref`). Identical dispatch logic
+// to `Pipe::collect` / `Pipe::for_each` / `TryPipe::try_collect`, but the
+// input is a shared `&'i [E]` — see the borrowed-core section comment above
+// for the lifetime plumbing and the `E: Sync` bound shift.
+
+/// Entry point for the borrowed-input `.collect()`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(super) fn fused_collect_by_ref<'i, S, E>(
+    input: &'i [E],
+    stages: S,
+    workload: Workload,
+    pool: &ComputePool,
+) -> Vec<S::Output>
+where
+    S: FusedStage<&'i E> + Sync,
+    E: Sync,
+    S::Output: Send,
+{
+    let n = input.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let num_threads = pool.num_workers();
+    if prefers_serial(n, num_threads, workload) {
+        if S::MAY_FILTER {
+            return input.iter().filter_map(|item| stages.apply(item)).collect();
+        }
+        return input.iter().map(|item| stages.apply_pure(item)).collect();
+    }
+    let oversplit = workload_oversplit(n, num_threads, workload);
+    let splits = split_depth(n, num_threads, oversplit);
+    if S::MAY_FILTER {
+        join_fused_collect_by_ref(pool, input, &stages, 0, n, splits)
+    } else {
+        let op = FusedOp(stages);
+        par_index_collect_by_ref(input, &op, splits, pool)
+    }
+}
+
+/// Entry point for the borrowed-input `.for_each()`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(super) fn fused_for_each_by_ref<'i, S, E, F>(
+    input: &'i [E],
+    stages: S,
+    f: F,
+    workload: Workload,
+    pool: &ComputePool,
+) where
+    S: FusedStage<&'i E> + Sync,
+    E: Sync,
+    S::Output: Send,
+    F: Fn(S::Output) + Sync,
+{
+    let n = input.len();
+    if n == 0 {
+        return;
+    }
+    let num_threads = pool.num_workers();
+    if prefers_serial(n, num_threads, workload) {
+        if S::MAY_FILTER {
+            for item in input {
+                if let Some(o) = stages.apply(item) {
+                    f(o);
+                }
+            }
+        } else {
+            for item in input {
+                let o = stages.apply_pure(item);
+                f(o);
+            }
+        }
+        return;
+    }
+    let oversplit = workload_oversplit(n, num_threads, workload);
+    let splits = split_depth(n, num_threads, oversplit);
+    let op = FusedSink(stages, f);
+    par_for_each_by_ref(input, &op, splits, pool);
+}
+
+/// Entry point for the borrowed-input `.try_collect()`. `E` (the error type)
+/// still requires `'static`: the fast path routes failures through the hybrid
+/// dispatcher's type-erased slots, which downcast by concrete type — same
+/// caveat as `fused_try_collect_scoped`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(super) fn fused_try_collect_by_ref<'i, S, E, F>(
+    input: &'i [E],
+    stages: S,
+    workload: Workload,
+    pool: &ComputePool,
+) -> Result<Vec<S::Output>, F>
+where
+    S: FusedTryStage<&'i E, Error = F> + Sync,
+    E: Sync,
+    S::Output: Send,
+    F: Send + 'static,
+{
+    let n = input.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let num_threads = pool.num_workers();
+    if prefers_serial(n, num_threads, workload) {
+        let mut out = Vec::with_capacity(n);
+        for item in input {
+            if let Some(o) = stages.try_apply(item)? {
+                out.push(o);
+            }
+        }
+        return Ok(out);
+    }
+    let oversplit = workload_oversplit(n, num_threads, workload);
+    let splits = split_depth(n, num_threads, oversplit);
+    if S::MAY_FILTER {
+        join_fused_try_collect_by_ref(pool, input, &stages, 0, n, splits)
+    } else {
+        let op = FusedTryOp(stages);
+        par_index_try_collect_by_ref(input, &op, splits, pool)
     }
 }
 

@@ -68,9 +68,9 @@ pub mod sync;
 pub(crate) mod util;
 
 pub use builder::{
-    Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, Pipe, PipelineConfig,
-    StageMarker, StageOptions, StreamPipe, StreamStart, SyncMap, TryMap, TryPipe, Workload, pipe,
-    stream,
+    Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, Pipe, PipeRef,
+    PipelineConfig, StageMarker, StageOptions, StreamPipe, StreamStart, SyncMap, TryMap, TryPipe,
+    TryPipeRef, Workload, pipe, pipe_ref, stream,
 };
 pub use executor::{ComputePool, compute::MAX_COMPUTE_WORKERS};
 pub use handoff::{

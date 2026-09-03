@@ -4,8 +4,9 @@ mod typed;
 
 pub use config::{PipelineConfig, Workload};
 pub use typed::{
-    Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, Pipe, StageMarker,
-    StageOptions, StreamPipe, StreamStart, SyncMap, TryMap, TryPipe, pipe, stream,
+    Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, Pipe, PipeRef,
+    StageMarker, StageOptions, StreamPipe, StreamStart, SyncMap, TryMap, TryPipe, TryPipeRef, pipe,
+    pipe_ref, stream,
 };
 // `pub(crate)` re-export so `crate::scope::ScopedPipe` can drive the same
 // `fused_collect_scoped` machinery as `Pipe::collect`, but with `'env`
