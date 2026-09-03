@@ -426,14 +426,19 @@ fn test_sync_to_async_does_not_stall_tokio_driver() {
 
     // Strong guarantee: the single tokio worker was never parked by a blocking
     // send. Heartbeat gaps stay near 5 ms even while sync workers are parked
-    // on `send` under backpressure. 40 ms leaves headroom for single-worker
-    // scheduling jitter; a stalled driver either never finishes the heartbeat
-    // (timeout below) or spikes past this.
+    // on `send` under backpressure. A *stalled* driver parks the heartbeat for
+    // the whole backpressure drain — (3000 − 256 buffer) items at 4 × 1 ms
+    // consumers ≈ 700 ms — so the bound just needs to separate that regime
+    // from scheduler noise. 250 ms does with ~3× margin each way: tight
+    // enough to catch a real stall, loose enough to survive this test running
+    // inside the parallel test suite, where dozens of other tests' pools and
+    // runtimes routinely spike a 5 ms sleep's wake-up by 100 ms+ (observed
+    // flakes at the old 40 ms bound on an otherwise idle machine).
     let max_gap = hb_rx
         .recv_timeout(Duration::from_secs(30))
         .expect("heartbeat never finished — tokio worker stalled by a blocking op");
     assert!(
-        max_gap < Duration::from_millis(40),
+        max_gap < Duration::from_millis(250),
         "tokio driver stalled under sync→async backpressure: max heartbeat gap {max_gap:?} \
          (expected ~5 ms) — a blocking send is likely running on the tokio worker"
     );
@@ -1142,24 +1147,40 @@ fn test_stream_for_each_ordered_sees_input_order() {
 /// worker). Inner batches exceed the default 256-slot feeder buffer so the
 /// pool-feeder path (not the inline one) is exercised.
 ///
-/// Runs on a helper thread with a bounded wait so a regression fails the
-/// test instead of hanging the harness; miri is skipped (thread-count stress
-/// the interpreter cannot make progress on).
+/// The whole scenario runs on a small **dedicated** pool so the test is
+/// self-contained: under the parallel test suite the *global* pool is
+/// arbitrarily occupied by other tests' long-running jobs, which starves this
+/// pipeline's feeder/worker jobs for seconds and turns a liveness regression
+/// test into a flaky timing test. On the dedicated pool the healthy path
+/// completes in milliseconds; the 30 s bound only ever trips on a real
+/// deadlock (which never completes). Runs on a helper thread so a regression
+/// fails the test instead of hanging the harness; miri is skipped
+/// (thread-count stress the interpreter cannot make progress on).
 #[test]
 #[cfg_attr(miri, ignore)]
 fn test_nested_stream_inside_pool_worker_no_deadlock() {
+    let pool = youpipe::ComputePool::new(8);
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         // Shape 1: fused outer — for_each closures run on pool workers.
-        pipe(0..4u64).for_each(|_x: u64| {
-            let inner: Vec<u64> = stream(0..2000u64).stage(|v: u64| v + 1).run();
+        let p1 = pool.clone();
+        pipe(0..4u64).with_compute_pool(pool.clone()).for_each(move |_x: u64| {
+            let inner: Vec<u64> = stream(0..2000u64)
+                .with_compute_pool(p1.clone())
+                .stage(|v: u64| v + 1)
+                .run();
             assert_eq!(inner.len(), 2000);
         });
 
         // Shape 2: streaming outer — stage closures run on pool workers.
+        let p2 = pool.clone();
         let outer: Vec<u64> = stream(0..4u64)
-            .stage(|_x: u64| {
-                let inner: Vec<u64> = stream(0..2000u64).stage(|v: u64| v + 1).run();
+            .with_compute_pool(pool.clone())
+            .stage(move |_x: u64| {
+                let inner: Vec<u64> = stream(0..2000u64)
+                    .with_compute_pool(p2.clone())
+                    .stage(|v: u64| v + 1)
+                    .run();
                 inner.len() as u64
             })
             .run();
