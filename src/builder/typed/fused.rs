@@ -1531,12 +1531,19 @@ const LOW_OVERSPLIT_ITEMS_PER_THREAD: usize = 1024;
 /// dispatch overhead). `4` (128 leaves on 32 cores) is the sweet spot.
 const BALANCED_OVERSPLIT: usize = 4;
 
+/// Oversplit factor for `Workload::Unbalanced`: fixed at `8`, independent of
+/// batch size. Unlike `Balanced`, the whole point is that an idle worker must
+/// find a stealable leaf even when the batch is small — the per-node dispatch
+/// overhead is the price of tail-latency insurance on a skewed workload (the
+/// adaptive `Balanced` path would drop to `1` below
+/// [`LOW_OVERSPLIT_ITEMS_PER_THREAD`]).
+const UNBALANCED_OVERSPLIT: usize = 8;
+
 /// Oversplit factor for the fork/join tree, adapting to batch size.
 ///
 /// See [`LOW_OVERSPLIT_ITEMS_PER_THREAD`] for the rationale. `Unbalanced`
-/// always uses `8` for the stealing slack its expensive tail needs;
-/// `Custom(n)` pins `n` for full manual control (benchmarking, known-skew
-/// workloads outside the two presets).
+/// always uses [`UNBALANCED_OVERSPLIT`]; `Custom(n)` pins `n` for full manual
+/// control (benchmarking, known-skew workloads outside the two presets).
 fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize {
     match workload {
         Workload::Balanced => {
@@ -1546,7 +1553,7 @@ fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize
                 BALANCED_OVERSPLIT
             }
         },
-        Workload::Unbalanced => 8,
+        Workload::Unbalanced => UNBALANCED_OVERSPLIT,
         Workload::Custom(factor) => factor.get(),
     }
 }
