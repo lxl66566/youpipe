@@ -1,6 +1,5 @@
 # ComputePool — Work-Stealing Scheduler
 
-> [← Documentation index](README.md)
 
 ### Architecture
 

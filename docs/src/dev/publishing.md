@@ -1,6 +1,5 @@
 # Publishing
 
-> [← Documentation index](README.md)
 
 How the workspace crates ship to crates.io, and how local development stays
 on relative paths while published builds resolve registry versions.

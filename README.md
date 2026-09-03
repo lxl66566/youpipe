@@ -116,52 +116,53 @@ async/blocking IO, mixed sync+async, and two realistic three-stage pipelines,
 including HTTP over a loopback mock server). 32-core AMD (Zen) Linux, 31
 pinned cores, 5 interleaved rounds per measurement (ABCABC order, median).
 CPU rows use each library's idiomatic borrow (`pipe_ref` vs `par_iter`).
-Charts show throughput — higher is better; whiskers span the 5 rounds.
-Simulated IO is pure sleeps — nothing touches the disk. Methodology and full
-data: [docs/benchmarks.md](docs/benchmarks.md#horizontal-cross-library-comparison-2026-09).
+Charts show throughput — higher is better; bar-chart whiskers span the
+5 rounds. Simulated IO is pure sleeps — nothing touches the disk. Methodology
+and full data:
+[docs/src/dev/benchmarks.md](docs/src/dev/benchmarks.md#horizontal-cross-library-comparison-2026-09).
 
 <p align="center">
-  <img src="docs/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">
+  <img src="docs/src/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">
 </p>
 <p align="center">
-  <img src="docs/assets/bench-io.svg" alt="IO pipelines: youpipe vs tokio vs futures">
+  <img src="docs/src/assets/bench-io.svg" alt="IO pipelines: youpipe vs tokio vs futures">
 </p>
 <p align="center">
-  <img src="docs/assets/bench-real.svg" alt="Mixed sync + async pipelines: youpipe vs tokio vs futures vs rayon">
+  <img src="docs/src/assets/bench-real.svg" alt="Mixed sync + async pipelines: youpipe vs tokio vs futures vs rayon">
 </p>
 
 Highlights (median wall time, youpipe vs the strongest alternative;
 per-iteration time, setup excluded):
 
 - **CPU, balanced (`pipe_ref` vs rayon `par_iter`)** — youpipe wins at
-  10K–100K items (−20 % vs rayon at 100K); rayon wins 1K (fixed setup cost,
+  10K–100K items (−23 % vs rayon at 100K); rayon wins 1K (fixed setup cost,
   ~20 µs) and 1M (its fork-join runs inline on the calling thread; the 1M
   batch is bandwidth-bound). All three are 5–10× faster than hand-rolled
   equal-chunk threading.
 - **CPU, skewed (10 % of items cost 1000×)** — `Workload::Unbalanced` +
-  work stealing beats rayon at 100K (0.254 vs 0.263 ms) and is 3× faster
+  work stealing beats rayon at 100K (0.248 vs 0.260 ms) and is 3× faster
   than equal-chunk threading, which strands the slow items in a few
   threads.
 - **Async IO (512 in flight, 1/8 ms tail)** — tied with the async baselines:
-  ±2 % vs tokio (crossing ahead at ≥2K items), 2–5 % behind the lighter
+  ±1 % vs tokio (ahead at ≥2K items), 2–5 % behind the lighter
   `futures::stream` combinator stack. youpipe rides the same tokio runtime.
 - **Blocking IO** — with a 512-thread oversubscribed pool youpipe matches
-  `spawn_blocking` (8.66 vs 8.87 ms @ 500); at the default 32 threads it is
+  `spawn_blocking` (8.65 vs 8.88 ms @ 500); at the default 32 threads it is
   wait-bound (34 ms). Blocking stages need oversubscription — see
   [Advanced usage](#advanced-usage).
-- **Mixed sync CPU + async IO** — 10.8 vs 13.2 ms @ 2K items (−18 % vs a
+- **Mixed sync CPU + async IO** — 10.8 vs 13.5 ms @ 2K items (−20 % vs a
   hand-written tokio channel chain); `futures::stream` edges youpipe out by
   running the CPU stage inline on runtime workers.
 - **Realistic doc pipeline (fetch → parse → save, heavy-tailed sizes)** —
-  14.3 vs 17.1 ms @ 4K docs: −16 % vs hand-written tokio, 9.6× vs rayon
+  14.2 vs 18.4 ms @ 4K docs: −23 % vs hand-written tokio, 9.7× vs rayon
   (whose pool stalls on the blocking IO).
-- **Realistic web pipeline (HTTP GET → parse → aggregate)** — 23.0 vs 27.7 ms
-  @ 2K requests: −17 % vs tokio, −22 % vs futures.
+- **Realistic web pipeline (HTTP GET → parse → aggregate)** — 23.0 vs 27.5 ms
+  @ 2K requests: −16 % vs tokio, −22 % vs futures.
 
 Reproduce:
 
 ```sh
-cargo bench --bench horizontal -- --rounds 5
+cargo bench -p youpipe --bench horizontal -- --rounds 5
 uv run perf/plot-horizontal.py   # JSON → SVG (matplotlib)
 ```
 
@@ -257,7 +258,8 @@ Not every config knob applies to every engine: a fused `pipe()` reads only
 
 ## How it works
 
-see [`docs/README.md`](docs/README.md).
+see the [developer guide](docs/src/SUMMARY.md) (mdbook source; build with
+`mdbook build docs`).
 
 ## Attribution
 

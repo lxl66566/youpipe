@@ -1,0 +1,12 @@
+[book]
+title     = "youpipe"
+authors   = ["lxl66566"]
+src       = "src"
+language  = "en"
+
+[build]
+build-dir       = "book"
+create-missing  = false
+
+[output.html]
+git-repository-url = "https://github.com/lxl66566/youpipe"

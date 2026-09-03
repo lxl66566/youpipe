@@ -1,6 +1,5 @@
 # Design Philosophy & Module Map
 
-> [← Documentation index](README.md)
 
 ### Data-First
 
@@ -130,7 +129,7 @@ crates/youpipe/src/
 ```
 
 The miri/loom-transparent primitive layer (former `src/util/`) lives in its
-own workspace crate, [`crates/youpipe-sys`](../crates/youpipe-sys):
+own workspace crate, `crates/youpipe-sys`:
 `CachePadded<T>` plus the `Mutex`/`Condvar`/atomics/`thread_yield` shims that
 switch backend by compilation context (parking_lot / miri-std / `--cfg loom`).
 `pool/` and `handoff/` source their primitives from there.

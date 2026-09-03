@@ -1,6 +1,3 @@
 /target
 session-*.md
-# Sub-crates: standalone build artifacts in case cargo runs inside a member
-# directory outside workspace context
-crates/*/target/
-crates/*/Cargo.lock
+/docs/book

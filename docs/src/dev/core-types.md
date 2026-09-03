@@ -1,6 +1,5 @@
 # Core Types & Execution Paths
 
-> [← Documentation index](README.md)
 
 ### `Workload` — Per-Item Cost Distribution Hint
 

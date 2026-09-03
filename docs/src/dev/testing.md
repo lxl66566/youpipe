@@ -1,6 +1,5 @@
 # Miri & Loom Compatibility
 
-> [← Documentation index](README.md)
 
 Canonical runners (they reap stale miri processes, apply per-binary
 timeouts and the required flag combinations):

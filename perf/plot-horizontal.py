@@ -8,18 +8,21 @@ SVG charts for the README.
 
 Throughput (items per second), higher is better — the inverse of the wall
 time the harness measures, but with an intuitive direction and explicit
-units per panel. Whiskers show the min–max spread across interleaved rounds.
+units per panel. Bar panels draw min–max whiskers across the interleaved
+rounds; line panels stay whisker-free (min–max would clutter overlapping
+polylines — the min–max spread lives in perf/horizontal/results.json).
 
 Usage:
     uv run perf/plot-horizontal.py [results.json] [outdir]
 
-Defaults: results.json = perf/horizontal/results.json, outdir = docs/assets.
+Defaults: results.json = perf/horizontal/results.json, outdir = docs/src/assets.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+from math import log10
 from pathlib import Path
 
 import matplotlib as mpl
@@ -145,6 +148,7 @@ def line_panel(ax, data: dict, sc: str, title: str, note: str,
 
     top = 0.0
     bottom = float("inf")
+    meds_by_lib: dict[str, list[float]] = {}
     for li, lib in enumerate(libs):
         meds, los, his = [], [], []
         for n in sizes:
@@ -152,27 +156,32 @@ def line_panel(ax, data: dict, sc: str, title: str, note: str,
             meds.append(med)
             los.append(lo)
             his.append(hi)
+        meds_by_lib[lib] = meds
         color = LIB_STYLE.get(lib, {"color": "#888"})["color"]
         ax.plot(xs, meds, color=color, lw=2.0, marker="o", ms=4.2,
                 label=lib, zorder=3)
-        yerr = [[m - l for m, l in zip(meds, los)],
-                [h - m for m, h in zip(meds, his)]]
-        ax.errorbar(xs, meds, yerr=yerr, fmt="none", ecolor=ERR,
-                    elinewidth=1.0, capsize=2, zorder=4)
-        # Even-indexed libraries label above the whisker top, odd-indexed to
-        # the right of the marker — close lines (youpipe vs rayon) never
-        # overwrite each other's annotations.
-        off, ha = ((0, 5), "center") if li % 2 == 0 else ((9, -12), "left")
-        for x, m, hi in zip(xs, meds, his):
-            ax.annotate(fmt_val(m), (x, hi), xytext=off,
-                        textcoords="offset points", fontsize=7.2,
-                        ha=ha, color=INK)
         top = max(top, *his)
         bottom = min(bottom, *los)
 
+    # Value labels on the top layer (above every line and marker). Within one
+    # x column, labels stack bottom-up in ascending value order with
+    # collision-aware clearance (log10 units): each label sits just above its
+    # own marker unless that would overlap the label below it, so
+    # far-apart polylines keep their labels anchored while coinciding ones
+    # (youpipe vs rayon) get pushed apart instead of overprinting.
+    LABEL_GAP = 0.05   # clearance between a marker and its label bottom
+    LABEL_STEP = 0.08  # vertical room per label (font height + small gap)
+    for xi in xs:
+        floor = 0.0
+        for med, lib in sorted((meds_by_lib[lib][xi], lib) for lib in libs):
+            y = max(log10(med) + LABEL_GAP, floor)
+            ax.annotate(fmt_val(med), (xi, 10.0**y), ha="center", va="bottom",
+                        fontsize=7.2, color=INK, zorder=6)
+            floor = y + LABEL_STEP
+
     ax.set_yscale("log")
-    ax.set_ylim(bottom * 0.4, top * 2.8)  # headroom for labels + odd offsets
-    ax.set_xlim(-0.5, len(sizes) - 0.5)   # side margins for offset labels
+    ax.set_ylim(bottom * 0.55, 10.0 ** (log10(top) + 0.4))  # label headroom
+    ax.set_xlim(-0.5, len(sizes) - 0.5)
     ax.set_xticks(list(xs), [fmt_n(n) for n in sizes])
     ax.set_xlabel("batch size", fontsize=8.0, color=MUTED)
     _decorate(ax, unit, logy=True)
@@ -205,7 +214,7 @@ def bar_panel(ax, data: dict, sc: str, title: str, note: str,
                     elinewidth=1.0, capsize=2, zorder=4)
         for x, m, h in zip(offs, meds, his):
             ax.text(x, h, fmt_val(m), ha="center", va="bottom",
-                    fontsize=7.4, color=INK)
+                    fontsize=7.4, color=INK, zorder=6)
         top = max(top, *his)
 
     ax.set_ylim(0, top * 1.16)
@@ -245,13 +254,13 @@ PANEL_KIND = {"line": line_panel, "bar": bar_panel}
 
 def main() -> None:
     results = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("perf/horizontal/results.json")
-    outdir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("docs/assets")
+    outdir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("docs/src/assets")
     outdir.mkdir(parents=True, exist_ok=True)
     meta, data = load(results)
 
     rounds = meta.get("rounds", "?")
     sub = (f'{meta.get("cpus", "?")} pinned cores · {rounds} interleaved round'
-           f'{"s" if rounds != 1 else ""}, median · whiskers = min–max across rounds · '
+           f'{"s" if rounds != 1 else ""}, median · bar whiskers = min–max across rounds · '
            f'{meta.get("timestamp", "")[:10]}')
 
     for fname, ftitle, fig_w, panels in CHART_DEFS:

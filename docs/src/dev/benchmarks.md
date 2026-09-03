@@ -1,7 +1,5 @@
 # Performance Benchmarks & Methodology
 
-> [← Documentation index](README.md)
->
 > All numbers below are from a 32-core AMD (Zen) Linux machine, `criterion`
 > `--sample-size 30 --measurement-time 5` (the historical full-treatment
 > config; see below), tables refreshed with the current quick config.
@@ -366,12 +364,12 @@ question across the ecosystem — youpipe, rayon, tokio, `futures::stream`,
 and hand-written `std::thread` baselines — over seven representative
 scenarios, and exports JSON that `perf/plot-horizontal.py` renders into the
 README's SVG charts (matplotlib via `uv run`; throughput, higher is better,
-min–max whiskers across rounds). The source data for the published charts is
+min–max whiskers on the bar panels). The source data for the published charts is
 committed at `perf/horizontal/results.json`.
 
 ```sh
-cargo bench --bench horizontal -- --rounds 5      # ~5 min incl. build
-uv run perf/plot-horizontal.py                     # results.json → docs/assets/*.svg
+cargo bench -p youpipe --bench horizontal -- --rounds 5  # ~5 min incl. build
+uv run perf/plot-horizontal.py                     # results.json → docs/src/assets/*.svg
 ```
 
 ### Methodology
@@ -426,23 +424,23 @@ uv run perf/plot-horizontal.py                     # results.json → docs/asset
 
 | Scenario | n | Best | Runner-up | Rest |
 | --- | --- | --- | --- | --- |
-| cpu_balanced | 1K | rayon 0.036 | youpipe 0.056 | std threads 0.543 |
-| cpu_balanced | 10K | youpipe 0.059 | rayon 0.062 | std threads 0.565 |
-| cpu_balanced | 100K | youpipe 0.099 | rayon 0.123 | std threads 0.766 |
-| cpu_balanced | 1M | rayon 0.471 | youpipe 0.522 | std threads 2.98 |
-| cpu_unbalanced | 10K | youpipe (Unbalanced) 0.074 | rayon 0.077 | youpipe (default) 0.080, std 0.577 |
-| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.254 | rayon 0.263 | youpipe (default) 0.265, std 0.799 |
-| io_async | 500 | futures 9.14 | tokio 9.45 | youpipe 9.65 |
-| io_async | 2000 | futures 17.5 | youpipe 18.4 | tokio 18.5 |
-| io_async | 5000 | futures 34.0 | youpipe 34.9 | tokio 35.5 |
-| io_blocking | 500 | youpipe (512 thr) 8.66 | tokio 8.87 | std 17.0, youpipe (32 thr) 34.1 |
-| io_blocking | 2000 | youpipe (512 thr) 12.6 | tokio 12.7 | std 47.9, youpipe (32 thr) 122 |
-| mixed_cpu_io | 500 | futures 9.16 | youpipe 9.71 | tokio 10.7 |
-| mixed_cpu_io | 2000 | futures 9.31 | youpipe 10.8 | tokio 13.2 |
-| real_doc | 1000 | tokio 10.8 | youpipe 11.4 | rayon 38.1 |
-| real_doc | 4000 | youpipe 14.3 | tokio 17.1 | rayon 137 |
-| real_web | 500 | youpipe 12.1 | tokio 12.9 | futures 13.2 |
-| real_web | 2000 | youpipe 23.0 | tokio 27.7 | futures 29.4 |
+| cpu_balanced | 1K | rayon 0.037 | youpipe 0.056 | std threads 0.546 |
+| cpu_balanced | 10K | youpipe 0.059 | rayon 0.062 | std threads 0.571 |
+| cpu_balanced | 100K | youpipe 0.095 | rayon 0.123 | std threads 0.754 |
+| cpu_balanced | 1M | rayon 0.473 | youpipe 0.508 | std threads 2.792 |
+| cpu_unbalanced | 10K | youpipe (Unbalanced) 0.076 | rayon 0.077 | youpipe (default) 0.08, std threads 0.569 |
+| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.248 | rayon 0.26 | youpipe (default) 0.267, std threads 0.808 |
+| io_async | 500 | futures 9.104 | tokio 9.53 | youpipe 9.604 |
+| io_async | 2K | futures 17.542 | youpipe 18.253 | tokio 18.388 |
+| io_async | 5K | futures 34.043 | youpipe 34.712 | tokio 35.467 |
+| io_blocking | 500 | youpipe (512 thr) 8.649 | tokio 8.882 | std threads 16.881, youpipe (32 thr) 34.092 |
+| io_blocking | 2K | youpipe (512 thr) 12.602 | tokio 12.729 | std threads 47.523, youpipe (32 thr) 121.897 |
+| mixed_cpu_io | 500 | futures 9.135 | youpipe 9.726 | tokio 10.654 |
+| mixed_cpu_io | 2K | futures 9.325 | youpipe 10.769 | tokio 13.452 |
+| real_doc | 1K | tokio 10.837 | youpipe 11.058 | rayon 38.093 |
+| real_doc | 4K | youpipe 14.157 | tokio 18.352 | rayon 137.218 |
+| real_web | 500 | youpipe 12.024 | tokio 12.869 | futures 13.148 |
+| real_web | 2K | youpipe 22.99 | tokio 27.528 | futures 29.414 |
 
 ### Reading the results
 
@@ -450,17 +448,17 @@ uv run perf/plot-horizontal.py                     # results.json → docs/asset
   rayon wins 1K — its fixed setup is ~20 µs cheaper (caller-inline fork-join
   vs youpipe's inject + wake cascade) — and 1M, where the batch is
   memory-bandwidth-bound and rayon's inline execution on the calling thread
-  keeps ~10 % (0.471 vs 0.522 ms). youpipe owns the 10K–100K middle, widest
-  at 100K (−20 %). Equal-chunk hand-threading is 5–10× behind everywhere:
+  keeps ~7 % (0.473 vs 0.508 ms). youpipe owns the 10K–100K middle, widest
+  at 100K (−23 %). Equal-chunk hand-threading is 5–10× behind everywhere:
   32 spawns per call, no stealing.
 - **Skewed CPU**: `Workload::Unbalanced` + work stealing edges out rayon at
-  100K (0.254 vs 0.263 ms); at 10K the three stealing rows sit within 5 %
+  100K (0.248 vs 0.260 ms); at 10K the three stealing rows sit within 5 %
   (the adaptive oversplit already handles the skew without the knob) and
   static chunking is ~3× behind — it strands the 10 % heavy items in
   whichever chunks they landed in. (Below 10K rayon's fixed-cost advantage
   dominates; see the criterion `cpu_unbalanced_*` groups.)
-- **Async IO is a near-tie** — the whiskers overlap in the chart. youpipe
-  multiplexes over the same tokio runtime: ±2 % vs tokio (ahead at ≥2K items
+- **Async IO is a near-tie** — the spreads overlap. youpipe
+  multiplexes over the same tokio runtime: ±1 % vs tokio (ahead at ≥2K items
   as channel throughput stops mattering), 2–5 % behind `futures::stream`,
   the lightest async *combinator* stack. futures' mixed_cpu_io lead has the
   same cause: it runs the CPU stage inline on runtime workers. That is fine
@@ -472,9 +470,9 @@ uv run perf/plot-horizontal.py                     # results.json → docs/asset
   waits serialize (122 ms @ 2K). The chart keeps that failure visible on
   purpose — blocking stages must size the pool, not the framework.
 - **Realistic pipelines** are where the streaming engine pays off: 3-stage
-  sync+async chains beat hand-written tokio channel plumbing by 16-19 % at
-  the larger batches (fewer tasks, pooled scheduling, mixed-mode channels)
-  and beat rayon by ~10× once IO blocks its workers.
+  sync+async chains beat hand-written tokio channel plumbing by up to 23 %
+  at the larger batches (fewer tasks, pooled scheduling, mixed-mode
+  channels) and beat rayon by ~10× once IO blocks its workers.
 
 ## Perf-event counter measurement (`crates/youpipe-bench-counter`)
 

@@ -1,6 +1,5 @@
 # Data Transfer, Ordering & Fences
 
-> [← Documentation index](README.md)
 
 ### MPMC Channels (`channel.rs`)
 
