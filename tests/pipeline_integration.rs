@@ -1129,6 +1129,48 @@ fn test_stream_for_each_ordered_sees_input_order() {
     assert_eq!(seen, (0..150).collect::<Vec<u32>>());
 }
 
+/// Regression: a `stream()` started *inside* a closure that already runs on
+/// the same compute pool must not deadlock. The feeder job used to go
+/// through `submit`, which pushes onto the calling worker's local LIFO deque
+/// when the caller is a same-pool worker — breaking the injector-FIFO
+/// ordering ("feeder before its stage workers") that the stream concurrency
+/// argument depends on: every worker then parks on an empty channel recv
+/// while the feeder sits unreachable behind the blocked caller's deque.
+///
+/// Both nesting shapes are covered: fused outer (closure runs in a pool
+/// worker via hybrid dispatch) and streaming outer (closure runs in a stage
+/// worker). Inner batches exceed the default 256-slot feeder buffer so the
+/// pool-feeder path (not the inline one) is exercised.
+///
+/// Runs on a helper thread with a bounded wait so a regression fails the
+/// test instead of hanging the harness; miri is skipped (thread-count stress
+/// the interpreter cannot make progress on).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_nested_stream_inside_pool_worker_no_deadlock() {
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // Shape 1: fused outer — for_each closures run on pool workers.
+        pipe(0..4u64).for_each(|_x: u64| {
+            let inner: Vec<u64> = stream(0..2000u64).stage(|v: u64| v + 1).run();
+            assert_eq!(inner.len(), 2000);
+        });
+
+        // Shape 2: streaming outer — stage closures run on pool workers.
+        let outer: Vec<u64> = stream(0..4u64)
+            .stage(|_x: u64| {
+                let inner: Vec<u64> = stream(0..2000u64).stage(|v: u64| v + 1).run();
+                inner.len() as u64
+            })
+            .run();
+        assert_eq!(outer, vec![2000; 4]);
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("nested stream inside a pool worker deadlocked");
+}
+
 #[test]
 #[cfg(feature = "tokio-runtime")]
 fn test_stream_for_each_after_async_stage() {

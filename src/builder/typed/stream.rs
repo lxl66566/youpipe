@@ -121,6 +121,15 @@ impl Feeder {
 /// job simply runs as soon as any stage worker finishes an item (they all
 /// make progress because the collector drains the terminal channel).
 ///
+/// The pool-path job is **injected** (`submit_injected`), never `submit`ed:
+/// it must sit in the injector FIFO *before* the stage-worker jobs that
+/// [`StreamPipe::run`] submits after this returns. `submit` from a worker of
+/// the same pool pushes onto the calling worker's local LIFO deque instead —
+/// and a nested `stream(..).run()` inside a pool closure then deadlocks:
+/// every worker parks on an empty channel recv while the feeder sits
+/// unreachable behind the blocked caller's own deque (regression-tested in
+/// `test_nested_stream_inside_pool_worker_no_deadlock`).
+///
 /// # Panic semantics
 ///
 /// The job wraps the push loop in `catch_unwind` (an uncaught panic in a
@@ -150,7 +159,7 @@ fn feed_items<I: Send + 'static>(
     } else {
         let slot: FeederPanicSlot = Arc::new(std::sync::Mutex::new(None));
         let job_slot = Arc::clone(&slot);
-        pool.submit(move || {
+        pool.submit_injected(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 for (seq, item) in items.into_iter().enumerate() {
                     if cancel_active(cancel.as_ref()) {

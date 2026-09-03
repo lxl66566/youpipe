@@ -62,6 +62,22 @@ impl ComputePool {
         self.registry.inject_or_push(job_ref);
     }
 
+    /// Submit a `'static` job directly to the global injector, bypassing the
+    /// on-pool local-deque fast path of [`Self::submit`].
+    ///
+    /// The injector's FIFO order is load-bearing here: a job injected before
+    /// its dependent jobs is guaranteed to be popped first, whereas `submit`
+    /// from a same-pool worker pushes onto that worker's local LIFO deque —
+    /// where a job whose runners are all blocked can sit unreachable forever.
+    pub(crate) fn submit_injected<F>(&self, job: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let heap_job = pool::job::HeapJob::new(job);
+        let job_ref = heap_job.into_static_job_ref();
+        self.registry.inject(job_ref);
+    }
+
     /// Submit multiple jobs at once (reduces per-job notification overhead).
     pub fn submit_batch<F, I>(&self, jobs: I)
     where
@@ -96,7 +112,6 @@ impl ComputePool {
     }
 
     /// Returns a reference to the underlying registry.
-    #[allow(dead_code)]
     pub(crate) fn registry(&self) -> &Arc<Registry> {
         &self.registry
     }
