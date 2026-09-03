@@ -365,18 +365,7 @@ impl WorkerThread {
         }
     }
 
-    #[inline]
-    fn local_deque_is_empty(&self) -> bool {
-        self.worker.is_empty()
-    }
-
     /// Pop from the local deque.
-    #[inline]
-    fn take_local_job(&self) -> Option<JobRef> {
-        self.worker.pop()
-    }
-
-    /// Pop from the local deque (pub(crate) for join's use).
     #[inline]
     pub(crate) fn try_pop_local(&self) -> Option<JobRef> {
         self.worker.pop()
@@ -411,7 +400,7 @@ impl WorkerThread {
 
         'outer: while !latch.probe() {
             // Check for local work before going idle.
-            if let Some(job) = self.take_local_job() {
+            if let Some(job) = self.try_pop_local() {
                 unsafe { Self::execute(job) };
                 continue;
             }
@@ -447,7 +436,7 @@ impl WorkerThread {
             self.wait_until(registry.thread_infos[index].terminate.as_core_latch());
         }
         // Drain remaining local work.
-        while let Some(job) = self.take_local_job() {
+        while let Some(job) = self.try_pop_local() {
             unsafe { Self::execute(job) };
         }
         // Let registry know we are done.
@@ -464,7 +453,7 @@ impl WorkerThread {
         // pop is a single CAS-free dequeue, whereas `steal()` does a full
         // randomized peer-scan whose coherence traffic is wasted when the work
         // is actually sitting in the injector.
-        self.take_local_job()
+        self.try_pop_local()
             .or_else(|| self.registry.pop_injected_job())
             .or_else(|| self.steal())
     }
