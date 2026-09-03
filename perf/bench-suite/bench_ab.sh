@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Interleaved (ABAB… / ABCABC…) criterion A/B runner with CPU pinning.
 #
-# Why this exists (hard-won lessons, see docs/benchmarks.md "measurement
+# Why this exists (hard-won lessons, see docs/src/dev/benchmarks.md "measurement
 # traps"): back-to-back full-group passes have ±10% inter-run drift on this
 # machine, and `target/criterion` accumulates stale baseline subdirs that
 # produce phantom regressions in naive diff scripts. This runner instead:

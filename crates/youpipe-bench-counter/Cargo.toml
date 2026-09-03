@@ -16,7 +16,7 @@
 #   PERF_EVENT=cycles    cargo bench --manifest-path perf/counter-bench/Cargo.toml
 #   PERF_EVENT=walltime  cargo bench --manifest-path perf/counter-bench/Cargo.toml
 #
-# See the "perf-event counters" section in docs/benchmarks.md for what the
+# See the "perf-event counters" section in docs/src/dev/benchmarks.md for what the
 # counters are good for (and what they are not).
 [package]
 name         = "youpipe-bench-counter"

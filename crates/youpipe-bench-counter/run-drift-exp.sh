@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Drift experiment for the perf-event counters (see docs/benchmarks.md
+# Drift experiment for the perf-event counters (see docs/src/dev/benchmarks.md
 # "perf-event counters"): run the perf_events bench N times per measurement
 # kind — walltime plus the hardware events — each run in an isolated
 # CRITERION_HOME, then let summarize-drift.py compare cross-run drift

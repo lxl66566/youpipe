@@ -30,7 +30,7 @@ temperature: 0
 
 ### 具体实现
 
-详情请参考 docs/README.md 索引。
+详情请参考 mdbook（docs/src/SUMMARY.md，`mdbook build docs` 构建）。
 
 - Workspace 布局：根目录是 virtual workspace（只有清单与共享配置），`youpipe` 主 crate 在 `crates/youpipe`（含 src/benches/tests/examples），其余子 crate 也都在 `crates/` 下——`youpipe-sys`（miri/loom 透明原语层，util 的 sys shims + CachePadded）、两个 fork（`youpipe-st3`、`youpipe-concurrent-queue`，原 vendor 目录）、`youpipe-criterion-perf-counters` 和 4 个 bench crate（均 `youpipe-` 命名，bench 均 `publish = false`）。`perf/` 只放非 crate 的方法论文档与脚本。workspace 内部依赖用 path+version 双声明：本地走 path，发布后走 crates.io 版本（见 docs/publishing.md）。主 crate 的 README 用 symlink 指向仓库根 README（cargo package 会解引用）。
   - `cargo build/test/clippy` 默认只覆盖 youpipe + youpipe-sys（default-members）；fork 与 bench 用 `-p`/`--workspace` 显式选择。
