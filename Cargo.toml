@@ -1,15 +1,15 @@
 [workspace]
-resolver = "2"
-members = [
-    "crates/youpipe",
-    "crates/youpipe-sys",
-    "crates/youpipe-st3",
-    "crates/youpipe-concurrent-queue",
-    "crates/youpipe-criterion-perf-counters",
-    "crates/youpipe-bench-counter",
-    "crates/youpipe-bench-file-encrypt",
-    "crates/youpipe-bench-hotpath-profile",
-    "crates/youpipe-bench-pipeline",
+resolver        = "2"
+members         = [
+  "crates/youpipe",
+  "crates/youpipe-bench-counter",
+  "crates/youpipe-bench-file-encrypt",
+  "crates/youpipe-bench-hotpath-profile",
+  "crates/youpipe-bench-pipeline",
+  "crates/youpipe-concurrent-queue",
+  "crates/youpipe-criterion-perf-counters",
+  "crates/youpipe-st3",
+  "crates/youpipe-sys",
 ]
 # Plain `cargo build/test/clippy` at the root covers only the library crates;
 # the vendored forks and the perf benches are opt-in via `-p` / `--workspace`
@@ -24,8 +24,8 @@ default-members = ["crates/youpipe", "crates/youpipe-sys"]
 version      = "0.5.0"
 edition      = "2024"
 rust-version = "1.85"
-license      = "Apache-2.0"
 repository   = "https://github.com/lxl66566/youpipe"
+license      = "Apache-2.0"
 
 [workspace.lints.clippy]
 all                     = { level = "warn", priority = -1 }

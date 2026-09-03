@@ -1,14 +1,14 @@
 [package]
-name              = "youpipe"
-version.workspace = true
-edition.workspace = true
+name                   = "youpipe"
+version.workspace      = true
+edition.workspace      = true
 rust-version.workspace = true
-description       = "High-performance data-first pipelines with fused CPU stages and streaming async IO"
-readme            = "README.md"
-repository.workspace = true
-license.workspace = true
-keywords          = ["concurrency", "map-reduce", "parallel", "pipeline", "work-stealing"]
-categories        = ["concurrency"]
+description            = "High-performance data-first pipelines with fused CPU stages and streaming async IO"
+readme                 = "README.md"
+repository.workspace   = true
+license.workspace      = true
+keywords               = ["concurrency", "map-reduce", "parallel", "pipeline", "work-stealing"]
+categories             = ["concurrency"]
 
 # Examples that exercise `.stage_async` / `.with_async_pool` — only buildable
 # when the tokio runtime is enabled.
@@ -64,15 +64,23 @@ concurrent-queue = { package = "youpipe-concurrent-queue", path = "../youpipe-co
 crossfire        = "3.1"
 hotpath          = { version = "0.24", optional = true }
 st3              = { package = "youpipe-st3", path = "../youpipe-st3", version = "0.5" }
-youpipe-sys      = { path = "../youpipe-sys", version = "0.5" }
 tokio            = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"], optional = true }
+youpipe-sys      = { path = "../youpipe-sys", version = "0.5" }
 
 [dev-dependencies]
 criterion         = "0.8"
 crossbeam-channel = "0.5"
 futures           = "0.3"
 rayon             = "1"
-tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "time", "net", "io-util"] }
+tokio             = { version = "1", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "sync",
+  "test-util",
+  "time"
+] }
 
 # ── Concurrency-model testing of the pool's synchronization cores ──
 # Loom is activated by the `--cfg loom` rustflag (the ecosystem-standard
