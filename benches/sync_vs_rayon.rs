@@ -139,12 +139,32 @@ fn bench_lightweight_work(c: &mut Criterion) {
             },
         );
 
-        // Owned-input variant (fresh clone, no warming): documents the
-        // one-shot cost of the owning `pipe(v)` API. glibc's large `memcpy`
-        // uses non-temporal stores that bypass the cache, so the fresh clone
-        // arrives cold-from-RAM and the measured time is dominated by
-        // allocator/memory latency — a property of the input lifecycle, not
-        // of the engine. Not comparable to the borrowed rows above.
+        group.bench_with_input(
+            BenchmarkId::new("rayon_par_iter", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let r: Vec<u64> = data.par_iter().map(|&x| black_box(x + 1)).collect();
+                    black_box(r)
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Owned-input caliber (`pipe(data.clone())`), deliberately in its **own
+/// group**: it is a one-shot-cost documentation of the owning API (fresh
+/// clone, cold from RAM — glibc's large `memcpy` uses non-temporal stores),
+/// *not* comparable to the borrowed rows in `sync_lightweight`. Keeping it in
+/// the same group invited cross-row comparisons in charts that the input
+/// lifecycle (not the engine) dominates.
+fn bench_lightweight_owned_cold(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sync_lightweight_owned_cold");
+    for size in [10_000, 1_000_000] {
+        let data: Vec<u64> = (0..size).collect();
+
+        group.throughput(Throughput::Elements(size));
         group.bench_with_input(
             BenchmarkId::new("youpipe_par_map_owned_cold", size),
             &data,
@@ -155,17 +175,6 @@ fn bench_lightweight_work(c: &mut Criterion) {
                             .map(|x| black_box(x.wrapping_add(1)))
                             .collect(),
                     )
-                });
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("rayon_par_iter", size),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    let r: Vec<u64> = data.par_iter().map(|&x| black_box(x + 1)).collect();
-                    black_box(r)
                 });
             },
         );
@@ -197,11 +206,17 @@ fn bench_try_collect(c: &mut Criterion) {
             },
         );
 
-        // rayon equivalent: try for each + collect
+        // rayon equivalent: Result-carrying chain collected into a Result —
+        // the short-circuiting counterpart of youpipe's try_map/try_collect
+        // (a plain map chain would give rayon a cheaper closure).
         group.bench_with_input(BenchmarkId::new("rayon_try_map", size), &data, |b, data| {
             b.iter(|| {
-                let r: Vec<u64> = data.par_iter().map(|&x| x + 1).map(|x| x * 3).collect();
-                black_box(r)
+                let r: Result<Vec<u64>, &'static str> = data
+                    .par_iter()
+                    .map(|&x| -> Result<u64, &'static str> { Ok(x + 1) })
+                    .map(|r| r.map(|x| x * 3))
+                    .collect();
+                black_box(r.unwrap())
             });
         });
     }
@@ -223,19 +238,20 @@ fn bench_for_each_vs_rayon(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size));
 
         // CPU-heavy: same per-item work as `bench_par_map_vs_rayon`. The sink
-        // accumulates into a relaxed atomic so the closure is not optimised
-        // away, but the atomic is uncontended (one store per item, no RMW loop).
-        let sink = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // just consumes the value with `black_box` — enough to defeat dead-code
+        // elimination. (An earlier version accumulated into a shared
+        // `AtomicU64::fetch_add`, which under 32 workers bounces one cache
+        // line per item: identical on both sides, but pure measurement noise
+        // layered on top of the dispatch machinery under comparison.)
         group.bench_with_input(
             BenchmarkId::new("youpipe_cpu_heavy", size),
             &data,
             |b, data| {
                 b.iter(|| {
-                    let sink = sink.clone();
                     youpipe::pipe_ref(data)
                         .map(|&x| black_box(cpu_work(x)))
-                        .for_each(move |r| {
-                            sink.fetch_add(r, std::sync::atomic::Ordering::Relaxed);
+                        .for_each(|r| {
+                            black_box(r);
                         });
                 });
             },
@@ -246,11 +262,10 @@ fn bench_for_each_vs_rayon(c: &mut Criterion) {
             &data,
             |b, data| {
                 b.iter(|| {
-                    let sink = sink.clone();
                     data.par_iter()
                         .map(|&x| black_box(cpu_work(x)))
-                        .for_each(move |r| {
-                            sink.fetch_add(r, std::sync::atomic::Ordering::Relaxed);
+                        .for_each(|r| {
+                            black_box(r);
                         });
                 });
             },
@@ -327,6 +342,7 @@ criterion_group! {
         bench_lightweight_work,
         bench_try_collect,
         bench_for_each_vs_rayon,
-        bench_filter_chain
+        bench_filter_chain,
+        bench_lightweight_owned_cold
 }
 criterion_main!(benches);

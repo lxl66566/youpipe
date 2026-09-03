@@ -9,10 +9,10 @@
 //! its thread and caps concurrency at the thread count.
 //!
 //! Groups:
-//! * `io_async_pure` — single IO stage. Compares youpipe `run_async` (M:N) vs blocking approaches
-//!   vs tokio-native async.
-//! * `io_async_mixed` — CPU stage (sync) -> IO stage. Compares youpipe `run_mixed_async` (sync CPU
-//!   + async IO) vs the all-blocking `run_multi_stage` vs tokio.
+//! * `io_async_pure` — single IO stage. Compares youpipe `stream(..).stage_async(..).run()`
+//!   (M:N concurrency) vs blocking approaches vs tokio-native async.
+//! * `io_async_mixed` — CPU stage (sync) -> IO stage (async). Compares youpipe's mixed sync+async
+//!   chain vs the all-blocking sync chain vs tokio.
 
 mod common;
 
