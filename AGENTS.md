@@ -53,3 +53,4 @@ temperature: 0
   cargo run --release -p youpipe-bench-hotpath-profile
   ```
 - miri 测试：`MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo miri test`
+- 写测试/bench 的时候都需要注意耗时，不要搞出要跑太久的测试；如果在某个测试上卡了太久，请立刻尝试定位并使用 debugger 分析，不要一直等。
