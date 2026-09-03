@@ -96,13 +96,25 @@ impl Registry {
         });
 
         for (index, worker) in workers.into_iter().enumerate() {
-            let registry = Arc::clone(&registry);
-            thread::Builder::new()
+            let thread_registry = Arc::clone(&registry);
+            match thread::Builder::new()
                 .name(format!("yp-pool-{index}"))
                 .spawn(move || {
-                    unsafe { main_loop(worker, registry, index) };
-                })
-                .expect("failed to spawn pool worker");
+                    unsafe { main_loop(worker, thread_registry, index) };
+                }) {
+                Ok(_) => {},
+                Err(e) => {
+                    // The already-spawned workers hold Arc references, so the
+                    // registry's Drop (whose force-terminate path would
+                    // otherwise stop them) never runs while they are alive:
+                    // without this explicit terminate() they park forever on
+                    // their terminate latches — a thread + memory leak on top
+                    // of the panic. With the latches set they exit and free
+                    // the registry themselves.
+                    registry.terminate();
+                    panic!("failed to spawn pool worker {index}: {e}");
+                },
+            }
         }
 
         registry
