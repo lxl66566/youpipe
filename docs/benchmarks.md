@@ -1,18 +1,19 @@
 # Performance Benchmarks & Methodology
 
 > [← Documentation index](README.md)
-
+>
 > All numbers below are from a 32-core AMD (Zen) Linux machine, `criterion`
 > `--sample-size 30 --measurement-time 5` (the historical full-treatment
-> config; see below). Methodology note: `pipe()` takes ownership of the
-> input, so a benchmark iteration must rebuild the input (`warm_clone`).
-> glibc's large `memcpy` uses non-temporal stores that bypass the cache, so
-> a naïve `data.clone()` arrives **cold-from-RAM** — measuring
-> allocator/memory latency rather than the framework. The `sync_vs_rayon`
-> bench therefore warms the input in the (untimed) setup so the timed region
-> is a fair, like-for-like comparison with rayon's warm `par_iter` borrow. A
-> `_cold` variant is kept for the lightweight group to document the one-shot
-> cold-memory cost.
+> config; see below), tables refreshed with the current quick config.
+> Methodology note: comparisons against rayon borrow the input on both sides
+> (`pipe_ref(&data)` vs `par_iter`) — the same warm slice, nothing cloned or
+> freed inside the timed region, no lifecycle-alignment tricks needed. The
+> engines that *must* take ownership (`pipe(v)`, `stream(v)`) rebuild the
+> input in the untimed setup and pull it into cache (`warm_clone`): glibc's
+> large `memcpy` uses non-temporal stores that bypass the cache, so a naïve
+> `data.clone()` arrives **cold-from-RAM** and measures allocator/memory
+> latency instead of the framework. The `_owned_cold` variant in the
+> lightweight group documents that one-shot cold cost.
 
 ## Suite budget (quick config)
 
@@ -69,16 +70,15 @@ Appending `-r N` to the same outdir later adds rounds (the worktrees and
 their builds are reused); cleanup is
 `rm -rf <outdir> && git worktree prune`.
 
-### CPU-Heavy `pipe()` vs rayon (`sync_cpu_heavy`, 100 iters/item, warm input)
+### CPU-Heavy `pipe_ref()` vs rayon (`sync_cpu_heavy`, 100 iters/item, borrowed input)
 
 | Size | youpipe | rayon   |
 | ---- | ------- | ------- |
-| 1K   | ~59 µs  | ~38 µs  |
-| 10K  | ~61 µs  | ~69 µs  |
-| 100K | ~102 µs | ~137 µs |
+| 1K   | ~57 µs  | ~42 µs  |
+| 100K | ~96 µs  | ~123 µs |
 
-The 1K case still trails rayon but the gap narrowed from ~33 µs to ~21 µs after
-two changes that together removed ~11 µs of fixed overhead:
+The 1K case still trails rayon (~15 µs residual) after two changes that
+together removed ~11 µs of fixed overhead:
 
 1. **`Workload::Balanced` is now the default** (was `Unbalanced` → oversplit 8).
    For 1K/10K batches `n / num_threads ≤ 1024`, so the adaptive path picks
@@ -150,14 +150,16 @@ catastrophic for expensive per-item work (file IO, crypto) whose small batches
 would be wrongly serialized. The heuristic was removed — see `prefers_serial`
 in `src/builder/typed/fused.rs`.
 
-### Pipeline Fusion (3 stages) vs rayon chain (`pipeline_fusion`, warm input)
+### Pipeline Fusion (3 stages) vs rayon chain (`pipeline_fusion`, borrowed input)
 
 | Size | youpipe fused | rayon chain |
 | ---- | ------------- | ----------- |
-| 10K  | ~59 µs        | ~66 µs      |
-| 100K | ~79 µs        | ~100 µs     |
+| 10K  | ~59 µs        | ~56 µs      |
+| 100K | ~74 µs        | ~86 µs      |
 
-The fused stage chain now beats rayon at every size after five changes: the
+Under the borrowed caliber (both sides read a warm slice) 10K is a near-tie
+within the ±5-10 % cross-run drift; at 100K the fused chain is ~13 % ahead.
+The margin comes from five changes: the
 sleeping-bitmask rewrite of `wake_any_threads`, moving the `condvar.notify_one`
 outside the `is_blocked` mutex, the `.cargo/config.toml` perf-friendly
 `opt-level=3`/`panic=unwind` override, adaptive oversplit (`workload_oversplit`,
@@ -169,20 +171,22 @@ stealing. The hybrid alone measured −6.5 % @ 10 k and −6.7 % @ 100 k.
 
 ### Lightweight `pipe()` vs rayon (`sync_lightweight`, `x+1`)
 
-| Size | youpipe (warm) | youpipe (cold) | rayon   |
-| ---- | -------------- | -------------- | ------- |
-| 10K  | ~59 µs         | ~67 µs         | ~64 µs  |
-| 100K | ~77 µs         | ~120 µs        | ~105 µs |
-| 1M   | ~540 µs        | ~4.23 ms       | ~273 µs |
+| Size | youpipe (borrowed) | youpipe (owned, cold clone) | rayon   |
+| ---- | ------------------ | --------------------------- | ------- |
+| 10K  | ~58 µs             | ~64 µs                      | ~56 µs  |
+| 1M   | ~187 µs            | ~3.92 ms                    | ~247 µs |
 
-Warm-input lightweight went ~1.9 ms (pre-`Slots`) → ~390 µs (slice view) →
-**~516 µs** (perf-config + sleeping-bitmask wake + hybrid flat/tree dispatch,
-which alone shaved −9.6 % by eliminating fork/join ramp-up). The 1 M case still
-trails rayon because the leaf work itself is so cheap (~0.12 ns/item) that the
-off-pool spin/mutex wait + per-chunk tree fixed cost dominate; at 10 k and
-100 k youpipe beats rayon because the leaf amortises the overhead better.
+The borrowed `pipe_ref` row flips the 1M story that the owned caliber told
+for years: with nothing cloned or freed in-region, the fused engine wins at
+1M (−24 % vs rayon); the owned row's ~3.9 ms is the cold-clone trap (the
+fresh 8 MB buffer arrives cold-from-RAM), not engine cost — the very reason
+`pipe_ref` exists. Warm-input lightweight went ~1.9 ms (pre-`Slots`) →
+~390 µs (slice view) → **~516 µs** (perf-config + sleeping-bitmask wake +
+hybrid flat/tree dispatch, which alone shaved −9.6 % by eliminating fork/join
+ramp-up). At 10K the leaf work is so cheap (~0.12 ns/item) that fixed
+dispatch cost dominates and the three readings converge.
 
-### Fallible `try_map().try_collect()` vs rayon (`try_collect`, warm input)
+### Fallible `try_map().try_collect()` vs rayon (`try_collect`, borrowed input)
 
 When the chain has `MAY_FILTER == false`, `try_collect` uses the same
 zero-allocation index-based fast path as `collect` — pre-allocating the output
@@ -190,21 +194,21 @@ buffer and writing at known indices instead of the `Vec`-merge fallback.
 
 | Size | youpipe try_map | rayon   |
 | ---- | --------------- | ------- |
-| 10K  | ~64 µs          | ~66 µs  |
-| 100K | ~85 µs          | ~98 µs  |
+| 10K  | ~58 µs          | ~56 µs  |
+| 100K | ~71 µs          | ~85 µs  |
 
-### `for_each()` vs rayon (`sync_for_each`, cpu_heavy per item, warm input)
+### `for_each()` vs rayon (`sync_for_each`, cpu_heavy per item, borrowed input)
 
 | Size | youpipe `for_each` | rayon `for_each` |
 | ---- | ------------------ | ---------------- |
-| 1K   | ~62 µs             | ~47 µs           |
-| 10K  | ~183 µs            | ~203 µs          |
-| 100K | ~1.54 ms           | ~1.49 ms         |
+| 1K   | ~63 µs             | ~46 µs           |
+| 100K | ~1.63 ms           | ~1.56 ms         |
 
 `for_each` was the last fused terminal still on the single-tree path. Porting
 it to the shared `hybrid_dispatch` (via the `SinkStrategy` impl of
 `HybridStrategy`) measured **−8.7 % @ 1K, −7.2 % @ 10K, −5.0 % @ 100K** vs the
-prior tree-only `par_for_each`. At 10K youpipe now beats rayon; the 1K case
+prior tree-only `par_for_each` (sizes at the time of that A/B); at 100K it
+pulled youpipe level with rayon. The 1K case
 still trails because the off-pool driver blocks instead of participating the
 way rayon's `par_iter` runs inline on the caller (a known remaining gap —
 see the note under "CPU-Heavy `pipe()` vs rayon" above). Consolidating all
@@ -361,13 +365,13 @@ an hour+ without completing; with it the whole suite finishes in seconds.
 question across the ecosystem — youpipe, rayon, tokio, `futures::stream`,
 and hand-written `std::thread` baselines — over seven representative
 scenarios, and exports JSON that `perf/plot-horizontal.py` renders into the
-README's SVG charts (hand-written SVG, zero plotting dependencies). The
-source data for the published charts is committed at
-`perf/horizontal/results.json`.
+README's SVG charts (matplotlib via `uv run`; throughput, higher is better,
+min–max whiskers across rounds). The source data for the published charts is
+committed at `perf/horizontal/results.json`.
 
 ```sh
-cargo bench --bench horizontal -- --rounds 5      # ~6 min incl. build
-python3 perf/plot-horizontal.py                   # perf/horizontal/results.json → docs/assets/*.svg
+cargo bench --bench horizontal -- --rounds 5      # ~5 min incl. build
+uv run perf/plot-horizontal.py                     # results.json → docs/assets/*.svg
 ```
 
 ### Methodology
@@ -379,9 +383,15 @@ python3 perf/plot-horizontal.py                   # perf/horizontal/results.json
   process (one tokio runtime + one `TokioPool` handle shared by everything;
   per-iteration runtime construction would dominate small batches).
 - **Per-iteration timing, setup excluded.** Each job times only the workload
-  (`Instant` around the run); input rebuild / cache-warming (`warm_clone`,
-  same rationale as `sync_vs_rayon`) happens outside the timed region.
-  Results are black-boxed so LLVM cannot DCE the map chains.
+  (`Instant` around the run). CPU scenarios are **borrowed-input on both
+  sides** — youpipe `pipe_ref(&data)` vs rayon `data.par_iter()` vs chunked
+  borrows: each library's idiomatic call over the same warm slice, nothing
+  cloned or freed inside the timed region. (History: before `pipe_ref`
+  existed, the owned `pipe(v)` rows consumed a fresh cache-warmed clone and
+  freed it in-region, and rayon was given an `into_par_iter` twin to match —
+  a four-caliber tangle whose lesson, that fresh-clone/free cycles are worth
+  ~35 % at 1 M, lives on in the criterion benches above.) Results are
+  black-boxed so LLVM cannot DCE the map chains.
 - **Simulated IO never touches the disk.** Async waits use
   `tokio::time::sleep`, blocking waits `thread::sleep` (1 ms / 8 ms tail).
   The realistic web scenario speaks HTTP/1.1 over a **loopback Unix-socket
@@ -400,87 +410,69 @@ python3 perf/plot-horizontal.py                   # perf/horizontal/results.json
   *finite-cap* regime (all three at 512), `mixed/real_doc/real_web` compare
   the *unbounded* regime (all three effectively unlimited). Fairness is a
   property of the scenario, not of each library's default.
-- **Input lifecycle must be aligned within a CPU scenario** (2026-09 fix).
-  youpipe's `pipe(v)` takes ownership: each timed iteration consumes a fresh
-  `warm_clone` and frees the input buffer *inside* the timed region, paying
-  the clone's cache thrash right before the clock starts. rayon's idiomatic
-  `data.par_iter()` borrows the same warm buffer every iteration — nothing
-  freed in-region, no clone thrash — an asymmetric advantage that grew with
-  batch size (at 1 M, the 8 MB clone+free cycle is worth ~35 % of the
-  batch). The chart therefore shows **four readings**: the primary `rayon`
-  row consumes a fresh `warm_clone` via `into_par_iter()` (like-for-like
-  memory behavior vs the owned `pipe(v)`); `rayon (borrowed)` keeps the
-  idiomatic call; `youpipe` pays the owned lifecycle; `youpipe (borrowed)`
-  (`pipe_ref(&data)`, added 2026-09) is youpipe's idiomatic borrow — the
-  natural like-for-like pair of `rayon (borrowed)`. The distinction matters:
-  under the aligned lifecycle rayon's 100 K–1 M numbers rise 50–60 % (it,
-  too, pays the fresh-input costs), while youpipe's stay put — those costs
-  were always in its baseline.
+- **Input lifecycle must be uniform within a CPU scenario** (2026-09 fix,
+  superseded 2026-09 by `pipe_ref`): comparing an owned-input call against a
+  borrowing one measures the input lifecycle, not the engine — the freeing
+  side pays the clone's cache thrash right before the clock starts, an
+  asymmetry worth ~35 % at 1 M. The fix is structural now: both sides borrow
+  the same warm slice (`pipe_ref` vs `par_iter`), which also collapsed the
+  1 M round-to-round drift from ±25 % (fresh 8 MB clone + in-region free) to
+  a few percent.
 - Machine: 32-core AMD (Zen) Linux, bench pinned to cores 1–31
   (`taskset -c 1-31`, core 0 left to OS/IRQ housekeeping), 5 rounds ×
   700 ms measurement, ~2-8 % cross-round spread on most cells.
 
-### Results (median ms per iteration, 5 interleaved rounds; cpu_balanced 9)
+### Results (median ms per iteration, 5 interleaved rounds)
 
 | Scenario | n | Best | Runner-up | Rest |
 | --- | --- | --- | --- | --- |
-| cpu_balanced | 1K | rayon (borrowed) 0.038 | rayon 0.040 | youpipe 0.057 = youpipe (borrowed) 0.056*, std threads 0.545 |
-| cpu_balanced | 10K | youpipe 0.060 | youpipe (borrowed) 0.059* | rayon (borrowed) 0.062, rayon 0.063, std threads 0.562 |
-| cpu_balanced | 100K | youpipe (borrowed) 0.097* | youpipe 0.114 | rayon (borrowed) 0.122, rayon 0.187, std threads 0.736 |
-| cpu_balanced | 1M | rayon (borrowed) 0.473 | rayon 0.557 | youpipe (borrowed) 0.532*, youpipe 0.672, std threads 2.80 |
-| cpu_unbalanced | 10K | youpipe (Unbalanced) 0.073 | youpipe (default) 0.079 | rayon (borrowed) 0.079, rayon 0.081, std 0.568 |
-| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.254 | rayon (borrowed) 0.272 | youpipe (default) 0.258, rayon 0.315, std 0.781 |
-| io_async | 500 | futures 9.12 | tokio 9.45 | youpipe 9.57 |
-| io_async | 2000 | futures 17.6 | youpipe 18.2 | tokio 18.5 |
-| io_async | 5000 | futures 34.0 | youpipe 34.8 | tokio 35.5 |
-| io_blocking | 500 | youpipe (512 thr) 8.65 | tokio 8.85 | std 16.9, youpipe (32 thr) 34.1 |
-| io_blocking | 2000 | youpipe (512 thr) 12.6 | tokio 12.7 | std 47.8, youpipe (32 thr) 122 |
-| mixed_cpu_io | 500 | futures 9.14 | youpipe 9.68 | tokio 10.6 |
-| mixed_cpu_io | 2000 | futures 9.32 | youpipe 10.9 | tokio 13.4 |
-| real_doc | 1000 | tokio 10.8 | youpipe 11.2 | rayon 38.0 |
-| real_doc | 4000 | youpipe 14.1 | tokio 17.2 | rayon 137 |
-| real_web | 500 | youpipe 12.0 | tokio 12.8 | futures 13.1 |
-| real_web | 2000 | youpipe 22.9 | tokio 27.7 | futures 29.7 |
+| cpu_balanced | 1K | rayon 0.036 | youpipe 0.056 | std threads 0.543 |
+| cpu_balanced | 10K | youpipe 0.059 | rayon 0.062 | std threads 0.565 |
+| cpu_balanced | 100K | youpipe 0.099 | rayon 0.123 | std threads 0.766 |
+| cpu_balanced | 1M | rayon 0.471 | youpipe 0.522 | std threads 2.98 |
+| cpu_unbalanced | 10K | youpipe (Unbalanced) 0.074 | rayon 0.077 | youpipe (default) 0.080, std 0.577 |
+| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.254 | rayon 0.263 | youpipe (default) 0.265, std 0.799 |
+| io_async | 500 | futures 9.14 | tokio 9.45 | youpipe 9.65 |
+| io_async | 2000 | futures 17.5 | youpipe 18.4 | tokio 18.5 |
+| io_async | 5000 | futures 34.0 | youpipe 34.9 | tokio 35.5 |
+| io_blocking | 500 | youpipe (512 thr) 8.66 | tokio 8.87 | std 17.0, youpipe (32 thr) 34.1 |
+| io_blocking | 2000 | youpipe (512 thr) 12.6 | tokio 12.7 | std 47.9, youpipe (32 thr) 122 |
+| mixed_cpu_io | 500 | futures 9.16 | youpipe 9.71 | tokio 10.7 |
+| mixed_cpu_io | 2000 | futures 9.31 | youpipe 10.8 | tokio 13.2 |
+| real_doc | 1000 | tokio 10.8 | youpipe 11.4 | rayon 38.1 |
+| real_doc | 4000 | youpipe 14.3 | tokio 17.1 | rayon 137 |
+| real_web | 500 | youpipe 12.1 | tokio 12.9 | futures 13.2 |
+| real_web | 2000 | youpipe 23.0 | tokio 27.7 | futures 29.4 |
 
 ### Reading the results
 
-- **Balanced CPU, four readings** (`rayon` = fresh-input lifecycle aligned
-  with youpipe's ownership API; `rayon (borrowed)` = idiomatic borrow;
-  `youpipe` = owned; `youpipe (borrowed)` = `pipe_ref`, idiomatic borrow):
-  rayon wins 1K on both (fixed setup, its caller-inline fork-join); youpipe
-  wins the 10K–100K middle on every pairing, widest at 100K (−21 % for
-  borrowed-vs-borrowed, −39 % vs aligned rayon). At 1M rayon's borrowed row
-  wins (bandwidth-bound; ~470 µs, ±3 %), but `pipe_ref` closes most of the
-  owned row's gap (0.532 vs 0.672 ms) **and collapses the variance**: the
-  owned 1 M rows drift ±25 % round-to-round (fresh 8 MB clone + in-region
-  free; the documented large-batch measurement trap), while `pipe_ref`'s
-  spread is ±2.5 % ([518–543] µs over 5 rounds) — with nothing cloned or
-  freed in-region there is no allocator/system state to drift on. The
-  borrowed and owned youpipe rows otherwise sit on the same execution core
-  (all four 2026-09 re-run medians within noise), so the lifecycle caliber,
-  not the engine, is what separates them. Equal-chunk hand-threading is
-  5–10× behind everywhere: 32 spawns per call, and no stealing.
-  (* `youpipe (borrowed)` cells: separate 5-round run, 2026-09 `pipe_ref`
-  verification; other cells from the 9-round dataset.)
-- **Skewed CPU**: with `Workload::Unbalanced` youpipe beats both rayon
-  readings at 100K (0.254 vs 0.272/0.315 ms) and both are ~3× ahead of
-  static chunking, which strands the 10 % heavy items in whichever chunks
-  they landed in. At 10K youpipe's adaptive oversplit already handles the
-  skew (the `Unbalanced` knob adds nothing at that size).
-- **Async IO is a near-tie** — youpipe multiplexes over the same tokio
-  runtime: ±2 % vs tokio (crossing ahead at ≥2K items as channel throughput
-  stops mattering), 2–5 % behind `futures::stream`, the lightest async
-  *combinator* stack. futures' mixed_cpu_io lead has the same cause: it runs
-  the CPU stage inline on runtime workers. That is fine at 100 ns/item CPU,
-  and the reason youpipe exists is everything it can't do there: fences,
-  cancellation, ordered output, dedicated CPU-pool isolation, backpressure
-  across *stages* rather than futures.
+- **Balanced CPU** (`pipe_ref` vs `par_iter`, both borrowing warm data):
+  rayon wins 1K — its fixed setup is ~20 µs cheaper (caller-inline fork-join
+  vs youpipe's inject + wake cascade) — and 1M, where the batch is
+  memory-bandwidth-bound and rayon's inline execution on the calling thread
+  keeps ~10 % (0.471 vs 0.522 ms). youpipe owns the 10K–100K middle, widest
+  at 100K (−20 %). Equal-chunk hand-threading is 5–10× behind everywhere:
+  32 spawns per call, no stealing.
+- **Skewed CPU**: `Workload::Unbalanced` + work stealing edges out rayon at
+  100K (0.254 vs 0.263 ms); at 10K the three stealing rows sit within 5 %
+  (the adaptive oversplit already handles the skew without the knob) and
+  static chunking is ~3× behind — it strands the 10 % heavy items in
+  whichever chunks they landed in. (Below 10K rayon's fixed-cost advantage
+  dominates; see the criterion `cpu_unbalanced_*` groups.)
+- **Async IO is a near-tie** — the whiskers overlap in the chart. youpipe
+  multiplexes over the same tokio runtime: ±2 % vs tokio (ahead at ≥2K items
+  as channel throughput stops mattering), 2–5 % behind `futures::stream`,
+  the lightest async *combinator* stack. futures' mixed_cpu_io lead has the
+  same cause: it runs the CPU stage inline on runtime workers. That is fine
+  at 100 ns/item CPU, and the reason youpipe exists is everything it can't
+  do there: fences, cancellation, ordered output, dedicated CPU-pool
+  isolation, backpressure across *stages* rather than futures.
 - **Blocking IO is a configuration story**: correctly oversubscribed, youpipe
   ≈ tokio `spawn_blocking` (same 512 threads); at the default 32 threads the
   waits serialize (122 ms @ 2K). The chart keeps that failure visible on
   purpose — blocking stages must size the pool, not the framework.
 - **Realistic pipelines** are where the streaming engine pays off: 3-stage
-  sync+async chains beat hand-written tokio channel plumbing by 17-19 % at
+  sync+async chains beat hand-written tokio channel plumbing by 16-19 % at
   the larger batches (fewer tasks, pooled scheduling, mixed-mode channels)
   and beat rayon by ~10× once IO blocks its workers.
 
