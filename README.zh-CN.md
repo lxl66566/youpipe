@@ -1,6 +1,6 @@
 # youpipe
 
-[English](./README.md) | 简体中文
+[English](https://github.com/lxl66566/youpipe/blob/main/README.md) | 简体中文
 
 youpipe 是一个高性能、数据优先、支持混合 CPU 负载与流式异步 IO 的并行 pipeline。数据从入口传入，各阶段自然串联，最终通过一次终端调用
 （`.collect()` / `.run()`）执行完整链。两种 pipeline 引擎覆盖不同场景：
@@ -93,16 +93,16 @@ sync+async，以及两个真实的三阶段 pipeline，含本地 mock server 上
 顺序，取中位数）。CPU 场景双方都用各自的惯用借用调用（`pipe_ref` vs
 `par_iter`）。图表为吞吐量——越高越好；柱状图须线为 5 轮的最小–最大范围。模拟 IO 全部为
 sleep，不碰磁盘。方法论与完整数据见
-[`docs/src/dev/benchmarks.md`](docs/src/dev/benchmarks.md#horizontal-cross-library-comparison-2026-09)。
+[`docs/src/dev/benchmarks.md`](https://github.com/lxl66566/youpipe/blob/main/docs/src/dev/benchmarks.md#horizontal-cross-library-comparison-2026-09)。
 
 <p align="center">
-  <img src="docs/src/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">
+  <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">
 </p>
 <p align="center">
-  <img src="docs/src/assets/bench-io.svg" alt="IO pipelines: youpipe vs tokio vs futures">
+  <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-io.svg" alt="IO pipelines: youpipe vs tokio vs futures">
 </p>
 <p align="center">
-  <img src="docs/src/assets/bench-real.svg" alt="Mixed sync + async pipelines: youpipe vs tokio vs futures vs rayon">
+  <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-real.svg" alt="Mixed sync + async pipelines: youpipe vs tokio vs futures vs rayon">
 </p>
 
 要点（中位数耗时；youpipe 对比最强基线；仅计工作负载本身，不含数据准备）：
@@ -214,13 +214,14 @@ let r = (0..1000).stream()
 恢复输入顺序。tokio runtime 构建失败会让 `.run()` panic；改用 `.try_run()`
 可拿到 `Result`。
 
-并非所有配置项对所有引擎都生效：fused `pipe()` 只读取 `compute_workers` 与
-`workload`；`buffer_size` / `async_workers` / `io_concurrency` 仅对流式路径生效。
+并非所有配置项对所有引擎都生效：fused `pipe()` 只从配置中读取 `workload`
+（池大小用 `with_compute_pool` 配置）；`buffer_size` / `async_workers` /
+`io_concurrency` 仅对流式路径生效。
 线程池规模上限为 `MAX_COMPUTE_WORKERS = 511`（调度器休眠位宽为 9 bit）。
 
 ## 工作原理
 
-见[开发者指南](docs/src/SUMMARY.md)（mdbook 源码；`mdbook build docs` 构建）。
+见[开发者指南](https://github.com/lxl66566/youpipe/blob/main/docs/src/SUMMARY.md)（mdbook 源码；`mdbook build docs` 构建）。
 
 ## 第三方声明
 

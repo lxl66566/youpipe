@@ -1,6 +1,6 @@
 # youpipe
 
-English | [简体中文](./README.zh-CN.md)
+English | [简体中文](https://github.com/lxl66566/youpipe/blob/main/README.zh-CN.md)
 
 youpipe is a high-performance, data-first parallel pipeline supporting mixed
 CPU workloads and streaming async IO. Items enter at the front, stages chain
@@ -119,16 +119,16 @@ CPU rows use each library's idiomatic borrow (`pipe_ref` vs `par_iter`).
 Charts show throughput — higher is better; bar-chart whiskers span the
 5 rounds. Simulated IO is pure sleeps — nothing touches the disk. Methodology
 and full data:
-[docs/src/dev/benchmarks.md](docs/src/dev/benchmarks.md#horizontal-cross-library-comparison-2026-09).
+[docs/src/dev/benchmarks.md](https://github.com/lxl66566/youpipe/blob/main/docs/src/dev/benchmarks.md#horizontal-cross-library-comparison-2026-09).
 
 <p align="center">
-  <img src="docs/src/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">
+  <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">
 </p>
 <p align="center">
-  <img src="docs/src/assets/bench-io.svg" alt="IO pipelines: youpipe vs tokio vs futures">
+  <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-io.svg" alt="IO pipelines: youpipe vs tokio vs futures">
 </p>
 <p align="center">
-  <img src="docs/src/assets/bench-real.svg" alt="Mixed sync + async pipelines: youpipe vs tokio vs futures vs rayon">
+  <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-real.svg" alt="Mixed sync + async pipelines: youpipe vs tokio vs futures vs rayon">
 </p>
 
 Highlights (median wall time, youpipe vs the strongest alternative;
@@ -252,13 +252,14 @@ input order via a `ReorderBuffer`. `.run()` panics if the tokio runtime
 cannot be built; use `.try_run()` to surface that as a `Result`.
 
 Not every config knob applies to every engine: a fused `pipe()` reads only
-`compute_workers` and `workload`; `buffer_size` / `async_workers` /
-`io_concurrency` are streaming-only. Pool sizes are capped at
+`workload` from the config (size its pool with `with_compute_pool`);
+`buffer_size` / `async_workers` / `io_concurrency` are streaming-only. Pool
+sizes are capped at
 `MAX_COMPUTE_WORKERS = 511` (the scheduler's sleep bitmask is 9 bits wide).
 
 ## How it works
 
-see the [developer guide](docs/src/SUMMARY.md) (mdbook source; build with
+see the [developer guide](https://github.com/lxl66566/youpipe/blob/main/docs/src/SUMMARY.md) (mdbook source; build with
 `mdbook build docs`).
 
 ## Attribution

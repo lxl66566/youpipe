@@ -13,8 +13,8 @@ This book has three parts:
 
 | Part | Read it for |
 | ---- | ----------- |
-| User guide | Feature walkthroughs, minimal snippets. *(in progress)* |
-| Performance tuning | Pick the right engine and knobs for your workload. *(in progress)* |
+| [User guide](guide/getting-started.md) | Feature walkthroughs, minimal snippets. |
+| [Performance tuning](advanced/choosing-engine.md) | Pick the right engine and knobs for your workload. |
 | [Developer guide](dev/design.md) | Internals: scheduler, channels, verification, methodology. |
 
 Benchmark charts and cross-library comparisons live in the repository
