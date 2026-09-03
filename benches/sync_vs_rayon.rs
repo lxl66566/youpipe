@@ -299,6 +299,25 @@ fn bench_filter_chain(c: &mut Criterion) {
             },
         );
 
+        // Owned caliber: same chain over `pipe(data.clone())`. The clone is
+        // input-lifecycle cost paid identically on every side of an A/B; it
+        // exercises the owned filter tree (`fused_filter_collect`), which is
+        // a different implementation from the borrowed one.
+        group.bench_with_input(
+            BenchmarkId::new("youpipe_filter_map_owned", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let r: Vec<u64> = youpipe::pipe(data.clone())
+                        .map(|x| x + 1)
+                        .filter(|&x: &u64| x % 3 == 0)
+                        .map(|x| x * 2)
+                        .collect();
+                    black_box(r)
+                });
+            },
+        );
+
         group.bench_with_input(
             BenchmarkId::new("rayon_filter_map", size),
             &data,
