@@ -710,7 +710,8 @@ struct ChunkJob<T> {
 // `pool`/`latch`/`fail_slot` are accessed from distinct workers but over
 // disjoint index ranges (`Slots`) or through `Sync` types (`ErasedStrategy:
 // Sync`, `ComputePool: Sync`, `CountLatch`, `Mutex`); each `ChunkJob` itself
-// is touched by exactly one worker (the one that pops its `JobRef`).
+// is executed by exactly one thread (a pool worker or the off-pool driver —
+// whoever pops its `JobRef` from the injector).
 unsafe impl<T: Send> Send for ChunkJob<T> {}
 
 impl<T> Job for ChunkJob<T>
@@ -747,12 +748,25 @@ where
     }
 }
 
+/// Tail chunks withheld from the injector for the hybrid driver's work-assist
+/// (small batches only — see `hybrid_dispatch`). The driver runs chunk 0
+/// inline plus this many reserve chunks from its wait loop; workers execute
+/// the rest. Each unit absorbs one slowest-to-wake worker's worth of tail
+/// latency. A/B (3+2 interleaved rounds, 2026-09): no measurable wall-time
+/// change at 1 or 4 — under back-to-back benchmark loops most workers stay
+/// ready, so the rescue value only shows when workers are absent (see
+/// `test_hybrid_driver_assists_when_workers_busy`); 1 stays the conservative
+/// default because raising it shifts more of the batch onto the (otherwise
+/// spinning) driver at the cost of parallelism when workers ARE available.
+const ASSIST_RESERVE_CHUNKS: usize = 1;
+
 /// Hybrid top-level dispatcher. Splits `[0, n)` into `num_chunks` contiguous
 /// ranges. Chunk 0 is run **inline on the driver thread** (mirrors rayon's
 /// off-pool path where the calling thread participates; see the inline comment
 /// in the body for the ramp-up/wake-cascade rationale); chunks
-/// 1..num_chunks are injected as `ChunkJob`s and the driver blocks until all
-/// complete.
+/// `1..num_chunks - reserve` are injected as `ChunkJob`s and the driver blocks
+/// until all complete. The `reserve` tail chunks (small batches only) are
+/// never injected — the driver executes them from its wait loop instead.
 ///
 /// Returns `Err(first_failure)` if any chunk (driver or pool) failed (after
 /// the strategy has cleaned up the successful chunks' per-chunk resources so
@@ -785,24 +799,45 @@ where
     let chunk = n / num_chunks;
     let rem = n % num_chunks;
 
-    // Driver-inline participation: the off-pool calling thread runs chunk 0
-    // while the pool handles the rest — mirroring rayon's off-pool path.
-    // This saves 1 injector push and reduces the condvar wake cascade by 1
-    // (the `new_injected_jobs` logic wakes one fewer sleeping worker).
+    // Driver participation (small batches, `chunk_splits == 0`): the off-pool
+    // calling thread runs chunk 0 inline while the pool handles the rest —
+    // mirroring rayon's off-pool path. Beyond chunk 0, `ASSIST_RESERVE_CHUNKS`
+    // tail chunks are withheld from the injector and executed by the driver
+    // from its wait loop (`wait_spin_assist`): a parked worker takes ~µs-scale
+    // to wake and the slowest-to-wake worker gates the batch tail, so letting
+    // the otherwise-spinning driver absorb the last chunk(s) closes exactly
+    // that tail.
     //
-    // Guarded by `chunk_splits == 0` so the driver only runs a single leaf
-    // (≈ n/num_threads items, sub-microsecond for the small/medium batches
-    // this targets). For large batches (`chunk_splits > 0`) the driver
-    // chunk would be a multi-leaf range processed sequentially — its memory
-    // traffic competes with the pool workers' bandwidth on memory-bound
-    // workloads, which regressed `sync_lightweight` 1 M by ~3 %. Keeping
-    // the driver to leaf-size avoids that: the driver's memory footprint is
-    // ≤ 1/num_threads of the batch, the same as one pool worker's share.
+    // The reserve is kept OUT of the injector on purpose — the driver must not
+    // interact with the pool-global queue at all. Two pop-based variants were
+    // tried and reverted: (a) executing any popped job breaks on foreign
+    // worker-only jobs (`in_worker_cold`'s `StackJob` asserts on the worker
+    // TLS and unwinds straight through the driver frame, skipping the latch
+    // wait); (b) popping, identity-checking and re-queueing foreign jobs
+    // reorders the injector's FIFO, which foreign submitters depend on — a
+    // stream feeder pushed behind resident stage-worker jobs starves, and
+    // with every worker parked on an empty channel recv the whole pool
+    // deadlocks (reproduced under the parallel test suite).
+    //
+    // Guarded by `chunk_splits == 0` so the driver only runs single-leaf
+    // chunks (≈ n/num_threads items, sub-microsecond for the small/medium
+    // batches this targets). For large batches (`chunk_splits > 0`) the
+    // driver chunk would be a multi-leaf range processed sequentially — its
+    // memory traffic competes with the pool workers' bandwidth on
+    // memory-bound workloads, which regressed `sync_lightweight` 1 M by
+    // ~3 %.
     let driver_participates = chunk_splits == 0;
     let first_pool_chunk = usize::from(driver_participates);
+    let reserve = if driver_participates {
+        ASSIST_RESERVE_CHUNKS.min(num_chunks - first_pool_chunk - 1)
+    } else {
+        0
+    };
     let pool_chunks = num_chunks - first_pool_chunk;
-    // `prefers_serial` guarantees num_chunks ≥ 2 here, so pool_chunks ≥ 1.
+    debug_assert!(pool_chunks >= 1, "prefers_serial guarantees num_chunks ≥ 2");
     let fail_slot: Mutex<Option<ErasedFailure>> = Mutex::new(None);
+    // The latch waits for every non-inline chunk, including the driver's
+    // reserve: the driver's own execution decrements it like a worker's would.
     let latch = CountLatch::with_count(pool_chunks, None);
 
     // Build pool chunk jobs (chunks `first_pool_chunk..num_chunks`). All
@@ -840,13 +875,16 @@ where
     }
     debug_assert_eq!(start, n);
     let jobs: Box<[ChunkJob<T>]> = jobs_vec.into_boxed_slice();
+    // The tail `reserve` jobs are driver-owned (never injected); only
+    // `jobs[..injected_len]` get JobRefs.
+    let injected_len = jobs.len() - reserve;
 
     // Inject pool chunks: a single JEC increment + a single wake cascade.
     // Every idle worker pops a chunk on its next `find_work`. The JobRefs are
     // produced lazily from the boxed slice (no intermediate `Vec<JobRef>`
     // allocation).
     let registry = pool.registry();
-    let job_refs = jobs
+    let job_refs = jobs[..injected_len]
         .iter()
         .map(|j| unsafe { JobRef::new(ptr::from_ref(j)) });
     registry.inject_batch(job_refs);
@@ -883,7 +921,33 @@ where
     // land inside the spin window and skips the syscall; long waits still
     // fall through to the condvar. See `CountLatch::wait_spin` for the
     // synchronization argument.
-    latch.wait_spin();
+    //
+    // Work-assist (driver-participates regime only): while waiting, the
+    // driver runs the batch's withheld reserve chunks (see the reserve block
+    // above for why they never touch the injector). `counter == 0` still
+    // implies every *injected* `JobRef` was fully consumed (the completion
+    // `set` lives inside `execute`), which is load-bearing for the teardown
+    // below: once `wait` returns and this frame (owning the `Box<[ChunkJob]>`)
+    // goes away, no worker can touch a freed chunk.
+    if driver_participates {
+        let mut reserve_next = injected_len;
+        let assist = || {
+            if reserve_next >= jobs.len() {
+                return false;
+            }
+            let j = &jobs[reserve_next];
+            reserve_next += 1;
+            // SAFETY: reserve chunks are never injected — this driver is
+            // their sole executor, and its frame outlives the latch wait.
+            // Runs the same `execute` a worker would (panic capture, failure
+            // recording, latch decrement).
+            unsafe { <ChunkJob<T> as Job>::execute(ptr::from_ref(j).cast::<()>()) };
+            true
+        };
+        latch.wait_spin_assist(assist);
+    } else {
+        latch.wait_spin();
+    }
 
     // After `wait_spin` returns every pool chunk's `execute` has run
     // `CountLatch::set`; the SeqCst fence there carries the `succeeded`

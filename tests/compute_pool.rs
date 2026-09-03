@@ -67,3 +67,68 @@ fn test_compute_pool_many_small_tasks() {
     wg.wait();
     assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), total);
 }
+
+/// Driver work-assist on the hybrid dispatch path (reserve chunks): with every
+/// pool worker busy on a blocking submitted job, the driver still runs its own
+/// inline chunk 0 plus the reserve chunk(s), and the injected chunks complete
+/// once the workers come back — the batch finishes correctly with each chunk
+/// executed exactly once. The blockers auto-release after a delay so the
+/// parked wait terminates without test-side coordination.
+#[test]
+fn test_hybrid_driver_assists_when_workers_busy() {
+    use std::sync::mpsc;
+
+    let pool = youpipe::ComputePool::new(4);
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    for _ in 0..4 {
+        let rx = Arc::clone(&release_rx);
+        let tx = started_tx.clone();
+        pool.submit(move || {
+            tx.send(()).unwrap();
+            let _ = rx.lock().unwrap().recv();
+        });
+    }
+    drop(started_tx);
+    // Wait until all 4 workers are provably inside their blockers — from here
+    // on no worker can pick up hybrid chunks until released.
+    for _ in 0..4 {
+        started_rx.recv().unwrap();
+    }
+    // Auto-release on a helper thread: the driver covers chunk 0 + reserve,
+    // then parks on the latch until the workers drain the injected chunks.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(if cfg!(miri) {
+            200
+        } else {
+            300
+        }));
+        for _ in 0..4 {
+            release_tx.send(()).unwrap();
+        }
+    });
+
+    let n: u32 = if cfg!(miri) {
+        256
+    } else {
+        4096
+    };
+    let input: Vec<u64> = (0..u64::from(n)).collect();
+    let expected: Vec<u64> = input.iter().map(|x| x * 2 + 1).collect();
+    let got: Vec<u64> = youpipe::pipe(input)
+        .with_compute_pool(pool.clone())
+        .map(|x| x * 2 + 1)
+        .collect();
+    assert_eq!(got, expected);
+
+    // The pool must still accept and run new work after the drain.
+    let (tx, rx) = mpsc::channel();
+    pool.submit(move || {
+        tx.send(42).unwrap();
+    });
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap(),
+        42
+    );
+}

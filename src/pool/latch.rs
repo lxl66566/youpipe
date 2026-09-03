@@ -295,6 +295,53 @@ mod loom_tests {
         });
     }
 
+    /// `wait_spin_assist` (Blocking variant): one external setter plus one
+    /// "reserve chunk" executed by the waiter's own hook. The hook's
+    /// decrement participates in the same counter, so the wait must return
+    /// only after both sides completed, with both sides' writes visible —
+    /// the hook runs on the waiting thread, but its store must be ordered by
+    /// the counter's SeqCst chain exactly like a remote setter's.
+    #[test]
+    fn count_latch_assist_hook_decrements_like_a_setter() {
+        loom::model(|| {
+            use std::cell::Cell;
+
+            struct Hooked {
+                latch: CountLatch,
+                flag: AtomicUsize,
+            }
+
+            let hl = Arc::new(Hooked {
+                latch: CountLatch::with_count(2, None),
+                flag: AtomicUsize::new(0),
+            });
+
+            let a = Arc::clone(&hl);
+            loom::thread::spawn(move || {
+                a.flag.fetch_or(1, Ordering::Release);
+                unsafe { CountLatch::set(ptr::from_ref(&a.latch)) };
+            });
+
+            let b = Arc::clone(&hl);
+            let ran = Cell::new(false);
+            b.latch.wait_spin_assist(|| {
+                if ran.get() {
+                    return false;
+                }
+                ran.set(true);
+                b.flag.fetch_or(2, Ordering::Release);
+                unsafe { CountLatch::set(ptr::from_ref(&b.latch)) };
+                true
+            });
+
+            assert_eq!(
+                hl.flag.load(Ordering::Acquire),
+                3,
+                "both the setter's and the hook's writes visible"
+            );
+        });
+    }
+
     /// `CountLatch` (Blocking variant): two setters + a `wait_spin` waiter.
     /// Relaxed data flags published by each setter must be visible after the
     /// wait returns — the counter's SeqCst fetch_sub + LockLatch mutex must
@@ -414,9 +461,13 @@ impl CountLatch {
     /// condvar path relies on.
     ///
     /// No-stealing note: the caller is an off-pool thread with no worker deque,
-    /// so unlike the `Stealing` variant it cannot help by stealing while it
-    /// waits — a bounded spin is strictly better than parking for short waits.
-    /// The `Stealing` variant keeps its work-stealing `wait()`.
+    /// so unlike the `Stealing` variant it cannot help by stealing from peers
+    /// while it waits — a bounded spin is strictly better than parking for
+    /// short waits. (The hybrid dispatcher layers work-*assisting* on top via
+    /// [`wait_spin_assist`]; the `Stealing` variant keeps its work-stealing
+    /// `wait()`.)
+    ///
+    /// [`wait_spin_assist`]: CountLatch::wait_spin_assist
     pub(crate) fn wait_spin(&self) {
         match &self.kind {
             CountLatchKind::Stealing {
@@ -447,6 +498,71 @@ impl CountLatch {
                 // out (genuinely long wait), this parks until the setter's
                 // notify — releasing the core. Either way the mutex serializes
                 // us against the setter's in-flight latch access.
+                latch.wait();
+            },
+        }
+    }
+
+    /// [`wait_spin`](Self::wait_spin) with a work-assist hook: between spins,
+    /// the off-pool driver runs one of its **reserve chunks** via `try_work`,
+    /// and productive work resets the spin budget.
+    ///
+    /// The hybrid dispatcher keeps a small tail of chunks out of the injector
+    /// (see `hybrid_dispatch`); `try_work` returns `true` while any remain,
+    /// `false` once the local reserve is exhausted (monotone — the driver is
+    /// their only executor). This lets the driver absorb the wake-latency tail
+    /// — chunks that slow-to-wake workers would otherwise gate the batch on —
+    /// without the driver ever touching the pool-global injector (whose FIFO
+    /// order foreign submitters, e.g. stream feeders, depend on; an earlier
+    /// pop-and-requeue assist variant reordered those jobs and deadlocked
+    /// resident stream workers parked on empty channels).
+    ///
+    /// Tier structure and the mutex-serialization soundness argument are
+    /// identical to [`wait_spin`](Self::wait_spin); the only additions are the
+    /// hook call and the budget reset on productive work.
+    ///
+    /// Liveness: `try_work` returning `false` means every remaining chunk was
+    /// injected (and is popped/executing on a worker) — parking is safe, the
+    /// last executor's `LockLatch::set` notifies us.
+    pub(crate) fn wait_spin_assist(&self, mut try_work: impl FnMut() -> bool) {
+        match &self.kind {
+            CountLatchKind::Stealing { .. } => {
+                // On-pool callers never reach the hybrid dispatcher's assist
+                // path (the dispatch entry points route on-pool callers to
+                // `join` instead); keep the work-stealing wait as a safe
+                // fallback.
+                self.wait_spin();
+            },
+            CountLatchKind::Blocking { latch } => {
+                let mut spins_left = OFF_POOL_SPIN_ITERS;
+                loop {
+                    if try_work() {
+                        // Productive work resets the budget: a driver that
+                        // keeps running its reserve chunks is making progress,
+                        // not spinning, and must not fall through to the
+                        // condvar while reserve work remains.
+                        spins_left = OFF_POOL_SPIN_ITERS;
+                        if self.counter.load(Ordering::Acquire) == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    if self.counter.load(Ordering::Acquire) == 0 {
+                        break;
+                    }
+                    if spins_left == 0 {
+                        // Tier 2: condvar park (see `wait_spin`). Returns only
+                        // with the latch set — terminal state.
+                        latch.wait();
+                        return;
+                    }
+                    spins_left -= 1;
+                    std::hint::spin_loop();
+                }
+                // Broke out of the loop on counter == 0: still serialize
+                // against the last setter's in-flight `LockLatch::set` via the
+                // mutex acquire (see `wait_spin`'s soundness doc). In the
+                // common case `*guard` is already `true` — no park.
                 latch.wait();
             },
         }
