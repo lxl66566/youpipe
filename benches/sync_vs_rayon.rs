@@ -259,6 +259,65 @@ fn bench_for_each_vs_rayon(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_filter_chain(c: &mut Criterion) {
+    // Filter chains cannot use the index-based core (output cardinality is
+    // unknown), so they exercise the merge path — historically a single
+    // fork/join tree even for off-pool callers. Watch this group when touching
+    // the filter dispatch (hybrid ramp-up for filter chains).
+    let mut group = c.benchmark_group("sync_filter");
+    for size in [1_000, 10_000, 100_000] {
+        let data: Vec<u64> = (0..size).collect();
+
+        group.throughput(Throughput::Elements(size));
+        group.bench_with_input(
+            BenchmarkId::new("youpipe_filter_map", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let r: Vec<u64> = youpipe::pipe_ref(data)
+                        .map(|&x| x + 1)
+                        .filter(|&x: &u64| x % 3 == 0)
+                        .map(|x| x * 2)
+                        .collect();
+                    black_box(r)
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("rayon_filter_map", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    black_box(
+                        data.par_iter()
+                            .map(|&x| x + 1)
+                            .filter(|&x: &u64| x % 3 == 0)
+                            .map(|x| x * 2)
+                            .collect::<Vec<u64>>(),
+                    )
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("sequential", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    black_box(
+                        data.iter()
+                            .map(|&x| x + 1)
+                            .filter(|&x: &u64| x % 3 == 0)
+                            .map(|x| x * 2)
+                            .collect::<Vec<u64>>(),
+                    )
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = common::criterion();
@@ -267,6 +326,7 @@ criterion_group! {
         bench_pipeline_fusion,
         bench_lightweight_work,
         bench_try_collect,
-        bench_for_each_vs_rayon
+        bench_for_each_vs_rayon,
+        bench_filter_chain
 }
 criterion_main!(benches);
