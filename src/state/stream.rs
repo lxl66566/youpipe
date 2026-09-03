@@ -1,31 +1,61 @@
 use crate::{
-    handoff::{RecvItem, TryRecvError},
+    handoff::{AsyncRecvItem, RecvItem, TryRecvError},
     state::ReorderBuffer,
 };
 
-/// Drain `input_rx` in input-order (sequence-tagged) fashion, returning the
-/// fully ordered result vector.
-///
-/// Items arrive tagged with their original sequence number `(seq, item)`;
-/// out-of-order arrivals are re-sequenced through a [`ReorderBuffer`]. The
-/// receiver loop exits once all senders drop, then any remaining buffered
-/// items are flushed in seq order.
-///
-/// Generic over the receiver type so it works with both MPMC (`Receiver`) and
-/// MPSC (`MpscReceiver`) channels.
+// ── Shared terminal-drain loops ──
+//
+// Every streaming terminal (`.run()`'s Vec collector, `.for_each()`'s sink,
+// sync and async alike) drains the final receiver with the same "burst-drain"
+// loop. The four helpers below are the single implementation of unordered /
+// ordered × sync / async drains, parameterized by a per-item `sink` closure —
+// collect pushes into a `Vec`, for_each invokes the user's closure. After
+// inlining the sink is free, so all terminals share one code path with zero
+// per-item overhead.
+
+/// Drain `rx` in arrival order, invoking `sink` per item.
 ///
 /// # Burst-drain strategy
 ///
-/// Mirrors the unordered collector: when multiple items land in the channel
-/// before the collector loops back (common with parallel workers finishing in
-/// bursts), a tight `try_recv` loop absorbs the burst without per-item
-/// blocking-recv overhead (condvar/park bookkeeping inside the channel on the
-/// empty path); only the first item of each burst goes through the blocking
-/// `recv()`. Ordering is unaffected — the [`ReorderBuffer`] re-sequences by
-/// `seq` regardless of arrival order.
-#[must_use]
+/// When multiple items land in the channel before the collector loops back
+/// (common with parallel workers finishing in bursts), a tight `try_recv` loop
+/// absorbs the burst without per-item blocking-recv overhead (condvar/park
+/// bookkeeping inside the channel on the empty path); only the first item of
+/// each burst goes through the blocking `recv()`.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub fn run_ordered_collect<R, O>(input_rx: &R, expected_items: usize) -> Vec<O>
+pub(crate) fn drain_unordered<R, O>(rx: &R, mut sink: impl FnMut(O))
+where
+    R: RecvItem<(u64, O)>,
+    O: Send + 'static,
+{
+    loop {
+        // Burst-drain: pop everything already queued without blocking.
+        loop {
+            match rx.try_recv() {
+                Ok((_, item)) => sink(item),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => return,
+            }
+        }
+        // Queue drained but channel may still be open — block for one.
+        match rx.recv() {
+            Ok((_, item)) => sink(item),
+            Err(_) => return,
+        }
+    }
+}
+
+/// Drain `rx` in **input order** (sequence-tagged), invoking `sink` per item.
+///
+/// Items arrive tagged with their original sequence number `(seq, item)`;
+/// out-of-order arrivals are re-sequenced through a [`ReorderBuffer`]. The
+/// loop exits once all senders drop, then any remaining buffered items are
+/// flushed in seq order.
+///
+/// Burst-drains like [`drain_unordered`]; ordering is unaffected — the
+/// [`ReorderBuffer`] re-sequences by `seq` regardless of arrival order.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn drain_ordered<R, O>(rx: &R, expected_items: usize, mut sink: impl FnMut(O))
 where
     R: RecvItem<(u64, O)>,
     O: Send + 'static,
@@ -37,25 +67,121 @@ where
     // sane.
     let capacity = expected_items.next_power_of_two().clamp(1 << 10, 1 << 20);
     let mut buffer = ReorderBuffer::new(capacity);
-    let mut results = Vec::with_capacity(expected_items);
     loop {
         // Burst-drain: pop everything already queued without blocking.
         loop {
-            match input_rx.try_recv() {
-                Ok((seq, item)) => buffer.insert_into(seq, item, &mut results),
+            match rx.try_recv() {
+                Ok((seq, item)) => buffer.insert_into(seq, item, &mut sink),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Closed) => {
-                    results.extend(buffer.flush_remaining());
-                    return results;
+                    for item in buffer.flush_remaining() {
+                        sink(item);
+                    }
+                    return;
                 },
             }
         }
-        // Queue drained but the channel may still be open — block for one.
-        if let Ok((seq, item)) = input_rx.recv() {
-            buffer.insert_into(seq, item, &mut results);
+        // Queue drained but channel may still be open — block for one.
+        if let Ok((seq, item)) = rx.recv() {
+            buffer.insert_into(seq, item, &mut sink);
         } else {
-            results.extend(buffer.flush_remaining());
-            return results;
+            for item in buffer.flush_remaining() {
+                sink(item);
+            }
+            return;
         }
     }
+}
+
+/// Async counterpart of [`drain_unordered`]: `try_recv` bursts without
+/// awaiting, one `recv().await` per burst to register a waker.
+///
+/// The burst phase matters more here than on the sync side: once the first
+/// wave of async consumers wakes — tokio's coarse timer wheel batches
+/// same-duration timeouts into one tick — every item after the first is
+/// already queued, and a plain `while let Ok(..) = rx.recv().await` would pay
+/// one waker-register/wake round-trip per item. The two-phase loop converts
+/// that per-item `await` cost into per-burst cost.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) async fn drain_unordered_async<R, O>(rx: &R, mut sink: impl FnMut(O))
+where
+    R: AsyncRecvItem<(u64, O)>,
+    O: Send + 'static,
+{
+    loop {
+        // Burst-drain: pop everything already queued without awaiting.
+        loop {
+            match rx.try_recv() {
+                Ok((_, item)) => sink(item),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => return,
+            }
+        }
+        // Queue is drained but channel may still be open. Await exactly one
+        // item to register a waker; the next iteration's burst-drain picks up
+        // anything that arrived in the meantime.
+        match rx.recv().await {
+            Ok((_, item)) => sink(item),
+            Err(_) => return,
+        }
+    }
+}
+
+/// Async counterpart of [`drain_ordered`]: re-sequences through a
+/// [`ReorderBuffer`] while burst-draining like [`drain_unordered_async`].
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) async fn drain_ordered_async<R, O>(
+    rx: &R,
+    expected_items: usize,
+    mut sink: impl FnMut(O),
+)
+where
+    R: AsyncRecvItem<(u64, O)>,
+    O: Send + 'static,
+{
+    let capacity = expected_items.next_power_of_two().clamp(1 << 10, 1 << 20);
+    let mut buffer = ReorderBuffer::new(capacity);
+    loop {
+        loop {
+            match rx.try_recv() {
+                Ok((seq, o)) => buffer.insert_into(seq, o, &mut sink),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Closed) => {
+                    for item in buffer.flush_remaining() {
+                        sink(item);
+                    }
+                    return;
+                },
+            }
+        }
+        if let Ok((seq, o)) = rx.recv().await {
+            buffer.insert_into(seq, o, &mut sink);
+        } else {
+            for item in buffer.flush_remaining() {
+                sink(item);
+            }
+            return;
+        }
+    }
+}
+
+/// Drain `input_rx` in input-order (sequence-tagged) fashion, returning the
+/// fully ordered result vector.
+///
+/// Items arrive tagged with their original sequence number `(seq, item)`;
+/// out-of-order arrivals are re-sequenced through a [`ReorderBuffer`]. The
+/// receiver loop exits once all senders drop, then any remaining buffered
+/// items are flushed in seq order.
+///
+/// Generic over the receiver type so it works with both MPMC (`Receiver`) and
+/// MPSC (`MpscReceiver`) channels.
+#[must_use]
+pub fn run_ordered_collect<R, O>(input_rx: &R, expected_items: usize) -> Vec<O>
+where
+    R: RecvItem<(u64, O)>,
+    O: Send + 'static,
+{
+    let mut results = Vec::with_capacity(expected_items);
+    drain_ordered(input_rx, expected_items, |item| results.push(item));
+    results
 }

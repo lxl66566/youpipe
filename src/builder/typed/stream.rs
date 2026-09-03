@@ -11,11 +11,11 @@ use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
     handoff::{
-        MpscReceiver, Receiver, RecvItem, SendItem, SyncSender, TryRecvError, channel::channel,
+        MpscReceiver, Receiver, RecvItem, SendItem, SyncSender, channel::channel,
         mpsc_channel,
     },
     runtime::{AsyncRuntime, DefaultRuntime},
-    state::{FenceBarrier, FenceMode, ReorderBuffer, run_ordered_collect},
+    state::{FenceBarrier, FenceMode, run_ordered_collect},
     sync::CancellationToken,
 };
 
@@ -1913,124 +1913,38 @@ impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<T> for ForEachCollector<F>
     }
 }
 
-/// Item-by-item drain of a sync final receiver, mirroring [`collect_sync`]'s
-/// burst-drain strategy. Ordered mode re-sequences through a [`ReorderBuffer`],
-/// consuming each ready batch (small transient `Vec` per batch, not a full
-/// output buffer).
+/// Item-by-item drain of a sync final receiver — the shared
+/// [`drain_unordered`]/[`drain_ordered`] loops with the user closure as the
+/// sink.
 #[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
-fn for_each_sync<R, T, F>(rx: R, ordered: bool, n: usize, mut f: F)
+fn for_each_sync<R, T, F>(rx: R, ordered: bool, n: usize, f: F)
 where
     R: RecvItem<(u64, T)>,
     T: Send + Unpin + 'static,
     F: FnMut(T),
 {
-    if !ordered {
-        loop {
-            loop {
-                match rx.try_recv() {
-                    Ok((_, item)) => f(item),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Closed) => return,
-                }
-            }
-            match rx.recv() {
-                Ok((_, item)) => f(item),
-                Err(_) => return,
-            }
-        }
-    }
-    let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
-    let mut buffer = ReorderBuffer::new(capacity);
-    let mut batch: Vec<T> = Vec::new();
-    loop {
-        loop {
-            match rx.try_recv() {
-                Ok((seq, item)) => {
-                    batch.extend(buffer.insert(seq, item));
-                    for item in batch.drain(..) {
-                        f(item);
-                    }
-                },
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Closed) => {
-                    for item in buffer.flush_remaining() {
-                        f(item);
-                    }
-                    return;
-                },
-            }
-        }
-        if let Ok((seq, item)) = rx.recv() {
-            batch.extend(buffer.insert(seq, item));
-            for item in batch.drain(..) {
-                f(item);
-            }
-        } else {
-            for item in buffer.flush_remaining() {
-                f(item);
-            }
-            return;
-        }
+    if ordered {
+        crate::state::drain_ordered(&rx, n, f);
+    } else {
+        crate::state::drain_unordered(&rx, f);
     }
 }
 
-/// Async counterpart of [`for_each_sync`] — mirrors [`collect_async`]'s
-/// burst-drain phases but applies `f` instead of pushing into a `Vec`.
+/// Async counterpart of [`for_each_sync`] — the shared
+/// [`drain_unordered_async`]/[`drain_ordered_async`] loops with the user
+/// closure as the sink.
 #[cfg(feature = "tokio-runtime")]
 #[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
-async fn for_each_async<R, T, F>(rx: R, ordered: bool, n: usize, mut f: F)
+async fn for_each_async<R, T, F>(rx: R, ordered: bool, n: usize, f: F)
 where
     R: AsyncRecvItem<(u64, T)>,
     T: Send + Unpin + 'static,
     F: FnMut(T),
 {
-    if !ordered {
-        loop {
-            loop {
-                match rx.try_recv() {
-                    Ok((_, item)) => f(item),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Closed) => return,
-                }
-            }
-            match rx.recv().await {
-                Ok((_, item)) => f(item),
-                Err(_) => return,
-            }
-        }
-    }
-    let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
-    let mut buffer = ReorderBuffer::new(capacity);
-    let mut batch: Vec<T> = Vec::new();
-    loop {
-        loop {
-            match rx.try_recv() {
-                Ok((seq, item)) => {
-                    batch.extend(buffer.insert(seq, item));
-                    for item in batch.drain(..) {
-                        f(item);
-                    }
-                },
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Closed) => {
-                    for item in buffer.flush_remaining() {
-                        f(item);
-                    }
-                    return;
-                },
-            }
-        }
-        if let Ok((seq, item)) = rx.recv().await {
-            batch.extend(buffer.insert(seq, item));
-            for item in batch.drain(..) {
-                f(item);
-            }
-        } else {
-            for item in buffer.flush_remaining() {
-                f(item);
-            }
-            return;
-        }
+    if ordered {
+        crate::state::drain_ordered_async(&rx, n, f).await;
+    } else {
+        crate::state::drain_unordered_async(&rx, f).await;
     }
 }
 
@@ -2263,19 +2177,12 @@ where
     }
 }
 
-/// Sync collector: drains `rx` into a `Vec`. If `ordered`, uses a
-/// [`ReorderBuffer`] to restore input order.
-///
-/// # Burst-drain strategy (unordered path)
-///
-/// Mirrors the async collector's burst-drain: when multiple items land in the
-/// channel before the collector loops back (common with parallel workers),
-/// `try_recv` absorbs the burst without per-item condvar overhead. Only the
-/// first item of each burst goes through the blocking `recv()`.
+/// Sync collector: drains `rx` into a `Vec` via the shared drain loops —
+/// ordered through [`run_ordered_collect`], unordered through
+/// [`drain_unordered`](crate::state) with a `Vec` push sink.
 #[allow(clippy::needless_pass_by_value)]
 // `rx` is the terminal drain of the
 // pipeline: `run` passes the sole receiver by value to express "consume fully".
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_sync<R, T>(rx: R, ordered: bool, n: usize) -> Vec<T>
 where
     R: RecvItem<(u64, T)>,
@@ -2285,104 +2192,32 @@ where
         run_ordered_collect(&rx, n)
     } else {
         let mut results = Vec::with_capacity(n);
-        loop {
-            // Burst-drain: pop everything already queued without blocking.
-            loop {
-                match rx.try_recv() {
-                    Ok((_, item)) => results.push(item),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Closed) => return results,
-                }
-            }
-            // Queue drained but channel may still be open — block for one.
-            match rx.recv() {
-                Ok((_, item)) => results.push(item),
-                Err(_) => return results,
-            }
-        }
+        crate::state::drain_unordered(&rx, |item| results.push(item));
+        results
     }
 }
 
-/// Async collector: drains `rx` into a `Vec` via the async runtime. If
-/// `ordered`, uses a [`ReorderBuffer`].
+/// Async collector: drains `rx` into a `Vec` via the shared async drain
+/// loops. If `ordered`, re-sequences through a [`ReorderBuffer`].
 ///
 /// Generic over the async receiver type so it works with both MPMC
 /// ([`AsyncReceiver`]) and MPSC ([`MpscAsyncReceiver`]) channels — the
 /// collector is always the sole consumer of the final channel, and the MPSC
 /// variant eliminates the per-item `lock cmpxchg` that the MPMC ring buffer
 /// pays on every `recv`.
-///
-/// # Burst-drain strategy (unordered path)
-///
-/// When multiple items land in the channel before the collector loops back
-/// (common once the first wave of async consumers wakes — tokio's coarse
-/// timer wheel batches same-duration timeouts into one tick), a pure
-/// `while let Ok(..) = rx.recv().await` pays one waker-register/wake
-/// round-trip per item even though every item after the first is already
-/// queued. The unordered path therefore drains in two phases per burst:
-///
-///   1. Spin `try_recv` until `Empty` — no `await`, no waker registration.
-///   2. When drained but still open, `recv().await` exactly once to register a waker; then loop
-///      back to step 1.
-///
-/// This converts per-item `await` cost into per-burst cost — measurable for
-/// `io_async_pure` at size 500 (~450 items completing in the same ~1 ms
-/// timer tick).
 #[cfg(feature = "tokio-runtime")]
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn collect_async<R, T>(rx: R, ordered: bool, n: usize) -> Vec<T>
 where
     R: AsyncRecvItem<(u64, T)>,
     T: Send + Unpin + 'static,
 {
-    if !ordered {
-        let mut results = Vec::with_capacity(n);
-        loop {
-            // Burst-drain: pop everything already queued without awaiting.
-            // `try_recv` is a non-blocking pop; on `Empty` we fall through
-            // to the awaited `recv` below.
-            loop {
-                match rx.try_recv() {
-                    Ok((_, item)) => results.push(item),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Closed) => return results,
-                }
-            }
-            // Queue is drained but channel may still be open. Await exactly
-            // one item to register a waker; the next iteration's burst-drain
-            // picks up anything that arrived in the meantime.
-            match rx.recv().await {
-                Ok((_, item)) => results.push(item),
-                Err(_) => return results,
-            }
-        }
-    }
-    let capacity = n.next_power_of_two().clamp(1 << 10, 1 << 20);
-    let mut buffer = ReorderBuffer::new(capacity);
     let mut results = Vec::with_capacity(n);
-    // Burst-drain, mirroring the unordered path above (and the sync
-    // `run_ordered_collect`): drain whatever is already queued via `try_recv`
-    // (no `await`, no waker registration), then `recv().await` exactly once to
-    // register a waker. Ordering is unaffected — the `ReorderBuffer`
-    // re-sequences by `seq` regardless of arrival order.
-    loop {
-        loop {
-            match rx.try_recv() {
-                Ok((seq, o)) => buffer.insert_into(seq, o, &mut results),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Closed) => {
-                    results.extend(buffer.flush_remaining());
-                    return results;
-                },
-            }
-        }
-        if let Ok((seq, o)) = rx.recv().await {
-            buffer.insert_into(seq, o, &mut results);
-        } else {
-            results.extend(buffer.flush_remaining());
-            return results;
-        }
+    if ordered {
+        crate::state::drain_ordered_async(&rx, n, |item| results.push(item)).await;
+    } else {
+        crate::state::drain_unordered_async(&rx, |item| results.push(item)).await;
     }
+    results
 }
 
 #[cfg(test)]

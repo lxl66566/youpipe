@@ -62,15 +62,17 @@ impl<T> ReorderBuffer<T> {
         }
     }
 
-    /// Insert `item` tagged with `seq`, writing any newly-contiguous run of
-    /// items directly into `sink` — the zero-allocation hot path used by the
+    /// Insert `item` tagged with `seq`, passing any newly-contiguous run of
+    /// items to `sink` one by one — the zero-allocation hot path used by the
     /// streaming ordered collectors.
     ///
-    /// The `sink` out-parameter avoids the per-call `Vec` of [`insert`]: in the
-    /// in-order steady state that returned `Vec` has length 1, so callers paid
-    /// a `malloc` + `free` per item purely to move one value — at 100 k+ items
-    /// that churn dominated the ordered collector's cost.
-    pub fn insert_into(&mut self, seq: u64, item: T, sink: &mut Vec<T>) {
+    /// The closure sink (rather than a `&mut Vec<T>` out-parameter) lets both
+    /// terminal kinds share it: `.run()` pushes into its result `Vec`,
+    /// `.for_each()` invokes the user closure. Neither constructs a per-item
+    /// `Vec` — the earlier `insert()`-returning-a-`Vec` shape cost a
+    /// `malloc` + `free` per item purely to move one value, which at 100 k+
+    /// items dominated the ordered collector's cost.
+    pub fn insert_into(&mut self, seq: u64, item: T, sink: &mut impl FnMut(T)) {
         // Fast path: item is exactly next expected and nothing is buffered.
         // `len == 0` implies every slot is unoccupied (occupied slots are
         // counted by `len`), so this scalar guard subsumes a defensive
@@ -78,7 +80,7 @@ impl<T> ReorderBuffer<T> {
         // in-order stream never allocates it at all. Nothing can be flushable,
         // so the flush pass is skipped too.
         if seq == self.next_expected && self.len == 0 {
-            sink.push(item);
+            sink(item);
             self.next_expected += 1;
             return;
         }
@@ -112,16 +114,15 @@ impl<T> ReorderBuffer<T> {
 
     /// Insert `item` and return any newly-contiguous run as a `Vec`.
     ///
-    /// Convenience wrapper around [`insert_into`](Self::insert_into) (e.g.
-    /// tests); prefer `insert_into` on hot paths to avoid the per-call
-    /// allocation.
+    /// Convenience wrapper (e.g. tests); prefer [`insert_into`](Self::insert_into)
+    /// on hot paths to avoid the per-call allocation.
     pub fn insert(&mut self, seq: u64, item: T) -> Vec<T> {
         let mut ready = Vec::new();
-        self.insert_into(seq, item, &mut ready);
+        self.insert_into(seq, item, &mut |item| ready.push(item));
         ready
     }
 
-    fn flush_ready_into(&mut self, sink: &mut Vec<T>) {
+    fn flush_ready_into(&mut self, sink: &mut impl FnMut(T)) {
         // `len == 0` ⇒ no occupied slots ⇒ the loop below would break on its
         // first iteration anyway. Also keeps the lazy `slots` array (empty
         // `Vec`) safely unindexed.
@@ -141,7 +142,7 @@ impl<T> ReorderBuffer<T> {
             slot.occupied = false;
             self.len -= 1;
             self.next_expected += 1;
-            sink.push(item);
+            sink(item);
         }
     }
 
@@ -215,7 +216,7 @@ mod tests {
         let mut buf = ReorderBuffer::<i32>::new(16);
         let mut out = Vec::new();
         for i in 0..10u64 {
-            buf.insert_into(i, i32::try_from(i * 10).unwrap(), &mut out);
+            buf.insert_into(i, i32::try_from(i * 10).unwrap(), &mut |item| out.push(item));
         }
         assert_eq!(out, (0..10).map(|i| i * 10).collect::<Vec<_>>());
         assert!(buf.is_empty());
@@ -227,12 +228,12 @@ mod tests {
     fn test_fast_path_flushes_buffered_run() {
         let mut buf = ReorderBuffer::<i32>::new(16);
         let mut out = Vec::new();
-        buf.insert_into(2, 30, &mut out); // buffered
-        buf.insert_into(3, 40, &mut out); // buffered
+        buf.insert_into(2, 30, &mut |item| out.push(item)); // buffered
+        buf.insert_into(3, 40, &mut |item| out.push(item)); // buffered
         assert_eq!(out, Vec::<i32>::new());
-        buf.insert_into(0, 10, &mut out); // fast path — immediately emitted
+        buf.insert_into(0, 10, &mut |item| out.push(item)); // fast path — immediately emitted
         assert_eq!(out, vec![10]);
-        buf.insert_into(1, 20, &mut out); // fast path; flushes 2, 3
+        buf.insert_into(1, 20, &mut |item| out.push(item)); // fast path; flushes 2, 3
         assert_eq!(out, vec![10, 20, 30, 40]);
         assert!(buf.is_empty());
     }
@@ -282,7 +283,7 @@ mod tests {
         let mut buf = ReorderBuffer::<i32>::new(1 << 20);
         let mut out = Vec::new();
         for i in 0..1000u64 {
-            buf.insert_into(i, i32::try_from(i).unwrap(), &mut out);
+            buf.insert_into(i, i32::try_from(i).unwrap(), &mut |item| out.push(item));
             assert!(buf.slots.is_empty(), "in-order arrival must not allocate");
         }
         assert_eq!(out.len(), 1000);
@@ -297,16 +298,16 @@ mod tests {
         let mut buf = ReorderBuffer::<i32>::new(16);
         let mut out = Vec::new();
         for i in 0..50u64 {
-            buf.insert_into(i, i32::try_from(i).unwrap(), &mut out);
+            buf.insert_into(i, i32::try_from(i).unwrap(), &mut |item| out.push(item));
         }
         assert!(buf.slots.is_empty());
-        buf.insert_into(52, 520, &mut out); // out of order → allocate
+        buf.insert_into(52, 520, &mut |item| out.push(item)); // out of order → allocate
         let cap = buf.slots.len();
         assert!(cap >= 16);
-        buf.insert_into(50, 500, &mut out); // fills the gap
-        buf.insert_into(51, 510, &mut out); // flushes 50..=52
+        buf.insert_into(50, 500, &mut |item| out.push(item)); // fills the gap
+        buf.insert_into(51, 510, &mut |item| out.push(item)); // flushes 50..=52
         assert_eq!(buf.slots.len(), cap, "no reallocation on later reorders");
-        buf.insert_into(53, 530, &mut out); // in-order again (len == 0 fast path)
+        buf.insert_into(53, 530, &mut |item| out.push(item)); // in-order again (len == 0 fast path)
         assert_eq!(out.iter().copied().skip(50).collect::<Vec<_>>(), vec![
             500, 510, 520, 530
         ]);
