@@ -1,12 +1,12 @@
 //! `WaitGroup`: a counter barrier used by streaming stages to track worker
 //! completion.
 //!
-//! Atomics/Mutex/Condvar come from `crate::util::sys` so `--cfg loom`
-//! can swap them for simulated ones (see `sys.rs`).
+//! Atomics/Mutex/Condvar come from `youpipe-sys` so `--cfg loom`
+//! can swap them for simulated ones.
 
 use std::sync::Arc;
 
-use crate::util::sys::{AtomicUsize, Condvar, Mutex, Ordering};
+use youpipe_sys::{AtomicUsize, Condvar, Mutex, Ordering};
 
 pub struct WaitGroup {
     count: AtomicUsize,
@@ -94,8 +94,9 @@ impl Clone for SharedWaitGroup {
 mod loom_tests {
     use std::sync::Arc;
 
+    use youpipe_sys::AtomicUsize;
+
     use super::*;
-    use crate::util::sys::AtomicUsize;
 
     /// Two `done()`s and a `wait()`: the waiter must observe data published
     /// before each `done()` (the RMW release-sequence + condvar/mutex must

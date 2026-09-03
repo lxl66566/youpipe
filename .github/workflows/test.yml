@@ -62,6 +62,6 @@ jobs:
       - run: RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
       # The vendored queue's models need upstream's preemption bound to
       # finish in seconds instead of hours (LOOM_MAX_PREEMPTIONS=2).
-      - run: RUSTFLAGS="--cfg loom" cargo test --manifest-path vendor/youpipe-concurrent-queue/Cargo.toml --test loom
+      - run: RUSTFLAGS="--cfg loom" cargo test -p youpipe-concurrent-queue --test loom
         env:
           LOOM_MAX_PREEMPTIONS: "2"

@@ -1,4 +1,4 @@
-# criterion-perf-counters
+# youpipe-criterion-perf-counters
 
 A [Criterion.rs](https://github.com/criterion-rs/criterion) measurement
 plugin for Linux `perf` hardware events — retired instructions, cycles,
@@ -28,7 +28,7 @@ Maintained fork of
 ```toml
 [dev-dependencies]
 criterion = "0.8"
-criterion-perf-counters = "0.5"
+youpipe-criterion-perf-counters = "0.5"
 perfcnt = "0.8"
 ```
 

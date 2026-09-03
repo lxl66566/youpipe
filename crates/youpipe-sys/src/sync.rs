@@ -9,24 +9,25 @@
 //! `GetModuleHandleA`, a Windows foreign function Miri cannot emulate, whereas
 //! the std primitives are natively supported by the interpreter.
 //!
-//! Under `--cfg loom` (concurrency-model testing, see `Cargo.toml`) everything
-//! is backed by `loom::sync` / `loom::sync::atomic` so the model checker
-//! observes the atomics and lock/condvar interleavings instead of the real OS
-//! primitives. The modules under test (`pool/sleep.rs`, `pool/latch.rs`,
-//! `pool/sleep_mask.rs`, `handoff/notify.rs`) source their atomics from here
-//! for exactly this reason.
+//! Under `--cfg loom` (concurrency-model testing, switched by the rustflag —
+//! see youpipe's `Cargo.toml` for the rationale) everything is backed by
+//! `loom::sync` / `loom::sync::atomic` so the model checker observes the
+//! atomics and lock/condvar interleavings instead of the real OS primitives.
+//! youpipe's synchronization cores (`pool/sleep.rs`, `pool/latch.rs`,
+//! `pool/sleep_mask.rs`, `handoff/notify.rs`) source their primitives from
+//! here for exactly this reason.
 //!
 //! All paths expose identical, infallible APIs so callers never branch on
 //! `cfg`.
 
 #[cfg(all(not(miri), not(loom)))]
 #[allow(unused_imports)]
-pub(crate) use parking_lot::{Condvar, Mutex, MutexGuard};
+pub use parking_lot::{Condvar, Mutex, MutexGuard};
 
 #[cfg(loom)]
-pub(crate) use self::loom_shim::{Condvar, Mutex};
+pub use self::loom_shim::{Condvar, Mutex, MutexGuard};
 #[cfg(miri)]
-pub(crate) use self::shim::{Condvar, Mutex, MutexGuard};
+pub use self::shim::{Condvar, Mutex, MutexGuard};
 
 /// loom-backed shim matching the infallible `parking_lot` API shape (loom's
 /// `Mutex::lock` returns a `Result` like std's; the model never poisons, so
@@ -37,12 +38,12 @@ mod loom_shim {
 
     use loom::sync::{Condvar as LCondvar, Mutex as LMutex, MutexGuard as LMutexGuard};
 
-    pub(crate) struct Mutex<T: ?Sized>(LMutex<T>);
-    pub(crate) struct MutexGuard<'a, T: ?Sized>(Option<LMutexGuard<'a, T>>);
+    pub struct Mutex<T: ?Sized>(LMutex<T>);
+    pub struct MutexGuard<'a, T: ?Sized>(Option<LMutexGuard<'a, T>>);
 
     impl<T> Mutex<T> {
         #[inline]
-        pub(crate) fn new(value: T) -> Self {
+        pub fn new(value: T) -> Self {
             Self(LMutex::new(value))
         }
     }
@@ -56,7 +57,7 @@ mod loom_shim {
 
     impl<T: ?Sized> Mutex<T> {
         #[inline]
-        pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
+        pub fn lock(&self) -> MutexGuard<'_, T> {
             MutexGuard(Some(
                 self.0
                     .lock()
@@ -90,7 +91,7 @@ mod loom_shim {
         }
     }
 
-    pub(crate) fn condvar_wait<'a, T>(cv: &LCondvar, guard: &mut MutexGuard<'a, T>) {
+    pub fn condvar_wait<'a, T>(cv: &LCondvar, guard: &mut MutexGuard<'a, T>) {
         let taken = guard.0.take().expect("guard already in condvar wait");
         let returned = cv
             .wait(taken)
@@ -105,7 +106,7 @@ mod loom_shim {
         }
     }
 
-    pub(crate) struct Condvar(LCondvar);
+    pub struct Condvar(LCondvar);
 
     impl std::fmt::Debug for Condvar {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -115,7 +116,7 @@ mod loom_shim {
 
     impl Condvar {
         #[inline]
-        pub(crate) fn new() -> Self {
+        pub fn new() -> Self {
             Self(LCondvar::new())
         }
 
@@ -127,36 +128,36 @@ mod loom_shim {
         /// `Option::take` so loom's model tracks the whole hand-off (a raw
         /// `ptr::read`/`ptr::write` dance would bypass its bookkeeping).
         #[inline]
-        pub(crate) fn wait<'a, T>(&self, guard: &mut MutexGuard<'a, T>) {
+        pub fn wait<'a, T>(&self, guard: &mut MutexGuard<'a, T>) {
             super::loom_shim::condvar_wait(&self.0, guard);
         }
 
         #[inline]
-        pub(crate) fn notify_one(&self) {
+        pub fn notify_one(&self) {
             self.0.notify_one();
         }
 
         #[inline]
-        pub(crate) fn notify_all(&self) {
+        pub fn notify_all(&self) {
             self.0.notify_all();
         }
     }
 }
 
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
+pub use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 /// Atomics routed through loom under `--cfg loom` so the model checker sees
 /// them; plain std atomics otherwise.
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
+pub use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 /// Cooperative yield for idle backoff loops. Under loom this MUST be
 /// `loom::thread::yield_now` so the model checker can switch threads — a
 /// `std::thread::yield_now` would be a real syscall inside the model and
 /// break exploration.
 #[inline]
-pub(crate) fn thread_yield() {
+pub fn thread_yield() {
     #[cfg(loom)]
     loom::thread::yield_now();
     #[cfg(not(loom))]
@@ -167,20 +168,20 @@ pub(crate) fn thread_yield() {
 mod shim {
     use std::{sync as s, time::Duration};
 
-    pub(crate) struct Mutex<T: ?Sized>(s::Mutex<T>);
-    pub(crate) struct MutexGuard<'a, T: ?Sized>(s::MutexGuard<'a, T>);
-    pub(crate) struct Condvar(s::Condvar);
+    pub struct Mutex<T: ?Sized>(s::Mutex<T>);
+    pub struct MutexGuard<'a, T: ?Sized>(s::MutexGuard<'a, T>);
+    pub struct Condvar(s::Condvar);
 
     impl<T> Mutex<T> {
         #[inline]
-        pub(crate) const fn new(value: T) -> Self {
+        pub const fn new(value: T) -> Self {
             Self(s::Mutex::new(value))
         }
     }
 
     impl<T: ?Sized> Mutex<T> {
         #[inline]
-        pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
+        pub fn lock(&self) -> MutexGuard<'_, T> {
             MutexGuard(self.0.lock().unwrap_or_else(|e| e.into_inner()))
         }
     }
@@ -234,7 +235,7 @@ mod shim {
 
     impl Condvar {
         #[inline]
-        pub(crate) fn new() -> Self {
+        pub fn new() -> Self {
             Self(s::Condvar::new())
         }
 
@@ -254,7 +255,7 @@ mod shim {
         /// guard), so a panic here would leak the original guard rather than
         /// double-free — acceptable for the test-only Miri path.
         #[inline]
-        pub(crate) fn wait<'a, T>(&self, guard: &mut MutexGuard<'a, T>) {
+        pub fn wait<'a, T>(&self, guard: &mut MutexGuard<'a, T>) {
             // SAFETY: see method-level comment.
             let taken = unsafe { std::ptr::read(&guard.0) };
             let returned = self.0.wait(taken).unwrap_or_else(|e| e.into_inner());
@@ -266,11 +267,7 @@ mod shim {
         /// Returns `true` if notified before the timeout, `false` otherwise.
         /// See [`Self::wait`] for the move-dance rationale.
         #[inline]
-        pub(crate) fn wait_for<'a, T>(
-            &self,
-            guard: &mut MutexGuard<'a, T>,
-            timeout: Duration,
-        ) -> bool {
+        pub fn wait_for<'a, T>(&self, guard: &mut MutexGuard<'a, T>, timeout: Duration) -> bool {
             // SAFETY: see `wait` method-level comment.
             let taken = unsafe { std::ptr::read(&guard.0) };
             let (returned, result) = match self.0.wait_timeout(taken, timeout) {
@@ -286,12 +283,12 @@ mod shim {
         }
 
         #[inline]
-        pub(crate) fn notify_one(&self) {
+        pub fn notify_one(&self) {
             self.0.notify_one();
         }
 
         #[inline]
-        pub(crate) fn notify_all(&self) {
+        pub fn notify_all(&self) {
             self.0.notify_all();
         }
     }

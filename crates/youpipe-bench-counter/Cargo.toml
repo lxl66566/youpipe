@@ -1,8 +1,7 @@
 # Perf-event counter benchmarks (Linux only): criterion driven by hardware
-# performance counters instead of wall-clock time, using the standalone
-# criterion-perf-counters crate (../criterion-perf-counters — a maintained
-# fork of criterion-perf-events; kept as a sibling directory because it is
-# meant for independent publication, see its Cargo.toml).
+# performance counters instead of wall-clock time, using the workspace's
+# youpipe-criterion-perf-counters crate (a maintained fork of
+# criterion-perf-events, publishable in its own right).
 #
 # A standalone crate rather than a root `benches/` target on purpose:
 #   * `dev-dependencies` cannot be optional (cargo rejects
@@ -20,7 +19,7 @@
 # See the "perf-event counters" section in docs/benchmarks.md for what the
 # counters are good for (and what they are not).
 [package]
-name         = "counter-bench"
+name         = "youpipe-bench-counter"
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.85"
@@ -38,5 +37,5 @@ youpipe = { path = "../..", default-features = false }
 [dev-dependencies]
 criterion               = "0.8"
 rayon                   = "1"
-criterion-perf-counters = { path = "../../criterion-perf-counters" }
+criterion-perf-counters = { package = "youpipe-criterion-perf-counters", path = "../youpipe-criterion-perf-counters" }
 perfcnt                 = "0.8"

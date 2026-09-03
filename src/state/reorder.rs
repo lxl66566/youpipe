@@ -229,7 +229,7 @@ mod tests {
         let mut out = Vec::new();
         buf.insert_into(2, 30, &mut out); // buffered
         buf.insert_into(3, 40, &mut out); // buffered
-        assert_eq!(out, Vec::new());
+        assert_eq!(out, Vec::<i32>::new());
         buf.insert_into(0, 10, &mut out); // fast path — immediately emitted
         assert_eq!(out, vec![10]);
         buf.insert_into(1, 20, &mut out); // fast path; flushes 2, 3
@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn test_out_of_order() {
         let mut buf = ReorderBuffer::<i32>::new(16);
-        assert_eq!(buf.insert(2, 30), Vec::new());
+        assert_eq!(buf.insert(2, 30), Vec::<i32>::new());
         assert_eq!(buf.insert(0, 10), vec![10]);
         assert_eq!(buf.insert(1, 20), vec![20, 30]);
     }
@@ -249,10 +249,10 @@ mod tests {
     fn test_gap() {
         let mut buf = ReorderBuffer::<i32>::new(16);
         assert_eq!(buf.insert(0, 10), vec![10]);
-        assert_eq!(buf.insert(3, 40), Vec::new());
-        assert_eq!(buf.insert(5, 60), Vec::new());
+        assert_eq!(buf.insert(3, 40), Vec::<i32>::new());
+        assert_eq!(buf.insert(5, 60), Vec::<i32>::new());
         assert_eq!(buf.insert(1, 20), vec![20]);
-        assert_eq!(buf.insert(4, 50), Vec::new());
+        assert_eq!(buf.insert(4, 50), Vec::<i32>::new());
     }
 
     #[test]
@@ -269,9 +269,9 @@ mod tests {
     #[test]
     fn test_capacity_overflow() {
         let mut buf = ReorderBuffer::<i32>::new(2);
-        assert_eq!(buf.insert(5, 50), Vec::new());
-        assert_eq!(buf.insert(3, 30), Vec::new());
-        assert_eq!(buf.insert(1, 10), Vec::new());
+        assert_eq!(buf.insert(5, 50), Vec::<i32>::new());
+        assert_eq!(buf.insert(3, 30), Vec::<i32>::new());
+        assert_eq!(buf.insert(1, 10), Vec::<i32>::new());
         assert!(buf.len() <= 2);
     }
 

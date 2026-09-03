@@ -18,5 +18,4 @@ echo "==> youpipe loom models"
 RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
 
 echo "==> vendored youpipe-concurrent-queue loom models"
-RUSTFLAGS="--cfg loom" timeout 600 \
-    cargo test --manifest-path vendor/youpipe-concurrent-queue/Cargo.toml --test loom
+RUSTFLAGS="--cfg loom" timeout 600 cargo test -p youpipe-concurrent-queue --test loom

@@ -1,0 +1,3 @@
+# Vendored fork: keep the source byte-identical to the fork repo it is
+# synced from — exclude it from the workspace-wide `cargo fmt --all`.
+ignore = ["/src", "/tests", "/benches"]

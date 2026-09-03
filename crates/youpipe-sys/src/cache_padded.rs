@@ -5,7 +5,7 @@
 /// inflates the explored state.
 #[cfg_attr(not(loom), repr(C, align(64)))]
 #[derive(Default)]
-pub(crate) struct CachePadded<T>(pub(crate) T);
+pub struct CachePadded<T>(pub T);
 
 impl<T> std::ops::Deref for CachePadded<T> {
     type Target = T;

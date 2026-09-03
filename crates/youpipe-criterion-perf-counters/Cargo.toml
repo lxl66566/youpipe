@@ -15,8 +15,12 @@
 #     (criterion 0.8 added both variants; upstream matches no longer
 #     compile) and an `event_name` field so reports say "instructions"
 #     instead of a hardcoded "cycles".
+#
+# The package is renamed to the `youpipe-` prefix (workspace convention,
+# youpipe/st3 already have it); the lib target keeps the name
+# `criterion_perf_counters` so call sites don't churn.
 [package]
-name         = "criterion-perf-counters"
+name         = "youpipe-criterion-perf-counters"
 version      = "0.5.0"
 edition      = "2021"
 rust-version = "1.85"
@@ -24,9 +28,12 @@ authors      = ["Jens Breitbart <jbreitbart@gmail.com>"]
 description  = "Criterion.rs measurement plugin for Linux perf events: process-wide per-thread hardware counters (instructions, cycles, cache misses, ...) as a drop-in alternative to wall-clock time"
 readme       = "README.md"
 license      = "MIT OR Apache-2.0"
-repository   = "https://github.com/lxl66566/criterion-perf-counters"
+repository   = "https://github.com/lxl66566/youpipe"
 keywords     = ["benchmark", "criterion", "perf", "profiling", "linux"]
 categories   = ["development-tools::profiling", "os::linux-apis"]
+
+[lib]
+name = "criterion_perf_counters"
 
 [dependencies]
 criterion = "0.8"

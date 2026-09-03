@@ -21,7 +21,10 @@ authors      = [
   "John Nunley <dev@notgull.net>"
 ]
 edition      = "2021"
-rust-version = "1.60"
+# Aligned with the youpipe workspace MSRV (upstream: 1.60) — youpipe requires
+# 1.85 anyway, and a lower declared MSRV makes clippy's workspace-wide
+# clippy.toml warn on every `cargo clippy --workspace`.
+rust-version = "1.85"
 description  = "Concurrent multi-producer multi-consumer queue (youpipe fork)"
 license      = "Apache-2.0 OR MIT"
 repository   = "https://github.com/smol-rs/concurrent-queue"
@@ -63,3 +66,8 @@ std     = ["crossbeam-utils/std"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[lints.clippy]
+# Upstream's private `unsafe fn destroy` helpers carry no `# Safety` docs;
+# kept as-is to stay diffable against upstream.
+missing_safety_doc = "allow"

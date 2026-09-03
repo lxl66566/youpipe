@@ -488,7 +488,10 @@ mod tests {
     fn test_pipe_ref_empty_and_single() {
         let empty: Vec<u64> = vec![];
         let r: Vec<u64> = pipe_ref(&empty).map(|&x| x + 1).collect();
-        assert_eq!(r, vec![]);
+        // Explicit element type: with serde_json in the graph (hotpath feature
+        // unification), Vec<u64> == Vec<_> has two candidate PartialEq impls
+        // for u64 and the empty vec's element type no longer infers.
+        assert_eq!(r, Vec::<u64>::new());
         let r: Vec<u64> = pipe_ref(&[41u64]).map(|&x| x + 1).collect();
         assert_eq!(r, vec![42]);
     }
@@ -505,7 +508,7 @@ mod tests {
             });
         assert_eq!(
             sum.load(std::sync::atomic::Ordering::Relaxed),
-            (0..10_000u64).sum()
+            (0..10_000u64).sum::<u64>()
         );
 
         let pool = ComputePool::new(4);
@@ -518,7 +521,7 @@ mod tests {
             });
         assert_eq!(
             sum2.load(std::sync::atomic::Ordering::Relaxed),
-            (0..10_000u64).sum()
+            (0..10_000u64).sum::<u64>()
         );
     }
 
@@ -533,9 +536,7 @@ mod tests {
 
         // Index fast path (no filter → MAY_FILTER == false).
         let boom = |&x: &u64| {
-            if x == 9_999 {
-                panic!("boom at {x}");
-            }
+            assert!(x != 9_999, "boom at {x}");
             x + 1
         };
         let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -561,9 +562,7 @@ mod tests {
         let snapshot = data.clone();
         let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
             pipe_ref(&data).for_each(|&x: &u64| {
-                if x == 12_345 {
-                    panic!("sink boom");
-                }
+                assert!(x != 12_345, "sink boom");
             });
         }));
         assert!(r.is_err());
@@ -578,9 +577,7 @@ mod tests {
         let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let out: Result<Vec<u64>, &'static str> = pipe_ref(&data)
                 .try_map(|&x: &u64| {
-                    if x == 500 {
-                        panic!("try boom");
-                    }
+                    assert!(x != 500, "try boom");
                     Ok(x)
                 })
                 .try_collect();

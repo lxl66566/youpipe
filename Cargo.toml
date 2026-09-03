@@ -1,15 +1,67 @@
-[package]
-name         = "youpipe"
+[workspace]
+members = [
+    "crates/youpipe-sys",
+    "crates/youpipe-st3",
+    "crates/youpipe-concurrent-queue",
+    "crates/youpipe-criterion-perf-counters",
+    "crates/youpipe-bench-counter",
+    "crates/youpipe-bench-file-encrypt",
+    "crates/youpipe-bench-hotpath-profile",
+    "crates/youpipe-bench-pipeline",
+]
+# Plain `cargo build/test/clippy` at the root covers only the library crates;
+# the vendored forks and the perf benches are opt-in via `-p` / `--workspace`
+# (the perf benches pull heavyweight deps: aes-gcm, zstd, perfcnt, ...).
+default-members = [".", "crates/youpipe-sys"]
+
+# Shared metadata for the youpipe-* crates developed in-tree (everything
+# lives under crates/). The vendored forks keep fully self-contained
+# manifests (they are synced from their own fork repos and must stay
+# diffable against them).
+[workspace.package]
 version      = "0.5.0"
 edition      = "2024"
 rust-version = "1.85"
+license      = "Apache-2.0"
+repository   = "https://github.com/lxl66566/youpipe"
+
+[workspace.lints.clippy]
+all                     = { level = "warn", priority = -1 }
+cargo                   = { level = "warn", priority = -1 }
+doc_markdown            = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+multiple_crate_versions = "allow"
+pedantic                = { level = "warn", priority = -1 }
+wildcard_imports        = "allow"
+
+[workspace.lints.rust]
+# `loom` is set via `RUSTFLAGS="--cfg loom"` (see below), not a feature
+unexpected_cfgs       = { level = "warn", check-cfg = ["cfg(loom)"] }
+unsafe_code           = "allow"
+unused_qualifications = "warn"
+
+[package]
+name         = "youpipe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description  = "High-performance data-first pipelines with fused CPU stages and streaming async IO"
 readme       = "README.md"
-repository   = "https://github.com/lxl66566/youpipe"
-license      = "Apache-2.0"
+repository.workspace = true
+license.workspace = true
 keywords     = ["concurrency", "map-reduce", "parallel", "pipeline", "work-stealing"]
 categories   = ["concurrency"]
-exclude      = ["/.github", "/.opencode", "/.vscode", "/AGENTS.md", "/docs", "/perf", "/criterion-perf-counters"]
+exclude      = [
+    "/.github",
+    "/.opencode",
+    "/.tombi.toml",
+    "/.vscode",
+    "/AGENTS.md",
+    "/crates",
+    "/docs",
+    "/perf",
+]
 
 # Examples that exercise `.stage_async` / `.with_async_pool` — only buildable
 # when the tokio runtime is enabled.
@@ -57,11 +109,15 @@ name              = "horizontal"
 required-features = ["tokio-runtime"]
 
 [dependencies]
-concurrent-queue = { package = "youpipe-concurrent-queue", path = "vendor/youpipe-concurrent-queue" }
+# Workspace-internal path deps carry a `version` too: cargo builds against the
+# path in this repo, while the manifest published to crates.io drops the path
+# and resolves the registry crate at that requirement instead (must be
+# published first; `cargo publish` refuses to ship a mismatched pair).
+concurrent-queue = { package = "youpipe-concurrent-queue", path = "crates/youpipe-concurrent-queue", version = "0.5" }
 crossfire        = "3.1"
 hotpath          = { version = "0.24", optional = true }
-parking_lot      = "0.12"
-st3              = { package = "youpipe-st3", path = "vendor/youpipe-st3" }
+st3              = { package = "youpipe-st3", path = "crates/youpipe-st3", version = "0.5" }
+youpipe-sys      = { path = "crates/youpipe-sys", version = "0.5" }
 tokio            = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"], optional = true }
 
 [dev-dependencies]
@@ -123,21 +179,8 @@ hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
 # runtime, monoio, …) slots in without touching the streaming code.
 tokio-runtime = ["dep:tokio"]
 
-[lints.clippy]
-all                     = { level = "warn", priority = -1 }
-cargo                   = { level = "warn", priority = -1 }
-doc_markdown            = "allow"
-missing_errors_doc      = "allow"
-missing_panics_doc      = "allow"
-multiple_crate_versions = "allow"
-pedantic                = { level = "warn", priority = -1 }
-wildcard_imports        = "allow"
-
-[lints.rust]
-# `loom` is set via `RUSTFLAGS="--cfg loom"` (see above), not a feature
-unexpected_cfgs       = { level = "warn", check-cfg = ["cfg(loom)"] }
-unsafe_code           = "allow"
-unused_qualifications = "warn"
+[lints]
+workspace = true
 
 # Same rationale as `[profile.release]`, applied to the criterion bench
 # profile so A/B runs can't be distorted by the code-layout lottery either.

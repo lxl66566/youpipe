@@ -291,7 +291,7 @@ still leads there.
 
 ### hotpath instrumentation round (2026-09)
 
-With `perf/hotpath-profile` (p50 percentiles over `HOTPATH_OUTPUT_FORMAT=json`
+With `crates/youpipe-bench-hotpath-profile` (p50 percentiles over `HOTPATH_OUTPUT_FORMAT=json`
 reports — p50 is the noise-robust statistic; raw call counts from hotpath are
 approximate under load because its per-thread batch queue drops events):
 
@@ -476,11 +476,11 @@ uv run perf/plot-horizontal.py                     # results.json → docs/asset
   the larger batches (fewer tasks, pooled scheduling, mixed-mode channels)
   and beat rayon by ~10× once IO blocks its workers.
 
-## Perf-event counter measurement (`perf/counter-bench`)
+## Perf-event counter measurement (`crates/youpipe-bench-counter`)
 
-`perf/counter-bench` runs the same bench code under Linux perf hardware
+`crates/youpipe-bench-counter` runs the same bench code under Linux perf hardware
 counters (instructions / cycles / ref-cycles / cache-misses / …) instead of
-wall time, via the standalone `criterion-perf-counters` crate — a maintained
+wall time, via the workspace's `youpipe-criterion-perf-counters` crate — a maintained
 fork of criterion-perf-events re-targeted at criterion 0.8 and extended with
 process-wide per-thread counters (upstream counts the main thread only,
 which for a pool library measures the coordinator and misses the workers).
@@ -490,9 +490,9 @@ windows multiply the per-window `4 × n_threads` counter syscalls by the
 iteration count and inflate fast benches).
 
 ```sh
-cargo bench --manifest-path perf/counter-bench/Cargo.toml --bench perf_events
-PERF_EVENT=ref-cycles cargo bench --manifest-path perf/counter-bench/Cargo.toml
-perf/counter-bench/run-drift-exp.sh   # N runs per event + drift summary table
+cargo bench -p youpipe-bench-counter --bench perf_events
+PERF_EVENT=ref-cycles cargo bench -p youpipe-bench-counter
+crates/youpipe-bench-counter/run-drift-exp.sh   # N runs per event + drift summary table
 ```
 
 Drift experiment (2026-09, 3 runs × 20 samples per kind, taskset 1-31) —

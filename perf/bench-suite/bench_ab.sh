@@ -158,7 +158,7 @@ materialize() {
         echo "==> side $label: snapshotting working tree -> $dir"
         rsync -a --delete \
             --exclude '/target' --exclude '/.git' \
-            --exclude '/perf/*/target' \
+            --exclude '/crates/*/target' \
             ./ "$dir/"
     else
         git rev-parse --verify -q "$rev^{commit}" >/dev/null \

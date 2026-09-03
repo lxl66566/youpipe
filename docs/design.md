@@ -126,10 +126,14 @@ src/
 │   ├── join.rs       # fork-join
 │   ├── unwind.rs     # AbortIfPanic, halt/resume_unwinding
 │   └── mod.rs
-└── util/             # Shared utilities
-    ├── cache_padded.rs # CachePadded<T>
-    └── sys.rs          # Miri/loom-transparent Mutex/Condvar/atomics shims
+└── ...
 ```
+
+The miri/loom-transparent primitive layer (former `src/util/`) lives in its
+own workspace crate, [`crates/youpipe-sys`](../crates/youpipe-sys):
+`CachePadded<T>` plus the `Mutex`/`Condvar`/atomics/`thread_yield` shims that
+switch backend by compilation context (parking_lot / miri-std / `--cfg loom`).
+`pool/` and `handoff/` source their primitives from there.
 
 ---
 

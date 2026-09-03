@@ -2,14 +2,12 @@
 //! the fast path (posting work while threads are awake) is pure atomics — no
 //! Mutex/Condvar in the hot path. Adapted from rayon-core (RFC #5).
 //!
-//! Atomics/Mutex/Condvar/yield come from `crate::util::sys` so the `loom`
-//! feature can swap them for simulated ones (see `sys.rs`).
+//! Atomics/Mutex/Condvar/yield come from `youpipe-sys` so `--cfg loom`
+//! can swap them for simulated ones.
+
+use youpipe_sys::{AtomicUsize, CachePadded, Condvar, Mutex, Ordering, fence, thread_yield};
 
 use super::{latch::CoreLatch, sleep_mask::SleepMask};
-use crate::util::{
-    CachePadded,
-    sys::{self, AtomicUsize, Condvar, Mutex, Ordering},
-};
 
 // ── Packed counter layout ──
 
@@ -302,12 +300,12 @@ impl Sleep {
             idle.rounds += 1;
         } else if idle.rounds < ROUNDS_UNTIL_SLEEPY {
             // Yield phase: cooperate with the OS scheduler but stay runnable.
-            sys::thread_yield();
+            thread_yield();
             idle.rounds += 1;
         } else if idle.rounds == ROUNDS_UNTIL_SLEEPY {
             idle.jobs_counter = self.announce_sleepy();
             idle.rounds += 1;
-            sys::thread_yield();
+            thread_yield();
         } else {
             self.sleep(idle, latch, has_injected_jobs);
         }
@@ -375,7 +373,7 @@ impl Sleep {
         }
 
         // Final check for injected jobs to prevent deadlock.
-        sys::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         if has_injected_jobs() {
             self.counters.sub_sleeping_thread();
             // We never reached `condvar.wait`, so no waker cleared our bit.
@@ -404,7 +402,7 @@ impl Sleep {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn new_injected_jobs(&self, num_jobs: u32, queue_was_empty: bool) {
         // Fence guarantees sleepy/sleeping threads observe injected work.
-        sys::fence(Ordering::SeqCst);
+        fence(Ordering::SeqCst);
         self.new_jobs(num_jobs, queue_was_empty);
     }
 
@@ -494,8 +492,9 @@ impl IdleState {
 mod loom_tests {
     use std::sync::Arc;
 
+    use youpipe_sys::AtomicUsize;
+
     use super::*;
-    use crate::util::sys::AtomicUsize;
 
     /// Drives `Sleep`'s full sleep/wake protocol with one sleeper and one
     /// poster, letting loom explore every interleaving of:

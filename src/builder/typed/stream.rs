@@ -2050,7 +2050,7 @@ where
     /// stream(0..100)
     ///     .stage(|x: u64| x * 2)
     ///     .for_each(|x| total += x); // plain &mut capture, no Arc<Atomic>
-    /// assert_eq!(total, (0..100u64).map(|x| x * 2).sum());
+    /// assert_eq!(total, (0..100u64).map(|x| x * 2).sum::<u64>());
     /// ```
     ///
     /// # Panics

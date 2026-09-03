@@ -184,22 +184,26 @@ pub fn fs_type_name(path: &Path) -> String {
     if unsafe { libc::statfs(c.as_ptr(), &mut buf) } != 0 {
         return "<statfs failed>".into();
     }
-    // `f_type`'s integer signedness differs across libc targets; cast the
-    // constants with `as _` so this compiles warning-free on both.
-    let ft = buf.f_type;
-    if ft == 0x0102_1994_u32 as _ {
+    // `f_type`'s integer signedness differs across libc targets; normalize to
+    // i64 once (all filesystem magics are < 2^31, so the reinterpretation is
+    // lossless). Plain `==` on the literals keeps type inference unambiguous —
+    // `ft == C as _` breaks (E0283) as soon as any dependency adds a second
+    // `PartialEq` impl for i64, e.g. serde_json's `Value` (workspace feature
+    // unification pulls it in here).
+    let ft = buf.f_type as i64;
+    if ft == 0x0102_1994 {
         "tmpfs"
-    } else if ft == 0x8584_5868_u32 as _ {
+    } else if ft == 0x8584_5868 {
         "ramfs"
-    } else if ft == 0x9123_683E_u32 as _ {
+    } else if ft == 0x9123_683E {
         "btrfs"
-    } else if ft == 0xEF53_u32 as _ {
+    } else if ft == 0xEF53 {
         "ext4"
-    } else if ft == 0x5846_5342_u32 as _ {
+    } else if ft == 0x5846_5342 {
         "xfs"
-    } else if ft == 0x794c_7630_u32 as _ {
+    } else if ft == 0x794c_7630 {
         "overlay"
-    } else if ft == 0x6573_5546_u32 as _ {
+    } else if ft == 0x6573_5546 {
         "fuse"
     } else {
         "other"

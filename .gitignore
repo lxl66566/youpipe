@@ -1,5 +1,6 @@
 /target
 session-*.md
-# Vendored fork crates: standalone build artifacts (e.g. from `cargo test -p youpipe-st3`)
-vendor/*/target/
-vendor/*/Cargo.lock
+# Sub-crates: standalone build artifacts in case cargo runs inside a member
+# directory outside workspace context
+crates/*/target/
+crates/*/Cargo.lock

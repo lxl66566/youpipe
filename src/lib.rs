@@ -25,7 +25,10 @@
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
-    clippy::doc_markdown
+    clippy::doc_markdown,
+    // In-source `warn(clippy::cargo)` outranks the [lints] table `-A`; two syn
+    // versions (2.0 via clap, 3.0 via newer derives) are unavoidable.
+    clippy::multiple_crate_versions
 )]
 
 // ── Compile-time guard: `panic = "abort"` disables panic safety ──
@@ -65,7 +68,6 @@ pub mod runtime;
 pub mod scope;
 pub mod state;
 pub mod sync;
-pub(crate) mod util;
 
 pub use builder::{
     Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, Pipe, PipeRef,

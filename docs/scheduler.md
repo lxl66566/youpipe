@@ -18,12 +18,12 @@ Worker₃ ←→ Stealer₃
 - `EventCount`-style packed atomic counters (`pool/sleep.rs`) wake idle workers
 - `SleepMask` (`pool/sleep_mask.rs`): fixed-size inline `[AtomicU64; N]` bitmask tracking which workers are parked, so `wake_any_threads` jumps straight to set bits instead of linearly locking every worker's `is_blocked` mutex. `THREADS_BITS` is sized so the mask fits in one cache line (8 words = 64 B on 64-bit, covering up to 511 workers). The single-`AtomicUsize` predecessor silently aliased bits for `worker_index >= 64` (`1usize << 64` wraps to bit 0 in Rust) and deadlocked under heavy oversubscription; see `sleep_mask.rs` module doc.
 
-#### Vendored scheduler dependencies (`vendor/`)
+#### Vendored scheduler dependencies (`crates/`)
 
 The two lock-free primitives the pool is built on are **vendored forks**, so
 their hot paths can be tuned in-tree without waiting on upstream releases:
 
-- `vendor/youpipe-st3` (package `youpipe-st3`, lib name `st3`) — fork of
+- `crates/youpipe-st3` (package `youpipe-st3`, lib name `st3`) — fork of
   [asynchronics/st3](https://github.com/asynchronics/st3) v0.4.1. Carries an
   optimization line on top of upstream: bulk segmented steal copies
   (`transfer::transfer_items` splits both ring ranges at the union of their
@@ -34,7 +34,7 @@ their hot paths can be tuned in-tree without waiting on upstream releases:
   uninitialized buffer allocation, in-place `Arc` construction, and a
   single-item transfer fast path. Provenance + per-commit detail live in the
   vendored `Cargo.toml` header and `st3_PERF_OPTIMIZATION.md`.
-- `vendor/youpipe-concurrent-queue` (package `youpipe-concurrent-queue`, lib
+- `crates/youpipe-concurrent-queue` (package `youpipe-concurrent-queue`, lib
   name `concurrent_queue`) — fork of
   [smol-rs/concurrent-queue](https://github.com/smol-rs/concurrent-queue)
   v2.5.0 with the adaptive-backoff change (contention paths spin with

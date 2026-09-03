@@ -1,5 +1,5 @@
 [package]
-name         = "hotpath-profile"
+name         = "youpipe-bench-hotpath-profile"
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.85"
@@ -11,5 +11,5 @@ publish      = false
 # hotpath::measure)]` probes into real per-function timing/alloc/CPU recorders.
 # `hotpath` must match youpipe's pinned version so the probes and the
 # `HotpathGuard` below share the same global state.
-hotpath = "0.19"
+hotpath = "0.24"
 youpipe = { path = "../..", features = ["hotpath"] }

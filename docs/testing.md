@@ -10,7 +10,8 @@ perf/verify/miri.sh            # lib + all integration binaries
 perf/verify/loom.sh            # youpipe models + vendored queue models
 ```
 
-The `util/sys` module provides a unified `Mutex`/`Condvar`/atomics API via
+The `youpipe-sys` crate (workspace member `crates/youpipe-sys`) provides a
+unified `Mutex`/`Condvar`/atomics API via
 `cfg`:
 
 | Environment | Mutex/Condvar | Atomics |
@@ -26,7 +27,7 @@ natively supported by the interpreter. The unified API lets callers write
 
 The pool's synchronization cores (`pool/sleep.rs`, `pool/latch.rs`,
 `pool/sleep_mask.rs`, `handoff/notify.rs`) source their atomics, locks, and
-`thread_yield` from `util/sys` — *nothing else in the crate does* — so under
+`thread_yield` from `youpipe-sys` — *nothing else in youpipe does* — so under
 `--cfg loom` exactly those primitives become model-checked simulations
 while the rest of the crate keeps real ones. `Registry` spawns real OS
 threads (which loom cannot simulate), so the model tests drive the

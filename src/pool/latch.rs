@@ -3,13 +3,14 @@
 //! A latch starts as false. Eventually `set()` makes it true. Once `probe()`
 //! returns true, all memory effects from before `set()` are visible.
 //!
-//! Atomics/Mutex/Condvar come from `crate::util::sys` so `--cfg loom`
+//! Atomics/Mutex/Condvar come from `youpipe-sys` so `--cfg loom`
 //! can swap them for simulated ones (see `sys.rs`).
 
 use std::{marker::PhantomData, ops::Deref, sync::Arc};
 
+use youpipe_sys::{AtomicUsize, Condvar, Mutex, Ordering};
+
 use super::registry::Registry;
-use crate::util::sys::{AtomicUsize, Condvar, Mutex, Ordering};
 
 /// Trait for latches that can be set. Operates on `*const Self` to allow the
 /// latch to become dangling during `set` (the waiter may wake and deallocate).
@@ -264,8 +265,9 @@ enum CountLatchKind {
 mod loom_tests {
     use std::{ptr, sync::Arc};
 
+    use youpipe_sys::AtomicUsize;
+
     use super::*;
-    use crate::util::sys::AtomicUsize;
 
     /// The 4-state transition protocol: a sleeper may only be told "you were
     /// sleeping" (`set` returns true) if it had actually reached SLEEPING,
