@@ -64,7 +64,7 @@ let r: Vec<i32> = (0..1000).pipe()
     .map(|x| x * 10)
     .collect();
 
-// fallable
+// fallible
 let r: Result<Vec<String>, _> = (0..100).pipe()
     .try_map(|x: i32| if x == 50 { Err("bad") } else { Ok(x * 2) })
     .map(|x| format!("{x}"))
@@ -259,8 +259,8 @@ sizes are capped at
 
 ## How it works
 
-see the [developer guide](https://github.com/lxl66566/youpipe/blob/main/docs/src/SUMMARY.md) (mdbook source; build with
-`mdbook build docs`).
+see the [developer guide](https://github.com/lxl66566/youpipe/blob/main/docs/src/SUMMARY.md)
+(mdbook; build locally with `mdbook build docs`).
 
 ## Attribution
 
