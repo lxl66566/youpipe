@@ -539,9 +539,13 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
+    // mp is 0-based from March (Hinnant civil_from_days); a previous version
+    // derived the month as mp + 10*(mp<2) - 2*(mp>=2), which silently mapped
+    // September→April (mp=6→4). Keep the canonical mp<10 ? mp+3 : mp-9.
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
     (
-        y + i64::from(mp < 2),
-        (mp + i64::from(mp < 2) * 10 - i64::from(mp >= 2) * 2) as u32,
+        y + i64::from(month <= 2),
+        month as u32,
         (doy - (153 * mp + 2) / 5 + 1) as u32,
     )
 }
