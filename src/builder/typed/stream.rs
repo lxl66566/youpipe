@@ -632,6 +632,19 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
         None
     }
 
+    /// Whether this chain contains at least one async stage — i.e. whether
+    /// `run()` will need an async runtime backend at all.
+    ///
+    /// [`StreamPipe::try_exec`] pre-warms the lazily-built runtime when this
+    /// is `true` *before* spawning the chain: the `OnceLock` then caches the
+    /// `Ok`, so every `acquire_async().expect(..)` inside the spawn walk
+    /// (bridges, async consumers) is guaranteed to succeed — a construction
+    /// failure surfaces up front as `try_run`'s `Err` instead of panicking
+    /// half way through pipeline setup.
+    fn has_async_stage(&self) -> bool {
+        false
+    }
+
     /// Spawn with an async feeder receiver. Called by [`StreamPipe::run`]
     /// when [`Self::first_consumer_is_async`] returns `Some(true)`.
     ///
@@ -1025,6 +1038,10 @@ where
         self.prev.first_consumer_is_async().or(Some(false))
     }
 
+    fn has_async_stage(&self) -> bool {
+        self.prev.has_async_stage()
+    }
+
     fn has_expand(&self) -> bool {
         self.prev.has_expand()
     }
@@ -1116,6 +1133,10 @@ where
         self.prev.first_consumer_is_async().or(Some(false))
     }
 
+    fn has_async_stage(&self) -> bool {
+        self.prev.has_async_stage()
+    }
+
     fn has_expand(&self) -> bool {
         true
     }
@@ -1188,6 +1209,10 @@ where
         self.prev.first_consumer_is_async()
     }
 
+    fn has_async_stage(&self) -> bool {
+        self.prev.has_async_stage()
+    }
+
     fn has_expand(&self) -> bool {
         self.prev.has_expand()
     }
@@ -1254,6 +1279,10 @@ where
         // Defer to prev's opinion; if prev had none, *we* are the first real
         // consumer — and we're async.
         self.prev.first_consumer_is_async().or(Some(true))
+    }
+
+    fn has_async_stage(&self) -> bool {
+        true
     }
 
     fn has_expand(&self) -> bool {
@@ -2158,6 +2187,17 @@ where
             cached_pool: OnceLock::new(),
             _marker: PhantomData,
         };
+
+        // Warm the lazily-built async runtime (when the chain needs one)
+        // BEFORE spawning it: the OnceLock caches this result, so every
+        // `acquire_async().expect(..)` inside the spawn walk (bridges, async
+        // consumers) is guaranteed to read an `Ok` and can never panic — a
+        // construction failure (e.g. OS thread limits) surfaces here as
+        // `try_run`'s `Err` instead of aborting a half-spawned pipeline.
+        #[cfg(feature = "tokio-runtime")]
+        if stages.has_async_stage() {
+            ctx.acquire_async()?;
+        }
 
         let buffer = ctx.buffer_size(per_stage_parallelism);
 
