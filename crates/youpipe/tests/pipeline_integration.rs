@@ -1302,7 +1302,9 @@ fn test_compute_workers_pin_survives_compute_pool() {
 /// Mirrors the dedicated-pool rationale of
 /// `test_nested_stream_inside_pool_worker_no_deadlock` (self-contained
 /// scheduling, immune to parallel-suite noise).
-#[cfg(not(miri))]
+// NOT cfg(not(miri)): the callers are `#[cfg_attr(miri, ignore)]`, and
+// `ignore` skips execution but still compiles the call — gating the
+// definition out made `cargo miri test` fail to build this target.
 fn run_with_deadlock_watchdog<F, T>(f: F) -> T
 where
     F: FnOnce() -> T + Send + 'static,
