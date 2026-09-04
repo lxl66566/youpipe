@@ -16,17 +16,17 @@ use crate::{
 // # crossfire `try_recv` quirk (load-bearing)
 //
 // crossfire's `try_recv` can spuriously report `Disconnected` (mapped to
-// `TryRecvError::Closed`) while a sender→receiver direct-copy handoff is still
-// in flight: the receiver's waker stays registered across blocking-recv
-// rounds, so a sender may direct-copy an item into that waker slot — bypassing
-// the queue — while the collector is in the `try_recv` burst phase, where the
-// slot is never examined. If the last sender then drops, `try_recv` reports
-// Closed with the item stranded, and exiting here would silently drop items
-// (reproduced with pure crossfire: bounded/unbounded × mpsc/mpmc all affected;
-// only the try_recv+recv *mix* triggers it — neither pure pattern does).
-// Blocking `recv` *does* check the waker slot, so every `Closed` verdict below
-// is confirmed with one blocking `recv` before exiting: a genuinely closed
-// channel errs immediately, a spurious one yields the in-flight item.
+// `TryRecvError::Closed`): `ChannelShared::try_recv` (shared.rs:42) pops the
+// queue first and only then checks `tx_count`, with no re-validation. A
+// sender can complete `send()` and drop its `tx` between those two
+// observations, so "empty AND all senders dropped" never held at once — yet
+// `Closed` is returned with the item still receivable (reproduced with pure
+// crossfire: bounded/unbounded × mpsc/mpmc all affected; every drain that
+// trusts the verdict loses items, pure blocking `recv` is immune — its
+// `_recv_blocking` re-pops after the closed-check).
+// Every `Closed` verdict below is therefore confirmed with one blocking
+// `recv` before exiting: a genuinely closed channel errs immediately, a
+// spurious one yields the in-flight item.
 
 /// Drain `rx` in arrival order, invoking `sink` per item.
 ///
