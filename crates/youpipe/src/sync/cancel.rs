@@ -36,8 +36,13 @@ impl CancellationToken {
     }
 
     /// Clears the cancellation flag, allowing reuse.
+    ///
+    /// RMW (`swap`) rather than a plain store: a load that happens-after this
+    /// reset is guaranteed to miss a `cancel()` that was overwritten by it,
+    /// which a Relaxed store would not promise on the reuse path. Cold path —
+    /// at most once per run — so the RMW cost is irrelevant.
     pub fn reset(&self) {
-        self.cancelled.store(false, Ordering::Relaxed);
+        self.cancelled.swap(false, Ordering::AcqRel);
     }
 }
 
