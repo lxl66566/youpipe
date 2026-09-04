@@ -308,13 +308,35 @@ fn spawn_expand_stage<I, N, Tx, R>(
             let tx = tx.clone();
             let worker_cancel = ctx.cancel.clone();
             move || {
-                while let Ok((seq, item)) = rx.recv() {
+                'outer: loop {
+                    // Anchor + burst-drain, same shape as `spawn_stage`.
+                    let Ok((seq, item)) = rx.recv() else { break };
                     if cancel_active(worker_cancel.as_ref()) {
                         break;
                     }
                     for n in expand(item) {
                         if tx.send((seq, n)).is_err() {
                             break;
+                        }
+                    }
+                    loop {
+                        let (seq, item) = match rx.try_recv() {
+                            Ok(v) => v,
+                            Err(TryRecvError::Empty) => continue 'outer,
+                            // Spurious-close guard: see the module doc on
+                            // crossfire's try_recv quirk.
+                            Err(TryRecvError::Closed) => match rx.recv() {
+                                Ok(v) => v,
+                                Err(_) => break 'outer,
+                            },
+                        };
+                        if cancel_active(worker_cancel.as_ref()) {
+                            break 'outer;
+                        }
+                        for n in expand(item) {
+                            if tx.send((seq, n)).is_err() {
+                                break 'outer;
+                            }
                         }
                     }
                 }
@@ -362,20 +384,58 @@ fn forward_fenced<M, Tx>(
         FenceMode::Barrier => FenceBarrier::with_capacity(mode, expected),
         FenceMode::Chunked(_) => FenceBarrier::new(mode),
     };
-    while let Ok(item) = mid_rx.recv() {
-        if cancel_active(cancel) {
-            return;
-        }
+    // Push one item through the fence, forwarding any released batch.
+    // Returns false when the downstream channel is closed.
+    fn fwd<M2, Tx2>(
+        fence: &mut FenceBarrier<(u64, M2)>,
+        fenced_tx: &Tx2,
+        item: (u64, M2),
+    ) -> bool
+    where
+        M2: Send + Unpin + 'static,
+        Tx2: SendItem<(u64, M2)>,
+    {
         if let Some(mut batch) = fence.push(item) {
             // Drain in place so the allocation survives and can be recycled
             // by the barrier — steady state is zero allocator traffic per
             // batch (see `FenceBarrier::reuse`).
             for it in batch.drain(..) {
                 if fenced_tx.send(it).is_err() {
-                    return;
+                    return false;
                 }
             }
             fence.reuse(batch);
+        }
+        true
+    }
+    'outer: loop {
+        // Anchor + burst-drain (same shape as the stage workers): the
+        // forwarder is the sole consumer, but draining the mid channel while
+        // its cache lines are hot also releases upstream backpressure sooner.
+        let Ok(item) = mid_rx.recv() else { break };
+        if cancel_active(cancel) {
+            return;
+        }
+        if !fwd(&mut fence, &fenced_tx, item) {
+            return;
+        }
+        loop {
+            let item = match mid_rx.try_recv() {
+                Ok(v) => v,
+                Err(TryRecvError::Empty) => continue 'outer,
+                // Spurious-close guard: see the module doc on crossfire's
+                // try_recv quirk.
+                Err(TryRecvError::Closed) => match mid_rx.recv() {
+                    Ok(v) => v,
+                    Err(_) => break 'outer,
+                },
+            };
+            if cancel_active(cancel) {
+                return;
+            }
+            if !fwd(&mut fence, &fenced_tx, item) {
+                return;
+            }
         }
     }
     // Normal drain (mid_rx closed): flush remaining buffered items. This path
