@@ -344,7 +344,7 @@ type Job = Box<dyn FnMut() -> f64>;
 
 struct Batch {
     n: usize,
-    libs: Vec<(&'static str, Job)>,
+    libs: Vec<(String, Job)>,
 }
 
 struct Scenario {
@@ -354,7 +354,7 @@ struct Scenario {
 
 struct ResultRec {
     scenario: &'static str,
-    lib: &'static str,
+    lib: String,
     n: usize,
     /// Per-round per-iteration times, nanoseconds.
     rounds_ns: Vec<f64>,
@@ -405,7 +405,7 @@ fn run_all(cfg: &Config) -> Vec<ResultRec> {
             for batch in &mut sc.batches {
                 // ABCABC interleaving: reverse the library order on odd rounds
                 // to cancel position bias.
-                let iter: Box<dyn Iterator<Item = &mut (&'static str, Job)>> = if round % 2 == 0 {
+                let iter: Box<dyn Iterator<Item = &mut (String, Job)>> = if round % 2 == 0 {
                     Box::new(batch.libs.iter_mut())
                 } else {
                     Box::new(batch.libs.iter_mut().rev())
@@ -421,7 +421,7 @@ fn run_all(cfg: &Config) -> Vec<ResultRec> {
                     );
                     recs.push(ResultRec {
                         scenario: sc.name,
-                        lib,
+                        lib: lib.clone(),
                         n: batch.n,
                         rounds_ns: vec![ns],
                     });
@@ -578,7 +578,7 @@ fn cpu_balanced() -> Scenario {
                 n,
                 libs: vec![
                     (
-                        "youpipe",
+                        "youpipe".to_owned(),
                         Box::new({
                             let data = data.clone();
                             move || {
@@ -590,7 +590,7 @@ fn cpu_balanced() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "rayon",
+                        "rayon".to_owned(),
                         Box::new({
                             let data = data.clone();
                             move || {
@@ -602,7 +602,7 @@ fn cpu_balanced() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "std threads",
+                        "std threads".to_owned(),
                         Box::new(move || {
                             let t = Instant::now();
                             let r = std_chunked_map(&data, |x| bb(cpu_work(x, 100)));
@@ -631,7 +631,7 @@ fn cpu_unbalanced() -> Scenario {
                 n,
                 libs: vec![
                     (
-                        "youpipe (Unbalanced)",
+                        "youpipe (Unbalanced)".to_owned(),
                         Box::new({
                             let data = data.clone();
                             move || {
@@ -645,7 +645,7 @@ fn cpu_unbalanced() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "youpipe (default)",
+                        "youpipe (default)".to_owned(),
                         Box::new({
                             let data = data.clone();
                             move || {
@@ -657,7 +657,7 @@ fn cpu_unbalanced() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "rayon",
+                        "rayon".to_owned(),
                         Box::new({
                             let data = data.clone();
                             move || {
@@ -671,7 +671,7 @@ fn cpu_unbalanced() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "std threads",
+                        "std threads".to_owned(),
                         Box::new({
                             let data = data.clone();
                             move || {
@@ -702,7 +702,7 @@ fn io_async() -> Scenario {
                 n,
                 libs: vec![
                     (
-                        "youpipe",
+                        "youpipe".to_owned(),
                         Box::new({
                             let tasks = tasks.clone();
                             move || {
@@ -719,7 +719,7 @@ fn io_async() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "tokio",
+                        "tokio".to_owned(),
                         Box::new({
                             let tasks = tasks.clone();
                             move || {
@@ -745,7 +745,7 @@ fn io_async() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "futures",
+                        "futures".to_owned(),
                         Box::new({
                             let tasks = tasks.clone();
                             move || {
@@ -781,8 +781,10 @@ fn io_blocking() -> Scenario {
             Batch {
                 n,
                 libs: vec![
+                    // Actual default pool size varies by machine — a
+                    // hardcoded thread count would misreport the JSON.
                     (
-                        "youpipe (32 thr)",
+                        format!("youpipe ({} thr)", num_cpus()),
                         Box::new({
                             let tasks = tasks.clone();
                             move || {
@@ -795,7 +797,7 @@ fn io_blocking() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "youpipe (512 thr)",
+                        "youpipe (512 thr)".to_owned(),
                         Box::new({
                             let tasks = tasks.clone();
                             move || {
@@ -809,7 +811,7 @@ fn io_blocking() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "tokio",
+                        "tokio".to_owned(),
                         Box::new({
                             let tasks = tasks.clone();
                             move || {
@@ -832,7 +834,7 @@ fn io_blocking() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "std threads",
+                        "std threads".to_owned(),
                         Box::new({
                             let tasks = tasks.clone();
                             move || {
@@ -871,7 +873,7 @@ fn mixed_cpu_io() -> Scenario {
                 n,
                 libs: vec![
                     (
-                        "youpipe",
+                        "youpipe".to_owned(),
                         Box::new({
                             let tasks = tasks.clone();
                             move || {
@@ -891,7 +893,7 @@ fn mixed_cpu_io() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "tokio",
+                        "tokio".to_owned(),
                         Box::new({
                             let tasks = tasks.clone();
                             move || {
@@ -930,7 +932,7 @@ fn mixed_cpu_io() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "futures",
+                        "futures".to_owned(),
                         Box::new({
                             let tasks = tasks.clone();
                             move || {
@@ -975,7 +977,7 @@ fn real_doc() -> Scenario {
                 n,
                 libs: vec![
                     (
-                        "youpipe",
+                        "youpipe".to_owned(),
                         Box::new({
                             let docs = docs.clone();
                             move || {
@@ -997,7 +999,7 @@ fn real_doc() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "tokio",
+                        "tokio".to_owned(),
                         Box::new({
                             let docs = docs.clone();
                             move || {
@@ -1051,7 +1053,7 @@ fn real_doc() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "rayon",
+                        "rayon".to_owned(),
                         Box::new({
                             let docs = docs.clone();
                             move || {
@@ -1090,7 +1092,7 @@ fn real_web() -> Scenario {
                 n,
                 libs: vec![
                     (
-                        "youpipe",
+                        "youpipe".to_owned(),
                         Box::new({
                             let path = path.to_owned();
                             move || {
@@ -1116,7 +1118,7 @@ fn real_web() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "tokio",
+                        "tokio".to_owned(),
                         Box::new({
                             let path = path.to_owned();
                             move || {
@@ -1157,7 +1159,7 @@ fn real_web() -> Scenario {
                         }) as Job,
                     ),
                     (
-                        "futures",
+                        "futures".to_owned(),
                         Box::new({
                             let path = path.to_owned();
                             move || {

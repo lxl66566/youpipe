@@ -321,6 +321,33 @@ fn bench_io_unbalanced(c: &mut Criterion) {
             },
         );
 
+        // Oversubscribed pool (512 threads, matching tokio's blocking pool
+        // size): sleep-bound groups compare tokio_spawn_blocking's 512
+        // threads against the default pool's n_cpus threads — without this
+        // arm the comparison favours tokio by thread count alone.
+        {
+            let pool = ComputePool::new(512);
+            group.bench_with_input(
+                BenchmarkId::new("youpipe_stream_oversub", size),
+                &tasks,
+                |b, tasks| {
+                    b.iter_batched(
+                        || warm_clone_io_tasks(tasks),
+                        |v| {
+                            let r = stream(v)
+                                .with_compute_pool(pool.clone())
+                                .stage(|(x, micros): (u64, u64)| {
+                                    bb(io_work_variable(x, micros))
+                                })
+                                .run();
+                            bb(r)
+                        },
+                        BatchSize::PerIteration,
+                    );
+                },
+            );
+        }
+
         group.bench_with_input(
             BenchmarkId::new("tokio_spawn_blocking", size),
             &tasks,
@@ -373,19 +400,23 @@ fn bench_mixed_unbalanced(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("youpipe_stream", size), |b| {
             let cpu_tasks = cpu_tasks.clone();
             let io_tasks = io_tasks.clone();
-            b.iter(|| {
-                let cpu_results = stream(cpu_tasks.clone())
-                    .stage(|(x, iters): (u64, u32)| bb(cpu_work_variable(x, iters)))
-                    .run();
-                let io_items: Vec<(u64, u64)> = cpu_results
-                    .into_iter()
-                    .zip(io_tasks.iter().map(|&(_, micros)| micros))
-                    .collect();
-                let r = stream(io_items)
-                    .stage(|(x, micros): (u64, u64)| bb(io_work_variable(x, micros)))
-                    .run();
-                bb(r)
-            });
+            b.iter_batched(
+                || warm_clone_tasks(&cpu_tasks),
+                |cpu_tasks| {
+                    let cpu_results = stream(cpu_tasks)
+                        .stage(|(x, iters): (u64, u32)| bb(cpu_work_variable(x, iters)))
+                        .run();
+                    let io_items: Vec<(u64, u64)> = cpu_results
+                        .into_iter()
+                        .zip(io_tasks.iter().map(|&(_, micros)| micros))
+                        .collect();
+                    let r = stream(io_items)
+                        .stage(|(x, micros): (u64, u64)| bb(io_work_variable(x, micros)))
+                        .run();
+                    bb(r)
+                },
+                BatchSize::PerIteration,
+            );
         });
 
         group.bench_function(BenchmarkId::new("tokio_mixed", size), |b| {

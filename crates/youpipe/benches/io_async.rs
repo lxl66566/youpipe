@@ -18,8 +18,35 @@ mod common;
 
 use std::{hint::black_box as bb, time::Duration};
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{
+    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+};
 use youpipe::{PipelineConfig, TokioPool, stream};
+
+/// Warm-clone discipline shared with `async_vs_tokio.rs` / `unbalanced.rs`:
+/// rebuild the owned input in the (untimed) setup and touch it so it is
+/// cache-resident — an in-loop clone would measure allocator/memcpy latency
+/// instead of the framework (glibc's large memcpy uses non-temporal stores;
+/// see docs/benchmarks.md).
+fn warm_clone_tasks(src: &[(u64, Duration)]) -> Vec<(u64, Duration)> {
+    let v = src.to_vec();
+    let mut acc = 0u64;
+    for (x, _) in &v {
+        acc = acc.wrapping_add(*x);
+    }
+    bb(acc);
+    v
+}
+
+fn warm_clone_mixed(src: &[((u64, u32), Duration)]) -> Vec<((u64, u32), Duration)> {
+    let v = src.to_vec();
+    let mut acc = 0u64;
+    for ((x, _), _) in &v {
+        acc = acc.wrapping_add(*x);
+    }
+    bb(acc);
+    v
+}
 
 /// CPU work, variable cost controlled by `iters`.
 fn cpu_work(x: u64, iters: u32) -> u64 {
@@ -107,16 +134,20 @@ fn bench_pure_io_async(c: &mut Criterion) {
                 BenchmarkId::new("youpipe_async", size),
                 &tasks,
                 |b, tasks| {
-                    b.iter(|| {
-                        let r = stream(tasks.clone())
-                            .with_config(PipelineConfig::default().with_io_concurrency(512))
-                            .with_async_pool(TokioPool::new(pool_handle.clone()))
-                            .stage_async(|(x, dur): (u64, Duration)| async move {
-                                async_io(x, dur).await
-                            })
-                            .run();
-                        bb(r)
-                    });
+                    b.iter_batched(
+                        || warm_clone_tasks(tasks),
+                        |v| {
+                            let r = stream(v)
+                                .with_config(PipelineConfig::default().with_io_concurrency(512))
+                                .with_async_pool(TokioPool::new(pool_handle.clone()))
+                                .stage_async(|(x, dur): (u64, Duration)| async move {
+                                    async_io(x, dur).await
+                                })
+                                .run();
+                            bb(r)
+                        },
+                        BatchSize::PerIteration,
+                    );
                 },
             );
         }
@@ -126,12 +157,16 @@ fn bench_pure_io_async(c: &mut Criterion) {
             BenchmarkId::new("youpipe_blocking", size),
             &tasks,
             |b, tasks| {
-                b.iter(|| {
-                    let r = stream(tasks.clone())
-                        .stage(|(x, dur): (u64, Duration)| bb(blocking_io(x, dur)))
-                        .run();
-                    bb(r)
-                });
+                b.iter_batched(
+                    || warm_clone_tasks(tasks),
+                    |v| {
+                        let r = stream(v)
+                            .stage(|(x, dur): (u64, Duration)| bb(blocking_io(x, dur)))
+                            .run();
+                        bb(r)
+                    },
+                    BatchSize::PerIteration,
+                );
             },
         );
 
@@ -146,13 +181,17 @@ fn bench_pure_io_async(c: &mut Criterion) {
                 BenchmarkId::new("youpipe_blocking_oversub", size),
                 &tasks,
                 |b, tasks| {
-                    b.iter(|| {
-                        let r = stream(tasks.clone())
-                            .with_compute_pool(pool.clone())
-                            .stage(|(x, dur): (u64, Duration)| bb(blocking_io(x, dur)))
-                            .run();
-                        bb(r)
-                    });
+                    b.iter_batched(
+                        || warm_clone_tasks(tasks),
+                        |v| {
+                            let r = stream(v)
+                                .with_compute_pool(pool.clone())
+                                .stage(|(x, dur): (u64, Duration)| bb(blocking_io(x, dur)))
+                                .run();
+                            bb(r)
+                        },
+                        BatchSize::PerIteration,
+                    );
                 },
             );
         }
@@ -225,19 +264,23 @@ fn bench_mixed_cpu_io(c: &mut Criterion) {
                 BenchmarkId::new("youpipe_mixed_async", size),
                 &items,
                 |b, items| {
-                    b.iter(|| {
-                        let r = stream(items.clone())
-                            .with_config(PipelineConfig::default().with_io_concurrency(512))
-                            .with_async_pool(TokioPool::new(pool_handle.clone()))
-                            .stage(|((x, iters), dur): ((u64, u32), Duration)| {
-                                (bb(cpu_work(x, iters)), dur)
-                            })
-                            .stage_async(|(val, dur): (u64, Duration)| async move {
-                                async_io(val, dur).await
-                            })
-                            .run();
-                        bb(r)
-                    });
+                    b.iter_batched(
+                        || warm_clone_mixed(items),
+                        |v| {
+                            let r = stream(v)
+                                .with_config(PipelineConfig::default().with_io_concurrency(512))
+                                .with_async_pool(TokioPool::new(pool_handle.clone()))
+                                .stage(|((x, iters), dur): ((u64, u32), Duration)| {
+                                    (bb(cpu_work(x, iters)), dur)
+                                })
+                                .stage_async(|(val, dur): (u64, Duration)| async move {
+                                    async_io(val, dur).await
+                                })
+                                .run();
+                            bb(r)
+                        },
+                        BatchSize::PerIteration,
+                    );
                 },
             );
         }
@@ -249,15 +292,19 @@ fn bench_mixed_cpu_io(c: &mut Criterion) {
                 BenchmarkId::new("youpipe_mixed_blocking", size),
                 &items,
                 |b, items| {
-                    b.iter(|| {
-                        let r = stream(items.clone())
-                            .stage(|((x, iters), dur): ((u64, u32), Duration)| {
-                                (bb(cpu_work(x, iters)), dur)
-                            })
-                            .stage(|(val, dur): (u64, Duration)| bb(blocking_io(val, dur)))
-                            .run();
-                        bb(r)
-                    });
+                    b.iter_batched(
+                        || warm_clone_mixed(items),
+                        |v| {
+                            let r = stream(v)
+                                .stage(|((x, iters), dur): ((u64, u32), Duration)| {
+                                    (bb(cpu_work(x, iters)), dur)
+                                })
+                                .stage(|(val, dur): (u64, Duration)| bb(blocking_io(val, dur)))
+                                .run();
+                            bb(r)
+                        },
+                        BatchSize::PerIteration,
+                    );
                 },
             );
         }
