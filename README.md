@@ -13,113 +13,62 @@ whole chain. Two pipeline engines cover different regimes:
   async IO, cancellation, fences, 1-to-N expansion, and more.
 
 A rayon-style work-stealing scheduler (`st3` LIFO deque + packed atomic
-sleep counters) handles balanced and unbalanced loads. `scope()` supports non-`'static`
-closures that borrow stack-local data.
+sleep counters) handles balanced and unbalanced loads. `scope()` supports
+non-`'static` closures that borrow stack-local data.
 
 Usage: `cargo add youpipe`.
 
-## API
+## Quick start
 
 `pipe(items)` / `items.pipe()` produce the same types — either works.
 
 ```rust
-use youpipe::pipe;
-let r: Vec<i32> = pipe(0..1000).map(|x| x + 1).collect();
-// same as
-use youpipe::prelude::*;
-let r: Vec<i32> = (0..1000).pipe().map(|x| x + 1).collect();
-```
-
-Pick the entry point by workload:
-
-| Workload                     | Entry                                                |
-| ---------------------------- | ---------------------------------------------------- |
-| Pure CPU map/filter          | `pipe(items)`                                        |
-| Side-effect only (no output) | `pipe(items).for_each(\|x\| ..)`                     |
-| Async IO, mixed sync+async   | `stream(items).stage_async(...)`                     |
-| Unbalanced CPU workloads     | `pipe(items).with_workload(Unbalanced)`              |
-| Custom split granularity     | `pipe(items).with_workload(Workload::Custom(n))`     |
-| Cancellation, fences, expand | `stream(items).with_cancel(..).fence(..).expand(..)` |
-| Borrow a slice, no clone     | `pipe_ref(&slice).map(\|&x\| ..)` — rayon `par_iter` counterpart, zero-copy |
-| Borrow stack-local data      | `pipe_ref(&data).map(\|x\| ..&local..)` (no scope needed), or `scope(\|s\| s.pipe(items)..)` for non-slice inputs |
-| Fallible + borrow            | `pipe_ref(&data).try_map(..).try_collect()`          |
-
-Below ~10 µs of total work or ~100 ns per item, youpipe is not recommended —
-the parallel setup overhead won't pay off. Sequential `iter().map().collect()`
-is faster in that range.
-
-## Examples
-
-youpipe does **not** wait for one stage to finish completely before starting
-the next. Use a fence between stages if you need strict stage isolation.
-
-```rust
-use std::num::NonZeroUsize;
 use youpipe::prelude::*;
 
-// fused CPU bound
+// fused CPU chain: one monomorphized closure per worker
 let r: Vec<i32> = (0..1000).pipe()
     .map(|x| x + 1)
     .filter(|x: &i32| x % 2 == 0)
     .map(|x| x * 10)
     .collect();
 
-// fallible
-let r: Result<Vec<String>, _> = (0..100).pipe()
-    .try_map(|x: i32| if x == 50 { Err("bad") } else { Ok(x * 2) })
-    .map(|x| format!("{x}"))
-    .try_collect();
-
-// sync CPU stage + async IO stage (overlap on separate pools)
+// sync CPU stage + async IO stage, overlapped on separate pools
 let r: Vec<u64> = (0..1000).stream()
     .stage(|x: u64| x + 1)
     .stage_async(|x: u64| async move { fetch(x).await })
     .run();
-
-// fence: batch every 64 items between two adjacent stages
-let r: Vec<i32> = (0..1000).stream()
-    .stage(|x: i32| x + 1)
-    .fence(FenceMode::Chunked(NonZeroUsize::new(64).unwrap()))
-    .stage(|x: i32| x * 2)
-    .run();
-
-// for_each: side-effect terminal (no output Vec allocated) — the
-// counterpart of rayon's par_iter().for_each(). `Fn + Sync`, so use
-// atomics/Mutex for accumulation rather than &mut capture.
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
-let total = Arc::new(AtomicU64::new(0));
-let t = total.clone();
-pipe(0..1000).for_each(move |x: u64| t.fetch_add(x, Ordering::Relaxed));
-
-// scope + pipe(&slice): borrow without cloning — counterpart of rayon's
-// slice.par_iter(). One Vec<&T> allocation, zero clones of T.
-let files: Vec<String> = (0..50).map(|i| format!("f{i}")).collect();
-let chars = Arc::new(AtomicU64::new(0));
-let c = chars.clone();
-scope(|s| s.pipe(&files).for_each(move |f: &String| {
-    c.fetch_add(f.len() as u64, Ordering::Relaxed);
-}));
-
-// scope borrows local `factor` and `table`, no clone
-let factor = 7;
-let table: Vec<String> = (0..100).map(|i| format!("row-{i}")).collect();
-let r: Vec<usize> = scope(|s| {
-    s.pipe(0..table.len()).map(|i: usize| table[i].len() * factor).collect()
-});
 ```
+
+Pick the engine and tuning knobs by workload — see
+[Choosing the right engine](https://lxl66566.github.io/youpipe/advanced/choosing-engine.html).
+
+## Documentation
+
+Full manual at **[lxl66566.github.io/youpipe](https://lxl66566.github.io/youpipe/)**:
+
+- [User guide](https://lxl66566.github.io/youpipe/guide/getting-started.html) —
+  fused, streaming, borrowing and fallible pipelines
+- [Performance tuning](https://lxl66566.github.io/youpipe/advanced/choosing-engine.html) —
+  engine choice, workload hints, pools, per-stage knobs
+- [Benchmarks and methodology](https://lxl66566.github.io/youpipe/dev/benchmarks.html) —
+  cross-library comparison and how it is measured
+- [Developer guide](https://lxl66566.github.io/youpipe/dev/design.html) —
+  scheduler, channels, verification (miri/loom)
+
+Sources live under `docs/` (`mdbook build docs` to build locally).
 
 ## Performance
 
 Cross-library comparison against rayon, tokio, `futures::stream`, and
-hand-written `std::thread` pipelines: seven workloads (balanced/skewed CPU,
-async/blocking IO, mixed sync+async, and two realistic three-stage pipelines,
-including HTTP over a loopback mock server). 32-core AMD (Zen) Linux, 31
-pinned cores, 5 interleaved rounds per measurement (ABCABC order, median).
-CPU rows use each library's idiomatic borrow (`pipe_ref` vs `par_iter`).
-Charts show throughput — higher is better; bar-chart whiskers span the
-5 rounds. Simulated IO is pure sleeps — nothing touches the disk. Methodology
-and full data:
-[docs/src/dev/benchmarks.md](https://github.com/lxl66566/youpipe/blob/main/docs/src/dev/benchmarks.md#horizontal-cross-library-comparison-2026-09).
+hand-written `std::thread` pipelines over seven workloads (balanced/skewed
+CPU, async/blocking IO, mixed sync+async, and two realistic three-stage
+pipelines, including HTTP over a loopback mock server): youpipe leads the
+mid-size CPU range (−23 % vs rayon @ 100K), wins skewed workloads with
+`Workload::Unbalanced`, and beats hand-written tokio channel plumbing by up
+to 23 % on realistic sync+async pipelines. 32-core AMD (Zen) Linux, 31 pinned
+cores, 5 interleaved rounds (median). Simulated IO is pure sleeps — nothing
+touches the disk. Methodology and full data:
+[Benchmarks and methodology](https://lxl66566.github.io/youpipe/dev/benchmarks.html).
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">
@@ -131,136 +80,9 @@ and full data:
   <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-real.svg" alt="Mixed sync + async pipelines: youpipe vs tokio vs futures vs rayon">
 </p>
 
-Highlights (median wall time, youpipe vs the strongest alternative;
-per-iteration time, setup excluded):
-
-- **CPU, balanced (`pipe_ref` vs rayon `par_iter`)** — youpipe wins at
-  10K–100K items (−23 % vs rayon at 100K); rayon wins 1K (fixed setup cost,
-  ~20 µs) and 1M (its fork-join runs inline on the calling thread; the 1M
-  batch is bandwidth-bound). All three are 5–10× faster than hand-rolled
-  equal-chunk threading.
-- **CPU, skewed (10 % of items cost 1000×)** — `Workload::Unbalanced` +
-  work stealing beats rayon at 100K (0.248 vs 0.260 ms) and is 3× faster
-  than equal-chunk threading, which strands the slow items in a few
-  threads.
-- **Async IO (512 in flight, 1/8 ms tail)** — tied with the async baselines:
-  ±1 % vs tokio (ahead at ≥2K items), 2–5 % behind the lighter
-  `futures::stream` combinator stack. youpipe rides the same tokio runtime.
-- **Blocking IO** — with a 512-thread oversubscribed pool youpipe matches
-  `spawn_blocking` (8.65 vs 8.88 ms @ 500); at the default 32 threads it is
-  wait-bound (34 ms). Blocking stages need oversubscription — see
-  [Advanced usage](#advanced-usage).
-- **Mixed sync CPU + async IO** — 10.8 vs 13.5 ms @ 2K items (−20 % vs a
-  hand-written tokio channel chain); `futures::stream` edges youpipe out by
-  running the CPU stage inline on runtime workers.
-- **Realistic doc pipeline (fetch → parse → save, heavy-tailed sizes)** —
-  14.2 vs 18.4 ms @ 4K docs: −23 % vs hand-written tokio, 9.7× vs rayon
-  (whose pool stalls on the blocking IO).
-- **Realistic web pipeline (HTTP GET → parse → aggregate)** — 23.0 vs 27.5 ms
-  @ 2K requests: −16 % vs tokio, −22 % vs futures.
-
-Reproduce:
-
-```sh
-cargo bench -p youpipe --bench horizontal -- --rounds 5
-uv run perf/plot-horizontal.py   # JSON → SVG (matplotlib)
-```
-
-## Advanced usage
-
-Defaults: `compute_workers = async_workers = available_parallelism`,
-`io_concurrency = 128`, `buffer_size = 256`, `Workload::Balanced`. The tokio
-runtime is built lazily on first `.run()` and reused for that run; pass a
-`TokioPool` to share one across runs.
-
-```rust
-use youpipe::prelude::*;
-
-// Unbalanced: ~10% slow items, 1000× cost spread → raises oversplit factor
-let r: Vec<_> = (0..5_000).pipe()
-    .with_workload(Workload::Unbalanced)
-    .map(|x| expensive(x))
-    .collect();
-
-// Workload::Custom(n): pin the fork/join oversplit yourself (1 = coarsest,
-// 16 = very fine-grained stealing for extreme skew)
-let r: Vec<_> = (0..5_000).pipe()
-    .with_workload(Workload::Custom(std::num::NonZeroUsize::new(16).unwrap()))
-    .map(|x| expensive(x))
-    .collect();
-
-// Tuned config + reused runtime
-let cfg = PipelineConfig::default()
-    .with_compute_workers(16)
-    .with_async_workers(8)
-    .with_io_concurrency(512)
-    .with_buffer_size(1024);
-let pool = TokioPool::build_default()?;
-let r = items.stream()
-    .with_config(cfg)
-    .with_async_pool(pool)
-    .stage_async(|x| async move { io(x).await })
-    .run();
-
-// Per-stage tuning: heavy CPU stage pinned to 8 workers, the async stage to
-// 512 concurrent IO tasks with a deep buffer — unset knobs fall back to the
-// pipeline-level config.
-let r: Vec<_> = items.stream()
-    .stage_with(StageOptions::new().workers(8), |x| crunch(x))
-    .stage(|x| light(x))
-    .stage_async_with(
-        StageOptions::new().io_concurrency(512).buffer(1024),
-        |x| async move { io(x).await },
-    )
-    .run();
-
-// Side-effect terminal without materialising the output Vec — plain &mut
-// capture works, the drain runs on the calling thread.
-let mut total = 0u64;
-stream(0..10_000).stage(|x| x * 2).for_each(|x| total += x);
-
-// Cancellation
-let token = CancellationToken::new();
-let r = (0..10_000).stream()
-    .with_cancel(token.clone())
-    .stage(|x| expensive(x))
-    .run();
-
-// Oversubscribed compute pool for blocking-IO sync stages. NOTE: pools are
-// capped at MAX_COMPUTE_WORKERS (511) — larger sizes are silently clamped.
-let pool = ComputePool::new(MAX_COMPUTE_WORKERS);
-let r = (0..1000).stream()
-    .with_compute_pool(pool)
-    .stage(|x| blocking_io(x))
-    .run();
-```
-
-`io_concurrency` is the M:N multiplier — async tasks yield the OS thread
-while waiting, so it can be far larger than `async_workers` (the thread
-count). Bound it to cap memory. Override it per async stage with
-`StageOptions::io_concurrency` (e.g. a network stage at 512, a disk stage
-at 16) via `.stage_async_with(opts, f)`; pin sync-stage worker counts with
-`StageOptions::workers` via `.stage_with(opts, f)` — explicit worker claims
-are deducted from the `compute_workers` budget before the rest is divided
-equally across the unpinned stages.
-
-`.fence(mode)` acts on one adjacent stage boundary. `FenceMode::Barrier`
-drains upstream fully before downstream starts; `FenceMode::Chunked(k)`
-releases every `k` items as they form (the default for mixed CPU/IO).
-`.run()` returns results in completion order; append `.ordered()` to restore
-input order via a `ReorderBuffer`. `.run()` panics if the tokio runtime
-cannot be built; use `.try_run()` to surface that as a `Result`.
-
-Not every config knob applies to every engine: a fused `pipe()` reads only
-`workload` from the config (size its pool with `with_compute_pool`);
-`buffer_size` / `async_workers` / `io_concurrency` are streaming-only. Pool
-sizes are capped at
-`MAX_COMPUTE_WORKERS = 511` (the scheduler's sleep bitmask is 9 bits wide).
-
-## How it works
-
-see the [developer guide](https://github.com/lxl66566/youpipe/blob/main/docs/src/SUMMARY.md)
-(mdbook; build locally with `mdbook build docs`).
+Below ~10 µs of total work or ~100 ns per item, youpipe is not recommended —
+the parallel setup overhead won't pay off. Sequential `iter().map().collect()`
+is faster in that range.
 
 ## Attribution
 
