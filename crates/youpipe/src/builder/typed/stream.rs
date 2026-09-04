@@ -2496,6 +2496,25 @@ where
             (stages.spawn_single::<R>(feeder_rx, &ctx), feeder)
         };
 
+        // Terminal-channel regression guard: both feeder paths must hand the
+        // collector a Single (MPSC) final channel — the collector is always
+        // the sole consumer. Async-first chains once silently degraded to the
+        // MPMC terminal (per-item `lock cmpxchg` in the collector); every
+        // debug-mode test run re-checks this here. Built-in stages all
+        // override `spawn_single` / `spawn_async_feeder_single`; `StageSpawn`
+        // is crate-private (not exported), so no external impl can return a
+        // non-Single variant.
+        #[cfg(feature = "tokio-runtime")]
+        debug_assert!(
+            matches!(final_rx, FinalRx::SyncSingle(_) | FinalRx::AsyncSingle(_)),
+            "terminal channel must be MPSC (Single variant)"
+        );
+        #[cfg(not(feature = "tokio-runtime"))]
+        debug_assert!(
+            matches!(final_rx, FinalRx::SyncSingle(_)),
+            "terminal channel must be MPSC (Single variant)"
+        );
+
         let results = match final_rx {
             FinalRx::Sync(rx) => terminal.drain_sync(rx, ordered, n),
             FinalRx::SyncSingle(rx) => terminal.drain_sync(rx, ordered, n),
