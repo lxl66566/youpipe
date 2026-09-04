@@ -1,6 +1,6 @@
 #[cfg(feature = "tokio-runtime")]
 use std::{future::Future, sync::OnceLock};
-use std::{marker::PhantomData, num::NonZeroUsize, sync::Arc};
+use std::{cell::Cell, marker::PhantomData, num::NonZeroUsize, sync::Arc};
 
 #[cfg(feature = "tokio-runtime")]
 use crate::handoff::{
@@ -78,24 +78,27 @@ fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
 type FeederPanicSlot = Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
 
 /// Handle returned by [`feed_items`]: either an inline push (already done,
-/// nothing to reap) or a feeder job running on the compute pool.
+/// nothing to reap) or a detached feeder (pool job or dedicated thread)
+/// whose panic payload is re-raised by [`Feeder::finish`].
 enum Feeder {
     Pool(FeederPanicSlot),
+    Thread(FeederPanicSlot),
     Inline,
 }
 
 impl Feeder {
     fn finish(self) {
-        if let Self::Pool(slot) = self {
-            // Same poison-recovery pattern as the hybrid dispatcher's
-            // fail slot.
-            if let Some(payload) = slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                std::panic::resume_unwind(payload);
-            }
+        let slot = match self {
+            Self::Pool(slot) | Self::Thread(slot) => slot,
+            Self::Inline => return,
+        };
+        // Same poison-recovery pattern as the hybrid dispatcher's fail slot.
+        if let Some(payload) = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            std::panic::resume_unwind(payload);
         }
     }
 }
@@ -107,7 +110,9 @@ impl Feeder {
 /// Otherwise the push loop runs as **a job on the compute pool** instead of
 /// a dedicated OS thread: pool workers are long-lived, so this saves the
 /// ~30-80 µs `thread::spawn` + join per `run()` call while keeping the same
-/// effective thread count (one feeder alongside the stage workers).
+/// effective thread count (one feeder alongside the stage workers). In
+/// dedicated-thread mode (`dedicated == true`, see [`StreamCtx`]) the pool
+/// cannot be relied on at all, so the feeder gets a dedicated OS thread too.
 ///
 /// # Deadlock safety
 ///
@@ -115,11 +120,11 @@ impl Feeder {
 /// sender never blocks on `Full`: even if every downstream worker is blocked
 /// on the *output* channel, the calling thread finishes pushing, drops the
 /// sender, and proceeds to collect — draining the output and unblocking
-/// workers. The pool path is the feeder/collector-concurrency case: the
-/// feeder job feeds while the calling thread collects, so neither can starve
-/// the other; if every pool worker is busy with stage workers, the feeder
-/// job simply runs as soon as any stage worker finishes an item (they all
-/// make progress because the collector drains the terminal channel).
+/// workers. The pool path is only taken when [`StreamPipe::try_exec`] has
+/// reserved a slot for it in the pool's liveness budget (one pool thread on
+/// top of every sync stage's workers), so the feeder job is always
+/// schedulable. The dedicated-thread path is trivially safe: the OS
+/// schedules the thread independently of the pool.
 ///
 /// The pool-path job is **injected** (`submit_injected`), never `submit`ed:
 /// it must sit in the injector FIFO *before* the stage-worker jobs that
@@ -132,9 +137,9 @@ impl Feeder {
 ///
 /// # Panic semantics
 ///
-/// The job wraps the push loop in `catch_unwind` (an uncaught panic in a
-/// pool job would abort the process via the worker's `AbortIfPanic`) and
-/// stores the payload; [`Feeder::finish`] re-raises it on the caller after
+/// The detached paths wrap the push loop in `catch_unwind` (an uncaught panic
+/// in a pool job would abort the process via the worker's `AbortIfPanic`) and
+/// store the payload; [`Feeder::finish`] re-raises it on the caller after
 /// the collect returns. The payload store happens before the sender drops
 /// (closing the channel), and the close is what releases the collector, so
 /// the caller always observes the payload.
@@ -145,6 +150,7 @@ fn feed_items<I: Send + 'static>(
     feeder_tx: SyncSender<(u64, I)>,
     cancel: Option<CancellationToken>,
     buffer: usize,
+    dedicated: bool,
 ) -> Feeder {
     if items.len() <= buffer {
         for (seq, item) in items.into_iter().enumerate() {
@@ -155,34 +161,41 @@ fn feed_items<I: Send + 'static>(
                 break;
             }
         }
-        Feeder::Inline
-    } else {
-        let slot: FeederPanicSlot = Arc::new(std::sync::Mutex::new(None));
-        let job_slot = Arc::clone(&slot);
-        pool.submit_injected(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                for (seq, item) in items.into_iter().enumerate() {
-                    if cancel_active(cancel.as_ref()) {
-                        break;
-                    }
-                    if feeder_tx.send((seq as u64, item)).is_err() {
-                        break;
-                    }
+        return Feeder::Inline;
+    }
+    let slot: FeederPanicSlot = Arc::new(std::sync::Mutex::new(None));
+    let job_slot = Arc::clone(&slot);
+    let push_loop = move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            for (seq, item) in items.into_iter().enumerate() {
+                if cancel_active(cancel.as_ref()) {
+                    break;
                 }
-            }));
-            if let Err(payload) = result {
-                *job_slot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload);
+                if feeder_tx.send((seq as u64, item)).is_err() {
+                    break;
+                }
             }
-        });
+        }));
+        if let Err(payload) = result {
+            *job_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload);
+        }
+    };
+    if dedicated {
+        std::thread::spawn(push_loop);
+        Feeder::Thread(slot)
+    } else {
+        pool.submit_injected(push_loop);
         Feeder::Pool(slot)
     }
 }
 
-/// Spawn `parallelism` workers on `pool` that pull from `rx`, apply `stage`,
-/// and forward to `tx`. Each worker loops until its receiver disconnects or the
-/// supplied cancellation token (if any) is signalled.
+/// Spawn `parallelism` workers that pull from `rx`, apply `stage`, and
+/// forward to `tx` — as pool jobs in pool mode, or as dedicated OS threads
+/// when [`StreamCtx::dedicated_threads`] is set. Each worker loops until its
+/// receiver disconnects or the supplied cancellation token (if any) is
+/// signalled.
 ///
 /// Items carry a `seq` tag so the collector can restore input order; sync
 /// stages unwrap, apply `stage`, re-wrap. Tagging is always on (even in
@@ -194,22 +207,22 @@ fn feed_items<I: Send + 'static>(
 /// its own endpoint clones, and each worker drops its clones when its recv
 /// loop ends — the downstream stage observes "no more items" when the last
 /// upstream sender goes away. No join handle is needed (workers are pool
-/// jobs); a former WaitGroup here was never awaited and only added per-stage
-/// atomics.
+/// jobs or detached threads that always terminate on disconnect); a former
+/// WaitGroup here was never awaited and only added per-stage atomics.
 #[allow(clippy::needless_pass_by_value)] // ownership transfer is intentional:
 // taking the endpoints by value ensures the caller cannot retain a clone that
 // would keep the channel open after the workers have finished.
-fn spawn_stage<I, O, Tx>(
-    pool: &ComputePool,
+fn spawn_stage<I, O, Tx, R>(
+    ctx: &StreamCtx<'_, R>,
     rx: Receiver<(u64, I)>,
     tx: Tx,
     parallelism: usize,
-    cancel: Option<CancellationToken>,
     stage: impl Fn(I) -> O + Send + Sync + 'static,
 ) where
     I: Send + Unpin + 'static,
     O: Send + Unpin + 'static,
     Tx: SendItem<(u64, O)>,
+    R: AsyncRuntime,
 {
     let stage = Arc::new(stage);
     // Collect all worker closures and submit as a single batch. This reduces
@@ -222,7 +235,7 @@ fn spawn_stage<I, O, Tx>(
             let stage = stage.clone();
             let rx = rx.clone();
             let tx = tx.clone();
-            let worker_cancel = cancel.clone();
+            let worker_cancel = ctx.cancel.clone();
             move || {
                 while let Ok((seq, item)) = rx.recv() {
                     if cancel_active(worker_cancel.as_ref()) {
@@ -236,7 +249,7 @@ fn spawn_stage<I, O, Tx>(
             }
         })
         .collect();
-    pool.submit_batch(jobs);
+    ctx.spawn_stage_jobs(jobs);
     drop(rx);
     drop(tx);
 }
@@ -245,17 +258,17 @@ fn spawn_stage<I, O, Tx>(
 /// Each expanded item inherits the parent's `seq` so the collector can group
 /// expansions from the same input.
 #[allow(clippy::needless_pass_by_value)] // runs inside a `pool.submit(move …)`
-fn spawn_expand_stage<I, N, Tx>(
-    pool: &ComputePool,
+fn spawn_expand_stage<I, N, Tx, R>(
+    ctx: &StreamCtx<'_, R>,
     rx: Receiver<(u64, I)>,
     tx: Tx,
     parallelism: usize,
-    cancel: Option<CancellationToken>,
     expand: impl Fn(I) -> Vec<N> + Send + Sync + 'static,
 ) where
     I: Send + Unpin + 'static,
     N: Send + Unpin + 'static,
     Tx: SendItem<(u64, N)>,
+    R: AsyncRuntime,
 {
     let expand = Arc::new(expand);
     let jobs: Vec<_> = (0..parallelism)
@@ -263,7 +276,7 @@ fn spawn_expand_stage<I, N, Tx>(
             let expand = expand.clone();
             let rx = rx.clone();
             let tx = tx.clone();
-            let worker_cancel = cancel.clone();
+            let worker_cancel = ctx.cancel.clone();
             move || {
                 while let Ok((seq, item)) = rx.recv() {
                     if cancel_active(worker_cancel.as_ref()) {
@@ -278,7 +291,7 @@ fn spawn_expand_stage<I, N, Tx>(
             }
         })
         .collect();
-    pool.submit_batch(jobs);
+    ctx.spawn_stage_jobs(jobs);
     drop(rx);
     drop(tx);
 }
@@ -364,16 +377,22 @@ fn forward_fenced<M, Tx>(
 /// # async fn fetch(x: u64) -> u64 { x }
 /// ```
 ///
-/// # Worker budget semantics (`workers`)
-///
-/// The runner first deducts every explicitly-set `workers` from the pool
-/// budget (`compute_workers`, or the custom pool's size), then divides what
-/// remains equally across the stages that did **not** set `workers`. This
-/// keeps the invariant that the total blocking jobs never exceeds the pool —
-/// the "stage 1 fills the pool, stage 2 starves, deadlock" failure mode.
-/// Consequently a chain of explicit overrides that exceeds the pool still
-/// runs (unspecified stages fall back to 1 worker) but may oversubscribe —
-/// the caller opted into that.
+    /// # Worker budget semantics (`workers`)
+    ///
+    /// The runner reserves one pool slot for the feeder (a pool job whenever
+    /// `n > buffer`), then treats the rest as the liveness budget: explicit
+    /// `workers` pins are granted first — upstream stage first — clamped to
+    /// what remains with one slot held back per not-yet-spawned sync stage,
+    /// and the remainder is divided equally across unpinned stages. Every
+    /// sync stage keeps ≥ 1 resident worker and the total blocking pool jobs
+    /// never exceed the pool — the "stage 1 fills the pool, stage 2 starves,
+    /// deadlock" failure mode. Pins therefore take effect in pipeline order
+    /// only until the budget runs out; later stages get 1 worker each.
+    ///
+    /// When even 1 worker per sync stage does not fit the pool (or `run()`
+    /// executes on a worker of the same pool), the runner leaves the pool
+    /// alone and spawns dedicated OS threads instead — the request is then
+    /// honored as-is, since threads are not pool-bounded.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StageOptions {
     pub(crate) workers: Option<NonZeroUsize>,
@@ -394,7 +413,10 @@ impl StageOptions {
     ///
     /// Use when stage costs are known to be unequal: a heavy parse stage
     /// deserves more workers than a cheap transform. Clamped per-run to the
-    /// item count (`workers = min(workers, n)`) like the default division.
+    /// item count (`workers = min(workers, n)`) like the default division,
+    /// and to the liveness budget remaining after upstream stages' grants —
+    /// see the [Worker budget semantics](#worker-budget-semantics-workers)
+    /// section above.
     #[must_use]
     pub fn workers(mut self, n: usize) -> Self {
         self.workers = NonZeroUsize::new(n);
@@ -808,6 +830,29 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// Bridges and fences (which have no options of their own) use this value
     /// directly.
     pub per_stage_parallelism: usize,
+    /// When `true`, sync/expand stage workers (and a non-inline feeder) run
+    /// as dedicated OS threads instead of pool jobs. Chosen by
+    /// [`StreamPipe::try_exec`] when the pool's liveness budget cannot give
+    /// every sync stage a resident worker (more sync stages than available
+    /// pool slots), or when `run()` itself executes on a worker of the same
+    /// pool (nested pipelines park that worker in the collector for the
+    /// whole run, so pool admission can never be guaranteed). The pool's
+    /// fixed thread count makes parked-in-channel jobs unschedulable by
+    /// definition; dedicated threads keep such chains deadlock-free at the
+    /// cost of one `thread::spawn` per worker.
+    pub dedicated_threads: bool,
+    /// Pool-mode liveness budget: worker slots still grantable to
+    /// not-yet-spawned sync stages. Initialised to `pool_threads - reserved`
+    /// (the feeder job reserves one slot when it is not inline) and decremented
+    /// by [`Self::stage_workers`] as the spawn walk grants workers upstream
+    /// first. Invariant: `worker_slots_left ≥ stages_left` holds at every
+    /// grant, so every stage keeps ≥ 1 resident worker and the total number
+    /// of blocking pool jobs never exceeds the pool — the "stage 1 fills the
+    /// pool, stage 2 starves, deadlock" failure mode.
+    pub(crate) worker_slots_left: Cell<usize>,
+    /// Sync/expand stages not yet spawned; decremented alongside
+    /// [`Self::worker_slots_left`] to preserve the invariant above.
+    pub(crate) stages_left: Cell<usize>,
     /// Custom compute pool (cloned from the builder's `with_compute_pool`).
     /// When `None`, sync stages use [`ComputePool::global`].
     pub compute_pool: Option<ComputePool>,
@@ -841,11 +886,57 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     /// Resolve a stage's worker count: the stage's explicit
     /// `StageOptions::workers` pin, or the runner-computed default division.
     /// Clamped to `[1, n]` (a stage never gets more workers than items).
+    ///
+    /// Pool mode additionally clamps the grant to the remaining liveness
+    /// budget (`worker_slots_left`), reserving one slot per not-yet-spawned
+    /// sync stage so explicit pins cannot push the total blocking pool jobs
+    /// past the pool size. Pins are therefore honored in pipeline order
+    /// (upstream first) only until the budget runs out; what remains is
+    /// spread over later stages at 1 worker each. In dedicated-thread mode
+    /// the pool is untouched and the request is honored as-is.
     pub fn stage_workers(&self, opts: &StageOptions) -> usize {
-        let resolved = opts
+        let requested = opts
             .workers
             .map_or(self.per_stage_parallelism, NonZeroUsize::get);
-        resolved.min(self.n.max(1)).max(1)
+        let requested = requested.min(self.n.max(1)).max(1);
+        if self.dedicated_threads {
+            return requested;
+        }
+        let slots = self.worker_slots_left.get();
+        let after = self.stages_left.get() - 1;
+        self.stages_left.set(after);
+        // `slots ≥ after + 1` holds by construction (try_exec picks pool mode
+        // only when the budget covers every sync stage), so `granted ≥ 1`
+        // never breaks the invariant — the `max(1)` is just the type-level
+        // floor.
+        let granted = requested.min(slots.saturating_sub(after)).max(1);
+        self.worker_slots_left.set(slots - granted);
+        granted
+    }
+
+    /// Dispatch a stage's worker closures: one batched pool submission in
+    /// pool mode, one dedicated OS thread per worker in dedicated-thread
+    /// mode. Threads are detached — workers always terminate on channel
+    /// disconnect (see [`spawn_stage`]), and the collector only returns once
+    /// every sender is dropped, so no thread outlives the run's usefulness.
+    pub(crate) fn spawn_stage_jobs<F>(&self, jobs: Vec<F>)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        if self.dedicated_threads {
+            for job in jobs {
+                std::thread::spawn(move || {
+                    // Match the pool's AbortIfPanic semantics: a panicking
+                    // stage worker must abort, not silently detach and
+                    // truncate the pipeline's output.
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                        std::process::abort();
+                    }
+                });
+            }
+        } else {
+            self.compute_pool().submit_batch(jobs);
+        }
     }
 
     /// Resolve a stage's output-channel capacity: the stage's explicit
@@ -951,14 +1042,7 @@ where
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = channel::<(u64, M)>(buffer);
-        spawn_stage(
-            ctx.compute_pool(),
-            mid_rx,
-            out_tx,
-            parallelism,
-            ctx.cancel.clone(),
-            self.f,
-        );
+        spawn_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::Sync(out_rx)
     }
 
@@ -978,14 +1062,7 @@ where
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = mpsc_channel::<(u64, M)>(buffer);
-        spawn_stage(
-            ctx.compute_pool(),
-            mid_rx,
-            out_tx,
-            parallelism,
-            ctx.cancel.clone(),
-            self.f,
-        );
+        spawn_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::SyncSingle(out_rx)
     }
 
@@ -1005,14 +1082,7 @@ where
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = sync_async_channel::<(u64, M)>(buffer);
-        spawn_stage(
-            ctx.compute_pool(),
-            mid_rx,
-            out_tx,
-            parallelism,
-            ctx.cancel.clone(),
-            self.f,
-        );
+        spawn_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         out_rx
     }
 
@@ -1056,14 +1126,7 @@ where
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = channel::<(u64, N)>(buffer);
-        spawn_expand_stage(
-            ctx.compute_pool(),
-            mid_rx,
-            out_tx,
-            parallelism,
-            ctx.cancel.clone(),
-            self.f,
-        );
+        spawn_expand_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::Sync(out_rx)
     }
 
@@ -1079,14 +1142,7 @@ where
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = mpsc_channel::<(u64, N)>(buffer);
-        spawn_expand_stage(
-            ctx.compute_pool(),
-            mid_rx,
-            out_tx,
-            parallelism,
-            ctx.cancel.clone(),
-            self.f,
-        );
+        spawn_expand_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::SyncSingle(out_rx)
     }
 
@@ -1102,14 +1158,7 @@ where
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
         let (out_tx, out_rx) = sync_async_channel::<(u64, N)>(buffer);
-        spawn_expand_stage(
-            ctx.compute_pool(),
-            mid_rx,
-            out_tx,
-            parallelism,
-            ctx.cancel.clone(),
-            self.f,
-        );
+        spawn_expand_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         out_rx
     }
 
@@ -2074,22 +2123,67 @@ where
             _marker,
         } = self;
 
-        // Compute the default per-stage compute-pool parallelism. Explicit
-        // `StageOptions::workers` pins are deducted from the pool budget
-        // first; the remainder is divided equally across the stages that did
-        // not pin one, so the total across all sync stages fits inside the
-        // pool — preventing the "stage 1 fills the pool, stage 2 starves,
-        // deadlock" failure mode. Fences and async stages don't consume pool
-        // slots.
+        // Compute the default per-stage compute-pool parallelism and the
+        // dispatch mode (pool jobs vs dedicated OS threads).
+        //
+        // Liveness invariant (pool mode): every blocking job the run parks
+        // on a pool thread must be simultaneously schedulable — that is
+        // `feeder(≤1) + Σ stage workers ≤ pool_threads`. A worker parked
+        // inside a crossfire send/recv never returns to the pool's find_work
+        // loop, so a job left queued while every thread is parked deadlocks
+        // the run (reproduced pre-fix: 4 stages on a 4-thread pool with
+        // n > k × buffer hung forever — the feeder job was uncounted and the
+        // per-stage floor of 1 pushed the total past the pool).
+        //
+        // The feeder therefore reserves a slot *before* dividing the budget:
+        // it is a pool job whenever `n > buffer`, inline on the calling
+        // thread otherwise. Explicit `StageOptions::workers` pins are granted
+        // first (clamped to what remains — see `StreamCtx::stage_workers`),
+        // then the rest is divided equally across unpinned stages.
+        //
+        // When even 1 worker per sync stage does not fit (k + feeder >
+        // pool_threads), or when `run()` itself executes on a worker of the
+        // same pool (nested pipelines: the collector parks that worker for
+        // the whole run, so pool admission of *any* further blocking job —
+        // feeder included — depends on other tenants' courtesy), stage
+        // workers and the feeder fall back to dedicated OS threads, which the
+        // OS schedules independently of pool occupancy.
         let budget = stages.stage_budget();
-        let per_stage_parallelism = budget.default_workers(config.compute_workers);
+        let pool = compute_pool
+            .as_ref()
+            .map_or_else(|| ComputePool::global().clone(), Clone::clone);
+        let pool_threads = pool.num_workers();
+        // Buffer/parallelism are mutually dependent (the buffer floor is
+        // `parallelism * 4`), so the feeder-path prediction uses a
+        // provisional division over the full pool. Pool mode only ever
+        // divides *fewer* slots, shrinking the buffer floor — never flipping
+        // a predicted-inline feeder into a blocking one. Dedicated mode may
+        // divide more, but there the feeder is a thread anyway.
+        let provisional = budget.default_workers(config.compute_workers.min(pool_threads));
+        let feeder_buffer = config.buffer_size.max(provisional * 4);
+        let live_slots = pool_threads.saturating_sub(usize::from(n > feeder_buffer));
+        let dedicated_threads = pool.is_on_this_pool() || live_slots < budget.stages;
+        let per_stage_parallelism = if dedicated_threads {
+            // Threads are not pool-bounded; divide the configured budget.
+            budget.default_workers(config.compute_workers)
+        } else {
+            budget.default_workers(config.compute_workers.min(live_slots))
+        };
+        let (worker_slots_left, stages_left) = if dedicated_threads {
+            (0, 0)
+        } else {
+            (live_slots, budget.stages)
+        };
 
         let ctx: StreamCtx<'_, R> = StreamCtx {
             config: &config,
             cancel,
             n,
             per_stage_parallelism,
-            compute_pool,
+            dedicated_threads,
+            worker_slots_left: Cell::new(worker_slots_left),
+            stages_left: Cell::new(stages_left),
+            compute_pool: Some(pool),
             #[cfg(feature = "tokio-runtime")]
             async_pool,
             #[cfg(feature = "tokio-runtime")]
@@ -2140,11 +2234,25 @@ where
         #[cfg(feature = "tokio-runtime")]
         let (final_rx, feeder) = if async_feeder {
             let (feeder_tx, feeder_rx) = sync_async_channel::<(u64, I)>(buffer);
-            let feeder = feed_items(ctx.compute_pool(), items, feeder_tx, feeder_cancel, buffer);
+            let feeder = feed_items(
+                ctx.compute_pool(),
+                items,
+                feeder_tx,
+                feeder_cancel,
+                buffer,
+                dedicated_threads,
+            );
             (stages.spawn_async_feeder::<R>(feeder_rx, &ctx), feeder)
         } else {
             let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
-            let feeder = feed_items(ctx.compute_pool(), items, feeder_tx, feeder_cancel, buffer);
+            let feeder = feed_items(
+                ctx.compute_pool(),
+                items,
+                feeder_tx,
+                feeder_cancel,
+                buffer,
+                dedicated_threads,
+            );
             // Use `spawn_single` so the terminal stage's output channel is MPSC
             // (store-based dequeue, lock-free waker registry) — the collector is
             // always the sole consumer of the final channel.
@@ -2153,7 +2261,14 @@ where
         #[cfg(not(feature = "tokio-runtime"))]
         let (final_rx, feeder) = {
             let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
-            let feeder = feed_items(ctx.compute_pool(), items, feeder_tx, feeder_cancel, buffer);
+            let feeder = feed_items(
+                ctx.compute_pool(),
+                items,
+                feeder_tx,
+                feeder_cancel,
+                buffer,
+                dedicated_threads,
+            );
             (stages.spawn_single::<R>(feeder_rx, &ctx), feeder)
         };
 

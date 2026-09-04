@@ -262,14 +262,12 @@ fn test_stream_with_fence_full_barrier() {
 /// the inter-stage channel buffer (256 by default). These run with a large
 /// input far above that buffer to lock in the eager-drain fix.
 ///
-/// Skipped under Miri: the regression requires the stage-1 and stage-2 pool
-/// jobs to run *concurrently* (the design keeps total blocking jobs ≤ pool
-/// size), i.e. a global pool of at least 2 workers. Miri reports
-/// `available_parallelism() == 1`, so the global pool has a single worker and
-/// the two stage jobs can't both be scheduled — the pipeline then deadlocks
-/// once input exceeds the buffer. This is a test-environment constraint, not
-/// a code defect. The fence code paths are still exercised here by the
-/// smaller-input `test_stream_with_fence*` tests.
+/// Skipped under Miri: not a correctness constraint — with the liveness
+/// fallback a 1-worker pool would switch the stage workers and feeder to
+/// dedicated OS threads and complete — but miri interprets every spawned
+/// thread, making a 5000-item, 3-thread pipeline prohibitively slow. The
+/// fence code paths are still exercised here by the smaller-input
+/// `test_stream_with_fence*` tests.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn test_stream_fence_large_input_no_deadlock() {
@@ -1093,12 +1091,11 @@ fn test_stage_options_buffer_override_runs() {
     // correctness (items flow through, none dropped).
     use youpipe::StageOptions;
 
-    // Under miri's single emulated pool worker, any `n > buffer` streaming
-    // run deadlocks regardless of the override (the feeder's pool job and the
-    // stage workers contend for the one thread — same constraint documented
-    // on the prelude doctest). Scale the buffer pins up there so the feeder
-    // still takes the inline path; the tight-backpressure shaping itself is
-    // covered by the native run.
+    // Miri: single emulated pool worker. An `n > buffer` run no longer
+    // deadlocks there (the runner falls back to dedicated OS threads when the
+    // pool cannot host every stage), but miri interprets each spawned thread
+    // — keep the pins on the inline-feeder path so the test stays fast. The
+    // tight-backpressure shaping itself is covered by the native run.
     let (n, b1, b2) = if cfg!(miri) {
         (100, 256, 256)
     } else {
@@ -1148,12 +1145,133 @@ fn test_stage_budget_explicit_deduction() {
     );
 }
 
+// ── Streaming liveness: worker budget vs pool size ──
+
+/// Helper: run `f` on a helper thread and require completion within 30 s, so
+/// a liveness regression fails the test instead of hanging the harness.
+/// Mirrors the dedicated-pool rationale of
+/// `test_nested_stream_inside_pool_worker_no_deadlock` (self-contained
+/// scheduling, immune to parallel-suite noise).
+#[cfg(not(miri))]
+fn run_with_deadlock_watchdog<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<T>();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(f());
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("streaming pipeline deadlocked")
+}
+
+/// Regression: the worker budget previously ignored the feeder job and floored
+/// every stage at 1 worker, so `k = P` default stages plus `n > k * buffer`
+/// parked every pool thread inside channel send/recv while the last stage's
+/// job sat unscheduled in the injector — a permanent hang. Now the feeder
+/// reserves a slot, and chains that still don't fit dispatch stage workers as
+/// dedicated threads. Both shapes complete here on a 4-thread pool.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_stream_stages_at_pool_size_no_deadlock() {
+    // k == P: every stage gets a dedicated-thread worker; feeder is a thread.
+    let r: Vec<u64> = run_with_deadlock_watchdog(|| {
+        stream(0..2000u64)
+            .with_compute_pool(youpipe::ComputePool::new(4))
+            .stage(|x| x + 1)
+            .stage(|x| x * 2)
+            .stage(|x| x ^ 0x5A5A)
+            .stage(|x| x.wrapping_mul(3))
+            .run()
+    });
+    assert_eq!(r.len(), 2000);
+    let mut sorted = r;
+    sorted.sort_unstable();
+    // `^ 0x5A5A` is not monotonic, so the expected side must be sorted too.
+    let mut expected: Vec<u64> = (0..2000u64)
+        .map(|x| (((x + 1) * 2) ^ 0x5A5A).wrapping_mul(3))
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(sorted, expected);
+
+    // k > P: same fallback, more stages than threads.
+    let r: Vec<u64> = run_with_deadlock_watchdog(|| {
+        stream(0..2000u64)
+            .with_compute_pool(youpipe::ComputePool::new(4))
+            .stage(|x| x + 1)
+            .stage(|x| x + 1)
+            .stage(|x| x + 1)
+            .stage(|x| x + 1)
+            .stage(|x| x + 1)
+            .stage(|x| x + 1)
+            .stage(|x| x + 1)
+            .stage(|x| x + 1)
+            .run()
+    });
+    assert_eq!(r.len(), 2000);
+    assert!(r.iter().all(|&x| x >= 8));
+}
+
+/// Regression: explicit `StageOptions::workers` pins whose sum (plus the
+/// feeder) exceeds the pool must be clamped to the liveness budget, not
+/// oversubscribe the pool into a deadlock. `workers(3) + workers(3)` on a
+/// 4-thread pool previously hung for n ≫ buffer.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_stream_explicit_pins_exceeding_pool_no_deadlock() {
+    use youpipe::StageOptions;
+
+    let r: Vec<u64> = run_with_deadlock_watchdog(|| {
+        stream(0..2000u64)
+            .with_compute_pool(youpipe::ComputePool::new(4))
+            .stage_with(StageOptions::new().workers(3), |x| x + 1)
+            .stage_with(StageOptions::new().workers(3), |x| x * 2)
+            .stage(|x| x + 10)
+            .run()
+    });
+    assert_eq!(r.len(), 2000);
+    let mut sorted = r;
+    sorted.sort_unstable();
+    let expected: Vec<u64> = (0..2000u64).map(|x| (x + 1) * 2 + 10).collect();
+    assert_eq!(sorted, expected);
+}
+
+/// Nested same-pool pipelines with large inner batches: the outer stage
+/// worker parks in the inner collector for the whole inner run, so the inner
+/// chain can never rely on pool admission and must take the dedicated-thread
+/// path. Small pool + `n > buffer` keeps the inner feeder non-inline.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_nested_stream_many_stages_no_deadlock() {
+    let outer: Vec<u64> = run_with_deadlock_watchdog(|| {
+        let pool = youpipe::ComputePool::new(4);
+        stream(0..4u64)
+            .with_compute_pool(pool.clone())
+            .stage(move |_x| {
+                let inner: Vec<u64> = stream(0..2000u64)
+                    .with_compute_pool(pool.clone())
+                    .stage(|v| v + 1)
+                    .stage(|v| v * 2)
+                    .stage(|v| v ^ 7)
+                    .stage(|v| v.wrapping_mul(5))
+                    .run();
+                inner.len() as u64
+            })
+            .run()
+    });
+    assert_eq!(outer, vec![2000; 4]);
+}
+
 // ── StreamPipe::for_each ──
 
 #[test]
 fn test_stream_for_each_unordered_sees_all_items() {
-    // miri: single emulated pool worker — keep n within the default feeder
-    // buffer (256) so the feeder stays on the inline path (see prelude doc).
+    // miri: keep n within the default feeder buffer (256) so the feeder
+    // stays on the inline path — larger n would take the pool/dedicated
+    // feeder path, which miri only pays for in interpretation time, not
+    // correctness (see prelude doc).
     let n: u64 = if cfg!(miri) {
         100
     } else {

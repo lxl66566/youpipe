@@ -6,8 +6,9 @@
 //! // Extension methods on every `IntoIterator` — equivalent to the free
 //! // `pipe(items)` / `stream(items)` functions:
 //! let r: Vec<i32> = (0..100).pipe().map(|x| x + 1).collect();
-//! // (100 items: under miri's single emulated worker a longer stream would
-//! // exceed the 256-slot channel buffer and deadlock the 2-job pipeline.)
+//! // (100 items: under miri a longer stream would just run slow — the
+//! // single emulated pool worker triggers the dedicated-thread fallback,
+//! // and miri interprets every spawned thread.)
 //! let s: Vec<i32> = (0..100).stream().stage(|x| x * 2).run();
 //! ```
 //!

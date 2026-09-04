@@ -358,12 +358,19 @@ stream(items)                       // StreamPipe<StreamStart, I, I>
 The stage chain is a typestate (`SyncStage<FenceLink<SyncStage<StreamStart,…>>>`)
 walked by the `StageSpawn` trait — `spawn` recurses inside-out (older stages
 first) so the data-flow direction matches. `stage_budget()` reports the number
-of compute-pool stages plus any `StageOptions::workers` pins, so `.run()`
-first deducts the explicit pins from `compute_workers` and divides the
-remainder equally across the unpinned stages, preventing the "stage 1 fills
-the pool → stage 2 starves → deadlock" failure mode. Per-stage `buffer` /
-`io_concurrency` pins replace the global `buffer_size` (and its
-`downstream_workers × 4` floor) / `io_concurrency` for that stage only.
+of compute-pool stages plus any `StageOptions::workers` pins. `.run()` then
+enforces the liveness invariant `feeder(≤1) + Σ stage workers ≤ pool_threads`:
+the feeder reserves its slot first, explicit pins are granted upstream-first
+(clamped to what remains, one slot held back per not-yet-spawned sync stage),
+and the rest is divided equally across unpinned stages — every sync stage
+keeps ≥ 1 resident worker, preventing the "stage 1 fills the pool → stage 2
+starves → deadlock" failure mode. When even 1 worker per sync stage does not
+fit, or `run()` executes on a worker of the same pool (nested pipelines park
+that worker in the collector for the whole run), the run switches to
+dedicated-thread mode: stage workers and the feeder are plain OS threads and
+the pool is left untouched. Per-stage `buffer` / `io_concurrency` pins
+replace the global `buffer_size` (and its `downstream_workers × 4` floor) /
+`io_concurrency` for that stage only.
 
 #### Async IO stages
 
@@ -407,21 +414,22 @@ under backpressure, stalling every other task on it (or deadlocking a
 single-worker runtime — covered by the
 `test_sync_to_async_does_not_stall_tokio_driver` regression test).
 
-#### The feeder — inline or pool job, never a per-run thread
+#### The feeder — inline, pool job, or dedicated thread
 
 `feed_items` pushes the input into the first stage's channel. When
 `items.len() ≤ buffer` it pushes inline from the calling thread (it can never
-block on `Full`, so no deadlock). Beyond that, the push loop used to run on a
-**dedicated OS thread spawned per `run()` call**; it now runs as **a job on
-the compute pool** (`pool.submit`) — workers are long-lived, so the
-~30-80 µs spawn/join per run disappears while the effective thread count is
-unchanged (one feeder alongside the stage workers). The job wraps the loop in
-`catch_unwind` (an uncaught panic in a pool job aborts via the worker's
-`AbortIfPanic`) and stores the payload; `Feeder::finish` re-raises it on the
-caller after the collect returns — the store precedes the sender drop whose
-channel-close releases the collector, so the payload is always observed.
-Measured (hotpath p50, `stream 1000` with buffer 256): `collect_sync`
-320.5 → 297.0 µs (−7.3 %).
+block on `Full`, so no deadlock). Beyond that, the push loop runs as **a job
+on the compute pool** in pool mode — workers are long-lived, so the ~30-80 µs
+spawn/join per run disappears while the effective thread count is unchanged
+(one feeder alongside the stage workers); the feeder then **reserves one slot
+in the pool's liveness budget** (see "Worker budget" below), so it is always
+schedulable. In dedicated-thread mode the pool cannot be relied on at all, so
+the feeder gets a **dedicated OS thread** instead. Both detached paths wrap
+the loop in `catch_unwind` (an uncaught panic in a pool job aborts via the
+worker's `AbortIfPanic`) and store the payload; `Feeder::finish` re-raises it
+on the caller after the collect returns — the store precedes the sender drop
+whose channel-close releases the collector, so the payload is always
+observed.
 
 A managed runtime may be attached via `.with_async_pool(...)` and reused across
 runs; otherwise a transient runtime is built per call (simpler, but pays

@@ -44,12 +44,15 @@ let r: Vec<u64> = (0..5_000).pipe()
 
 ## Worker budget across stages (streaming)
 
-`compute_workers` is a **budget**, not a thread count: it is divided equally
-across the chain's sync stages. `StageOptions::workers` pins a stage's share;
-explicit claims are deducted from the budget first and the remainder divided
-across unpinned stages (each at least 1). This keeps total blocking jobs
-within the pool and prevents "stage 1 filled the pool, stage 2 starved"
-deadlock.
+`compute_workers` is a **budget**, not a thread count. The runner first
+reserves one pool slot for the feeder (a pool job whenever `n > buffer`),
+then grants `StageOptions::workers` pins in pipeline order — each clamped to
+what remains, with one slot held back per not-yet-spawned sync stage — and
+divides the rest equally across unpinned stages. Every sync stage keeps at
+least 1 resident worker, so total blocking pool jobs never exceed the pool:
+the "stage 1 filled the pool, stage 2 starved" deadlock cannot occur. Pins
+exceeding the budget are silently clamped (later stages get 1 worker each) —
+if you need the pins honored exactly, give the pipeline a larger pool.
 
 ```rust
 use youpipe::prelude::*;
@@ -69,6 +72,13 @@ let r: Vec<u64> = items.stream()
 
 `with_compute_pool(pool)` sets the budget to the pool's actual worker count
 (see [pools](pools.md)).
+
+When the budget cannot give every sync stage a resident worker (more sync
+stages than pool slots), or `run()` is itself called on a worker of the same
+pool (nested pipelines park that worker in the collector for the whole run),
+the runner does not touch the pool at all: stage workers and the feeder run
+as dedicated OS threads — deadlock-free by construction, at the cost of one
+`thread::spawn` per worker.
 
 ## `io_concurrency`: M:N async fan-out (streaming)
 
