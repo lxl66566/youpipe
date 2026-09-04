@@ -10,3 +10,6 @@ create-missing  = false
 
 [output.html]
 git-repository-url = "https://github.com/lxl66566/youpipe"
+# GitHub Pages project sites are served from a subpath; without this the 404
+# page and search index resolve against the domain root.
+site-url           = "/youpipe/"
