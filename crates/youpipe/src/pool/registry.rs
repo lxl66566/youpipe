@@ -35,6 +35,17 @@ const LOCAL_DEQUE_CAPACITY: usize = 256;
 
 pub(crate) struct Registry {
     thread_infos: Vec<ThreadInfo>,
+    /// Number of workers actually spawned, `<= thread_infos.len()`.
+    ///
+    /// `thread_infos` is pre-created for all workers, but on a mid-way spawn
+    /// failure only `0..spawned` entries have a live thread that will ever
+    /// set its `primed`/`stopped` latches — `terminate` and `Drop` must not
+    /// touch the ghost tail (waiting on a ghost's `stopped` latch parks
+    /// forever).
+    ///
+    /// Monotonic; written only by the constructing thread before it releases
+    /// its Arc (or panics), read by whoever runs `Drop`.
+    spawned: AtomicUsize,
     sleep: Sleep,
     /// Global injector queue for jobs coming from outside the pool or
     /// overflowing a worker's local deque. Unbounded, so overflow never drops
@@ -90,6 +101,7 @@ impl Registry {
 
         let registry = Arc::new(Registry {
             thread_infos: stealers.into_iter().map(ThreadInfo::new).collect(),
+            spawned: AtomicUsize::new(0),
             sleep: Sleep::new(num_threads),
             injected_jobs: concurrent_queue::ConcurrentQueue::unbounded(),
             terminate_count: AtomicUsize::new(1),
@@ -102,15 +114,18 @@ impl Registry {
                 .spawn(move || {
                     unsafe { main_loop(worker, thread_registry, index) };
                 }) {
-                Ok(_) => {},
+                Ok(_) => {
+                    registry.spawned.store(index + 1, Ordering::Release);
+                },
                 Err(e) => {
                     // The already-spawned workers hold Arc references, so the
                     // registry's Drop (whose force-terminate path would
                     // otherwise stop them) never runs while they are alive:
                     // without this explicit terminate() they park forever on
                     // their terminate latches — a thread + memory leak on top
-                    // of the panic. With the latches set they exit and free
-                    // the registry themselves.
+                    // of the panic. With the latches set they exit, and Drop
+                    // waiting only on the spawned prefix of `thread_infos`
+                    // (see `spawned`) lets the last one free the registry.
                     registry.terminate();
                     panic!("failed to spawn pool worker {index}: {e}");
                 },
@@ -248,7 +263,9 @@ impl Registry {
 
     pub(crate) fn terminate(&self) {
         if self.terminate_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            for (i, info) in self.thread_infos.iter().enumerate() {
+            // Only signal workers that exist (see `spawned`).
+            let spawned = self.spawned.load(Ordering::Acquire);
+            for (i, info) in self.thread_infos[..spawned].iter().enumerate() {
                 unsafe {
                     OnceLatch::set_and_tickle_one(&raw const info.terminate, self, i);
                 }
@@ -271,7 +288,11 @@ impl Drop for Registry {
         if self.terminate_count.load(Ordering::Acquire) > 0 {
             self.terminate();
         }
-        for info in &self.thread_infos {
+        // Only the spawned prefix has a worker that will set `stopped`; on a
+        // failed construction (spawn error at index k) the k..N-1 latches
+        // belong to threads that never existed.
+        let spawned = self.spawned.load(Ordering::Acquire);
+        for info in &self.thread_infos[..spawned] {
             info.stopped.wait();
         }
     }
@@ -597,5 +618,56 @@ impl XorShift64Star {
     fn next_usize(&self, n: usize) -> usize {
         // Result bounded by `n` (usize), safe to truncate on 32-bit
         (self.next() % n as u64) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::mpsc, thread, time::Duration};
+
+    use super::*;
+
+    /// Regression test for the spawn-failure hang: `thread_infos` is
+    /// pre-created for all workers, so when construction fails at thread k
+    /// the k..N-1 `stopped` latches have no thread to ever set them. `Drop`
+    /// must wait only on the spawned prefix — pre-fix the last exiting worker
+    /// parked forever inside `Drop` (or the panic thread itself, when k == 0).
+    ///
+    /// Partial construction is simulated directly (a real spawn failure needs
+    /// RLIMIT_NPROC games unsuitable for CI): the `spawned` workers'
+    /// `stopped` latches are pre-set as if they had exited, the ghost ones
+    /// are left unset. A regression hangs the drop thread, caught by the
+    /// timeout instead of wedging the test binary.
+    #[test]
+    fn drop_waits_only_for_spawned_workers() {
+        for (num_threads, spawned) in [(4, 0), (4, 1), (4, 3), (8, 7)] {
+            let thread_infos = (0..num_threads)
+                .map(|_| {
+                    let worker = Worker::<JobRef>::new(LOCAL_DEQUE_CAPACITY);
+                    ThreadInfo::new(worker.stealer())
+                })
+                .collect();
+            let registry = Arc::new(Registry {
+                thread_infos,
+                spawned: AtomicUsize::new(spawned),
+                sleep: Sleep::new(num_threads),
+                injected_jobs: concurrent_queue::ConcurrentQueue::unbounded(),
+                terminate_count: AtomicUsize::new(1),
+            });
+            for info in &registry.thread_infos[..spawned] {
+                // SAFETY: `info` outlives the drop below.
+                unsafe { Latch::set(ptr::from_ref(&info.stopped)) };
+            }
+
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                drop(registry);
+                tx.send(()).unwrap();
+            });
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| {
+                    panic!("Registry::drop hung with {spawned}/{num_threads} workers spawned")
+                });
+        }
     }
 }

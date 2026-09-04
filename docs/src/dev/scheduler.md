@@ -118,4 +118,4 @@ or yield windows was measured as a global regression in 2026-06).
 (`terminate_count`); when the last clone drops (count 1→0) it sets each worker's
 `terminate` OnceLatch and tickles it awake. Each worker's `wait_until_out_of_work`
 then drains its remaining local-deque work, sets its `stopped` latch, and exits;
-`Registry::Drop` blocks on every worker's `stopped` before returning.
+`Registry::Drop` blocks on every spawned worker's `stopped` before returning.
