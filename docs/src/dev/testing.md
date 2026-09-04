@@ -53,7 +53,6 @@ What the models cover:
 - **CountLatch (Blocking)** — two setters + `wait_spin` waiter; relaxed flag
   reads after the wait must observe the setters' writes (happens-before via
   the SeqCst counter + LockLatch mutex).
-- **WaitGroup** — `done()`/`wait()` visibility and the 1→0 notify transition.
 - **Sleep** — the full park/wake protocol: `announce_sleepy` → `sleep()`
   (mask pre-publish under the `is_blocked` mutex, counters CAS, final
   queue check, condvar park) vs `new_injected_jobs` (fence, JEC increment,

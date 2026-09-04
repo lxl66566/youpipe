@@ -92,10 +92,6 @@ pub trait AsyncRuntime: Clone + Send + Sync + 'static {
     where
         T: Send + 'static,
         F: Future<Output = T>;
-
-    /// Number of OS threads backing the runtime. Used only for reporting /
-    /// sizing, not for spawning.
-    fn num_workers(&self) -> usize;
 }
 
 /// No-op runtime used as the default `R` when no backend feature is enabled.
@@ -135,10 +131,6 @@ impl AsyncRuntime for NoRuntime {
     {
         panic!("NoRuntime::block_on: no async runtime backend is enabled");
     }
-
-    fn num_workers(&self) -> usize {
-        0
-    }
 }
 
 // ── Backend re-exports ──
@@ -158,10 +150,3 @@ pub type DefaultRuntime = TokioPool;
 
 #[cfg(not(feature = "tokio-runtime"))]
 pub type DefaultRuntime = NoRuntime;
-
-/// `true` iff the async runtime backend is enabled. Gates the
-/// `stage_async` / `AsyncStage` machinery in `stream.rs`.
-#[must_use]
-pub const fn backend_enabled() -> bool {
-    cfg!(feature = "tokio-runtime")
-}

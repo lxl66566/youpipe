@@ -31,16 +31,15 @@ crossfire ships an `mpsc` module whose receiver uses:
 - **`WeakCell` waker registry** (lock-free) instead of `Mutex<VecDeque>`.
 
 youpipe exposes this via `MpscSender<T>` / `MpscReceiver<T>` (sync sender +
-sync receiver), `mpsc_sync_async_channel` (sync sender + async receiver),
-and `mpsc_async_channel` (`MpscAsyncSender` + `MpscAsyncReceiver` — both
-ends async, used when async-stage consumer tasks feed the sole async
-collector). The `StageSpawn` trait gains a `spawn_single` method that
-creates the terminal stage's output channel as MPSC instead of MPMC;
-`StreamPipe::try_run` calls `spawn_single` for the terminal path — covering
-sync stages, fence links, expand, and `AsyncStage` (whose `spawn_single`
-override builds the output channel as `mpsc_async_channel`). Intermediate
-stage channels remain MPMC (their receivers are shared across multiple
-worker threads via `clone`).
+sync receiver) and `mpsc_async_channel` (`MpscAsyncSender` +
+`MpscAsyncReceiver` — both ends async, used when async-stage consumer tasks
+feed the sole async collector). The `StageSpawn` trait gains a
+`spawn_single` method that creates the terminal stage's output channel as
+MPSC instead of MPMC; `StreamPipe::try_run` calls `spawn_single` for the
+terminal path — covering sync stages, fence links, expand, and
+`AsyncStage` (whose `spawn_single` override builds the output channel as
+`mpsc_async_channel`). Intermediate stage channels remain MPMC (their
+receivers are shared across multiple worker threads via `clone`).
 
 The collector itself is generic over a `RecvItem` (sync) or `AsyncRecvItem`
 (async) trait, so `collect_sync` / `collect_async` drain either the MPMC or
@@ -49,10 +48,6 @@ MPSC backing with one implementation.
 `SendItem<T>` / `RecvItem<T>` / `AsyncRecvItem<T>` traits abstract over the
 channel backings (MPMC vs MPSC, sync vs async) so `spawn_stage` and the
 collector functions are generic without virtual dispatch.
-
-### WaitGroup (`notify.rs`)
-
-Counter barrier: `add(n)` increments, `done()` decrements, `wait()` blocks until zero. When count transitions 1→0, condvar broadcasts. Used internally by streaming stages to track worker completion.
 
 ---
 
@@ -86,6 +81,6 @@ Data flow:
 2. Fence thread **eagerly drains** `mid_rx` into a `FenceBarrier<T>`, releasing batches to `fenced_tx` per `mode` (immediately in `Chunked`, or all at once on disconnect in `Barrier`)
 3. Stage2 workers pull from `fenced_rx` → process → send to `out_tx`
 
-Stage completion is signalled purely by channel disconnect (all sender clones dropped) — no `WaitGroup` is needed. Eager draining is essential: it prevents stage 1 from blocking on a full `mid` channel, which previously deadlocked when `items.len()` exceeded the channel buffer.
+Stage completion is signalled purely by channel disconnect (all sender clones dropped) — no per-stage counter barrier is needed. Eager draining is essential: it prevents stage 1 from blocking on a full `mid` channel, which previously deadlocked when `items.len()` exceeded the channel buffer.
 
 Batch-allocation recycling: `push` hands each full chunk to the forwarder via `mem::take`, which historically dropped the allocation and regrew the next batch from capacity 0 (`log2(k)` reallocs per batch). `FenceBarrier::reuse` lets the forwarder return the drained `Vec`; the next flush swaps it in, so the steady state is zero allocator traffic per batch (−23 % on `stream_pipeline/with_fence/100 K`).

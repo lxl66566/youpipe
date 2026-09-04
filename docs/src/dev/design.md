@@ -101,7 +101,6 @@ crates/youpipe/src/
 │   └── mod.rs
 ├── handoff/          # Data transfer layer
 │   ├── channel.rs    # MPMC channels (crossfire wrapper: sync + async)
-│   ├── notify.rs     # WaitGroup (counter barrier for stage synchronization)
 │   └── mod.rs
 ├── runtime/          # Pluggable async-runtime backend for streaming .stage_async
 │   ├── mod.rs        # AsyncRuntime trait, NoRuntime, DefaultRuntime alias

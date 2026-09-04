@@ -577,7 +577,7 @@ fn test_sync_to_async_does_not_stall_tokio_driver() {
     let (res_tx, res_rx) = std::sync::mpsc::channel::<Vec<u64>>();
     let pipe = stream(0..n)
         .with_config(PipelineConfig::default().with_io_concurrency(4))
-        .with_async_pool(TokioPool::new(rt.handle().clone(), 1))
+        .with_async_pool(TokioPool::new(rt.handle().clone()))
         .stage(|x: u64| x + 1)
         .stage_async(|x: u64| async move {
             tokio::time::sleep(Duration::from_millis(1)).await;

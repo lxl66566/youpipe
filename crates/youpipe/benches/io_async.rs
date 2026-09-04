@@ -110,7 +110,7 @@ fn bench_pure_io_async(c: &mut Criterion) {
                     b.iter(|| {
                         let r = stream(tasks.clone())
                             .with_config(PipelineConfig::default().with_io_concurrency(512))
-                            .with_async_pool(TokioPool::new(pool_handle.clone(), num_cpus()))
+                            .with_async_pool(TokioPool::new(pool_handle.clone()))
                             .stage_async(|(x, dur): (u64, Duration)| async move {
                                 async_io(x, dur).await
                             })
@@ -228,7 +228,7 @@ fn bench_mixed_cpu_io(c: &mut Criterion) {
                     b.iter(|| {
                         let r = stream(items.clone())
                             .with_config(PipelineConfig::default().with_io_concurrency(512))
-                            .with_async_pool(TokioPool::new(pool_handle.clone(), num_cpus()))
+                            .with_async_pool(TokioPool::new(pool_handle.clone()))
                             .stage(|((x, iters), dur): ((u64, u32), Duration)| {
                                 (bb(cpu_work(x, iters)), dur)
                             })

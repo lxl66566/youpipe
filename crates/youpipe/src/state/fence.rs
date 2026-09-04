@@ -123,16 +123,6 @@ impl<T> FenceBarrier<T> {
             None => false,
         }
     }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -162,10 +152,10 @@ mod tests {
             // Barrier mode never auto-flushes.
             assert!(fence.push(i).is_none());
         }
-        assert_eq!(fence.len(), 10);
         let remaining = fence.flush();
         assert_eq!(remaining, Some((0..10).collect::<Vec<_>>()));
-        assert!(fence.is_empty());
+        // Fully drained: a second flush has nothing left.
+        assert!(fence.flush().is_none());
     }
 
     #[test]

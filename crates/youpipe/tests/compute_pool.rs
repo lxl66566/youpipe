@@ -45,8 +45,6 @@ fn test_compute_pool_shared() {
 #[test]
 fn test_compute_pool_many_small_tasks() {
     let pool = Arc::new(youpipe::ComputePool::new(4));
-    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let wg = youpipe::SharedWaitGroup::new();
     // Miri: 10k submit/wait cycles over the injector + steal path take tens
     // of interpreted minutes; 500 exercises every queue/steal/latch path
     // (the pool has 4 emulated workers) in seconds.
@@ -55,17 +53,17 @@ fn test_compute_pool_many_small_tasks() {
     } else {
         10_000
     };
-    wg.add(total);
+    // Completion signal via a plain mpsc channel: one send per task, collect
+    // `total` of them. (Replaces the removed SharedWaitGroup.)
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     for _ in 0..total {
-        let counter = counter.clone();
-        let wg = wg.clone();
+        let done_tx = done_tx.clone();
         pool.submit(move || {
-            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            wg.done();
+            done_tx.send(()).unwrap();
         });
     }
-    wg.wait();
-    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), total);
+    drop(done_tx);
+    assert_eq!(done_rx.iter().count(), total);
 }
 
 /// Driver work-assist on the hybrid dispatch path (reserve chunks): with every

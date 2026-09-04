@@ -27,7 +27,6 @@ pub struct TokioPool {
     #[allow(dead_code)]
     runtime: Option<Arc<tokio::runtime::Runtime>>,
     handle: tokio::runtime::Handle,
-    num_workers: usize,
 }
 
 impl TokioPool {
@@ -36,11 +35,10 @@ impl TokioPool {
     /// The caller is responsible for keeping the source runtime alive for at
     /// least as long as this `TokioPool` (and every clone) is in use.
     #[must_use]
-    pub fn new(handle: tokio::runtime::Handle, num_workers: usize) -> Self {
+    pub fn new(handle: tokio::runtime::Handle) -> Self {
         Self {
             runtime: None,
             handle,
-            num_workers: num_workers.max(1),
         }
     }
 
@@ -59,7 +57,6 @@ impl TokioPool {
         Ok(Self {
             runtime: Some(Arc::new(runtime)),
             handle,
-            num_workers: num_workers.max(1),
         })
     }
 
@@ -153,21 +150,15 @@ impl AsyncRuntime for TokioPool {
             Err(payload) => std::panic::resume_unwind(payload),
         }
     }
-
-    fn num_workers(&self) -> usize {
-        self.num_workers
-    }
 }
 
-#[allow(clippy::missing_fields_in_debug)] // the omitted `Handle`/`Runtime`
-// fields have no useful Debug repr; the owned-vs-borrowed flag is the only
-// diagnostic that matters.
 impl std::fmt::Debug for TokioPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The `Handle`/`Runtime` fields have no useful Debug repr; the
+        // owned-vs-borrowed flag is the only diagnostic that matters.
         f.debug_struct("TokioPool")
             .field("owns_runtime", &self.runtime.is_some())
-            .field("num_workers", &self.num_workers)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

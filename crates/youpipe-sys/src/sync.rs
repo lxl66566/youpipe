@@ -166,7 +166,7 @@ pub fn thread_yield() {
 
 #[cfg(miri)]
 mod shim {
-    use std::{sync as s, time::Duration};
+    use std::sync as s;
 
     pub struct Mutex<T: ?Sized>(s::Mutex<T>);
     pub struct MutexGuard<'a, T: ?Sized>(s::MutexGuard<'a, T>);
@@ -242,8 +242,8 @@ mod shim {
         /// Park the current thread until notified.
         ///
         /// Matches the `parking_lot::Condvar::wait(&self, &mut MutexGuard)`
-        /// signature even though `std::sync::Condvar::wait` consumes the
-        /// guard and returns it. We move the inner std guard out via
+        /// signature even though std's (like loom's) consumes the guard and
+        /// returns it. We move the inner std guard out via
         /// `ptr::read`, hand it to std by value, then write the returned
         /// guard back through the same reference.
         ///
@@ -261,25 +261,6 @@ mod shim {
             let returned = self.0.wait(taken).unwrap_or_else(|e| e.into_inner());
             // SAFETY: see method-level comment.
             unsafe { std::ptr::write(&mut guard.0, returned) };
-        }
-
-        /// Park the current thread until notified or `timeout` elapses.
-        /// Returns `true` if notified before the timeout, `false` otherwise.
-        /// See [`Self::wait`] for the move-dance rationale.
-        #[inline]
-        pub fn wait_for<'a, T>(&self, guard: &mut MutexGuard<'a, T>, timeout: Duration) -> bool {
-            // SAFETY: see `wait` method-level comment.
-            let taken = unsafe { std::ptr::read(&guard.0) };
-            let (returned, result) = match self.0.wait_timeout(taken, timeout) {
-                Ok((g, r)) => (g, r),
-                Err(e) => {
-                    let (g, r) = e.into_inner();
-                    (g, r)
-                },
-            };
-            // SAFETY: see `wait` method-level comment.
-            unsafe { std::ptr::write(&mut guard.0, returned) };
-            !result.timed_out()
         }
 
         #[inline]

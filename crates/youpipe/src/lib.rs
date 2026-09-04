@@ -75,9 +75,7 @@ pub use builder::{
     TryPipeRef, Workload, pipe, pipe_ref, stream,
 };
 pub use executor::{ComputePool, compute::MAX_COMPUTE_WORKERS};
-pub use handoff::{
-    AsyncReceiver, AsyncSender, Receiver, Sender, SharedWaitGroup, async_channel, channel,
-};
+pub use handoff::{AsyncReceiver, AsyncSender, Receiver, Sender, async_channel, channel};
 #[cfg(feature = "tokio-runtime")]
 pub use runtime::TokioPool;
 pub use runtime::{AsyncRuntime, DefaultRuntime, NoRuntime};

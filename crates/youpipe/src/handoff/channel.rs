@@ -231,20 +231,6 @@ pub struct MpscAsyncReceiver<T: Send + Unpin + 'static> {
     rx: crossfire::AsyncRx<mpsc::Array<T>>,
 }
 
-/// Create a bounded MPSC mixed-mode channel: blocking sync sender paired with
-/// an async single-consumer receiver over the same queue.
-///
-/// This is the MPSC analogue of [`sync_async_channel`]. Use it when the
-/// collector runs as a single async task — the recv side avoids the MPMC
-/// ring-buffer CAS.
-#[must_use]
-pub fn mpsc_sync_async_channel<T: Send + Unpin + 'static>(
-    capacity: usize,
-) -> (MpscSender<T>, MpscAsyncReceiver<T>) {
-    let (tx, rx) = mpsc::bounded_blocking_async::<T>(capacity);
-    (MpscSender { tx }, MpscAsyncReceiver { rx })
-}
-
 /// Multi-producer, single-consumer async sender. Send semantics as
 /// [`AsyncSender`]; pairs with [`MpscAsyncReceiver`] (see [`mpsc_async_channel`]).
 pub struct MpscAsyncSender<T: Send + Unpin + 'static> {

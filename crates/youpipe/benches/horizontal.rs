@@ -115,7 +115,7 @@ fn tokio_rt() -> &'static tokio::runtime::Runtime {
 fn tokio_pool() -> TokioPool {
     static POOL: OnceLock<TokioPool> = OnceLock::new();
     let pool = POOL.get_or_init(|| TokioPool::build(num_cpus()).expect("youpipe async pool"));
-    TokioPool::new(pool.handle().clone(), num_cpus())
+    TokioPool::new(pool.handle().clone())
 }
 
 /// Oversubscribed compute pool for blocking-IO sync stages (512 threads,
