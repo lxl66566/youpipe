@@ -49,6 +49,26 @@ MPSC backing with one implementation.
 channel backings (MPMC vs MPSC, sync vs async) so `spawn_stage` and the
 collector functions are generic without virtual dispatch.
 
+### Worker recv loops: anchor + burst-drain
+
+Every sync consumer loop (`spawn_stage` / `spawn_expand_stage` workers, the
+fence forwarder) uses a two-phase recv loop: one blocking `recv` anchors the
+iteration (parks correctly when the channel is empty, exits on disconnect),
+followed by a `try_recv` burst phase that absorbs already-queued items without
+re-entering the blocking-recv preamble. Both phases guard crossfire's
+spurious `try_recv` `Closed` verdict with a confirming blocking `recv`
+(same quirk the terminal drains handle).
+
+The burst phase is what keeps multi-worker stages civil on the MPMC ring:
+when `k` workers contend on one input channel, the burst winners drain the
+backlog while the laggards park at the anchor — the contending population
+thins itself instead of every worker hammering the ring once per item.
+Without it, a light stage (per-item cost below the feeder's push interval)
+hits a contention cliff: measured 8 workers burning 30 cores for 1/4 the
+throughput of 2 workers (best case unreachable; convoy bistability). The
+terminal collectors have used the same shape since their burst-drain
+introduction.
+
 ---
 
 ## Ordered Output (`state/reorder.rs`)
