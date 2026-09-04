@@ -11,7 +11,7 @@ use crate::{
     builder::config::PipelineConfig,
     executor::compute::ComputePool,
     handoff::{
-        MpscReceiver, Receiver, RecvItem, SendItem, SyncSender, channel::channel,
+        MpscReceiver, Receiver, RecvItem, SendItem, SyncSender, TryRecvError, channel::channel,
         mpsc_channel,
     },
     runtime::{AsyncRuntime, DefaultRuntime},
@@ -237,13 +237,43 @@ fn spawn_stage<I, O, Tx, R>(
             let tx = tx.clone();
             let worker_cancel = ctx.cancel.clone();
             move || {
-                while let Ok((seq, item)) = rx.recv() {
+                'outer: loop {
+                    // Anchor: one blocking recv parks the worker when the
+                    // channel is empty; Err means all senders are gone.
+                    let Ok((seq, item)) = rx.recv() else { break };
                     if cancel_active(worker_cancel.as_ref()) {
                         break;
                     }
                     let output = stage(item);
                     if tx.send((seq, output)).is_err() {
                         break;
+                    }
+                    // Burst-drain: absorb already-queued items while the
+                    // channel's cache lines are hot, without re-entering the
+                    // blocking-recv preamble per item. With several workers
+                    // contending on the same MPMC ring, the workers that lag
+                    // behind park on the anchor while the burst winners drain
+                    // the backlog — the contending population thins itself
+                    // instead of every worker hammering the ring per item.
+                    loop {
+                        let (seq, item) = match rx.try_recv() {
+                            Ok(v) => v,
+                            Err(TryRecvError::Empty) => continue 'outer,
+                            // Spurious-close guard: confirm with a blocking
+                            // recv (see the module doc on crossfire's
+                            // try_recv quirk).
+                            Err(TryRecvError::Closed) => match rx.recv() {
+                                Ok(v) => v,
+                                Err(_) => break 'outer,
+                            },
+                        };
+                        if cancel_active(worker_cancel.as_ref()) {
+                            break 'outer;
+                        }
+                        let output = stage(item);
+                        if tx.send((seq, output)).is_err() {
+                            break 'outer;
+                        }
                     }
                 }
             }
