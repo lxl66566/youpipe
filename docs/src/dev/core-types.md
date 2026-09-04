@@ -404,10 +404,22 @@ while the async consumers `recv().await` from the _same_ queue. One channel,
 zero forwarding threads — for `stream(..).stage_async(..)` *and*
 `stream(..).stage(cpu).stage_async(io)` alike.
 
-A bridge thread survives only on the `spawn_async_feeder` path — chains whose
-*first* stage is async (e.g. `..stage_async(f1).stage(f2).stage_async(f3)`),
-where a sync stage reached through an async→sync conversion feeds a trailing
-async stage. Keeping the blocking `send` off the tokio worker avoids the
+Bridge threads survive only at **mode-conversion points** on the
+`spawn_async_feeder` path (chains whose *first* stage is async), and each
+conversion costs exactly one thread regardless of chain length:
+
+- async → sync (`bridge_async_to_sync`, reached via `finalize_prev_rx`): every
+  built-in stage overrides `spawn_async_feeder` to recurse through
+  `prev.spawn_async_feeder(..)`, so the feeder's async channel stays async
+  until the first stage that actually needs a sync receiver — `.stage_async(a)
+  .stage(s).stage(t)` pays one bridge thread, not one per level. (The default
+  trait impl — bridge up front, then plain `spawn` — previously stacked 3
+  bridge threads + an async→sync→async round-trip on that shape.)
+- sync → async (`bridge_final_rx_to_async`, the `FinalRx::Sync` arm): a
+  trailing async stage fed by a sync stage, e.g. `..stage_async(f1).stage(f2)
+  .stage_async(f3)`.
+
+Keeping the blocking `send` off the tokio worker avoids the
 "one thread is both async driver and blocking worker" anti-pattern: a
 `SyncSender::send` inside a `tokio::spawn` task would park the runtime worker
 under backpressure, stalling every other task on it (or deadlocking a

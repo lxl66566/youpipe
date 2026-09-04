@@ -119,7 +119,7 @@ fn test_owned_filter_panic_drop_accounting() {
     assert!(r.is_err(), "panic must propagate through the filter tree");
     assert_eq!(
         counter.load(Ordering::Relaxed),
-        n as usize,
+        usize::try_from(n).expect("item count fits usize"),
         "every input item must be dropped exactly once"
     );
 }
@@ -362,6 +362,105 @@ fn test_mixed_sync_async_without_explicit_pool() {
     assert_eq!(result, expected);
 }
 
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_two_async_stages_share_lazy_pool() {
+    // Two consecutive async stages — the hardest case for the lazy pool.
+    // Both stages' consumers and the async→async bridge all call
+    // `acquire_async`; they must observe the same lazily-built runtime, and
+    // the runtime must outlive every detached bridge task.
+    let items: Vec<u64> = (0..50).collect();
+    let result: Vec<u64> = stream(items)
+        .stage_async(|x: u64| async move { x + 1 })
+        .stage_async(|x: u64| async move { x * 10 })
+        .ordered()
+        .run();
+    let expected: Vec<u64> = (0..50).map(|x| (x + 1) * 10).collect();
+    assert_eq!(result, expected);
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_async_then_sync_via_bridge() {
+    // async-first → sync stage. The feeder uses a mixed-mode channel, the
+    // AsyncStage's `spawn_async_feeder` recurses into StreamStart (identity),
+    // and the AsyncStage's async output is bridged async→sync exactly once by
+    // the SyncStage's `spawn_async_feeder` override (one dedicated OS thread
+    // running `block_on` + a blocking forward). Historically this shape paid
+    // 3 bridge threads (feeder bridge + per-level default bridge + final
+    // bridge); the overrides keep exactly the one bridge that sync consumers
+    // genuinely need.
+    let items: Vec<u64> = (0..100).collect();
+    let result: Vec<u64> = stream(items)
+        .stage_async(|x: u64| async move { x + 1 })
+        .stage(|x: u64| x * 2)
+        .ordered()
+        .run();
+    let expected: Vec<u64> = (0..100).map(|x| (x + 1) * 2).collect();
+    assert_eq!(result, expected);
+}
+
+/// Async-first chains with every downstream kind — multiple sync stages,
+/// an expansion, a fence, and a second async stage — all correct through the
+/// `spawn_async_feeder` overrides. Guards the recursion added when the
+/// per-level default bridges were eliminated (a wrong override sends the
+/// async channel to a stage expecting a sync one, or vice versa, and
+/// typically deadlocks or drops items).
+///
+/// Runs on a private 2-thread pool: each of these chains would otherwise
+/// grant up to `n_cpus` workers per sync stage as pool jobs on the *global*
+/// pool, and the per-run liveness budget only holds while a single `run()`
+/// uses the pool — several full-budget chains running concurrently (as the
+/// parallel test harness does) can starve each other's feeder jobs, hanging
+/// the suite.
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_async_first_all_downstream_kinds() {
+    let pool = youpipe::ComputePool::new(2);
+    // .stage_async → .stage → .stage (async→sync bridge, then pure sync).
+    let r: Vec<u64> = stream(0..100u64)
+        .with_compute_pool(pool.clone())
+        .stage_async(|x| async move { x + 1 })
+        .stage(|x| x * 2)
+        .stage(|x| x + 10)
+        .ordered()
+        .run();
+    assert_eq!(r, (0..100u64).map(|x| (x + 1) * 2 + 10).collect::<Vec<_>>());
+
+    // .stage_async → .expand (async feeder into an expansion stage).
+    // usize elements keep the fan-out count cast-free.
+    let r: Vec<usize> = stream(0..20usize)
+        .with_compute_pool(pool.clone())
+        .stage_async(|x| async move { x + 1 })
+        .expand(|x| vec![x; x])
+        .run();
+    assert_eq!(
+        r.len(),
+        (1..=20usize).sum::<usize>(),
+        "expand after async lost items"
+    );
+
+    // .stage_async → .fence(Barrier) → .stage (async feeder through a fence).
+    let r: Vec<u64> = stream(0..100u64)
+        .with_compute_pool(pool.clone())
+        .stage_async(|x| async move { x + 1 })
+        .fence(FenceMode::Barrier)
+        .stage(|x| x * 3)
+        .ordered()
+        .run();
+    assert_eq!(r, (0..100u64).map(|x| (x + 1) * 3).collect::<Vec<_>>());
+
+    // .stage_async → .stage → .stage_async (async→sync→async round trip).
+    let r: Vec<u64> = stream(0..100u64)
+        .with_compute_pool(pool)
+        .stage_async(|x| async move { x + 1 })
+        .stage(|x| x * 2)
+        .stage_async(|x| async move { x - 3 })
+        .ordered()
+        .run();
+    assert_eq!(r, (0..100u64).map(|x| (x + 1) * 2 - 3).collect::<Vec<_>>());
+}
+
 // ── Streaming terminal inside an async context ──
 
 /// Silence the default panic hook around a closure that is expected to panic,
@@ -416,42 +515,6 @@ async fn test_run_in_spawn_blocking_works() {
     let mut sorted = result;
     sorted.sort_unstable();
     assert_eq!(sorted, (1..=8u64).collect::<Vec<_>>());
-}
-
-#[cfg(feature = "tokio-runtime")]
-#[test]
-fn test_two_async_stages_share_lazy_pool() {
-    // Two consecutive async stages — the hardest case for the lazy pool.
-    // Both stages' consumers and the async→async bridge all call
-    // `acquire_async`; they must observe the same lazily-built runtime, and
-    // the runtime must outlive every detached bridge task.
-    let items: Vec<u64> = (0..50).collect();
-    let result: Vec<u64> = stream(items)
-        .stage_async(|x: u64| async move { x + 1 })
-        .stage_async(|x: u64| async move { x * 10 })
-        .ordered()
-        .run();
-    let expected: Vec<u64> = (0..50).map(|x| (x + 1) * 10).collect();
-    assert_eq!(result, expected);
-}
-
-#[cfg(feature = "tokio-runtime")]
-#[test]
-fn test_async_then_sync_via_bridge() {
-    // async-first → sync stage. Exercises the default `spawn_async_feeder`
-    // path: the feeder uses a mixed-mode channel, the AsyncStage's
-    // `spawn_async_feeder` recurses into StreamStart (identity), and the
-    // SyncStage's default impl bridges async→sync on a dedicated OS thread.
-    // This is the topology that previously did a blocking `send` inside a
-    // `tokio::spawn` task (parking a tokio worker on backpressure).
-    let items: Vec<u64> = (0..100).collect();
-    let result: Vec<u64> = stream(items)
-        .stage_async(|x: u64| async move { x + 1 })
-        .stage(|x: u64| x * 2)
-        .ordered()
-        .run();
-    let expected: Vec<u64> = (0..100).map(|x| (x + 1) * 2).collect();
-    assert_eq!(result, expected);
 }
 
 #[cfg(feature = "tokio-runtime")]
