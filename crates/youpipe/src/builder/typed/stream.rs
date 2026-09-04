@@ -304,6 +304,13 @@ fn spawn_expand_stage<I, N, Tx, R>(
 /// [`FenceMode::Chunked`] mode batches flow as they accumulate, letting
 /// stage 2 overlap stage 1.
 ///
+/// `expected` is the input item count (`ctx.n`) — in Barrier mode the whole
+/// stream is buffered, so the Vec is preallocated once instead of growing
+/// 1→2→4→… (`log2` reallocs). Expand stages upstream may multiply the count;
+/// a short preallocation is still a strict improvement, never a correctness
+/// issue. Chunked mode ignores it: batch buffers are small and recycled via
+/// `reuse`, preallocating `expected` would pin peak-sized memory per batch.
+///
 /// Draining `mid_rx` eagerly (rather than waiting on a separate barrier
 /// first) is what keeps stage 1 from blocking on a full channel: this is the
 /// fix for the previous wait-before-drain deadlock.
@@ -315,12 +322,16 @@ fn forward_fenced<M, Tx>(
     mid_rx: Receiver<(u64, M)>,
     fenced_tx: Tx,
     mode: FenceMode,
+    expected: usize,
     cancel: Option<&CancellationToken>,
 ) where
     M: Send + Unpin + 'static,
     Tx: SendItem<(u64, M)>,
 {
-    let mut fence = FenceBarrier::<(u64, M)>::new(mode);
+    let mut fence = match mode {
+        FenceMode::Barrier => FenceBarrier::with_capacity(mode, expected),
+        FenceMode::Chunked(_) => FenceBarrier::new(mode),
+    };
     while let Ok(item) = mid_rx.recv() {
         if cancel_active(cancel) {
             return;
@@ -1296,8 +1307,11 @@ where
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = channel::<(u64, Prev::Out)>(buffer);
         let mode = self.mode;
+        let expected = ctx.n;
         let cancel = ctx.cancel.clone();
-        std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode, cancel.as_ref()));
+        std::thread::spawn(move || {
+            forward_fenced(mid_rx, fenced_tx, mode, expected, cancel.as_ref());
+        });
         FinalRx::Sync(fenced_rx)
     }
 
@@ -1313,8 +1327,11 @@ where
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = mpsc_channel::<(u64, Prev::Out)>(buffer);
         let mode = self.mode;
+        let expected = ctx.n;
         let cancel = ctx.cancel.clone();
-        std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode, cancel.as_ref()));
+        std::thread::spawn(move || {
+            forward_fenced(mid_rx, fenced_tx, mode, expected, cancel.as_ref());
+        });
         FinalRx::SyncSingle(fenced_rx)
     }
 
@@ -1332,8 +1349,11 @@ where
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = sync_async_channel::<(u64, Prev::Out)>(buffer);
         let mode = self.mode;
+        let expected = ctx.n;
         let cancel = ctx.cancel.clone();
-        std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode, cancel.as_ref()));
+        std::thread::spawn(move || {
+            forward_fenced(mid_rx, fenced_tx, mode, expected, cancel.as_ref());
+        });
         fenced_rx
     }
 
@@ -1350,8 +1370,11 @@ where
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = channel::<(u64, Prev::Out)>(buffer);
         let mode = self.mode;
+        let expected = ctx.n;
         let cancel = ctx.cancel.clone();
-        std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode, cancel.as_ref()));
+        std::thread::spawn(move || {
+            forward_fenced(mid_rx, fenced_tx, mode, expected, cancel.as_ref());
+        });
         FinalRx::Sync(fenced_rx)
     }
 
@@ -1365,8 +1388,11 @@ where
         let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = mpsc_channel::<(u64, Prev::Out)>(buffer);
         let mode = self.mode;
+        let expected = ctx.n;
         let cancel = ctx.cancel.clone();
-        std::thread::spawn(move || forward_fenced(mid_rx, fenced_tx, mode, cancel.as_ref()));
+        std::thread::spawn(move || {
+            forward_fenced(mid_rx, fenced_tx, mode, expected, cancel.as_ref());
+        });
         FinalRx::SyncSingle(fenced_rx)
     }
 
