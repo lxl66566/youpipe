@@ -122,7 +122,7 @@ impl<'a, S, T, O> PipeRef<'a, S, T, O> {
     /// [`Pipe::with_compute_workers`](crate::Pipe::with_compute_workers).
     #[must_use]
     pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self.config.set_compute_workers(n);
         self
     }
 
@@ -239,7 +239,7 @@ where
     /// (crate::Pipe::collect); the input slice is only read.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn collect(self) -> Vec<O> {
-        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
         let pool = exec.as_pool();
         fused_collect_by_ref(self.items, self.stages, self.config.workload, pool)
     }
@@ -257,7 +257,7 @@ where
     where
         F: Fn(O) + Sync,
     {
-        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
         let pool = exec.as_pool();
         fused_for_each_by_ref(self.items, self.stages, f, self.config.workload, pool);
     }
@@ -298,7 +298,7 @@ impl<'a, S, T, O, E> TryPipeRef<'a, S, T, O, E> {
     /// [`Pipe::with_compute_workers`](crate::Pipe::with_compute_workers).
     #[must_use]
     pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self.config.set_compute_workers(n);
         self
     }
 
@@ -424,7 +424,7 @@ where
     /// is only read.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn try_collect(self) -> Result<Vec<O>, E> {
-        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
         let pool = exec.as_pool();
         fused_try_collect_by_ref(self.items, self.stages, self.config.workload, pool)
     }

@@ -1201,6 +1201,37 @@ fn test_stage_budget_explicit_deduction() {
     );
 }
 
+/// A `with_compute_workers` pin must survive a subsequent `with_compute_pool`
+/// on an 8-thread pool (previously the pool setter silently overwrote the
+/// budget with its own thread count, so only call order decided which knob
+/// took effect). Observable through peak stage concurrency: a pinned budget
+/// of 2 never lets 3 stage workers overlap, while the clobber behaviour
+/// granted 8.
+#[test]
+#[cfg_attr(miri, ignore)] // wall-clock-based concurrency probing
+fn test_compute_workers_pin_survives_compute_pool() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (a, p) = (active.clone(), peak.clone());
+    let r = stream(0..200u64)
+        .with_compute_workers(2)
+        .with_compute_pool(youpipe::ComputePool::new(8))
+        .stage(move |x| {
+            let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+            p.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            a.fetch_sub(1, Ordering::SeqCst);
+            x + 1
+        })
+        .run();
+    assert_eq!(r.len(), 200);
+    assert!(
+        peak.load(Ordering::SeqCst) <= 2,
+        "pinned budget of 2 must cap stage concurrency, observed peak {}",
+        peak.load(Ordering::SeqCst)
+    );
+}
+
 // ── Streaming liveness: worker budget vs pool size ──
 
 /// Helper: run `f` on a helper thread and require completion within 30 s, so
@@ -1435,12 +1466,16 @@ fn test_stream_for_each_empty_input() {
 #[test]
 fn test_compute_workers_clamped_above_max() {
     // 10_000 ≫ MAX_COMPUTE_WORKERS (511): the clamp keeps the config usable
-    // instead of tripping the scheduler's THREADS_MAX assert.
+    // instead of tripping the scheduler's THREADS_MAX assert. Uses the
+    // streaming path: since the fused path now *honours* the budget (a
+    // non-default value creates a transient pool), a fused variant of this
+    // test would spawn 511 threads on every run.
     let n = 100u64;
-    let r: Vec<u64> = pipe(0..n)
+    let mut r: Vec<u64> = stream(0..n)
         .with_compute_workers(10_000)
-        .map(|x| x + 1)
-        .collect();
+        .stage(|x| x + 1)
+        .run();
+    r.sort_unstable();
     assert_eq!(r, (1..=n).collect::<Vec<_>>());
 }
 

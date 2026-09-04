@@ -34,12 +34,15 @@ let r = (0..1000).stream()
     .run();
 ```
 
-The fused path has the same knob (`with_compute_pool`) plus a convenience,
-`.with_oversubscribe(factor)`, which builds a transient `factor × num_cpus`
-pool at terminal time and tears it down after. Fine for one-shot pipelines;
-in loops prefer the pre-created pool. Factor guidance: CPU + fast IO → 1 (no
-benefit), CPU + slow disk IO → 2–3, network/lock contention → 3–4, mostly IO
-→ 4–8. Never oversubscribe pure-CPU work — measured 10–30 % regression.
+The fused path has the same knobs: `with_compute_pool`, plus two conveniences
+— `.with_compute_workers(n)`, which runs the terminal on a transient pool of
+exactly `n` threads whenever `n` differs from the machine default, and
+`.with_oversubscribe(factor)`, which builds a transient
+`factor × compute_workers` pool at terminal time and tears it down after.
+Both are fine for one-shot pipelines; in loops prefer the pre-created pool.
+Factor guidance: CPU + fast IO → 1 (no benefit), CPU + slow disk IO → 2–3,
+network/lock contention → 3–4, mostly IO → 4–8. Never oversubscribe pure-CPU
+work — measured 10–30 % regression.
 
 ## Blocking IO: the numbers
 

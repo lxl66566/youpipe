@@ -30,14 +30,15 @@ type PanicPayload = Box<dyn Any + Send>;
 
 // ── Pool resolution for the fused path ──
 //
-// Three sources of a compute pool, checked in priority order:
+// Four sources of a compute pool, checked in priority order:
 //   1. `with_compute_pool(pool)` — explicit, always wins.
-//   2. `with_oversubscribe(factor)` — a hint that creates a transient pool sized to `factor ×
-//      num_cpus` at execution time.
-//   3. Neither → the global pool (one thread per core).
+//   2. `with_oversubscribe(factor)` — a hint that creates a transient pool sized to
+//      `compute_workers × factor` at execution time.
+//   3. `with_compute_workers(n)` with `n ≠ num_cpus` — a transient pool of `n` threads.
+//   4. Neither → the global pool (one thread per core).
 //
-// The transient pool from (2) is owned by `ExecPool::Owned` and lives on the
-// stack frame of the terminal method (`.collect()` / `.for_each()` / …),
+// The transient pools from (2)/(3) are owned by `ExecPool::Owned` and live on
+// the stack frame of the terminal method (`.collect()` / `.for_each()` / …),
 // outliving all uses of the `&ComputePool` reference it hands out. Dropping
 // it at the end of the terminal call tears down the worker threads — correct
 // for a one-shot pipeline, but a per-call ~ms cost that tight loops should
@@ -48,8 +49,9 @@ type PanicPayload = Box<dyn Any + Send>;
 pub(crate) enum ExecPool<'a> {
     /// A borrowed reference — either the global pool or a user-supplied pool.
     Ref(&'a ComputePool),
-    /// A transient pool created from an oversubscribe factor. Owned so it is
-    /// dropped (and its worker threads joined) when the terminal returns.
+    /// A transient pool created from an oversubscribe factor or a non-default
+    /// worker budget. Owned so it is dropped (and its worker threads joined)
+    /// when the terminal returns.
     Owned(ComputePool),
 }
 
@@ -64,17 +66,31 @@ impl ExecPool<'_> {
 
 /// Resolve the pool for a fused terminal call.
 ///
-/// Precedence: explicit `compute_pool` > `oversubscribe` factor > global pool.
+/// Precedence: explicit `compute_pool` > `oversubscribe` factor >
+/// non-default `compute_workers` > global pool.
 pub(crate) fn resolve_exec_pool(
     compute_pool: Option<&ComputePool>,
     oversubscribe: Option<NonZeroUsize>,
+    compute_workers: usize,
 ) -> ExecPool<'_> {
     if let Some(p) = compute_pool {
         return ExecPool::Ref(p);
     }
+    // Same fallback as `global_registry` / `PipelineConfig::default` so a
+    // default-sized budget compares equal to the global pool's thread count.
+    let ncpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
     if let Some(factor) = oversubscribe {
-        let ncpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-        return ExecPool::Owned(ComputePool::new(ncpus * factor.get()));
+        // Base = the configured budget (== ncpus when untouched), so
+        // `with_compute_workers(n).with_oversubscribe(2)` yields n×2 threads.
+        return ExecPool::Owned(ComputePool::new(
+            compute_workers.saturating_mul(factor.get()),
+        ));
+    }
+    // A budget that differs from the machine default cannot run on the global
+    // pool (sized to ncpus) — honour it with a transient pool. Equal values
+    // keep the shared global pool and pay no per-call construction cost.
+    if compute_workers != ncpus {
+        return ExecPool::Owned(ComputePool::new(compute_workers));
     }
     ExecPool::Ref(ComputePool::global())
 }
@@ -1819,13 +1835,17 @@ impl<S, I, O> Pipe<S, I, O> {
 
     /// Set the compute-pool worker budget — see
     /// [`PipelineConfig::with_compute_workers`]. On the fused path this sizes
-    /// the transient pool behind [`Pipe::with_oversubscribe`]; the global
-    /// pool and an explicit [`Pipe::with_compute_pool`] ignore it. Streaming
-    /// knobs (`buffer_size`, `io_concurrency`, …) have no effect on the fused
-    /// path.
+    /// the pool: a value that differs from the machine default runs the
+    /// terminal on a transient pool of exactly this many threads, and
+    /// [`Pipe::with_oversubscribe`] multiplies it (`budget × factor`). An
+    /// explicit [`Pipe::with_compute_pool`] always takes precedence and the
+    /// budget is ignored. For repeated terminal calls prefer pre-creating a
+    /// pool once (transient pools pay a per-call ~ms construction cost).
+    /// Streaming knobs (`buffer_size`, `io_concurrency`, …) have no effect on
+    /// the fused path.
     #[must_use]
     pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self.config.set_compute_workers(n);
         self
     }
 
@@ -2064,7 +2084,7 @@ where
         if n == 0 {
             return Vec::new();
         }
-        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
         let pool = exec.as_pool();
         let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads) {
@@ -2126,7 +2146,7 @@ where
         if n == 0 {
             return;
         }
-        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
         let pool = exec.as_pool();
         let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads) {
@@ -2192,7 +2212,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
     /// Set the compute-pool worker budget — see [`Pipe::with_compute_workers`].
     #[must_use]
     pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self.config.set_compute_workers(n);
         self
     }
 
@@ -2324,7 +2344,7 @@ where
         if n == 0 {
             return Ok(Vec::new());
         }
-        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
         let pool = exec.as_pool();
         let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads) {
@@ -3308,6 +3328,36 @@ mod tests {
     };
 
     use super::*;
+
+    /// Pool resolution precedence + the compute-workers semantics that the
+    /// fused setters promise (an earlier version silently ignored the budget:
+    /// `resolve_exec_pool` looked only at the pool handle and the oversubscribe
+    /// factor, while the docs claimed the budget sized the pool).
+    #[test]
+    fn test_resolve_exec_pool_precedence() {
+        let ncpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+
+        // 1. Explicit pool always wins, regardless of budget/oversubscribe.
+        let pool = ComputePool::new(3);
+        let exec = resolve_exec_pool(Some(&pool), None, ncpus + 1);
+        assert_eq!(exec.as_pool().num_workers(), 3);
+
+        // 2. Oversubscribe multiplies the budget (not the machine default).
+        let factor = NonZeroUsize::new(2).unwrap();
+        let exec = resolve_exec_pool(None, Some(factor), 3);
+        assert_eq!(exec.as_pool().num_workers(), 6);
+
+        // 3. A non-default budget creates a transient pool of exactly n.
+        let exec = resolve_exec_pool(None, None, 3);
+        assert_eq!(exec.as_pool().num_workers(), 3);
+
+        // 4. The untouched default keeps the shared global pool.
+        let exec = resolve_exec_pool(None, None, ncpus);
+        assert_eq!(
+            exec.as_pool().num_workers(),
+            ComputePool::global().num_workers()
+        );
+    }
 
     #[test]
     fn test_with_compute_pool_collect() {

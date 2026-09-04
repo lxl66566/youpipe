@@ -70,8 +70,11 @@ let r: Vec<u64> = items.stream()
     .run();
 ```
 
-`with_compute_pool(pool)` sets the budget to the pool's actual worker count
-(see [pools](pools.md)).
+`with_compute_workers(n)` **pins** the budget: it applies regardless of
+`with_compute_pool` and regardless of the order the two were called in,
+clamped to the pool's thread count. With no pin set, the budget follows the
+pool (the global pool grants one worker per core) — see
+[pools](pools.md).
 
 When the budget cannot give every sync stage a resident worker (more sync
 stages than pool slots), or `run()` is itself called on a worker of the same

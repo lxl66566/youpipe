@@ -1635,6 +1635,12 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// be created once and reused across many `run()` calls — important for
     /// tight loops where per-call pool construction (~ms) would dominate.
     ///
+    /// The worker budget divided across sync stages follows the pool's thread
+    /// count — unless [`with_compute_workers`](Self::with_compute_workers)
+    /// pinned one explicitly, in which case the pin wins regardless of the
+    /// order the two setters were called in (clamped to the pool size, which
+    /// is a hard ceiling on schedulable blocking jobs).
+    ///
     /// (Pool sizes like 128 fit blocking-IO oversubscription; kept small
     /// here so the example also runs under miri — the streaming design
     /// schedules `workers + 1 feeder` blocking jobs, which must stay within
@@ -1651,11 +1657,12 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// ```
     #[must_use]
     pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
-        // Sync config.compute_workers to the pool's actual thread count so
-        // the worker budget (divided across sync stages in run()) matches the
-        // available parallelism. Without this, a 512-thread pool would still
-        // only get num_cpus worker jobs.
-        self.config.compute_workers = pool.num_workers();
+        // No budget overwrite here: run() resolves the worker budget from the
+        // pool's thread count unless the user pinned one via
+        // `with_compute_workers` (`PipelineConfig::compute_workers_pinned`).
+        // Overwriting here instead made the two setters silently clobber each
+        // other based on call order (a pool set after a workers pin reverted
+        // the pin to the pool size).
         self.compute_pool = Some(pool);
         self
     }
@@ -1664,9 +1671,15 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// stages (streaming counterpart of the fused path's thread count).
     /// Unset fields in a [`StageOptions`] attached to a stage fall back to a
     /// share of this budget.
+    ///
+    /// The budget is **pinned** by this call: it applies regardless of
+    /// [`with_compute_pool`](Self::with_compute_pool) and regardless of the
+    /// order the two setters were called in, clamped to the pool's thread
+    /// count. With no pin set, the budget follows the pool (global pool →
+    /// one worker per core).
     #[must_use]
     pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self.config.set_compute_workers(n);
         self
     }
 
@@ -2164,15 +2177,24 @@ where
         // divides *fewer* slots, shrinking the buffer floor — never flipping
         // a predicted-inline feeder into a blocking one. Dedicated mode may
         // divide more, but there the feeder is a thread anyway.
-        let provisional = budget.default_workers(config.compute_workers.min(pool_threads));
+        //
+        // Budget resolution: an explicitly pinned `with_compute_workers` wins
+        // (clamped to the pool below); unpinned follows the pool's thread
+        // count so a big blocking-IO pool actually gets its workers.
+        let workers_budget = if config.compute_workers_pinned {
+            config.compute_workers
+        } else {
+            config.compute_workers.max(pool_threads)
+        };
+        let provisional = budget.default_workers(workers_budget.min(pool_threads));
         let feeder_buffer = config.buffer_size.max(provisional * 4);
         let live_slots = pool_threads.saturating_sub(usize::from(n > feeder_buffer));
         let dedicated_threads = pool.is_on_this_pool() || live_slots < budget.stages;
         let per_stage_parallelism = if dedicated_threads {
             // Threads are not pool-bounded; divide the configured budget.
-            budget.default_workers(config.compute_workers)
+            budget.default_workers(workers_budget)
         } else {
-            budget.default_workers(config.compute_workers.min(live_slots))
+            budget.default_workers(workers_budget.min(live_slots))
         };
         let (worker_slots_left, stages_left) = if dedicated_threads {
             (0, 0)

@@ -62,15 +62,25 @@ pub enum Workload {
 pub struct PipelineConfig {
     /// Number of threads dedicated to CPU-bound (sync) work.
     ///
-    /// Fused path: sizes the transient pool behind `with_oversubscribe`; the
-    /// global pool / explicit `with_compute_pool` ignore it. Streaming path:
-    /// the worker budget divided across sync stages (see
+    /// Fused path: the pool size — the terminal runs on a transient pool of
+    /// this many threads whenever it differs from the machine default (the
+    /// global pool, one thread per core), and
+    /// [`with_oversubscribe`](crate::Pipe::with_oversubscribe) multiplies it.
+    /// An explicit `with_compute_pool` always takes precedence. Streaming
+    /// path: the worker budget divided across sync stages (see
     /// `StageOptions::workers` for per-stage overrides).
     ///
     /// Clamped to `[1, MAX_COMPUTE_WORKERS]` — the scheduler's sleep bitmask
     /// packs thread indices into 9 bits (511 threads), so larger values are
     /// truncated, not rejected.
     pub(crate) compute_workers: usize,
+    /// Whether `compute_workers` was explicitly pinned via any
+    /// `with_compute_workers` builder (or a hand-built config). Streaming
+    /// consults this to resolve the worker budget: a pinned value is honoured
+    /// as-is regardless of the compute pool's thread count, while an unpinned
+    /// one follows the pool. The fused path ignores it (it compares the value
+    /// against the machine default instead).
+    pub(crate) compute_workers_pinned: bool,
     /// Number of OS threads backing the async I/O runtime (worker threads of
     /// the active [`AsyncRuntime`](crate::AsyncRuntime) backend). Async stages
     /// multiplex many more tasks than this via the runtime's scheduler — see
@@ -109,6 +119,7 @@ impl Default for PipelineConfig {
         let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         Self {
             compute_workers: cpus,
+            compute_workers_pinned: false,
             async_workers: cpus,
             buffer_size: 256,
             io_concurrency: 128,
@@ -118,6 +129,14 @@ impl Default for PipelineConfig {
 }
 
 impl PipelineConfig {
+    /// Clamp-and-record a compute-worker budget set through any builder.
+    /// Shared by every `with_compute_workers` so the clamp and the pin flag
+    /// (see [`Self::compute_workers_pinned`]) cannot drift apart.
+    pub(crate) fn set_compute_workers(&mut self, n: usize) {
+        self.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self.compute_workers_pinned = true;
+    }
+
     /// Sets the number of CPU-bound worker threads.
     ///
     /// Silently clamped to `[1, MAX_COMPUTE_WORKERS]` (511 on 64-bit): the
@@ -126,7 +145,7 @@ impl PipelineConfig {
     /// panic so exploratory configs (`num_cpus * 16`, …) keep running.
     #[must_use]
     pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self.set_compute_workers(n);
         self
     }
 
@@ -160,5 +179,25 @@ impl PipelineConfig {
     pub fn with_workload(mut self, workload: Workload) -> Self {
         self.workload = workload;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_workers_clamp_and_pin() {
+        let mut cfg = PipelineConfig::default();
+        assert!(!cfg.compute_workers_pinned, "default is unpinned");
+        cfg.set_compute_workers(0);
+        assert_eq!(cfg.compute_workers, 1);
+        cfg.set_compute_workers(10_000);
+        assert_eq!(cfg.compute_workers, crate::MAX_COMPUTE_WORKERS);
+        assert!(cfg.compute_workers_pinned, "set_compute_workers pins");
+
+        let public = PipelineConfig::default().with_compute_workers(8);
+        assert_eq!(public.compute_workers, 8);
+        assert!(public.compute_workers_pinned, "public builder pins too");
     }
 }

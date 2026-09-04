@@ -144,7 +144,7 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
     /// here.
     #[must_use]
     pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self.config.set_compute_workers(n);
         self
     }
 
@@ -327,7 +327,7 @@ impl<'env, S, I, O, E> ScopedTryPipe<'env, S, I, O, E> {
     /// `with_workload` affect the fused path.
     #[must_use]
     pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        self.config.set_compute_workers(n);
         self
     }
 
@@ -452,7 +452,7 @@ where
     /// [`crate::TryPipe::try_collect`], minus the `'static` bounds.
     pub fn try_collect(self) -> Result<Vec<O>, E> {
         let exec =
-            crate::builder::resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+            crate::builder::resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
         let pool = exec.as_pool();
         fused_try_collect_scoped(self.items, self.stages, self.config.workload, pool)
     }
@@ -471,7 +471,7 @@ where
     /// stage chain contains a `Filter`, falls back to per-leaf `Vec` merge.
     pub fn collect(self) -> Vec<O> {
         let exec =
-            crate::builder::resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+            crate::builder::resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
         let pool = exec.as_pool();
         fused_collect_scoped(self.items, self.stages, self.config.workload, pool)
     }
@@ -508,7 +508,7 @@ where
         F: Fn(O) + Sync,
     {
         let exec =
-            crate::builder::resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe);
+            crate::builder::resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
         let pool = exec.as_pool();
         fused_for_each_scoped(self.items, self.stages, f, self.config.workload, pool);
     }
