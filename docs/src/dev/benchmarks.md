@@ -363,14 +363,26 @@ an hour+ without completing; with it the whole suite finishes in seconds.
 question across the ecosystem — youpipe, rayon, tokio, `futures::stream`,
 and hand-written `std::thread` baselines — over seven representative
 scenarios, and exports JSON that `perf/plot-horizontal.py` renders into the
-README's SVG charts (matplotlib via `uv run`; throughput, higher is better,
-min–max whiskers on the bar panels). The source data for the published charts is
-committed at `perf/horizontal/results.json`.
+published SVG charts — the README plus the charts below (matplotlib via
+`uv run`; throughput, higher is better, min–max whiskers on the bar panels).
+The source data for the published charts is committed at
+`perf/horizontal/results.json`.
 
 ```sh
 cargo bench -p youpipe --bench horizontal -- --rounds 5  # ~5 min incl. build
 uv run perf/plot-horizontal.py                     # results.json → docs/src/assets/*.svg
 ```
+
+### Charts
+
+Throughput, higher is better; bar-chart whiskers span the five interleaved
+rounds.
+
+![CPU pipelines: youpipe vs rayon vs hand-written std threads](../assets/bench-cpu.svg)
+
+![IO pipelines: youpipe vs tokio vs futures](../assets/bench-io.svg)
+
+![Mixed sync + async pipelines: youpipe vs tokio vs futures vs rayon](../assets/bench-real.svg)
 
 ### Methodology
 

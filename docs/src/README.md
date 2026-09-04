@@ -17,6 +17,5 @@ This book has three parts:
 | [Performance tuning](advanced/choosing-engine.md) | Pick the right engine and knobs for your workload. |
 | [Developer guide](dev/design.md) | Internals: scheduler, channels, verification, methodology. |
 
-Benchmark charts and cross-library comparisons live in the repository
-[README](https://github.com/lxl66566/youpipe) and
-[dev/benchmarks.md](dev/benchmarks.md).
+Benchmark charts and the full cross-library comparison live in
+[Benchmarks and methodology](dev/benchmarks.md).
