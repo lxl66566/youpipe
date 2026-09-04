@@ -82,6 +82,21 @@ impl TokioPool {
     }
 }
 
+/// Match tokio's fixed nested-runtime panic message ("Cannot start a runtime
+/// from within a runtime. …"), raised by `Handle::block_on` on threads that
+/// are driving async tasks. If tokio ever rewords it, the original payload is
+/// resumed unchanged — the guard degrades to the pre-guard behaviour instead
+/// of misclassifying panics.
+fn is_nested_runtime_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    const MARKER: &str = "Cannot start a runtime from within a runtime";
+    payload
+        .downcast_ref::<String>()
+        .is_some_and(|s| s.contains(MARKER))
+        || payload
+            .downcast_ref::<&str>()
+            .is_some_and(|s| s.contains(MARKER))
+}
+
 impl AsyncRuntime for TokioPool {
     fn build_default(workers: usize) -> std::io::Result<Self> {
         Self::build(workers)
@@ -99,6 +114,11 @@ impl AsyncRuntime for TokioPool {
         self.handle.spawn(fut);
     }
 
+    /// # Panics
+    ///
+    /// Panics with a youpipe-specific message when called from within an
+    /// async context (a thread currently driving async tasks). Wrap the call
+    /// in `tokio::task::spawn_blocking` instead.
     fn block_on<T, F>(&self, fut: F) -> T
     where
         T: Send + 'static,
@@ -109,7 +129,29 @@ impl AsyncRuntime for TokioPool {
         // not required to be `Send` — `Handle::block_on` runs the future inline
         // on this thread, matching the streaming collector that borrows
         // crossfire's `!Sync` async receiver.
-        self.handle.block_on(fut)
+        //
+        // A `Handle::try_current()` pre-check is NOT sufficient to guard the
+        // async-context case, so we catch tokio's own panic and re-raise it
+        // with an actionable message: probed on tokio 1.x, `try_current` also
+        // succeeds on `spawn_blocking` threads (where `block_on` is legal and
+        // the recommended fix runs), so the only reliable signal is tokio's
+        // nested-runtime error itself.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle.block_on(fut)));
+        match result {
+            Ok(v) => v,
+            Err(payload) if is_nested_runtime_panic(payload.as_ref()) => {
+                panic!(
+                    "youpipe: run()/for_each() was called inside an async context. The \
+                     streaming terminal drives its collector via block_on, which cannot \
+                     block a thread that is running async tasks. Wrap the pipeline call in \
+                     tokio::task::spawn_blocking (or run it on a plain sync thread)."
+                )
+            },
+            // Any other panic (e.g. from the driven future) propagates
+            // unchanged — payload and unwind semantics preserved.
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn num_workers(&self) -> usize {

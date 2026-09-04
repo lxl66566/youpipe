@@ -2012,8 +2012,13 @@ where
     /// # Panics
     ///
     /// Panics if `.ordered()` is combined with `.expand()` (see
-    /// [`FenceMode`] docs), or if the async runtime cannot be constructed
-    /// (e.g. OS thread/resource limits). To handle runtime construction
+    /// [`FenceMode`] docs), if the async runtime cannot be constructed
+    /// (e.g. OS thread/resource limits), or if `run()` is invoked inside an
+    /// async context on a chain with an async stage (e.g. from a tokio/axum
+    /// handler) — the terminal drives its collector via
+    /// [`AsyncRuntime::block_on`](crate::AsyncRuntime::block_on), which cannot
+    /// block a thread that is running async tasks; wrap the call in
+    /// `tokio::task::spawn_blocking` instead. To handle runtime construction
     /// failure gracefully, use [`try_run`](Self::try_run) or pass a pre-built
     /// backend via [`with_async_pool`](Self::with_async_pool).
     pub fn run(self) -> Vec<O> {

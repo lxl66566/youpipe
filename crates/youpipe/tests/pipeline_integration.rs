@@ -362,6 +362,62 @@ fn test_mixed_sync_async_without_explicit_pool() {
     assert_eq!(result, expected);
 }
 
+// ── Streaming terminal inside an async context ──
+
+/// Silence the default panic hook around a closure that is expected to panic,
+/// assert the message contains every `expected` fragment, and restore the
+/// hook. Keeps expected-panic tests from printing scary backtraces.
+#[cfg(feature = "tokio-runtime")]
+fn catch_panic_asserting<F: FnOnce()>(f: F, expected: &[&str]) {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .expect_err("closure was expected to panic but returned");
+    std::panic::set_hook(prev_hook);
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_else(|| panic!("panic payload was not a string: {payload:?}"));
+    for frag in expected {
+        assert!(msg.contains(frag), "panic message {msg:?} lacks {frag:?}");
+    }
+}
+
+/// `run()` on an async-stage chain inside a tokio runtime context must fail
+/// with a youpipe-specific panic pointing at `spawn_blocking` — not tokio's
+/// opaque "Cannot start a runtime from within a runtime" (the pre-fix
+/// behaviour, which never mentioned the caller's library).
+#[cfg(feature = "tokio-runtime")]
+#[tokio::test]
+async fn test_run_in_async_context_panics_with_youpipe_hint() {
+    catch_panic_asserting(
+        || {
+            stream(0..8u64)
+                .stage_async(|x| async move { x + 1 })
+                .run();
+        },
+        &["youpipe", "spawn_blocking"],
+    );
+}
+
+/// The recommended workaround actually works: the same chain inside
+/// `spawn_blocking` (a blocking thread has no runtime TLS context) completes.
+#[cfg(feature = "tokio-runtime")]
+#[tokio::test]
+async fn test_run_in_spawn_blocking_works() {
+    let result = tokio::task::spawn_blocking(|| {
+        stream(0..8u64)
+            .stage_async(|x| async move { x + 1 })
+            .run()
+    })
+    .await
+    .expect("spawn_blocking join");
+    let mut sorted = result;
+    sorted.sort_unstable();
+    assert_eq!(sorted, (1..=8u64).collect::<Vec<_>>());
+}
+
 #[cfg(feature = "tokio-runtime")]
 #[test]
 fn test_two_async_stages_share_lazy_pool() {

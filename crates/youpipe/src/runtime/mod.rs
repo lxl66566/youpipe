@@ -78,6 +78,16 @@ pub trait AsyncRuntime: Clone + Send + Sync + 'static {
     /// calling thread and has no `Send` bound, so the abstraction matches. (A
     /// future backend that wanted to drive `block_on` on another thread would
     /// have to reconcile this with the `!Send` collector future.)
+    ///
+    /// # Panics
+    ///
+    /// Must not be called on a thread that is currently driving async tasks
+    /// (an "async context"): blocking it would stall every task scheduled on
+    /// it. Backends reject this with a panic — [`TokioPool`] re-raises tokio's
+    /// nested-runtime error with a youpipe-specific message. Callers inside
+    /// async code (e.g. an axum handler) must move the pipeline run onto a
+    /// blocking thread, e.g. `tokio::task::spawn_blocking` (where `block_on`
+    /// remains legal).
     fn block_on<T, F>(&self, fut: F) -> T
     where
         T: Send + 'static,
