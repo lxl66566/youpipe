@@ -259,13 +259,7 @@ fn spawn_stage<I, O, Tx, R>(
                         let (seq, item) = match rx.try_recv() {
                             Ok(v) => v,
                             Err(TryRecvError::Empty) => continue 'outer,
-                            // Spurious-close guard: confirm with a blocking
-                            // recv (see the module doc on crossfire's
-                            // try_recv quirk).
-                            Err(TryRecvError::Closed) => match rx.recv() {
-                                Ok(v) => v,
-                                Err(_) => break 'outer,
-                            },
+                            Err(TryRecvError::Closed) => break 'outer,
                         };
                         if cancel_active(worker_cancel.as_ref()) {
                             break 'outer;
@@ -323,12 +317,7 @@ fn spawn_expand_stage<I, N, Tx, R>(
                         let (seq, item) = match rx.try_recv() {
                             Ok(v) => v,
                             Err(TryRecvError::Empty) => continue 'outer,
-                            // Spurious-close guard: see the module doc on
-                            // crossfire's try_recv quirk.
-                            Err(TryRecvError::Closed) => match rx.recv() {
-                                Ok(v) => v,
-                                Err(_) => break 'outer,
-                            },
+                            Err(TryRecvError::Closed) => break 'outer,
                         };
                         if cancel_active(worker_cancel.as_ref()) {
                             break 'outer;
@@ -423,12 +412,7 @@ fn forward_fenced<M, Tx>(
             let item = match mid_rx.try_recv() {
                 Ok(v) => v,
                 Err(TryRecvError::Empty) => continue 'outer,
-                // Spurious-close guard: see the module doc on crossfire's
-                // try_recv quirk.
-                Err(TryRecvError::Closed) => match mid_rx.recv() {
-                    Ok(v) => v,
-                    Err(_) => break 'outer,
-                },
+                Err(TryRecvError::Closed) => break 'outer,
             };
             if cancel_active(cancel) {
                 return;

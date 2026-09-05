@@ -55,9 +55,10 @@ Every sync consumer loop (`spawn_stage` / `spawn_expand_stage` workers, the
 fence forwarder) uses a two-phase recv loop: one blocking `recv` anchors the
 iteration (parks correctly when the channel is empty, exits on disconnect),
 followed by a `try_recv` burst phase that absorbs already-queued items without
-re-entering the blocking-recv preamble. Both phases guard crossfire's
-spurious `try_recv` `Closed` verdict with a confirming blocking `recv`
-(same quirk the terminal drains handle).
+re-entering the blocking-recv preamble. A `Closed` verdict in either phase is
+trusted as-is: the `crossfire >= 3.1.20` pin (crates/youpipe/Cargo.toml)
+carries the upstream fix (issue #70) for the spurious-`Closed` race that once
+required a confirming blocking `recv` after every `Closed`.
 
 The burst phase is what keeps multi-worker stages civil on the MPMC ring:
 when `k` workers contend on one input channel, the burst winners drain the

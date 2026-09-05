@@ -12,21 +12,6 @@ use crate::{
 // collect pushes into a `Vec`, for_each invokes the user's closure. After
 // inlining the sink is free, so all terminals share one code path with zero
 // per-item overhead.
-//
-// # crossfire `try_recv` quirk (load-bearing)
-//
-// crossfire's `try_recv` can spuriously report `Disconnected` (mapped to
-// `TryRecvError::Closed`): `ChannelShared::try_recv` (shared.rs:42) pops the
-// queue first and only then checks `tx_count`, with no re-validation. A
-// sender can complete `send()` and drop its `tx` between those two
-// observations, so "empty AND all senders dropped" never held at once — yet
-// `Closed` is returned with the item still receivable (reproduced with pure
-// crossfire: bounded/unbounded × mpsc/mpmc all affected; every drain that
-// trusts the verdict loses items, pure blocking `recv` is immune — its
-// `_recv_blocking` re-pops after the closed-check).
-// Every `Closed` verdict below is therefore confirmed with one blocking
-// `recv` before exiting: a genuinely closed channel errs immediately, a
-// spurious one yields the in-flight item.
 
 /// Drain `rx` in arrival order, invoking `sink` per item.
 ///
@@ -49,11 +34,7 @@ where
             match rx.try_recv() {
                 Ok((_, item)) => sink(item),
                 Err(TryRecvError::Empty) => break,
-                // Spurious-close guard: see the module doc above.
-                Err(TryRecvError::Closed) => match rx.recv() {
-                    Ok((_, item)) => sink(item),
-                    Err(_) => return,
-                },
+                Err(TryRecvError::Closed) => return,
             }
         }
         // Queue drained but channel may still be open — block for one.
@@ -92,16 +73,11 @@ where
             match rx.try_recv() {
                 Ok((seq, item)) => buffer.insert_into(seq, item, &mut sink),
                 Err(TryRecvError::Empty) => break,
-                // Spurious-close guard: see the module doc above.
                 Err(TryRecvError::Closed) => {
-                    if let Ok((seq, item)) = rx.recv() {
-                        buffer.insert_into(seq, item, &mut sink);
-                    } else {
-                        for item in buffer.flush_remaining() {
-                            sink(item);
-                        }
-                        return;
+                    for item in buffer.flush_remaining() {
+                        sink(item);
                     }
+                    return;
                 },
             }
         }
@@ -138,11 +114,7 @@ where
             match rx.try_recv() {
                 Ok((_, item)) => sink(item),
                 Err(TryRecvError::Empty) => break,
-                // Spurious-close guard: see the module doc above.
-                Err(TryRecvError::Closed) => match rx.recv().await {
-                    Ok((_, item)) => sink(item),
-                    Err(_) => return,
-                },
+                Err(TryRecvError::Closed) => return,
             }
         }
         // Queue is drained but channel may still be open. Await exactly one
@@ -174,16 +146,11 @@ where
             match rx.try_recv() {
                 Ok((seq, o)) => buffer.insert_into(seq, o, &mut sink),
                 Err(TryRecvError::Empty) => break,
-                // Spurious-close guard: see the module doc above.
                 Err(TryRecvError::Closed) => {
-                    if let Ok((seq, o)) = rx.recv().await {
-                        buffer.insert_into(seq, o, &mut sink);
-                    } else {
-                        for item in buffer.flush_remaining() {
-                            sink(item);
-                        }
-                        return;
+                    for item in buffer.flush_remaining() {
+                        sink(item);
                     }
+                    return;
                 },
             }
         }
