@@ -511,7 +511,11 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     // mp is 0-based from March (Hinnant civil_from_days); a previous version
     // derived the month as mp + 10*(mp<2) - 2*(mp>=2), which silently mapped
     // September→April (mp=6→4). Keep the canonical mp<10 ? mp+3 : mp-9.
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let month = if mp < 10 {
+        mp + 3
+    } else {
+        mp - 9
+    };
     (
         y + i64::from(month <= 2),
         month as u32,
@@ -619,8 +623,9 @@ fn cpu_unbalanced() -> Scenario {
                             let data = data.clone();
                             move || {
                                 let t = Instant::now();
-                                let r: Vec<u64> =
-                                    pipe_ref(&data).map(|&(x, iters)| bb(cpu_work(x, iters))).collect();
+                                let r: Vec<u64> = pipe_ref(&data)
+                                    .map(|&(x, iters)| bb(cpu_work(x, iters)))
+                                    .collect();
                                 finish(r, t)
                             }
                         }) as Job,

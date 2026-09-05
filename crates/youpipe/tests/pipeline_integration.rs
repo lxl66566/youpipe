@@ -95,7 +95,11 @@ fn test_owned_filter_panic_drop_accounting() {
         }
     }
 
-    let n: u64 = if cfg!(miri) { 500 } else { 20_000 };
+    let n: u64 = if cfg!(miri) {
+        500
+    } else {
+        20_000
+    };
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
     let items: Vec<DropCounter> = (0..n)
@@ -492,9 +496,7 @@ fn catch_panic_asserting<F: FnOnce()>(f: F, expected: &[&str]) {
 async fn test_run_in_async_context_panics_with_youpipe_hint() {
     catch_panic_asserting(
         || {
-            stream(0..8u64)
-                .stage_async(|x| async move { x + 1 })
-                .run();
+            stream(0..8u64).stage_async(|x| async move { x + 1 }).run();
         },
         &["youpipe", "spawn_blocking"],
     );
@@ -505,13 +507,10 @@ async fn test_run_in_async_context_panics_with_youpipe_hint() {
 #[cfg(feature = "tokio-runtime")]
 #[tokio::test]
 async fn test_run_in_spawn_blocking_works() {
-    let result = tokio::task::spawn_blocking(|| {
-        stream(0..8u64)
-            .stage_async(|x| async move { x + 1 })
-            .run()
-    })
-    .await
-    .expect("spawn_blocking join");
+    let result =
+        tokio::task::spawn_blocking(|| stream(0..8u64).stage_async(|x| async move { x + 1 }).run())
+            .await
+            .expect("spawn_blocking join");
     let mut sorted = result;
     sorted.sort_unstable();
     assert_eq!(sorted, (1..=8u64).collect::<Vec<_>>());
@@ -1334,7 +1333,7 @@ fn test_stream_stages_at_pool_size_no_deadlock() {
             .with_compute_pool(youpipe::ComputePool::new(4))
             .stage(|x| x + 1)
             .stage(|x| x * 2)
-            .stage(|x| x ^ 0x5A5A)
+            .stage(|x| x ^ 0x5a5a)
             .stage(|x| x.wrapping_mul(3))
             .run()
     });
@@ -1343,7 +1342,7 @@ fn test_stream_stages_at_pool_size_no_deadlock() {
     sorted.sort_unstable();
     // `^ 0x5A5A` is not monotonic, so the expected side must be sorted too.
     let mut expected: Vec<u64> = (0..2000u64)
-        .map(|x| (((x + 1) * 2) ^ 0x5A5A).wrapping_mul(3))
+        .map(|x| (((x + 1) * 2) ^ 0x5a5a).wrapping_mul(3))
         .collect();
     expected.sort_unstable();
     assert_eq!(sorted, expected);
@@ -1480,13 +1479,15 @@ fn test_nested_stream_inside_pool_worker_no_deadlock() {
     std::thread::spawn(move || {
         // Shape 1: fused outer — for_each closures run on pool workers.
         let p1 = pool.clone();
-        pipe(0..4u64).with_compute_pool(pool.clone()).for_each(move |_x: u64| {
-            let inner: Vec<u64> = stream(0..2000u64)
-                .with_compute_pool(p1.clone())
-                .stage(|v: u64| v + 1)
-                .run();
-            assert_eq!(inner.len(), 2000);
-        });
+        pipe(0..4u64)
+            .with_compute_pool(pool.clone())
+            .for_each(move |_x: u64| {
+                let inner: Vec<u64> = stream(0..2000u64)
+                    .with_compute_pool(p1.clone())
+                    .stage(|v: u64| v + 1)
+                    .run();
+                assert_eq!(inner.len(), 2000);
+            });
 
         // Shape 2: streaming outer — stage closures run on pool workers.
         let p2 = pool.clone();

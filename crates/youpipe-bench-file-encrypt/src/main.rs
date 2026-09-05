@@ -21,12 +21,11 @@
 //! # CPU load / task selection
 //!
 //! `FC_TASK` picks the per-file work:
-//! - `compress` (default): zstd (`FC_ZSTD_LEVEL`, default 15) **then**
-//!   AES-256-GCM. zstd at high level is genuinely CPU-heavy and scales with
-//!   input size — the regime where read/CPU/write pipelining overlaps real
-//!   compute with blocking `fsync`.
-//! - `aes`: plain AES-256-GCM. Fast (AES-NI); CPU is marginal so the workload
-//!   is IO/memory bound. Kept as the light-CPU reference point.
+//! - `compress` (default): zstd (`FC_ZSTD_LEVEL`, default 15) **then** AES-256-GCM. zstd at high
+//!   level is genuinely CPU-heavy and scales with input size — the regime where read/CPU/write
+//!   pipelining overlaps real compute with blocking `fsync`.
+//! - `aes`: plain AES-256-GCM. Fast (AES-NI); CPU is marginal so the workload is IO/memory bound.
+//!   Kept as the light-CPU reference point.
 //!
 //! # Run
 //!
@@ -110,7 +109,7 @@ fn main() {
         _ => {
             let level = env_or("FC_ZSTD_LEVEL", 15) as i32;
             cipher::Task::CompressEncrypt(level)
-        }
+        },
     };
 
     let root: PathBuf = std::env::var("FC_DATA_DIR")

@@ -34,9 +34,9 @@ pub struct FileEntry {
 /// scatter so that size-by-index isn't monotonic (no "all big files at the
 /// tail"). No external RNG dependency, and reproducible across runs.
 fn hash01(i: usize) -> f64 {
-    let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut x = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     x ^= x >> 29;
-    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x ^= x >> 32;
     (x as f64) / (u64::MAX as f64)
 }
@@ -88,7 +88,7 @@ fn lcg_next(state: &mut u64) -> u64 {
 
 fn write_file(path: &Path, size: usize, seed: u64) -> std::io::Result<()> {
     let mut f = std::fs::File::create(path)?;
-    let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut state = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut buf = vec![0u8; 1 << 16]; // 64 KiB chunks
     let mut written = 0;
     while written < size {
@@ -98,7 +98,7 @@ fn write_file(path: &Path, size: usize, seed: u64) -> std::io::Result<()> {
             // compressible, but the LCG stream is non-periodic so the
             // compressor does real entropy-coding + optimal-parsing work
             // instead of latching onto a single repeating block.
-            *b = b'a' + ((lcg_next(&mut state) >> 33) as u8 & 0x0F);
+            *b = b'a' + ((lcg_next(&mut state) >> 33) as u8 & 0x0f);
         }
         f.write_all(&buf[..n])?;
         written += n;
@@ -195,9 +195,9 @@ pub fn fs_type_name(path: &Path) -> String {
         "tmpfs"
     } else if ft == 0x8584_5868 {
         "ramfs"
-    } else if ft == 0x9123_683E {
+    } else if ft == 0x9123_683e {
         "btrfs"
-    } else if ft == 0xEF53 {
+    } else if ft == 0xef53 {
         "ext4"
     } else if ft == 0x5846_5342 {
         "xfs"

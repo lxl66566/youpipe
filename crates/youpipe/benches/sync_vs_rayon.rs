@@ -33,8 +33,9 @@ fn bench_par_map_vs_rayon(c: &mut Criterion) {
             &data,
             |b, data| {
                 b.iter(|| {
-                    let r: Vec<u64> =
-                        youpipe::pipe_ref(data).map(|&x| black_box(cpu_work(x))).collect();
+                    let r: Vec<u64> = youpipe::pipe_ref(data)
+                        .map(|&x| black_box(cpu_work(x)))
+                        .collect();
                     black_box(r)
                 });
             },
@@ -333,21 +334,17 @@ fn bench_filter_chain(c: &mut Criterion) {
                 });
             },
         );
-        group.bench_with_input(
-            BenchmarkId::new("sequential", size),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    black_box(
-                        data.iter()
-                            .map(|&x| x + 1)
-                            .filter(|&x: &u64| x % 3 == 0)
-                            .map(|x| x * 2)
-                            .collect::<Vec<u64>>(),
-                    )
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("sequential", size), &data, |b, data| {
+            b.iter(|| {
+                black_box(
+                    data.iter()
+                        .map(|&x| x + 1)
+                        .filter(|&x: &u64| x % 3 == 0)
+                        .map(|x| x * 2)
+                        .collect::<Vec<u64>>(),
+                )
+            });
+        });
     }
     group.finish();
 }

@@ -336,9 +336,7 @@ fn bench_io_unbalanced(c: &mut Criterion) {
                         |v| {
                             let r = stream(v)
                                 .with_compute_pool(pool.clone())
-                                .stage(|(x, micros): (u64, u64)| {
-                                    bb(io_work_variable(x, micros))
-                                })
+                                .stage(|(x, micros): (u64, u64)| bb(io_work_variable(x, micros)))
                                 .run();
                             bb(r)
                         },

@@ -13,28 +13,25 @@
 //!
 //! # Tuning rationale
 //!
-//! - **Oversubscribed compute pool.** File IO via `std::fs` *blocks* the OS
-//!   thread, so concurrent file operations (esp. durable `fsync`) are bounded
-//!   by the worker count — not by cores. The default global pool (one thread
-//!   per core) caps that at `num_cpus`, which serialises too many flushes. We
-//!   size the pool at `3 × num_cpus` (capped at 128): with 3 sync stages that
-//!   gives each stage `~num_cpus` workers — enough read/write concurrency to
-//!   keep the device busy, while the CPU process stage gets exactly the cores
-//!   it needs and is *not* oversubscribed. (Bigger pools were measured to be
-//!   slower: the even stage division oversubscribes the CPU process stage,
-//!   adding context-switch overhead without IO benefit. Sweep with `FC_POOL`.)
-//!   This is the `with_compute_pool` use case from `youpipe`'s docs.
+//! - **Oversubscribed compute pool.** File IO via `std::fs` *blocks* the OS thread, so concurrent
+//!   file operations (esp. durable `fsync`) are bounded by the worker count — not by cores. The
+//!   default global pool (one thread per core) caps that at `num_cpus`, which serialises too many
+//!   flushes. We size the pool at `3 × num_cpus` (capped at 128): with 3 sync stages that gives
+//!   each stage `~num_cpus` workers — enough read/write concurrency to keep the device busy, while
+//!   the CPU process stage gets exactly the cores it needs and is *not* oversubscribed. (Bigger
+//!   pools were measured to be slower: the even stage division oversubscribes the CPU process
+//!   stage, adding context-switch overhead without IO benefit. Sweep with `FC_POOL`.) This is the
+//!   `with_compute_pool` use case from `youpipe`'s docs.
 //!
-//! - **Small `buffer_size` (4).** Items here are whole files — up to tens of
-//!   MiB. The default 256-slot channel would let ~256 of these pile up between
-//!   stages and blow up peak memory. A buffer of 4 keeps enough slack for the
-//!   stages to stay pipelined (the processor never stalls on an empty channel
-//!   once the first read completes) while bounding resident memory.
+//! - **Small `buffer_size` (4).** Items here are whole files — up to tens of MiB. The default
+//!   256-slot channel would let ~256 of these pile up between stages and blow up peak memory. A
+//!   buffer of 4 keeps enough slack for the stages to stay pipelined (the processor never stalls on
+//!   an empty channel once the first read completes) while bounding resident memory.
 //!
-//! - **`Workload::Unbalanced`.** File sizes span 3+ orders of magnitude and the
-//!   CPU cost (zstd) scales with size, so the cost skew is even sharper than
-//!   the size skew; the finer oversplit factor helps work-stealing rebalance a
-//!   worker stuck on a large file against workers draining small ones.
+//! - **`Workload::Unbalanced`.** File sizes span 3+ orders of magnitude and the CPU cost (zstd)
+//!   scales with size, so the cost skew is even sharper than the size skew; the finer oversplit
+//!   factor helps work-stealing rebalance a worker stuck on a large file against workers draining
+//!   small ones.
 
 use std::{
     path::{Path, PathBuf},
@@ -120,7 +117,8 @@ pub fn config_str() -> String {
     let cpus = num_cpus();
     let pool_threads = pool_size(cpus);
     format!(
-        "pool={pool_threads} threads (~3×{cpus}), buffer=4, Workload::Unbalanced, stages=read|process|write"
+        "pool={pool_threads} threads (~3×{cpus}), buffer=4, Workload::Unbalanced, \
+         stages=read|process|write"
     )
 }
 

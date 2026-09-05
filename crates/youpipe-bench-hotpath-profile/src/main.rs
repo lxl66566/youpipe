@@ -64,7 +64,7 @@ fn main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(100);
             run_stream(size, iters);
-        }
+        },
         Some(size) => {
             let size: usize = size.parse().expect("size must be a usize");
             let light = args.get(2).map(String::as_str) == Some("light");
@@ -74,7 +74,7 @@ fn main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(100);
             run_focused(size, light, iters);
-        }
+        },
     }
 }
 
@@ -108,7 +108,11 @@ fn run_stream(size: usize, iters: usize) {
 
 fn run_focused(size: usize, light: bool, iters: usize) {
     let data: Vec<u64> = (0..size as u64).collect();
-    let work = if light { "light" } else { "heavy" };
+    let work = if light {
+        "light"
+    } else {
+        "heavy"
+    };
     for _ in 0..iters {
         let v = data.clone();
         let out: Vec<u64> = if light {

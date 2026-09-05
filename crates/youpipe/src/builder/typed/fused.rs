@@ -2086,7 +2086,11 @@ where
         if n == 0 {
             return Vec::new();
         }
-        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
         let pool = exec.as_pool();
         let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads) {
@@ -2148,7 +2152,11 @@ where
         if n == 0 {
             return;
         }
-        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
         let pool = exec.as_pool();
         let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads) {
@@ -2346,7 +2354,11 @@ where
         if n == 0 {
             return Ok(Vec::new());
         }
-        let exec = resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
         let pool = exec.as_pool();
         let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads) {

@@ -9,8 +9,8 @@
 //! its thread and caps concurrency at the thread count.
 //!
 //! Groups:
-//! * `io_async_pure` — single IO stage. Compares youpipe `stream(..).stage_async(..).run()`
-//!   (M:N concurrency) vs blocking approaches vs tokio-native async.
+//! * `io_async_pure` — single IO stage. Compares youpipe `stream(..).stage_async(..).run()` (M:N
+//!   concurrency) vs blocking approaches vs tokio-native async.
 //! * `io_async_mixed` — CPU stage (sync) -> IO stage (async). Compares youpipe's mixed sync+async
 //!   chain vs the all-blocking sync chain vs tokio.
 
@@ -18,9 +18,7 @@ mod common;
 
 use std::{hint::black_box as bb, time::Duration};
 
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
-};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use youpipe::{PipelineConfig, TokioPool, stream};
 
 /// Warm-clone discipline shared with `async_vs_tokio.rs` / `unbalanced.rs`:

@@ -237,7 +237,8 @@ fn main() {
     println!("CPU cores        : {ncpus}");
     println!("Documents        : {n_docs}");
     println!(
-        "Size distribution: log-normal (μ={LN_MU}, σ={LN_SIGMA}, clipped [{SIZE_MIN}..{SIZE_MAX}] B)"
+        "Size distribution: log-normal (μ={LN_MU}, σ={LN_SIGMA}, clipped [{SIZE_MIN}..{SIZE_MAX}] \
+         B)"
     );
     println!(
         "  median         : {p50} B  ({:.1} KiB)",
@@ -453,7 +454,8 @@ fn main() {
     println!("    Rayon dedicates all threads to full docs (IO + CPU + IO).");
     println!();
     println!(
-        "  • Tokio's spawn_blocking pool oversubscribes CPU cores (up to 512 threads vs {ncpus} cores),",
+        "  • Tokio's spawn_blocking pool oversubscribes CPU cores (up to 512 threads vs {ncpus} \
+         cores),",
     );
     println!("    adding context-switch overhead vs a fixed-size work-stealing pool.");
     println!("    Its async IO is efficient, but CPU throughput suffers.");

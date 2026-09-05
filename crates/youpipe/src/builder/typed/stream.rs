@@ -1,6 +1,6 @@
+use std::{cell::Cell, marker::PhantomData, num::NonZeroUsize, sync::Arc};
 #[cfg(feature = "tokio-runtime")]
 use std::{future::Future, sync::OnceLock};
-use std::{cell::Cell, marker::PhantomData, num::NonZeroUsize, sync::Arc};
 
 #[cfg(feature = "tokio-runtime")]
 use crate::handoff::{
@@ -371,11 +371,7 @@ fn forward_fenced<M, Tx>(
 {
     // Push one item through the fence, forwarding any released batch.
     // Returns false when the downstream channel is closed.
-    fn fwd<M2, Tx2>(
-        fence: &mut FenceBarrier<(u64, M2)>,
-        fenced_tx: &Tx2,
-        item: (u64, M2),
-    ) -> bool
+    fn fwd<M2, Tx2>(fence: &mut FenceBarrier<(u64, M2)>, fenced_tx: &Tx2, item: (u64, M2)) -> bool
     where
         M2: Send + Unpin + 'static,
         Tx2: SendItem<(u64, M2)>,
@@ -462,22 +458,22 @@ fn forward_fenced<M, Tx>(
 /// # async fn fetch(x: u64) -> u64 { x }
 /// ```
 ///
-    /// # Worker budget semantics (`workers`)
-    ///
-    /// The runner reserves one pool slot for the feeder (a pool job whenever
-    /// `n > buffer`), then treats the rest as the liveness budget: explicit
-    /// `workers` pins are granted first — upstream stage first — clamped to
-    /// what remains with one slot held back per not-yet-spawned sync stage,
-    /// and the remainder is divided equally across unpinned stages. Every
-    /// sync stage keeps ≥ 1 resident worker and the total blocking pool jobs
-    /// never exceed the pool — the "stage 1 fills the pool, stage 2 starves,
-    /// deadlock" failure mode. Pins therefore take effect in pipeline order
-    /// only until the budget runs out; later stages get 1 worker each.
-    ///
-    /// When even 1 worker per sync stage does not fit the pool (or `run()`
-    /// executes on a worker of the same pool), the runner leaves the pool
-    /// alone and spawns dedicated OS threads instead — the request is then
-    /// honored as-is, since threads are not pool-bounded.
+/// # Worker budget semantics (`workers`)
+///
+/// The runner reserves one pool slot for the feeder (a pool job whenever
+/// `n > buffer`), then treats the rest as the liveness budget: explicit
+/// `workers` pins are granted first — upstream stage first — clamped to
+/// what remains with one slot held back per not-yet-spawned sync stage,
+/// and the remainder is divided equally across unpinned stages. Every
+/// sync stage keeps ≥ 1 resident worker and the total blocking pool jobs
+/// never exceed the pool — the "stage 1 fills the pool, stage 2 starves,
+/// deadlock" failure mode. Pins therefore take effect in pipeline order
+/// only until the budget runs out; later stages get 1 worker each.
+///
+/// When even 1 worker per sync stage does not fit the pool (or `run()`
+/// executes on a worker of the same pool), the runner leaves the pool
+/// alone and spawns dedicated OS threads instead — the request is then
+/// honored as-is, since threads are not pool-bounded.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StageOptions {
     pub(crate) workers: Option<NonZeroUsize>,

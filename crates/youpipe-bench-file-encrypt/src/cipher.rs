@@ -2,15 +2,13 @@
 //!
 //! Two selectable via [`Task`] (set by `FC_TASK` in `main`):
 //!
-//! - [`Task::Aes`] — plain AES-256-GCM. Fast (AES-NI), so the CPU stage is
-//!   marginal and the workload is IO/memory bound. This is the original light
-//!   variant.
-//! - [`Task::CompressEncrypt`] — **zstd compress then AES-256-GCM encrypt**.
-//!   This is the real backup-encryption pipeline (restic / borg / age-with-zstd
-//!   all do compress-then-encrypt). zstd at a high level is genuinely CPU-heavy
-//!   and its cost scales with input size — exactly the regime where youpipe's
-//!   read/CPU/write pipelining pays off (the CPU stage has real work to overlap
-//!   with the blocking `fsync` of other files).
+//! - [`Task::Aes`] — plain AES-256-GCM. Fast (AES-NI), so the CPU stage is marginal and the
+//!   workload is IO/memory bound. This is the original light variant.
+//! - [`Task::CompressEncrypt`] — **zstd compress then AES-256-GCM encrypt**. This is the real
+//!   backup-encryption pipeline (restic / borg / age-with-zstd all do compress-then-encrypt). zstd
+//!   at a high level is genuinely CPU-heavy and its cost scales with input size — exactly the
+//!   regime where youpipe's read/CPU/write pipelining pays off (the CPU stage has real work to
+//!   overlap with the blocking `fsync` of other files).
 //!
 //! Wire format of one sealed blob is unchanged for `Aes` (`nonce ‖ ct ‖ tag`,
 //! +28 B, ct == plaintext). For `CompressEncrypt` it is
@@ -77,7 +75,7 @@ impl Cipher {
                 // compressed bytes. `encode_all` owns its allocations.
                 let compressed = zstd::encode_all(plaintext, level).expect("zstd compress");
                 self.aes_seal(&compressed)
-            }
+            },
         }
     }
 

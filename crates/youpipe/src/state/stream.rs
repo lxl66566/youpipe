@@ -134,8 +134,7 @@ pub(crate) async fn drain_ordered_async<R, O>(
     rx: &R,
     expected_items: usize,
     mut sink: impl FnMut(O),
-)
-where
+) where
     R: AsyncRecvItem<(u64, O)>,
     O: Send + 'static,
 {

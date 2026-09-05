@@ -139,9 +139,9 @@ impl AsyncRuntime for TokioPool {
             Ok(v) => v,
             Err(payload) if is_nested_runtime_panic(payload.as_ref()) => {
                 panic!(
-                    "youpipe: run()/for_each() was called inside an async context. The \
-                     streaming terminal drives its collector via block_on, which cannot \
-                     block a thread that is running async tasks. Wrap the pipeline call in \
+                    "youpipe: run()/for_each() was called inside an async context. The streaming \
+                     terminal drives its collector via block_on, which cannot block a thread that \
+                     is running async tasks. Wrap the pipeline call in \
                      tokio::task::spawn_blocking (or run it on a plain sync thread)."
                 )
             },

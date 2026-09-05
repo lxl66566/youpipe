@@ -451,8 +451,11 @@ where
     /// error. Drives the same work-stealing core as
     /// [`crate::TryPipe::try_collect`], minus the `'static` bounds.
     pub fn try_collect(self) -> Result<Vec<O>, E> {
-        let exec =
-            crate::builder::resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
+        let exec = crate::builder::resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
         let pool = exec.as_pool();
         fused_try_collect_scoped(self.items, self.stages, self.config.workload, pool)
     }
@@ -470,8 +473,11 @@ where
     /// top-level `Pipe::collect` — no `'static` bound required. When the
     /// stage chain contains a `Filter`, falls back to per-leaf `Vec` merge.
     pub fn collect(self) -> Vec<O> {
-        let exec =
-            crate::builder::resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
+        let exec = crate::builder::resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
         let pool = exec.as_pool();
         fused_collect_scoped(self.items, self.stages, self.config.workload, pool)
     }
@@ -507,8 +513,11 @@ where
     where
         F: Fn(O) + Sync,
     {
-        let exec =
-            crate::builder::resolve_exec_pool(self.compute_pool.as_ref(), self.oversubscribe, self.config.compute_workers);
+        let exec = crate::builder::resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
         let pool = exec.as_pool();
         fused_for_each_scoped(self.items, self.stages, f, self.config.workload, pool);
     }
