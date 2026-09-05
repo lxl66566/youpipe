@@ -82,3 +82,19 @@ pub use runtime::{AsyncRuntime, DefaultRuntime, NoRuntime};
 pub use scope::{PipelineScope, ScopedPipe, ScopedTryPipe, scope};
 pub use state::{FenceBarrier, FenceMode, ReorderBuffer};
 pub use sync::CancellationToken;
+
+/// Process-wide cache of `std::thread::available_parallelism()`.
+///
+/// On Linux, std re-reads the cgroup CPU-quota files (`/sys/fs/cgroup/...`)
+/// on *every* call — measured ~26 µs of openat/statx/read syscalls per call
+/// on the 32-core Zen bench machine (2026-09, NixOS). `PipelineConfig::default()`
+/// runs per `pipe()`/`pipe_ref()` construction and `resolve_exec_pool` per
+/// fused terminal, so two uncached calls added ~50 µs of fixed cost to every
+/// small fused batch (+60 % wall time at 1K items — regression found while
+/// bisecting the horizontal suite). Affinity/quota changes after the first
+/// call are intentionally not reflected; rayon sizes its global pool once for
+/// the same reason.
+pub(crate) fn num_cpus() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::thread::available_parallelism().map_or(4, std::num::NonZero::get))
+}

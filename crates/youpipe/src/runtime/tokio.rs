@@ -61,14 +61,14 @@ impl TokioPool {
     }
 
     /// Convenience wrapper around [`build`](Self::build) that picks the worker
-    /// count from `available_parallelism()` (clamped to ≥ 4 on failure).
+    /// count from the cached [`available_parallelism`](std::thread::available_parallelism)
+    /// value (see `crate::num_cpus`; clamped to ≥ 4 on failure).
     ///
     /// # Errors
     ///
     /// Returns `io::Error` if the tokio runtime cannot be built.
     pub fn build_default() -> std::io::Result<Self> {
-        let n = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-        Self::build(n)
+        Self::build(crate::num_cpus())
     }
 
     /// The underlying tokio handle. Useful for callers that need direct tokio

@@ -116,7 +116,7 @@ impl Default for PipelineConfig {
     /// for both worker pools, a 256-slot buffer, and 128-way async IO
     /// concurrency.
     fn default() -> Self {
-        let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        let cpus = crate::num_cpus();
         Self {
             compute_workers: cpus,
             compute_workers_pinned: false,

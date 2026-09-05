@@ -304,7 +304,7 @@ static GLOBAL_REGISTRY: OnceLock<Arc<Registry>> = OnceLock::new();
 
 pub(crate) fn global_registry() -> &'static Arc<Registry> {
     GLOBAL_REGISTRY.get_or_init(|| {
-        let cpus = thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        let cpus = crate::num_cpus();
         let registry = Registry::new(cpus);
         registry.wait_until_primed();
         registry

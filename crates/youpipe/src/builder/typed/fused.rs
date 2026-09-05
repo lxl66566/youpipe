@@ -78,7 +78,9 @@ pub(crate) fn resolve_exec_pool(
     }
     // Same fallback as `global_registry` / `PipelineConfig::default` so a
     // default-sized budget compares equal to the global pool's thread count.
-    let ncpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    // Cached: an uncached `available_parallelism()` here cost ~26 µs/call
+    // (cgroup file reads) — visible on every fused terminal (see `num_cpus`).
+    let ncpus = crate::num_cpus();
     if let Some(factor) = oversubscribe {
         // Base = the configured budget (== ncpus when untouched), so
         // `with_compute_workers(n).with_oversubscribe(2)` yields n×2 threads.
