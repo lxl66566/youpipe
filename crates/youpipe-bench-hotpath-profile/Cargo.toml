@@ -13,3 +13,6 @@ publish      = false
 # `HotpathGuard` below share the same global state.
 hotpath = "0.24"
 youpipe = { path = "../youpipe", features = ["hotpath"] }
+
+# Lab bench (publish = false): intentionally not inheriting the workspace lint set.
+[lints]

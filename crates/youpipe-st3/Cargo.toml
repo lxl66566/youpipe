@@ -20,7 +20,6 @@ edition      = "2021"
 rust-version = "1.85"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/asynchronics/st3"
-readme       = "README.md"
 description  = """
 A very fast lock-free, bounded, work-stealing LIFO queue (youpipe fork).
 """

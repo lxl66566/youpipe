@@ -93,8 +93,8 @@ impl SleepMask {
         }
         let mut woken = 0u32;
         'outer: while woken < target {
-            for w in 0..self.n_words {
-                let mut bits = self.words[w].load(Ordering::Acquire);
+            for (w, word) in self.words.iter().take(self.n_words).enumerate() {
+                let mut bits = word.load(Ordering::Acquire);
                 while bits != 0 {
                     let bit_pos = bits.trailing_zeros() as usize;
                     bits &= !(1u64 << bit_pos);

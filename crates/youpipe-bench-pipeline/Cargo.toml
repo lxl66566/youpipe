@@ -10,3 +10,6 @@ publish      = false
 rayon   = "1"
 tokio   = { version = "1", features = ["rt-multi-thread", "time"] }
 youpipe = { path = "../youpipe", default-features = true }
+
+# Lab bench (publish = false): intentionally not inheriting the workspace lint set.
+[lints]

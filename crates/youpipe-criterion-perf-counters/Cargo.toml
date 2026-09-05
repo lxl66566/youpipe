@@ -26,7 +26,6 @@ edition      = "2021"
 rust-version = "1.85"
 authors      = ["Jens Breitbart <jbreitbart@gmail.com>"]
 description  = "Criterion.rs measurement plugin for Linux perf events: process-wide per-thread hardware counters (instructions, cycles, cache misses, ...) as a drop-in alternative to wall-clock time"
-readme       = "README.md"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/lxl66566/youpipe"
 keywords     = ["benchmark", "criterion", "linux", "perf", "profiling"]
@@ -38,3 +37,7 @@ name = "criterion_perf_counters"
 [dependencies]
 criterion = "0.8"
 perfcnt   = "0.8"
+
+# Fork: sources stay diffable with upstream (no inline allow-churn), so the
+# workspace's pedantic lint set is deliberately not inherited here.
+[lints]

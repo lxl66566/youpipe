@@ -4,7 +4,6 @@ version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 description            = "High-performance data-first pipelines with fused CPU stages and streaming async IO"
-readme                 = "README.md"
 repository.workspace   = true
 license.workspace      = true
 keywords               = ["concurrency", "map-reduce", "parallel", "pipeline", "work-stealing"]

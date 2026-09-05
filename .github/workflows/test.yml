@@ -23,7 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo nextest run --all-features --no-tests pass && cargo test --doc && cargo check --examples
       - run: cargo check --no-default-features --examples
-      - run: cargo clippy --all-features -- -D warnings
+      - run: cargo clippy --all-features --all-targets -- -D warnings
 
   miri:
     name: cargo miri test

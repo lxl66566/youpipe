@@ -216,7 +216,9 @@ mod tests {
         let mut buf = ReorderBuffer::<i32>::new(16);
         let mut out = Vec::new();
         for i in 0..10u64 {
-            buf.insert_into(i, i32::try_from(i * 10).unwrap(), &mut |item| out.push(item));
+            buf.insert_into(i, i32::try_from(i * 10).unwrap(), &mut |item| {
+                out.push(item);
+            });
         }
         assert_eq!(out, (0..10).map(|i| i * 10).collect::<Vec<_>>());
         assert!(buf.is_empty());

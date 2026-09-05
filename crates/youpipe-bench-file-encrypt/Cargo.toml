@@ -16,3 +16,6 @@ zstd      = "0.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+# Lab bench (publish = false): intentionally not inheriting the workspace lint set.
+[lints]
