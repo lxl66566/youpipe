@@ -369,10 +369,6 @@ fn forward_fenced<M, Tx>(
     M: Send + Unpin + 'static,
     Tx: SendItem<(u64, M)>,
 {
-    let mut fence = match mode {
-        FenceMode::Barrier => FenceBarrier::with_capacity(mode, expected),
-        FenceMode::Chunked(_) => FenceBarrier::new(mode),
-    };
     // Push one item through the fence, forwarding any released batch.
     // Returns false when the downstream channel is closed.
     fn fwd<M2, Tx2>(
@@ -397,6 +393,10 @@ fn forward_fenced<M, Tx>(
         }
         true
     }
+    let mut fence = match mode {
+        FenceMode::Barrier => FenceBarrier::with_capacity(mode, expected),
+        FenceMode::Chunked(_) => FenceBarrier::new(mode),
+    };
     'outer: loop {
         // Anchor + burst-drain (same shape as the stage workers): the
         // forwarder is the sole consumer, but draining the mid channel while
