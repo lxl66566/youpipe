@@ -63,9 +63,9 @@ Cross-library comparison against rayon, tokio, `futures::stream`, and
 hand-written `std::thread` pipelines over seven workloads (balanced/skewed
 CPU, async/blocking IO, mixed sync+async, and two realistic three-stage
 pipelines, including HTTP over a loopback mock server): youpipe leads the
-mid-size CPU range (−23 % vs rayon @ 100K), wins skewed workloads with
-`Workload::Unbalanced`, and beats hand-written tokio channel plumbing by up
-to 23 % on realistic sync+async pipelines. 32-core AMD (Zen) Linux, 31 pinned
+entire measured CPU range (−76 % vs rayon @ 1K, −57 % @ 100K, tie @ 1M),
+wins skewed workloads with `Workload::Unbalanced`, and beats hand-written
+tokio channel plumbing by up to 23 % on realistic sync+async pipelines. 32-core AMD (Zen) Linux, 31 pinned
 cores, 5 interleaved rounds (median). Simulated IO is pure sleeps — nothing
 touches the disk. Methodology and full data:
 [Benchmarks and methodology](https://lxl66566.github.io/youpipe/dev/benchmarks.html).

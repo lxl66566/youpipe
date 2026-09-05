@@ -108,6 +108,13 @@ wake latency is skewed; `num_threads` fine-grained chunks are precisely the
 load-balancing unit that hides that skew (late-waking workers pick up
 remaining chunks instead of gating the batch with their wake latency).
 Fewer, meatier chunks hand the batch's tail to whichever workers wake last.
+
+(2026-09-05 postscript: the hypothesis's premise was later disproved — the
+1 K fixed cost was dominated by two uncached, cgroup-reading
+`available_parallelism()` calls per terminal (~50 µs), not the wake
+cascade. The experiment's verdict stands on its own interleaved A/B, but
+"wake cascade dominates small-batch fixed cost" is no longer the right
+mental model; see dev/benchmarks.md "CPU-Heavy `pipe_ref()` vs rayon".)
 The remaining wall-time floor at tiny batches is worker wake latency, whose
 backoff constants are already A/B-tuned (see `sleep.rs` — widening the spin
 or yield windows was measured as a global regression in 2026-06).

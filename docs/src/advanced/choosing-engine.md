@@ -30,8 +30,9 @@ covered in the [developer guide](../dev/design.md).
 ## When youpipe is the wrong tool
 
 **Total work below ~10 µs, or ~100 ns per item.** Fixed dispatch overhead
-(~20–30 µs per run on a 32-core machine) exceeds the parallel gain. Use a
-sequential `iter().map().collect()`.
+(a few µs per run on a 32-core machine; it was ~50 µs before the
+`available_parallelism` result was cached process-wide) exceeds the parallel
+gain. Use a sequential `iter().map().collect()`.
 
 **Pure async IO with no CPU stages.** If the chain is only `.await`-based IO
 and you need nothing beyond the futures themselves, raw tokio or
@@ -51,10 +52,10 @@ back-to-back and CPU stays isolated from IO (same benchmark harness):
 
 | Scenario | youpipe | Best alternative |
 | --- | --- | --- |
-| Mixed sync CPU + async IO, 2K items | 10.8 ms | tokio hand-written 13.5 ms |
-| Realistic 3-stage doc pipeline, 4K docs | 14.2 ms | tokio hand-written 18.4 ms (rayon 137) |
-| Realistic HTTP pipeline, 2K requests | 23.0 ms | tokio 27.5 ms, futures 29.4 ms |
+| Mixed sync CPU + async IO, 2K items | 10.7 ms | tokio hand-written 13.4 ms |
+| Realistic 3-stage doc pipeline, 4K docs | 13.9 ms | tokio hand-written 17.2 ms (rayon 137) |
+| Realistic HTTP pipeline, 2K requests | 23.0 ms | tokio 27.9 ms, futures 30.4 ms |
 
-Balanced CPU: youpipe wins 10K–100K items (−23 % vs rayon at 100K); rayon
-wins at 1K (fixed setup) and 1M (bandwidth-bound, inline fork-join). Full
+Balanced CPU: youpipe wins 1K–100K items (−57 % vs rayon at 100K) and ties
+at 1M (bandwidth-bound). Full
 data and methodology: [benchmarks](../dev/benchmarks.md).
