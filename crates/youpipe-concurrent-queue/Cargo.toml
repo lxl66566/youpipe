@@ -64,10 +64,10 @@ wasm-bindgen-test = "0.3"
 default = ["std"]
 std     = ["crossbeam-utils/std"]
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
-
 [lints.clippy]
 # Upstream's private `unsafe fn destroy` helpers carry no `# Safety` docs;
 # kept as-is to stay diffable against upstream.
 missing_safety_doc = "allow"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

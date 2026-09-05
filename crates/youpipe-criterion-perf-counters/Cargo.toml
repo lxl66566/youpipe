@@ -29,7 +29,7 @@ description  = "Criterion.rs measurement plugin for Linux perf events: process-w
 readme       = "README.md"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/lxl66566/youpipe"
-keywords     = ["benchmark", "criterion", "perf", "profiling", "linux"]
+keywords     = ["benchmark", "criterion", "linux", "perf", "profiling"]
 categories   = ["development-tools::profiling", "os::linux-apis"]
 
 [lib]

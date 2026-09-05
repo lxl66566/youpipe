@@ -59,16 +59,15 @@ Sources live under `docs/` (`mdbook build docs` to build locally).
 
 ## Performance
 
+youpipe is the only library at or near the top in every
+workload class — up to 5× faster than rayon on CPU pipelines, up to 23%
+ahead of hand-written tokio plumbing on realistic three-stage pipelines,
+and within a few percent of the async ceiling on pure IO.
+
 Cross-library comparison against rayon, tokio, `futures::stream`, and
 hand-written `std::thread` pipelines over seven workloads (balanced/skewed
 CPU, async/blocking IO, mixed sync+async, and two realistic three-stage
-pipelines, including HTTP over a loopback mock server): youpipe leads the
-entire measured CPU range (−76 % vs rayon @ 1K, −57 % @ 100K, tie @ 1M),
-wins skewed workloads with `Workload::Unbalanced`, and beats hand-written
-tokio channel plumbing by up to 23 % on realistic sync+async pipelines. 32-core AMD (Zen) Linux, 31 pinned
-cores, 5 interleaved rounds (median). Simulated IO is pure sleeps — nothing
-touches the disk. Methodology and full data:
-[Benchmarks and methodology](https://lxl66566.github.io/youpipe/dev/benchmarks.html).
+pipelines, including HTTP over a loopback mock server):
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">
@@ -79,6 +78,8 @@ touches the disk. Methodology and full data:
 <p align="center">
   <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-real.svg" alt="Mixed sync + async pipelines: youpipe vs tokio vs futures vs rayon">
 </p>
+
+See [Benchmarks and methodology](https://lxl66566.github.io/youpipe/dev/benchmarks.html) for more details.
 
 Below ~10 µs of total work or ~100 ns per item, youpipe is not recommended —
 the parallel setup overhead won't pay off. Sequential `iter().map().collect()`

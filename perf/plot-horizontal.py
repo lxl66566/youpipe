@@ -9,8 +9,18 @@ SVG charts for the README.
 Throughput (items per second), higher is better — the inverse of the wall
 time the harness measures, but with an intuitive direction and explicit
 units per panel. Bar panels draw min–max whiskers across the interleaved
-rounds; line panels stay whisker-free (min–max would clutter overlapping
-polylines — the min–max spread lives in perf/horizontal/results.json).
+rounds.
+
+Panels whose values span decades across the batch sweep (cpu_balanced:
+1.8 → 2070 M items/s) are plotted relative to a baseline lib (× rayon) on a
+linear axis instead. Lesson: a log-y line chart made the 4–5× youpipe-vs-
+rayon gaps read as near-parity (log compresses ratios into small offsets
+and every polyline converges at the large-n end), while absolute linear
+bars degenerated into invisible nubs for the small-n groups. Ratios per
+group keep every gap readable as a bar-length ratio, and the baseline's
+absolute throughput rides as a second line under each batch-size tick —
+any bar's absolute value is ratio × that number (absolute values also
+stay in the sibling panels and results.json).
 
 Usage:
     uv run perf/plot-horizontal.py [results.json] [outdir]
@@ -22,14 +32,13 @@ from __future__ import annotations
 
 import json
 import sys
-from math import log10
 from pathlib import Path
 
 import matplotlib as mpl
 
 mpl.use("svg")
-import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.ticker import FuncFormatter, FixedLocator  # noqa: E402
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FixedLocator, FuncFormatter
 
 # ── presentation config ──────────────────────────────────────────────────
 
@@ -94,6 +103,18 @@ def fmt_val(v: float) -> str:
     return f"{v:.2g}"
 
 
+def fmt_ratio(v: float) -> str:
+    return f"{v:.2g}×" if v < 10 else f"{v:.0f}×"  # 4.1× · 0.97× · 1×
+
+
+def fmt_tp(v: float) -> str:
+    """Compact absolute items/s: 1.8M/s · 159M/s · 2.07G/s."""
+    for div, suf in ((1e9, "G"), (1e6, "M"), (1e3, "K")):
+        if v >= div:
+            return f"{v / div:.3g}{suf}/s"
+    return f"{v:.3g}/s"
+
+
 def fmt_n(n: int) -> str:
     if n >= 1_000_000:
         return f"{n // 1_000_000}M"
@@ -109,23 +130,20 @@ def _header(ax, title: str, note: str) -> None:
             color=MUTED, va="bottom")
 
 
-def _decorate(ax, unit: str, logy: bool = False) -> None:
+def _decorate(ax, unit: str) -> None:
     ax.set_ylabel(unit, fontsize=8.6)
     ax.yaxis.grid(True, color=GRID, lw=0.8)
     ax.set_axisbelow(True)
     ax.spines[["top", "right"]].set_visible(False)
-    fmt = FuncFormatter(lambda v, _: fmt_val(v))
-    ax.yaxis.set_major_formatter(fmt)
-    if logy:
-        ax.yaxis.set_minor_locator(FixedLocator([]))  # log minor ticks unlabeled
-    else:
-        ax.yaxis.set_minor_locator(FixedLocator([]))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: fmt_val(v)))
+    ax.yaxis.set_minor_locator(FixedLocator([]))
 
 
-def _legend(ax, ncols: int) -> None:
-    # -0.16 keeps the row clear of the "batch size" xlabel (constrained
-    # layout reserves the extra room by shrinking the axes).
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncols=ncols,
+def _legend(ax, ncols: int, drop: float = 0.16) -> None:
+    # `drop` must sit the row clear of the "batch size" xlabel and, on
+    # ratio panels, the second tick line (constrained layout reserves the
+    # extra room by shrinking the axes).
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -drop), ncols=ncols,
               frameon=False, fontsize=8.2, handlelength=1.3,
               columnspacing=1.1, handletextpad=0.45, borderaxespad=0)
 
@@ -138,64 +156,26 @@ def _throughputs(data: dict, sc: str, lib: str, n: int, scale: float) -> tuple[f
     return mid, ordered[0], ordered[-1]
 
 
-def line_panel(ax, data: dict, sc: str, title: str, note: str,
-               unit: str, scale: float) -> None:
-    """One polyline per library; log-y throughput over the batch sweep."""
-    libs = lib_order(data, sc)
-    sizes = sizes_of(data, sc)
-    xs = range(len(sizes))
-    _header(ax, title, note)
-
-    top = 0.0
-    bottom = float("inf")
-    meds_by_lib: dict[str, list[float]] = {}
-    for li, lib in enumerate(libs):
-        meds, los, his = [], [], []
-        for n in sizes:
-            med, lo, hi = _throughputs(data, sc, lib, n, scale)
-            meds.append(med)
-            los.append(lo)
-            his.append(hi)
-        meds_by_lib[lib] = meds
-        color = LIB_STYLE.get(lib, {"color": "#888"})["color"]
-        ax.plot(xs, meds, color=color, lw=2.0, marker="o", ms=4.2,
-                label=lib, zorder=3)
-        top = max(top, *his)
-        bottom = min(bottom, *los)
-
-    # Value labels on the top layer (above every line and marker). Within one
-    # x column, labels stack bottom-up in ascending value order with
-    # collision-aware clearance (log10 units): each label sits just above its
-    # own marker unless that would overlap the label below it, so
-    # far-apart polylines keep their labels anchored while coinciding ones
-    # (youpipe vs rayon) get pushed apart instead of overprinting.
-    LABEL_GAP = 0.05   # clearance between a marker and its label bottom
-    LABEL_STEP = 0.08  # vertical room per label (font height + small gap)
-    for xi in xs:
-        floor = 0.0
-        for med, lib in sorted((meds_by_lib[lib][xi], lib) for lib in libs):
-            y = max(log10(med) + LABEL_GAP, floor)
-            ax.annotate(fmt_val(med), (xi, 10.0**y), ha="center", va="bottom",
-                        fontsize=7.2, color=INK, zorder=6)
-            floor = y + LABEL_STEP
-
-    ax.set_yscale("log")
-    ax.set_ylim(bottom * 0.55, 10.0 ** (log10(top) + 0.4))  # label headroom
-    ax.set_xlim(-0.5, len(sizes) - 0.5)
-    ax.set_xticks(list(xs), [fmt_n(n) for n in sizes])
-    ax.set_xlabel("batch size", fontsize=8.0, color=MUTED)
-    _decorate(ax, unit, logy=True)
-    _legend(ax, len(libs))
-
-
 def bar_panel(ax, data: dict, sc: str, title: str, note: str,
-              unit: str, scale: float) -> None:
-    """Grouped bars per batch size; value label above every bar."""
+              unit: str, scale: float, baseline: str | None = None) -> None:
+    """Grouped bars per batch size; value label above every bar.
+
+    With `baseline`, bars and whiskers are divided by that lib's median per
+    group and labels print as ratios (the baseline itself pins every group
+    at 1×). The baseline's absolute throughput rides as a second line under
+    each batch-size tick, turning any ratio back into an absolute value
+    (ratio × that number). It must not go above the baseline's own bar: at
+    near-parity groups the neighboring ratio labels sit at the same height
+    and wide absolute labels collide with them.
+    """
     libs = lib_order(data, sc)
     sizes = sizes_of(data, sc)
     xs = [i * (len(libs) * 0.9 + 0.6) for i in range(len(sizes))]
     bw = 0.82
     _header(ax, title, note)
+
+    base_med = ({n: _throughputs(data, sc, baseline, n, scale)[0]
+                 for n in sizes} if baseline else None)
 
     top = 0.0
     for i, lib in enumerate(libs):
@@ -203,6 +183,8 @@ def bar_panel(ax, data: dict, sc: str, title: str, note: str,
         meds, los, his, offs = [], [], [], []
         for gi, n in enumerate(sizes):
             med, lo, hi = _throughputs(data, sc, lib, n, scale)
+            if base_med is not None:
+                med, lo, hi = (v / base_med[n] for v in (med, lo, hi))
             meds.append(med)
             los.append(lo)
             his.append(hi)
@@ -212,44 +194,52 @@ def bar_panel(ax, data: dict, sc: str, title: str, note: str,
                 [h - m for m, h in zip(meds, his)]]
         ax.errorbar(offs, meds, yerr=yerr, fmt="none", ecolor=ERR,
                     elinewidth=1.0, capsize=2, zorder=4)
+        fmt_label = fmt_ratio if base_med is not None else fmt_val
         for x, m, h in zip(offs, meds, his):
-            ax.text(x, h, fmt_val(m), ha="center", va="bottom",
+            ax.text(x, h, fmt_label(m), ha="center", va="bottom",
                     fontsize=7.4, color=INK, zorder=6)
         top = max(top, *his)
 
     ax.set_ylim(0, top * 1.16)
-    ax.set_xticks(xs, [fmt_n(n) for n in sizes])
+    ticks = [fmt_n(n) for n in sizes]
+    if base_med is not None:
+        # base_med carries the panel scale; /scale recovers items/s.
+        ticks = [f"{t}\n({fmt_tp(base_med[n] / scale)})"
+                 for t, n in zip(ticks, sizes)]
+    ax.set_xticks(xs, ticks)
     ax.set_xlabel("batch size", fontsize=8.0, color=MUTED)
     _decorate(ax, unit)
-    _legend(ax, len(libs))
+    _legend(ax, len(libs), 0.20 if base_med is not None else 0.16)
 
 # ── chart definitions ────────────────────────────────────────────────────
-# (file, figure title, [(kind, scenario, panel title, note, unit, scale)])
+# (file, figure title, [(kind, scenario, panel title, note, unit, scale,
+#                        baseline)])
 
 CHART_DEFS = [
     ("bench-cpu.svg", "CPU pipelines", 9.7, [
-        ("line", "cpu_balanced", "Balanced CPU map",
-         "uniform cost · ~100 ns per item", "M items/s", 1e-6),
+        ("bar", "cpu_balanced", "Balanced CPU map",
+         "uniform cost · ~100 ns per item · lower tick row: (rayon items/s)",
+         "× rayon", 1.0, "rayon"),
         ("bar", "cpu_unbalanced", "Skewed CPU map",
-         "10% of items cost 1000×", "M items/s", 1e-6),
+         "10% of items cost 1000×", "M items/s", 1e-6, None),
     ]),
     ("bench-io.svg", "IO pipelines", 9.7, [
         ("bar", "io_async", "Async IO",
-         "sleep 1 ms + 8 ms tail · 512 in flight", "K items/s", 1e-3),
+         "sleep 1 ms + 8 ms tail · 512 in flight", "K items/s", 1e-3, None),
         ("bar", "io_blocking", "Blocking IO",
-         "thread-sleeping waits · 1 ms + 8 ms tail", "K items/s", 1e-3),
+         "thread-sleeping waits · 1 ms + 8 ms tail", "K items/s", 1e-3, None),
     ]),
     ("bench-real.svg", "Realistic mixed sync + async pipelines", 11.0, [
         ("bar", "mixed_cpu_io", "Mixed CPU + async IO",
-         "CPU stage → async IO stage", "K items/s", 1e-3),
+         "CPU stage → async IO stage", "K items/s", 1e-3, None),
         ("bar", "real_doc", "Document pipeline",
-         "fetch → parse → save · log-normal sizes", "K docs/s", 1e-3),
+         "fetch → parse → save · log-normal sizes", "K docs/s", 1e-3, None),
         ("bar", "real_web", "Web pipeline",
-         "HTTP GET → parse → sum · loopback server", "K req/s", 1e-3),
+         "HTTP GET → parse → sum · loopback server", "K req/s", 1e-3, None),
     ]),
 ]
 
-PANEL_KIND = {"line": line_panel, "bar": bar_panel}
+PANEL_KIND = {"bar": bar_panel}
 
 
 def main() -> None:
@@ -270,8 +260,8 @@ def main() -> None:
         fig, axs = plt.subplots(1, len(panels), figsize=(fig_w, 4.15),
                                 layout="constrained")
         axs = axs if len(panels) > 1 else [axs]
-        for ax, (kind, sc, ptitle, note, unit, scale) in zip(axs, panels):
-            PANEL_KIND[kind](ax, data, sc, ptitle, note, unit, scale)
+        for ax, (kind, sc, ptitle, note, unit, scale, baseline) in zip(axs, panels):
+            PANEL_KIND[kind](ax, data, sc, ptitle, note, unit, scale, baseline)
         fig.suptitle(f"{ftitle} — throughput, higher is better",
                      fontsize=12.0, fontweight="bold")
         fig.supxlabel(sub, fontsize=7.6, color=MUTED)

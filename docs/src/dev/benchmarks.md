@@ -401,7 +401,12 @@ uv run perf/plot-horizontal.py                     # results.json → docs/src/a
 ### Charts
 
 Throughput, higher is better; bar-chart whiskers span the five interleaved
-rounds.
+rounds. The balanced-CPU panel is drawn as × rayon on a linear axis: its
+absolute values span three decades across the batch sweep (1.8 → 2070
+M items/s), and on the previous log-scale line chart the 4–5× youpipe
+advantage read as near-parity. Rayon's absolute throughput at each batch
+size rides as a second line under the batch-size tick labels, so any
+bar's absolute value is ratio × that number.
 
 ![CPU pipelines: youpipe vs rayon vs hand-written std threads](../assets/bench-cpu.svg)
 

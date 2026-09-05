@@ -36,6 +36,6 @@ youpipe = { path = "../youpipe", default-features = false }
 
 [dev-dependencies]
 criterion               = "0.8"
-rayon                   = "1"
 criterion-perf-counters = { package = "youpipe-criterion-perf-counters", path = "../youpipe-criterion-perf-counters" }
 perfcnt                 = "0.8"
+rayon                   = "1"

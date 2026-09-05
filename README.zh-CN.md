@@ -37,16 +37,16 @@ let r: Vec<u64> = (0..1000).stream()
     .run();
 ```
 
-按负载选择引擎与调优旋钮——见[选择合适的引擎](https://lxl66566.github.io/youpipe/advanced/choosing-engine.html)。
+可按负载类型进行调优——见[选择合适的引擎](https://lxl66566.github.io/youpipe/advanced/choosing-engine.html)。
 
 ## 文档
 
-完整手册见 **[lxl66566.github.io/youpipe](https://lxl66566.github.io/youpipe/)**：
+详见 **[Github Pages](https://lxl66566.github.io/youpipe/)**：
 
 - [用户指南](https://lxl66566.github.io/youpipe/guide/getting-started.html) ——
   融合、流式、借用与 fallible pipeline
 - [性能调优](https://lxl66566.github.io/youpipe/advanced/choosing-engine.html) ——
-  引擎选择、workload 提示、线程池、逐阶段旋钮
+  引擎选择、workload 提示、线程池、逐阶段可调参数
 - [Benchmark 与方法论](https://lxl66566.github.io/youpipe/dev/benchmarks.html) ——
   横向库对比及其测量方法
 - [开发者指南](https://lxl66566.github.io/youpipe/dev/design.html) ——
@@ -56,14 +56,13 @@ let r: Vec<u64> = (0..1000).stream()
 
 ## 性能
 
-横向库对比（youpipe vs rayon vs tokio vs `futures::stream` vs 手写
+youpipe 在所有负载类别下都稳居第一梯队——CPU
+pipeline 上最高比 rayon 快 5×，真实三阶段 pipeline 领先手写 tokio channel
+代码最高 23%，纯异步 IO 距 futures 异步天花板仅差几个百分点。
+
+横向对比（youpipe vs rayon vs tokio vs `futures::stream` vs 手写
 `std::thread` pipeline），覆盖七类负载（均衡/倾斜 CPU、异步/阻塞 IO、混合
 sync+async，以及两个真实的三阶段 pipeline，含本地 mock server 上的 HTTP）：
-youpipe 在中等规模 CPU 区间领先（100K 时比 rayon 快 23%），倾斜负载靠
-`Workload::Unbalanced` 胜出，真实 sync+async pipeline 上比手写 tokio channel
-链最多快 23%。32 核 AMD (Zen) Linux，固定 31 核，5 个交叠轮次取中位数。
-模拟 IO 全部为 sleep，不碰磁盘。方法论与完整数据见
-[Benchmark 与方法论](https://lxl66566.github.io/youpipe/dev/benchmarks.html)。
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">
@@ -74,6 +73,8 @@ youpipe 在中等规模 CPU 区间领先（100K 时比 rayon 快 23%），倾斜
 <p align="center">
   <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-real.svg" alt="Mixed sync + async pipelines: youpipe vs tokio vs futures vs rayon">
 </p>
+
+详情见 [Benchmark 方法](https://lxl66566.github.io/youpipe/dev/benchmarks.html)。
 
 总工作量低于 ~10 µs 或单操作低于 ~100 ns 时，不建议使用 youpipe，并行设置
 开销无法收回成本。此时使用顺序 `iter().map().collect()` 更快。

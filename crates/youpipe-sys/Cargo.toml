@@ -1,14 +1,14 @@
 [package]
-name         = "youpipe-sys"
-version.workspace = true
-edition.workspace = true
+name                   = "youpipe-sys"
+version.workspace      = true
+edition.workspace      = true
 rust-version.workspace = true
-description  = "Miri/loom-transparent synchronization primitives and cache padding for youpipe"
-readme       = "README.md"
-repository.workspace = true
-license.workspace = true
-keywords     = ["concurrency", "loom", "miri", "cache-padding"]
-categories   = ["concurrency"]
+description            = "Miri/loom-transparent synchronization primitives and cache padding for youpipe"
+readme                 = "README.md"
+repository.workspace   = true
+license.workspace      = true
+keywords               = ["cache-padding", "concurrency", "loom", "miri"]
+categories             = ["concurrency"]
 
 [dependencies]
 parking_lot = "0.12"
