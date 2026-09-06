@@ -119,6 +119,66 @@ The remaining wall-time floor at tiny batches is worker wake latency, whose
 backoff constants are already A/B-tuned (see `sleep.rs` — widening the spin
 or yield windows was measured as a global regression in 2026-06).
 
+#### Flat top-level dispatch (tried, rejected)
+
+Hypothesis (2026-09): on expensive-item unbalanced batches (zstd-style
+compression of many differently-sized files, µs–ms per item), youpipe
+trailed rayon by 8–17 % because the hybrid dispatcher injects a fixed set
+of top-level chunks whose `oversplit` leaves hide inside each owner's
+fork/join tree, consumed LIFO — once a worker parks between back-to-back
+batches it wakes to a drained injector and self-consumed trees,
+contributing zero items for that batch. Instrumentation (per-thread
+first/last-item timestamps + engine-side ring-buffer trace) confirmed 1–6
+such workers per iteration on a 31-thread pool; a never-park control
+(`ROUNDS_UNTIL_SLEEPY += 100_000`) flipped every scenario to a win,
+proving the gap is park/wake handoff, not stealing throughput.
+
+Two changes were built on that diagnosis:
+
+- `TopChunking::FlatLeaves`: for `Unbalanced`/`Custom` batches with
+  `n ≥ num_threads × oversplit`, spend the whole split budget at the top
+  level — every leaf becomes a single-leaf chunk injected flat into the
+  FIFO injector, so late arrivals always find work and heavy items surface
+  in FIFO order instead of hiding behind an owner's sequential prefix.
+- Activity-gated park delay (`Sleep::note_flat_batch`): within 2 ms of a
+  flat-batch completion, idle workers restart their backoff ramp instead
+  of parking — a bounded never-park.
+
+**Rejected by measurement**, on both ends:
+
+- The criterion `unbalanced` family (n=5000, ns-scale items) regressed
+  **+164…+194 %** (3 interleaved A/B rounds, stable) — attributed almost
+  entirely to the flat layout itself (disabling the park delay moved it
+  <2 %): ~256 single-leaf chunks means one contended injector pop per
+  leaf, which exceeds the whole batch's runtime when items are cheap.
+  The dispatch site cannot see per-item cost (`Workload::Unbalanced`
+  carries no such information), and `n` cannot gate the two regimes apart
+  — the zstd repro (n=2000/8000, µs-scale items) and criterion (n=5000,
+  ns-scale) overlap in batch size.
+- On the target regime itself (independent 5-round interleaved repro,
+  lognormal sizes × ~3 ns/byte vs same-round rayon) the flat layout's net
+  effect was ~0.5 % with half the scenarios regressing (capped shapes:
+  +7.2 → +9.9 %); the park delay recovered ~10 % on uniform-cost batches
+  but cost 5–6 % on every straggler shape (idle workers restart
+  spin/steal scans while the tail runs — the 2026-06 "wider spin window"
+  lesson in miniature), plus unbounded idle burn while batches repeat.
+- Variants also rejected without reaching A/B: flat-2 (62 chunks × 2-level
+  trees) hid monster items back inside sequential prefixes — the original
+  problem; a passive driver was ±1 %.
+
+What survives: the `zstd_shape` criterion group (`benches/unbalanced.rs`),
+which reproduces the expensive-item regime with runtime iteration counts
+(LLVM cannot fold them — see dev/benchmarks.md "runtime iteration counts")
+and matches the standalone repro's baseline deltas exactly (heavy-tail
++13 %, capped +7 %, uniform +14 % vs rayon). Any future attempt should
+start from the structural difference the never-park control exposed:
+rayon's root job splits *on demand* (a stolen-from job re-splits, so the
+work supply never exhausts and no park/wake handoff gates the batch),
+whereas youpipe decides the entire tree at inject time. An execute-time
+split-back (worker pops a chunk, splits off the back half to the injector,
+runs the front) would preserve the work supply without the per-leaf pop
+storm — unexplored.
+
 ### Graceful Shutdown
 
 `ComputePool::Drop` calls `Registry::terminate()`, which decrements a ref-count

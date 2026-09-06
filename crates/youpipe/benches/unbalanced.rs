@@ -571,6 +571,88 @@ fn bench_fused_oversubscribe(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Zstd-shaped expensive-item benchmarks ──
+//
+// Reproduces the "compress many differently-sized files" regime that the
+// cheap-item groups above cannot see: per-item cost of µs~ms spread over a
+// lognormal size distribution (~3 ns/byte, zstd magnitude), runtime iters so
+// LLVM cannot fold the work. This family is the acceptance gate for any
+// future scheduler change that claims to close the rayon gap on expensive
+// unbalanced batches (see docs/src/dev/scheduler.md "flat top-level
+// dispatch" for the 2026-09 experiment this was distilled from).
+//
+// Deterministic Box-Muller over a fixed-seed LCG — same construction as the
+// /tmp repro used during the experiment, so historical numbers remain
+// comparable.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn generate_lognormal_tasks(n: usize, sigma: f64, cap_bytes: f64) -> Vec<(u64, u32)> {
+    const ITERS_PER_BYTE: usize = 32;
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next_f64 = || {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    (0..n)
+        .map(|i| {
+            let (u1, u2) = (next_f64().max(1e-12), next_f64());
+            let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+            let size = (9.0 + sigma * z).exp().clamp(256.0, cap_bytes) as usize;
+            (i as u64, (size * ITERS_PER_BYTE) as u32)
+        })
+        .collect()
+}
+
+fn bench_zstd_shape(c: &mut Criterion) {
+    let mut group = c.benchmark_group("zstd_shape");
+    // heavy-tail: max item exceeds a worker's fair share (straggler regime);
+    // capped: everything far below fair share (pure throughput regime);
+    // uniform: sigma=0, every item ~25 µs (park/wake-handoff regime).
+    for (shape, sigma, cap) in [
+        ("heavy_tail", 1.5, 2.0 * 1024.0 * 1024.0),
+        ("capped", 1.5, 256.0 * 1024.0),
+        ("uniform", 0.0, 2.0 * 1024.0 * 1024.0),
+    ] {
+        let tasks = generate_lognormal_tasks(2000, sigma, cap);
+
+        group.throughput(Throughput::Elements(tasks.len() as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("youpipe_unbalanced", shape),
+            &tasks,
+            |b, tasks| {
+                b.iter(|| {
+                    let r = pipe_ref(tasks)
+                        .with_workload(Workload::Unbalanced)
+                        .map(|&(x, iters)| bb(cpu_work_variable(x, iters)))
+                        .collect();
+                    bb(r)
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("rayon_par_iter", shape),
+            &tasks,
+            |b, tasks| {
+                b.iter(|| {
+                    let r: Vec<u64> = tasks
+                        .par_iter()
+                        .map(|&(x, iters)| bb(cpu_work_variable(x, iters)))
+                        .collect();
+                    bb(r)
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = common::criterion();
@@ -580,6 +662,7 @@ criterion_group! {
         bench_cpu_unbalanced_stream,
         bench_io_unbalanced,
         bench_mixed_unbalanced,
-        bench_fused_oversubscribe
+        bench_fused_oversubscribe,
+        bench_zstd_shape
 }
 criterion_main!(benches);
