@@ -537,13 +537,15 @@ fn build_scenarios() -> Vec<Scenario> {
     ]
 }
 
-/// S1: balanced CPU-heavy map (100 iters/item ≈ 100 ns). The canonical
-/// parallel-map workload; the batch sweep shows how fixed scheduling overhead
-/// amortizes with data volume. Borrowed input on every side (`pipe_ref` /
-/// `par_iter` / chunked borrows): each library's idiomatic call over the same
-/// warm slice.
+/// S1: balanced CPU-heavy map (100 iters/item — the constant count lets LLVM
+/// fold the loop to its closed form, ~6 ns/item; see
+/// docs/src/dev/benchmarks.md "LLVM folds constant-iteration CPU work"). The
+/// canonical parallel-map workload; the batch sweep shows how fixed
+/// scheduling overhead amortizes with data volume. Borrowed input on every
+/// side (`pipe_ref` / `par_iter` / chunked borrows): each library's
+/// idiomatic call over the same warm slice.
 fn cpu_balanced() -> Scenario {
-    let batches = [1_000usize, 10_000, 100_000, 1_000_000]
+    let batches = [1_000usize, 10_000, 100_000, 1_000_000, 2_000_000, 4_000_000]
         .into_iter()
         .map(|n| {
             let data: Vec<u64> = (0..n as u64).collect();
@@ -834,9 +836,9 @@ fn io_blocking() -> Scenario {
     }
 }
 
-/// S5: mixed load — sync CPU stage (100 iters/item) then async IO stage
-/// (1 ms / 8 ms tail). Overlapping CPU and IO on separate pools is the
-/// mixed-regime selling point.
+/// S5: mixed load — sync CPU stage (100 iters/item, folded to ~6 ns/item;
+/// see `cpu_balanced`) then async IO stage (1 ms / 8 ms tail). Overlapping
+/// CPU and IO on separate pools is the mixed-regime selling point.
 fn mixed_cpu_io() -> Scenario {
     let batches = [500usize, 2_000]
         .into_iter()

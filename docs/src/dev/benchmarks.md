@@ -382,6 +382,35 @@ numbers for that family are meaningless on this machine.
 The vendored queue's loom suite also has a runtime trap: without upstream's
 CI setting `LOOM_MAX_PREEMPTIONS=2`, the `spsc`/`spsc_force` models run for
 an hour+ without completing; with it the whole suite finishes in seconds.
+
+## LLVM folds constant-iteration CPU work (2026-09-07)
+
+A fourth trap, found while chasing the expensive-item regime: the
+`r = r*7+13` CPU-work kernel is a first-order linear recurrence, which LLVM
+strength-reduces by folding **every 8 iterations into one `imul $0x57f6c1`
++ `add $0xbe96a0`** (7⁸ and 13·(7⁸−1)/6). Runtime iteration counts measure
+~0.095 ns/iter, not the ~1 ns a naive cycle estimate suggests; and when the
+iteration count is a *compile-time constant* (the horizontal
+`cpu_balanced`'s 100, criterion `sync_cpu_heavy`'s same shape) the whole
+loop collapses to its closed form — **~6 ns/item, not "100 iters ≈ 100 ns"
+as the bench comments claimed**.
+
+Fairness survives (both frameworks run the same folded kernel), but every
+absolute load level in those tables is ~16× lighter than documented, and
+the expensive-item regime (µs–ms per item, where scheduler handoffs matter
+most) was simply never exercised by them. Consequences:
+
+- The 1 M `cpu_balanced` parity with rayon does not extend upward:
+  at 2 M/4 M (5-round medians, table below) rayon pulls ahead +14 %/+12 %
+  — above 1 M the batches leave the cache-resident regime that hides
+  per-item path differences (see "Reading the results").
+- Load-level claims in bench comments must derive from *measured*
+  ns/iter at the actual iteration count, not from iteration counts.
+- Expensive-item benchmarks need **runtime iteration counts** so LLVM
+  cannot fold them: the criterion `unbalanced` family's `(item, iters)`
+  tuples and the `zstd_shape` group (see dev/scheduler.md "flat top-level
+  dispatch") are built that way.
+
 ## Horizontal cross-library comparison (2026-09)
 
 `crates/youpipe/benches/horizontal.rs` answers the "what should I pick for my workload?"
@@ -462,37 +491,43 @@ bar's absolute value is ratio × that number.
   (`taskset -c 1-31`, core 0 left to OS/IRQ housekeeping), 5 rounds ×
   700 ms measurement, ~2-8 % cross-round spread on most cells.
 
-### Results (median ms per iteration, 5 interleaved rounds; 2026-09-05 rerun with the `num_cpus` cache)
+### Results (median ms per iteration, 5 interleaved rounds; 2026-09-07 rerun, cpu_balanced extended to 2 M/4 M)
 
 | Scenario | n | Best | Runner-up | Rest |
 | --- | --- | --- | --- | --- |
-| cpu_balanced | 1K | youpipe 0.009 | rayon 0.037 | std threads 0.562 |
+| cpu_balanced | 1K | youpipe 0.009 | rayon 0.037 | std threads 0.556 |
 | cpu_balanced | 10K | youpipe 0.012 | rayon 0.063 | std threads 0.583 |
-| cpu_balanced | 100K | youpipe 0.054 | rayon 0.127 | std threads 0.776 |
-| cpu_balanced | 1M | rayon 0.483 | youpipe 0.499 | std threads 2.910 |
-| cpu_unbalanced | 10K | youpipe (Unbalanced) 0.03 | youpipe (default) 0.038 | rayon 0.081, std threads 0.585 |
-| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.213 | youpipe (default) 0.241 | rayon 0.267, std threads 0.83 |
-| io_async | 500 | futures 9.147 | tokio 9.408 | youpipe 9.494 |
-| io_async | 2K | futures 17.725 | youpipe 18.228 | tokio 18.367 |
-| io_async | 5K | futures 34.137 | youpipe 34.744 | tokio 35.667 |
-| io_blocking | 500 | youpipe (512 thr) 8.558 | tokio 8.881 | std threads 16.946, youpipe (31 thr) 34.728 |
-| io_blocking | 2K | youpipe (512 thr) 12.561 | tokio 12.759 | std threads 47.99, youpipe (31 thr) 122.423 |
-| mixed_cpu_io | 500 | futures 9.147 | youpipe 9.641 | tokio 10.762 |
-| mixed_cpu_io | 2K | futures 9.325 | youpipe 10.664 | tokio 13.408 |
-| real_doc | 1K | tokio 10.663 | youpipe 10.799 | rayon 38.023 |
-| real_doc | 4K | youpipe 13.932 | tokio 17.223 | rayon 137.115 |
-| real_web | 500 | youpipe 11.904 | tokio 12.926 | futures 13.229 |
-| real_web | 2K | youpipe 22.963 | tokio 27.915 | futures 30.396 |
+| cpu_balanced | 100K | youpipe 0.053 | rayon 0.123 | std threads 0.764 |
+| cpu_balanced | 1M | rayon 0.469 | youpipe 0.475 | std threads 2.719 |
+| cpu_balanced | 2M | rayon 0.832 | youpipe 0.949 | std threads 6.210 |
+| cpu_balanced | 4M | rayon 1.707 | youpipe 1.907 | std threads 11.739 |
+| cpu_unbalanced | 10K | youpipe (Unbalanced) 0.029 | youpipe (default) 0.037 | rayon 0.079, std threads 0.587 |
+| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.204 | youpipe (default) 0.238 | rayon 0.263, std threads 0.815 |
+| io_async | 500 | futures 9.123 | youpipe 9.458 | tokio 9.471 |
+| io_async | 2K | futures 17.516 | youpipe 18.213 | tokio 18.462 |
+| io_async | 5K | futures 34.082 | youpipe 34.766 | tokio 35.739 |
+| io_blocking | 500 | youpipe (512 thr) 8.569 | tokio 8.871 | std threads 16.988, youpipe (31 thr) 34.725 |
+| io_blocking | 2K | youpipe (512 thr) 12.555 | tokio 12.716 | std threads 47.889, youpipe (31 thr) 122.419 |
+| mixed_cpu_io | 500 | futures 9.155 | youpipe 9.502 | tokio 10.728 |
+| mixed_cpu_io | 2K | futures 9.340 | youpipe 10.636 | tokio 13.393 |
+| real_doc | 1K | youpipe 10.753 | tokio 10.884 | rayon 37.918 |
+| real_doc | 4K | youpipe 14.199 | tokio 17.385 | rayon 137.073 |
+| real_web | 500 | youpipe 11.866 | tokio 12.888 | futures 13.155 |
+| real_web | 2K | youpipe 22.681 | tokio 27.610 | futures 28.840 |
 
 ### Reading the results
 
 - **Balanced CPU** (`pipe_ref` vs `par_iter`, both borrowing warm data):
-  youpipe leads 1K–100K (−76 % @ 1K, −81 % @ 10K, −57 % @ 100K) and ties at
-  1M (+3 %, bandwidth-bound). Before the `num_cpus` cache (2026-09-05),
-  rayon won 1K and 1M — the 1K loss was ~50 µs of cgroup-reading
-  `available_parallelism` syscalls per run, not scheduling overhead.
-  Equal-chunk hand-threading is 10–60× behind everywhere: 31 spawns per
-  call, no stealing.
+  youpipe leads 1K–100K (−76 % @ 1K, −81 % @ 10K, −57 % @ 100K), ties at
+  1 M (+1 %), then rayon pulls ahead at 2 M (+14 %) and 4 M (+12 %) —
+  above ~1 M the batches (≥ 32 MB of R+W buffer traffic) leave the
+  cache-resident regime and rayon's collect path sustains ~38 GB/s where
+  youpipe's holds ~34 GB/s. Whether the youpipe gap is output-slot
+  indexing, dispatch traffic, or allocator behavior is unattributed.
+  Before the `num_cpus` cache (2026-09-05), rayon won 1K and 1M — the 1K
+  loss was ~50 µs of cgroup-reading `available_parallelism` syscalls per
+  run, not scheduling overhead. Equal-chunk hand-threading is 10–60×
+  behind everywhere: 31 spawns per call, no stealing.
 - **Skewed CPU**: `Workload::Unbalanced` + work stealing now beats rayon at
   both sizes (0.03 vs 0.081 @ 10K; 0.213 vs 0.267 @ 100K) — at 10K the fixed
   syscall cost previously masked the win — and static chunking is ~3-19×
