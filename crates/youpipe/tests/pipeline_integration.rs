@@ -1051,6 +1051,48 @@ fn test_for_each_unbalanced_workload() {
 }
 
 #[test]
+// Multi-driver Unbalanced dispatch: external threads hammering interleaved
+// Unbalanced collect/for_each batches on the shared pool. Complements
+// `test_hybrid_dispatch_spin_wait_stress` (Balanced) on the Unbalanced
+// oversplit path: concurrent drivers contend for the injector and each
+// other's deques while the CountLatch accounting must stay exact.
+fn test_unbalanced_multi_driver_stress() {
+    const ITERS: usize = if cfg!(miri) { 50 } else { 2_000 };
+    const N: usize = if cfg!(miri) { 32 } else { 1_000 };
+    let data: Vec<u64> = (0..N as u64).collect();
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            let data = data.clone();
+            s.spawn(move || {
+                for i in 0..ITERS {
+                    if i % 2 == 0 {
+                        let r: Vec<u64> = pipe(data.clone())
+                            .with_workload(Workload::Unbalanced)
+                            .map(|x: u64| x.wrapping_mul(3).wrapping_add(1))
+                            .collect();
+                        for (j, v) in r.iter().enumerate() {
+                            assert_eq!(*v, j as u64 * 3 + 1);
+                        }
+                    } else {
+                        let sum = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                        let s2 = sum.clone();
+                        pipe(data.clone())
+                            .with_workload(Workload::Unbalanced)
+                            .for_each(move |x: u64| {
+                                s2.fetch_add(x, Ordering::Relaxed);
+                            });
+                        assert_eq!(
+                            sum.load(Ordering::Relaxed),
+                            (N as u64) * (N as u64 - 1) / 2
+                        );
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[test]
 // Native: 4 threads x 20k iterations x 1k cpu_heavy items. Under miri the
 // iteration count shrinks 200x (cpu_heavy itself is scaled down too, see
 // its comment) so the interpreter covers the same spin/latch interleavings
