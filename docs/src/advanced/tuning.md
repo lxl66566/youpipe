@@ -26,8 +26,8 @@ slow items strand a few workers while the rest go idle.
 | Variant | Oversplit | Behaviour |
 | --- | --- | --- |
 | `Workload::Balanced` (default) | adaptive: 1 below ~1024 items/worker, else 4 | right for near-equal costs |
-| `Workload::Unbalanced` | fixed 8 | idle workers can steal the remaining leaves around a slow item |
-| `Workload::Custom(n)` | pinned `n` | manual; useful envelope 4..=16 on large machines |
+| `Workload::Unbalanced` | fixed 32, plus 8 extra top-level chunks | idle workers can steal the remaining leaves around a slow item; late-arriving workers find a leftover chunk in the injector |
+| `Workload::Custom(n)` | pinned `n` | manual; useful envelope 8..=32 on large machines |
 
 ```rust
 use youpipe::prelude::*;
@@ -41,6 +41,12 @@ let r: Vec<u64> = (0..5_000).pipe()
 
 `Workload` never changes the thread count — that is a pool decision
 ([pools](pools.md)).
+
+For same-binary A/B benchmarking the two `Unbalanced` knobs are
+runtime-overridable: `YOUPIPE_OVERSPLIT` (leaf-count factor, default 32)
+and `YOUPIPE_CHUNK_SLACK` (extra top-level chunks, default 8; set 0 to
+recover the cheap-item side, which pays ~5–7 % for slack it cannot use —
+see the scheduler notes in the developer guide).
 
 ## Worker budget across stages (streaming)
 
@@ -118,7 +124,7 @@ overlaps — the right default for mixed CPU/IO.
 
 | Scenario | Knobs |
 | --- | --- |
-| Skewed CPU (10 % of items cost 1000×) | `with_workload(Workload::Unbalanced)`; extreme skew: `Custom(8..=16)` |
+| Skewed CPU (10 % of items cost 1000×) | `with_workload(Workload::Unbalanced)`; extreme skew: `Custom(16..=32)`; cheap ns-scale items: `YOUPIPE_CHUNK_SLACK=0` |
 | Blocking IO inside a sync `.stage()` | oversized compute pool via `with_compute_pool` — see [pools](pools.md); `Workload` will not help |
 | Many small async IO ops | raise `io_concurrency` (512+) globally or per stage; widen `buffer_size` for bursty sources |
 | Heavy CPU stage + light IO stage | pin the heavy stage's `StageOptions::workers`; give the async stage its own `io_concurrency`/`buffer` |

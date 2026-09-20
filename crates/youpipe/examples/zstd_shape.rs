@@ -46,8 +46,15 @@ fn cpu_work(x: u64, iters: u32) -> u64 {
 /// Lognormal file-size shape (Box-Muller over a fixed-seed LCG), clamped to
 /// [256 B, cap]; `iters = size × 32` ≈ 3 ns/byte — zstd magnitude. Runtime
 /// iteration counts so LLVM cannot fold the kernel.
+///
+/// `ZSTD_SEED` overrides the seed: heavy-tail results are sensitive to which
+/// chunk a monster item lands in, so cross-seed runs guard against chunk
+/// boundary luck (see dev/scheduler.md "Latecomer slack").
 fn gen_docs_shaped(n: usize, iters_per_byte: u32, sigma: f64, cap_b: f64) -> Vec<(u64, u32)> {
-    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut seed: u64 = std::env::var("ZSTD_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0x2545_f491_4f6c_dd1d);
     let mut next_f64 = || {
         seed = seed
             .wrapping_mul(6_364_136_223_846_793_005)

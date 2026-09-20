@@ -259,7 +259,12 @@ where
 ///
 /// Propagates any panic raised by `op`.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn par_index_collect<T, R, OP>(items: Vec<T>, op: &OP, splits: usize, pool: &ComputePool) -> Vec<R>
+fn par_index_collect<T, R, OP>(
+    items: Vec<T>,
+    op: &OP,
+    plan: SplitPlan,
+    pool: &ComputePool,
+) -> Vec<R>
 where
     T: Send,
     R: Send,
@@ -287,7 +292,7 @@ where
     // deadlocking this pool's workers.
     let on_pool = pool.is_on_this_pool();
     let result = if on_pool {
-        par_index_rec(pool, &input, &output, 0, n, op, splits)
+        par_index_rec(pool, &input, &output, 0, n, op, plan.depth)
             .err()
             .map(ErasedFailure::Panic)
     } else {
@@ -300,7 +305,7 @@ where
             &input,
             &ErasedStrategy::from(&strategy),
             n,
-            splits,
+            plan,
             num_threads,
         )
         .err()
@@ -781,7 +786,8 @@ impl<IN: ?Sized + Sync> Job for ChunkJob<IN> {
 const ASSIST_RESERVE_CHUNKS: usize = 1;
 
 /// Hybrid top-level dispatcher. Splits `[0, n)` into `num_chunks` contiguous
-/// ranges. Chunk 0 is run **inline on the driver thread** (mirrors rayon's
+/// ranges (`num_threads + plan.chunk_slack`, see [`UNBALANCED_CHUNK_SLACK`]).
+/// Chunk 0 is run **inline on the driver thread** (mirrors rayon's
 /// off-pool path where the calling thread participates; see the inline comment
 /// in the body for the ramp-up/wake-cascade rationale); chunks
 /// `1..num_chunks - reserve` are injected as `ChunkJob`s and the driver blocks
@@ -803,19 +809,32 @@ fn hybrid_dispatch<IN>(
     input: &IN,
     strategy: &ErasedStrategy<IN>,
     n: usize,
-    splits: usize,
+    plan: SplitPlan,
     num_threads: usize,
 ) -> Result<(), ErasedFailure>
 where
     IN: ?Sized + Sync,
 {
-    // One chunk per worker → instant parallel ramp-up. Round up the split
-    // depth reduction so the per-chunk tree is shallower: total leaf count
-    // stays ≈ num_threads * oversplit (matching the single-tree path), just
-    // distributed across the chunks instead of grown from one root.
-    let num_chunks = Ord::min(num_threads, n).max(1);
-    let chunk_log2 = num_chunks.next_power_of_two().trailing_zeros() as usize;
-    let chunk_splits = splits.saturating_sub(chunk_log2);
+    // One chunk per worker → instant parallel ramp-up; `chunk_slack` adds
+    // extra chunks that persist in the injector for late-arriving workers
+    // (see `UNBALANCED_CHUNK_SLACK`). Round the split depth reduction so the
+    // per-chunk tree is shallower: total leaf count stays ≈ num_threads *
+    // oversplit (matching the single-tree path), just distributed across the
+    // chunks instead of grown from one root.
+    let num_chunks = Ord::min(num_threads + plan.chunk_slack, n).max(1);
+    // With slack, use floor(log2(num_chunks)): a slack-sized count (33..48)
+    // keeps the same per-chunk tree depth as 32 chunks, preserving the total
+    // leaf budget fine-grained stealing needs (ceil would coarsen one level —
+    // measured +3 pt on uniform zstd). Without slack, keep the historical
+    // next-power-of-two rounding bit-for-bit (identical for the power-of-two
+    // chunk counts of `num_chunks == num_threads`, different only for
+    // `n < num_threads` batches where the old behavior is the tuned one).
+    let chunk_log2 = if plan.chunk_slack == 0 {
+        num_chunks.next_power_of_two().trailing_zeros() as usize
+    } else {
+        (usize::BITS - 1 - num_chunks.leading_zeros()) as usize
+    };
+    let chunk_splits = plan.depth.saturating_sub(chunk_log2);
 
     let chunk = n / num_chunks;
     let rem = n % num_chunks;
@@ -1131,7 +1150,7 @@ where
 ///
 /// Propagates any panic raised by `op`.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn par_for_each<T, OP>(items: Vec<T>, op: &OP, splits: usize, pool: &ComputePool)
+fn par_for_each<T, OP>(items: Vec<T>, op: &OP, plan: SplitPlan, pool: &ComputePool)
 where
     T: Send,
     OP: SinkOp<T>,
@@ -1156,7 +1175,7 @@ where
     // park). A worker of a *different* pool is fine.
     let on_pool = pool.is_on_this_pool();
     let result = if on_pool {
-        par_for_each_rec(pool, &input, 0, n, op, splits)
+        par_for_each_rec(pool, &input, 0, n, op, plan.depth)
             .err()
             .map(ErasedFailure::Panic)
     } else {
@@ -1166,7 +1185,7 @@ where
             &input,
             &ErasedStrategy::from(&strategy),
             n,
-            splits,
+            plan,
             num_threads,
         )
         .err()
@@ -1352,7 +1371,7 @@ where
 fn par_index_try_collect<T, R, E, OP>(
     items: Vec<T>,
     op: &OP,
-    splits: usize,
+    plan: SplitPlan,
     pool: &ComputePool,
 ) -> Result<Vec<R>, E>
 where
@@ -1369,7 +1388,7 @@ where
 
     let on_pool = pool.is_on_this_pool();
     let result = if on_pool {
-        par_index_try_rec(pool, &input, &output, 0, n, op, splits)
+        par_index_try_rec(pool, &input, &output, 0, n, op, plan.depth)
             .map_err(|e| TryFailure::Error(e))
             .err()
     } else {
@@ -1384,7 +1403,7 @@ where
             &input,
             &ErasedStrategy::from(&strategy),
             n,
-            splits,
+            plan,
             num_threads,
         )
         .err()
@@ -1574,7 +1593,7 @@ fn unbalanced_oversplit() -> usize {
 /// Oversplit factor for the fork/join tree, adapting to batch size.
 ///
 /// See [`LOW_OVERSPLIT_ITEMS_PER_THREAD`] for the rationale. `Unbalanced`
-/// always uses [`UNBALANCED_OVERSPLIT`]; `Custom(n)` pins `n` for full manual
+/// always uses [`unbalanced_oversplit`]; `Custom(n)` pins `n` for full manual
 /// control (benchmarking, known-skew workloads outside the two presets).
 fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize {
     match workload {
@@ -1587,6 +1606,64 @@ fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize
         },
         Workload::Unbalanced => unbalanced_oversplit(),
         Workload::Custom(factor) => factor.get(),
+    }
+}
+
+/// Extra top-level chunks injected beyond worker count for
+/// `Workload::Unbalanced` (runtime-overridable via `YOUPIPE_CHUNK_SLACK`,
+/// same-binary A/B).
+///
+/// Rationale (2026-09 diagnosis, see dev/scheduler.md "latecomer slack"):
+/// on an SMT machine a fully-loaded pool permanently excludes the 1–2
+/// workers that lose the first scheduling round after a batch inject —
+/// either their futex wake is delivered 100 µs–1.7 ms late (CFS wakeup
+/// preemption under oversubscription) or they sit in the `sched_yield`
+/// backoff phase, starved to one `find_work` scan per ~50–300 µs. By then
+/// all `num_threads` chunks are claimed and the stealable tree subtrees
+/// live only µs-scale windows (the spin-phase workers drain them at µs
+/// cadence), so a slow-cadence arrival never catches one. Leftover
+/// injector chunks, unlike deque subtrees, persist until popped — the one
+/// work source a latecomer can always find. Measured (32 logical / 16
+/// physical cores, zstd_shape, same-binary A/B): heavy-tail −7…−12 pt vs
+/// rayon (ahead), uniform −2…−3 pt, capped ±1 pt; cheap skewed/log-uniform
+/// n=200/5000 pay +2…+7 % but stay >2× ahead of rayon — the same
+/// trade-off shape (and much smaller cost) as `UNBALANCED_OVERSPLIT` 8→32.
+const UNBALANCED_CHUNK_SLACK: usize = 8;
+
+/// [`UNBALANCED_CHUNK_SLACK`], overridable via `YOUPIPE_CHUNK_SLACK`.
+fn unbalanced_chunk_slack() -> usize {
+    static FACTOR: OnceLock<usize> = OnceLock::new();
+    *FACTOR.get_or_init(|| {
+        std::env::var("YOUPIPE_CHUNK_SLACK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(UNBALANCED_CHUNK_SLACK)
+    })
+}
+
+/// Per-call dispatch plan derived once from the workload kind.
+///
+/// `depth` is the fork/join split budget ([`split_depth`]); `chunk_slack` is
+/// the extra top-level chunk count for the hybrid dispatcher
+/// ([`UNBALANCED_CHUNK_SLACK`], zero unless `Workload::Unbalanced`).
+/// Bundling both keeps the terminal → dispatcher signatures workload-typed
+/// instead of threading loose `usize`s.
+#[derive(Clone, Copy)]
+struct SplitPlan {
+    depth: usize,
+    chunk_slack: usize,
+}
+
+impl SplitPlan {
+    fn new(n: usize, num_threads: usize, workload: Workload) -> Self {
+        let oversplit = workload_oversplit(n, num_threads, workload);
+        Self {
+            depth: split_depth(n, num_threads, oversplit),
+            chunk_slack: match workload {
+                Workload::Unbalanced => unbalanced_chunk_slack(),
+                Workload::Balanced | Workload::Custom(_) => 0,
+            },
+        }
     }
 }
 
@@ -2127,14 +2204,13 @@ where
         // small batches (≤ `LOW_OVERSPLIT_ITEMS_PER_THREAD` per worker) use
         // `1` to minimise join-dispatch overhead; larger batches use
         // `BALANCED_OVERSPLIT` for stealing slack. See `workload_oversplit`.
-        let oversplit = workload_oversplit(n, num_threads, self.config.workload);
-        let splits = split_depth(n, num_threads, oversplit);
+        let plan = SplitPlan::new(n, num_threads, self.config.workload);
 
         if S::MAY_FILTER {
-            fused_filter_collect(items, &stages, splits, pool)
+            fused_filter_collect(items, &stages, plan.depth, pool)
         } else {
             let op = FusedOp(stages);
-            par_index_collect(items, &op, splits, pool)
+            par_index_collect(items, &op, plan, pool)
         }
     }
 
@@ -2192,10 +2268,9 @@ where
             return;
         }
 
-        let oversplit = workload_oversplit(n, num_threads, self.config.workload);
-        let splits = split_depth(n, num_threads, oversplit);
+        let plan = SplitPlan::new(n, num_threads, self.config.workload);
         let op = FusedSink(stages, f);
-        par_for_each(items, &op, splits, pool);
+        par_for_each(items, &op, plan, pool);
     }
 }
 
@@ -2385,17 +2460,16 @@ where
             return Ok(out);
         }
 
-        let oversplit = workload_oversplit(n, num_threads, self.config.workload);
-        let splits = split_depth(n, num_threads, oversplit);
+        let plan = SplitPlan::new(n, num_threads, self.config.workload);
         if S::MAY_FILTER {
-            join_fused_try_collect(pool, items, &stages, splits)
+            join_fused_try_collect(pool, items, &stages, plan.depth)
         } else {
             // Fast path: no filter → output cardinality == input cardinality.
             // Pre-allocate the output buffer and write at known indices,
             // avoiding the per-split `Vec::split_off` allocations of the
             // merge path.
             let op = FusedTryOp(stages);
-            par_index_try_collect(items, &op, splits, pool)
+            par_index_try_collect(items, &op, plan, pool)
         }
     }
 }
@@ -2597,7 +2671,7 @@ where
 fn par_index_collect_by_ref<'i, E, R, OP>(
     input: &'i [E],
     op: &OP,
-    splits: usize,
+    plan: SplitPlan,
     pool: &ComputePool,
 ) -> Vec<R>
 where
@@ -2615,7 +2689,7 @@ where
     // `CountLatch` park would deadlock it).
     let on_pool = pool.is_on_this_pool();
     let result = if on_pool {
-        par_index_rec_by_ref(pool, input, &output, 0, n, op, splits)
+        par_index_rec_by_ref(pool, input, &output, 0, n, op, plan.depth)
             .err()
             .map(ErasedFailure::Panic)
     } else {
@@ -2629,7 +2703,7 @@ where
             &input,
             &ErasedStrategy::from(&strategy),
             n,
-            splits,
+            plan,
             num_threads,
         )
         .err()
@@ -2740,7 +2814,7 @@ where
 /// Drive `par_for_each_rec_by_ref` over a borrowed `&'i [E]`. Counterpart of
 /// [`par_for_each`].
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn par_for_each_by_ref<'i, E, OP>(input: &'i [E], op: &OP, splits: usize, pool: &ComputePool)
+fn par_for_each_by_ref<'i, E, OP>(input: &'i [E], op: &OP, plan: SplitPlan, pool: &ComputePool)
 where
     E: Sync,
     OP: SinkOp<&'i E>,
@@ -2751,7 +2825,7 @@ where
 
     let on_pool = pool.is_on_this_pool();
     let result = if on_pool {
-        par_for_each_rec_by_ref(pool, input, 0, n, op, splits)
+        par_for_each_rec_by_ref(pool, input, 0, n, op, plan.depth)
             .err()
             .map(ErasedFailure::Panic)
     } else {
@@ -2761,7 +2835,7 @@ where
             &input,
             &ErasedStrategy::from(&strategy),
             n,
-            splits,
+            plan,
             num_threads,
         )
         .err()
@@ -2952,7 +3026,7 @@ where
 fn par_index_try_collect_by_ref<'i, E, R, F, OP>(
     input: &'i [E],
     op: &OP,
-    splits: usize,
+    plan: SplitPlan,
     pool: &ComputePool,
 ) -> Result<Vec<R>, F>
 where
@@ -2968,7 +3042,7 @@ where
 
     let on_pool = pool.is_on_this_pool();
     let result = if on_pool {
-        par_index_try_rec_by_ref(pool, input, &output, 0, n, op, splits)
+        par_index_try_rec_by_ref(pool, input, &output, 0, n, op, plan.depth)
             .map_err(TryFailure::Error)
             .err()
     } else {
@@ -2982,7 +3056,7 @@ where
             &input,
             &ErasedStrategy::from(&strategy),
             n,
-            splits,
+            plan,
             num_threads,
         )
         .err()
@@ -3124,13 +3198,12 @@ where
             .map(|item| stages.apply_pure(item))
             .collect();
     }
-    let oversplit = workload_oversplit(n, num_threads, workload);
-    let splits = split_depth(n, num_threads, oversplit);
+    let plan = SplitPlan::new(n, num_threads, workload);
     if S::MAY_FILTER {
-        fused_filter_collect(items, &stages, splits, pool)
+        fused_filter_collect(items, &stages, plan.depth, pool)
     } else {
         let op = FusedOp(stages);
-        par_index_collect(items, &op, splits, pool)
+        par_index_collect(items, &op, plan, pool)
     }
 }
 
@@ -3175,10 +3248,9 @@ pub(crate) fn fused_for_each_scoped<S, T, F>(
         }
         return;
     }
-    let oversplit = workload_oversplit(n, num_threads, workload);
-    let splits = split_depth(n, num_threads, oversplit);
+    let plan = SplitPlan::new(n, num_threads, workload);
     let op = FusedSink(stages, f);
-    par_for_each(items, &op, splits, pool);
+    par_for_each(items, &op, plan, pool);
 }
 
 /// `pub(crate)` entry point for the scoped fallible terminal
@@ -3219,13 +3291,12 @@ where
         }
         return Ok(out);
     }
-    let oversplit = workload_oversplit(n, num_threads, workload);
-    let splits = split_depth(n, num_threads, oversplit);
+    let plan = SplitPlan::new(n, num_threads, workload);
     if S::MAY_FILTER {
-        join_fused_try_collect(pool, items, &stages, splits)
+        join_fused_try_collect(pool, items, &stages, plan.depth)
     } else {
         let op = FusedTryOp(stages);
-        par_index_try_collect(items, &op, splits, pool)
+        par_index_try_collect(items, &op, plan, pool)
     }
 }
 
@@ -3260,13 +3331,12 @@ where
         }
         return input.iter().map(|item| stages.apply_pure(item)).collect();
     }
-    let oversplit = workload_oversplit(n, num_threads, workload);
-    let splits = split_depth(n, num_threads, oversplit);
+    let plan = SplitPlan::new(n, num_threads, workload);
     if S::MAY_FILTER {
-        join_fused_collect_by_ref(pool, input, &stages, 0, n, splits)
+        join_fused_collect_by_ref(pool, input, &stages, 0, n, plan.depth)
     } else {
         let op = FusedOp(stages);
-        par_index_collect_by_ref(input, &op, splits, pool)
+        par_index_collect_by_ref(input, &op, plan, pool)
     }
 }
 
@@ -3304,10 +3374,9 @@ pub(super) fn fused_for_each_by_ref<'i, S, E, F>(
         }
         return;
     }
-    let oversplit = workload_oversplit(n, num_threads, workload);
-    let splits = split_depth(n, num_threads, oversplit);
+    let plan = SplitPlan::new(n, num_threads, workload);
     let op = FusedSink(stages, f);
-    par_for_each_by_ref(input, &op, splits, pool);
+    par_for_each_by_ref(input, &op, plan, pool);
 }
 
 /// Entry point for the borrowed-input `.try_collect()`. `E` (the error type)
@@ -3341,13 +3410,12 @@ where
         }
         return Ok(out);
     }
-    let oversplit = workload_oversplit(n, num_threads, workload);
-    let splits = split_depth(n, num_threads, oversplit);
+    let plan = SplitPlan::new(n, num_threads, workload);
     if S::MAY_FILTER {
-        join_fused_try_collect_by_ref(pool, input, &stages, 0, n, splits)
+        join_fused_try_collect_by_ref(pool, input, &stages, 0, n, plan.depth)
     } else {
         let op = FusedTryOp(stages);
-        par_index_try_collect_by_ref(input, &op, splits, pool)
+        par_index_try_collect_by_ref(input, &op, plan, pool)
     }
 }
 

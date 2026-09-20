@@ -229,6 +229,67 @@ for workloads that want the cheap side. Balanced, stream, IO and
 horizontal suites re-measured clean (±1 %) — the factor only feeds the
 `Unbalanced`/`Custom` dispatch path.
 
+#### Latecomer slack: extra top-level chunks (accepted)
+
+The follow-up round (2026-09) instrumented the scheduler itself (temporary
+probe arrays: per-worker park/wake/inject timestamps, `find_work` scan log,
+pop/steal outcome counters; repro lives in `examples/zstd_shape.rs` modes
+`instr`/`instr2` of that era) and found the real reason the residual zstd
+gap did not respond to any tree-shape change. On the 16C/32T SMT bench
+machine the batch actually runs on ~30 of 32 workers; the missing 1–2 are
+**latecomers** that lose the first scheduling round after `inject_batch`
+and never rejoin:
+
+- A parked worker's futex wake can be **delivered 100 µs–1.7 ms late**
+  (measured: notifier side `WOKE=+13 µs`, sleeper side `RETURNED=+1723 µs`)
+  — CFS wakeup preemption under 2× SMT oversubscription.
+- A worker in the `sched_yield` backoff phase degrades to **one
+  `find_work` scan per ~50–300 µs** (starved by 30 CPU-bound siblings);
+  spin-phase workers scan at ~µs cadence.
+- All `num_threads` chunks are claimed within ~20 µs of inject, and the
+  stealable tree subtrees live only **µs-scale windows** — the spin-phase
+  majority drains every victim deque at µs cadence, so a slow-cadence
+  arrival never catches one (measured: idle worker scans 19× mid-batch,
+  0 successful steals, `Busy` never seen).
+- Rayon does not have this hole because its steal unit is a coarse leaf
+  (~`total/(2·nthreads)` items ≈ hundreds of µs of work): a queued half
+  stays stealable for ~leaf-time, so a 300 µs-cadence arrival still finds
+  one.
+
+The injector is the one work source with no race: a leftover chunk sits
+until popped. `UNBALANCED_CHUNK_SLACK = 8` (Unbalanced only, runtime knob
+`YOUPIPE_CHUNK_SLACK`) injects `num_threads + 8` top-level chunks so
+latecomers at any cadence find one. The per-chunk tree depth uses
+`floor(log2(num_chunks))` when slack is on — rounding up (the historical
+power-of-two formula) would coarsen every tree one level and give back
+~3 pt on uniform (the fine-leaf budget is what ov=32 bought).
+
+Same-binary A/B (`YOUPIPE_CHUNK_SLACK`, criterion `zstd_shape` +
+interleaved repro; within-session ratios, lower better):
+
+| scenario (vs same-run rayon) | slack=0 | slack=8 |
+|---|---|---|
+| zstd heavy-tail n=2000 | +4…+5 % | **−6.5…−10 %** (ahead of rayon) |
+| zstd capped n=2000 | +2…+6 % | +1…+4 % |
+| zstd uniform n=2000 | +5…+11 % | +1…+8 % (−3 pt, machine-state dependent) |
+| heavy-tail n=8000, 3 seeds | +5.1 % avg | **−0.9 % avg** |
+| cpu_unbalanced skewed/log_uniform n=200/5000 | — | +5…+7 % (still >2× ahead of rayon) |
+
+Two measurement lessons from this round:
+
+- **Heavy-tail results are boundary-lucky**: chunk boundaries shift with
+  the chunk count, which reshuffles which chunk a monster item lands in.
+  A single-seed n=8000 A/B showed slack=8 "regressing" +8 %; across three
+  seeds (`ZSTD_SEED` on the example) slack=8 won every seed pair. Never
+  accept a heavy-tail verdict from one seed.
+- Absolute vs-rayon ratios drift several points between sessions
+  (thermal/frequency state); only within-session interleaved A/B deltas
+  are decision-grade — the table above reports deltas, not absolutes.
+
+`Workload::Custom` gets no slack (it pins the oversplit factor only), so
+`Custom(n)` remains a clean manual control. Balanced/stream/IO/horizontal
+families re-measured clean with slack=8 (±2 %, probes removed).
+
 ### Graceful Shutdown
 
 `ComputePool::Drop` calls `Registry::terminate()`, which decrements a ref-count
