@@ -1609,9 +1609,9 @@ fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize
     }
 }
 
-/// Extra top-level chunks injected beyond worker count for
+/// Narrow-tier extra top-level chunks injected beyond worker count for
 /// `Workload::Unbalanced` (runtime-overridable via `YOUPIPE_CHUNK_SLACK`,
-/// same-binary A/B).
+/// same-binary A/B; see [`unbalanced_chunk_slack`] for the adaptive tier).
 ///
 /// Rationale (2026-09 diagnosis, see dev/scheduler.md "latecomer slack"):
 /// on an SMT machine a fully-loaded pool permanently excludes the 1–2
@@ -1630,15 +1630,48 @@ fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize
 /// trade-off shape (and much smaller cost) as `UNBALANCED_OVERSPLIT` 8→32.
 const UNBALANCED_CHUNK_SLACK: usize = 8;
 
-/// [`UNBALANCED_CHUNK_SLACK`], overridable via `YOUPIPE_CHUNK_SLACK`.
-fn unbalanced_chunk_slack() -> usize {
-    static FACTOR: OnceLock<usize> = OnceLock::new();
-    *FACTOR.get_or_init(|| {
+/// Wide-tier slack for batches whose wide-tier chunks still hold enough
+/// items ([`UNBALANCED_SLACK_WIDE_MIN_PER_CHUNK`]): heavier tails also
+/// suffer plain boundary luck — which fixed chunk the rare 2 MB items land
+/// in decides the straggler, and more, smaller chunks scatter that luck.
+/// Measured (same session as above, 6-seed cross-check, n=8000 =
+/// 200→167 items/chunk): worst seed +6.9 %→+1.3 % vs rayon, mean
+/// +1.1 %→−1.1 %, spread 14.6 pt→4.2 pt; n=4000 all three shapes improve
+/// (heavy-tail mean −2.5 pt, uniform −2 pt). n=2000 (≈42 items/chunk)
+/// regresses +2…+4 pt — per-chunk overhead dominates once chunks get
+/// small, hence the two tiers.
+///
+/// Rejected alongside: dropping the default to the 16 physical cores
+/// (SMT gives zstd ~1.9×; 16 threads lose +78…+89 % wall time — see the
+/// zstd_shape `threads` mode) and flat slack 32/64 (uniform n=2000 +3 %).
+const UNBALANCED_CHUNK_SLACK_WIDE: usize = 16;
+
+/// Items per wide-tier chunk (`n / (num_threads + WIDE)`) required to
+/// upgrade from [`UNBALANCED_CHUNK_SLACK`] to [`UNBALANCED_CHUNK_SLACK_WIDE`].
+/// Boundary data: 42 items/chunk (n=2000) prefers the narrow tier, 83
+/// (n=4000) the wide tier; 64 sits between the measured points.
+const UNBALANCED_SLACK_WIDE_MIN_PER_CHUNK: usize = 64;
+
+/// Adaptive [`UNBALANCED_CHUNK_SLACK`]: the wide tier once wide-tier chunks
+/// still hold ≥ [`UNBALANCED_SLACK_WIDE_MIN_PER_CHUNK`] items. `n` comes from
+/// the terminal's item count — chunk boundary luck only pays once chunks
+/// stay coarse enough for per-chunk overhead to amortize.
+fn unbalanced_chunk_slack(n: usize, num_threads: usize) -> usize {
+    static FACTOR: OnceLock<Option<usize>> = OnceLock::new();
+    let factor = FACTOR.get_or_init(|| {
         std::env::var("YOUPIPE_CHUNK_SLACK")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(UNBALANCED_CHUNK_SLACK)
-    })
+    });
+    if let Some(v) = factor {
+        return *v;
+    }
+    let wide = num_threads.saturating_add(UNBALANCED_CHUNK_SLACK_WIDE);
+    if n / wide.max(1) >= UNBALANCED_SLACK_WIDE_MIN_PER_CHUNK {
+        UNBALANCED_CHUNK_SLACK_WIDE
+    } else {
+        UNBALANCED_CHUNK_SLACK
+    }
 }
 
 /// Per-call dispatch plan derived once from the workload kind.
@@ -1660,7 +1693,7 @@ impl SplitPlan {
         Self {
             depth: split_depth(n, num_threads, oversplit),
             chunk_slack: match workload {
-                Workload::Unbalanced => unbalanced_chunk_slack(),
+                Workload::Unbalanced => unbalanced_chunk_slack(n, num_threads),
                 Workload::Balanced | Workload::Custom(_) => 0,
             },
         }

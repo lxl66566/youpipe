@@ -12,6 +12,7 @@
 //! ```sh
 //! cargo run --release -p youpipe --example zstd_shape -- main 5
 //! cargo run --release -p youpipe --example zstd_shape -- shape 5
+//! cargo run --release -p youpipe --example zstd_shape -- threads 5 16
 //! cargo run --release -p youpipe --example zstd_shape -- sweep 5 2000
 //! cargo run --release -p youpipe --example zstd_shape -- instr 5 1.5
 //! ```
@@ -230,6 +231,9 @@ fn summarize_instr(iter_start_us: u64, iter_end_us: u64, label: &str) {
     }
 }
 
+// One match arm per investigation mode keeps each experiment readable
+// side-by-side; the aggregate `main` is long by design.
+#[allow(clippy::too_many_lines)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map_or("main", String::as_str);
@@ -338,7 +342,19 @@ fn main() {
                 ("capped cap256KB n=8000", 1.5, 256.0 * 1024.0, 8000),
                 ("balanced(sigma0) n=8000", 0.0, 2.0 * 1024.0 * 1024.0, 8000),
             ];
-            for &(label, sigma, cap, n) in shapes {
+            // `ZSTD_SHAPE_N` overrides every shape's item count: the slack
+            // sweet spot depends on items per chunk, so the boundary region
+            // (e.g. n=4000) needs its own pass at fixed shape.
+            let n_override: Option<usize> = std::env::var("ZSTD_SHAPE_N")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            for &(label, sigma, cap, n0) in shapes {
+                let n = n_override.unwrap_or(n0);
+                let label: &'static str = if n == n0 {
+                    label
+                } else {
+                    Box::leak(format!("{label} n={n}").into_boxed_str())
+                };
                 println!("── {label} ──");
                 let mut results: Vec<(&'static str, Vec<f64>)> = Vec::new();
                 for r in 0..rounds {
@@ -402,6 +418,135 @@ fn main() {
                 }
             }
         },
+        // thread-count A/B: logical (default global pools) vs physical cores,
+        // both libraries on persistent pools — the SMT-oversubscription
+        // hypothesis for the residual uniform gap (dev/scheduler.md)
+        "threads" => {
+            let phys: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(16);
+            let logical = num_threads() as usize;
+            println!("── threads: logical={logical} physical={phys} ──");
+            let yp_phys = youpipe::ComputePool::new(phys);
+            let ry_phys = std::sync::Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(phys)
+                    .build()
+                    .expect("rayon pool"),
+            );
+            let shapes: &[(&str, f64, f64, usize)] = &[
+                ("uniform sigma0 n=2000", 0.0, 2.0 * 1024.0 * 1024.0, 2000),
+                ("heavy-tail n=2000", 1.5, 2.0 * 1024.0 * 1024.0, 2000),
+                ("uniform sigma0 n=8000", 0.0, 2.0 * 1024.0 * 1024.0, 8000),
+                ("heavy-tail n=8000", 1.5, 2.0 * 1024.0 * 1024.0, 8000),
+                ("capped n=8000", 1.5, 256.0 * 1024.0, 8000),
+            ];
+            for &(label, sigma, cap, n) in shapes {
+                println!("── {label} ──");
+                let mut results: Vec<(&'static str, Vec<f64>)> = Vec::new();
+                for r in 0..rounds {
+                    let mut libs: Vec<(&'static str, Job)> = vec![
+                        (
+                            "rayon@logical",
+                            Box::new({
+                                let docs = gen_docs_shaped(n, 32, sigma, cap);
+                                move || {
+                                    let t = Instant::now();
+                                    let v: Vec<u64> = docs
+                                        .par_iter()
+                                        .map(|&(x, it)| bb(cpu_work(x, it)))
+                                        .collect();
+                                    finish(v, t)
+                                }
+                            }) as Job,
+                        ),
+                        (
+                            "rayon@phys",
+                            Box::new({
+                                let docs = gen_docs_shaped(n, 32, sigma, cap);
+                                let pool = std::sync::Arc::clone(&ry_phys);
+                                move || {
+                                    let t = Instant::now();
+                                    let v: Vec<u64> = pool.install(|| {
+                                        docs.par_iter()
+                                            .map(|&(x, it)| bb(cpu_work(x, it)))
+                                            .collect()
+                                    });
+                                    finish(v, t)
+                                }
+                            }) as Job,
+                        ),
+                        (
+                            "yp@logical",
+                            Box::new({
+                                let docs = gen_docs_shaped(n, 32, sigma, cap);
+                                move || {
+                                    let t = Instant::now();
+                                    let v: Vec<u64> = pipe_ref(&docs)
+                                        .with_workload(Workload::Unbalanced)
+                                        .map(|&(x, it)| bb(cpu_work(x, it)))
+                                        .collect();
+                                    finish(v, t)
+                                }
+                            }) as Job,
+                        ),
+                        (
+                            "yp@phys",
+                            Box::new({
+                                let docs = gen_docs_shaped(n, 32, sigma, cap);
+                                let pool = yp_phys.clone();
+                                move || {
+                                    let t = Instant::now();
+                                    let v: Vec<u64> = pipe_ref(&docs)
+                                        .with_workload(Workload::Unbalanced)
+                                        .with_compute_pool(pool.clone())
+                                        .map(|&(x, it)| bb(cpu_work(x, it)))
+                                        .collect();
+                                    finish(v, t)
+                                }
+                            }) as Job,
+                        ),
+                    ];
+                    if r % 2 == 1 {
+                        libs.reverse();
+                    }
+                    for (name, job) in &mut libs {
+                        let (ns, _) = run_job(
+                            job.as_mut(),
+                            if r == 0 {
+                                3
+                            } else {
+                                1
+                            },
+                            400,
+                        );
+                        match results.iter_mut().find(|(n2, _)| n2 == name) {
+                            Some((_, v)) => v.push(ns / 1e6),
+                            None => results.push((name, vec![ns / 1e6])),
+                        }
+                    }
+                }
+                for (name, v) in &results {
+                    let mut v = v.clone();
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    println!(
+                        "  {name:<14} median={:.3} ms  rounds={:?}",
+                        v[v.len() / 2],
+                        v
+                    );
+                }
+                let med = |name: &str| {
+                    let v = &results.iter().find(|(n, _)| *n == name).unwrap().1;
+                    let mut v = v.clone();
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    v[v.len() / 2]
+                };
+                println!(
+                    "  vs rayon@logical: yp@logical {:+.1}%  yp@phys {:+.1}%  rayon@phys {:+.1}%",
+                    (med("yp@logical") / med("rayon@logical") - 1.0) * 100.0,
+                    (med("yp@phys") / med("rayon@logical") - 1.0) * 100.0,
+                    (med("rayon@phys") / med("rayon@logical") - 1.0) * 100.0,
+                );
+            }
+        },
         // participation instrumentation: ramp + late workers per batch
         "instr" => {
             let sigma: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1.5);
@@ -432,7 +577,7 @@ fn main() {
             }
         },
         _ => {
-            println!("unknown mode {mode:?}; see module docs for main|sweep|shape|instr");
+            println!("unknown mode {mode:?}; see module docs for main|sweep|shape|threads|instr");
         },
     }
 }

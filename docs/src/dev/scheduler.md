@@ -290,6 +290,38 @@ Two measurement lessons from this round:
 `Custom(n)` remains a clean manual control. Balanced/stream/IO/horizontal
 families re-measured clean with slack=8 (±2 %, probes removed).
 
+#### Adaptive slack tiers (accepted)
+
+The next round chased the residual uniform gap and instead found a second,
+n-independent effect: **boundary luck is a function of items per chunk**.
+With 200-item chunks (heavy-tail n=8000), which fixed chunk the rare 2 MB
+items land in decides the straggler — the per-seed vs-rayon spread was
+14.6 pt (worst seed +6.9 %, best −7.7 %) while rayon's own adaptive
+splitting self-repairs the imbalance. More, smaller chunks scatter that
+luck: slack 8→16 (40→48 chunks) took the worst seed to +1.3 %, the mean
+to −1.1 %, and the spread to 4.2 pt (6 seeds, interleaved). n=4000
+(83 items/chunk) improves on all three shapes; n=2000 (≈42 items/chunk)
+regresses +2…+4 pt — per-chunk dispatch overhead dominates once chunks
+get small.
+
+Hence two tiers (`unbalanced_chunk_slack`): slack 8, upgraded to 16 when
+`n / (num_threads + 16) ≥ 64` (`ZSTD_SHAPE_N` on the example sweeps the
+boundary). Cheap skewed/log-uniform n=5000 lands in the wide tier and
+pays +1.5…+5 % (µs-scale absolute, still >2× ahead of rayon) — the same
+trade-off face `UNBALANCED_OVERSPLIT` 8→32 already accepted; n=200
+stays narrow and clean. Guards: narrow tier is bit-identical to the old
+slack=8 path (criterion zstd_shape n=2000 unchanged), horizontal
+`cpu_unbalanced` n=10k flat / n=100k +2 % (−30 % ahead of rayon).
+
+Rejected in the same round — **dropping the default pool to physical
+cores** (the "SMT excludes ~2 workers" hypothesis suggested it): zstd
+gets ~1.9× from SMT on this machine, so 16 threads lose +78…+89 % wall
+time on every shape (`zstd_shape` mode `threads`, youpipe and rayon
+alike, 6-seed). Straggler cost and throughput cost are not in the same
+league; the latecomer-slack approach above attacks the straggler side
+without giving up SMT throughput. Also rejected: flat slack 32/64
+(uniform n=2000 +3 % — per-chunk overhead returns at small chunks).
+
 ### Graceful Shutdown
 
 `ComputePool::Drop` calls `Registry::terminate()`, which decrements a ref-count
