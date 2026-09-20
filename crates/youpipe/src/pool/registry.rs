@@ -368,13 +368,12 @@ impl WorkerThread {
     }
 
     /// Push a job onto the local deque (overflow spills to the injector).
-    ///
+    #[inline]
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     /// # Safety
     ///
     /// Must only be called by the thread that owns this `WorkerThread` (TLS
     /// contract): `self.worker` is a single-producer deque.
-    #[inline]
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) unsafe fn push(&self, job: JobRef) {
         let queue_was_empty = self.worker.is_empty();
         match self.worker.push(job) {

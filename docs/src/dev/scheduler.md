@@ -166,18 +166,68 @@ Two changes were built on that diagnosis:
   trees) hid monster items back inside sequential prefixes — the original
   problem; a passive driver was ±1 %.
 
-What survives: the `zstd_shape` criterion group (`benches/unbalanced.rs`),
-which reproduces the expensive-item regime with runtime iteration counts
-(LLVM cannot fold them — see dev/benchmarks.md "runtime iteration counts")
-and matches the standalone repro's baseline deltas exactly (heavy-tail
-+13 %, capped +7 %, uniform +14 % vs rayon). Any future attempt should
-start from the structural difference the never-park control exposed:
-rayon's root job splits *on demand* (a stolen-from job re-splits, so the
-work supply never exhausts and no park/wake handoff gates the batch),
-whereas youpipe decides the entire tree at inject time. An execute-time
-split-back (worker pops a chunk, splits off the back half to the injector,
-runs the front) would preserve the work supply without the per-leaf pop
-storm — unexplored.
+What survives from that round: the `zstd_shape` criterion group
+(`benches/unbalanced.rs`), which reproduces the expensive-item regime with
+runtime iteration counts (LLVM cannot fold them — see dev/benchmarks.md
+"runtime iteration counts") and matches the standalone repro's baseline
+deltas exactly (heavy-tail +13 %, capped +7 %, uniform +14 % vs rayon).
+
+#### Execute-time split-back (tried, rejected) and the layout-noise lesson
+
+The follow-up hypothesis (2026-10): rayon's root job splits *on demand*
+(a stolen-from job re-splits, so the work supply never exhausts and no
+park/wake handoff gates the batch), whereas youpipe decides the entire tree
+at inject time. An execute-time split-back was built: when a worker pops a
+top-level chunk, the injector is empty (the signal that a late worker
+would find nothing), and recent chunks were expensive (a per-pool chunk-cost
+EMA, 200 µs threshold separating the two regimes with ~7×/8× margin), it
+re-injects the chunk's back half as a fresh job (one latch increment, one
+heap box on an intrusive chain) and keeps the front. Failure cleanup walks
+the half-chain with `[start, kept_end)` scoping; panic and `try_collect`
+drop-accounting tests plus miri (tree-borrows) all passed.
+
+**Rejected by same-binary A/B**: with the mechanism gated at *runtime* in
+the experimental build (identical binary), zstd_shape deltas were
+identical (±0.3 %, interleaved rounds), and a debug counter showed exactly
+**one split per process** — the cold-start EMA window. In steady state the
+two gates almost never hold simultaneously: by the time the injector is
+empty (last chunk popped), the EMA of cheap-regime batches already sits
+under the threshold, and expensive-regime chunks that split cannot re-arm
+the condition for their halves. A mechanism that measures zero must go,
+whatever its elegance — the whole apparatus (EMA field, per-chunk `Instant`
+timing, half-chains, kept-end cleanup) was removed.
+
+The same investigation exposed a **methodology trap** worth more than the
+mechanism itself: compile-time A/B (flipping a `const ENABLED: bool` and
+recompiling) swings `sync_cpu_heavy` n=100k by a "+32 % stable regression"
+across interleaved recompile rounds — pure code-layout sensitivity
+(identical logic, different binary), first suspected as a real regression
+and chased through CAS contention, vDSO cost and EMA-stuck-at-zero
+theories before a runtime-switch experiment (env knob in the
+since-removed code) collapsed it to ±1 %. Rule: **A/B performance claims
+on tight benchmarks require the same binary with a runtime knob** (see
+`YOUPIPE_OVERSPLIT` below); recompile-pair results are only directional.
+
+#### `UNBALANCED_OVERSPLIT` 8 → 32 (accepted trade-off)
+
+Same-binary A/B (`YOUPIPE_OVERSPLIT`, one binary, interleaved rounds,
+31-thread pool) — the factor is monotone in both regimes and cannot
+satisfy both, so the default picks the expensive-item side:
+
+| scenario | ov=8 | ov=16 | ov=32 |
+|---|---|---|---|
+| zstd heavy-tail (vs rayon) | +5.2 % | +4.4 % | **+2.5 %** |
+| zstd capped (vs rayon) | +9.2 % | +7.1 % | **+2.8 %** |
+| zstd uniform (vs rayon) | +12.5 % | +6.4 % | **+3.0 %** |
+| cpu_unbalanced skewed n=5000 | **22.2 µs** | 25.0 µs | 29.9 µs |
+| cpu_unbalanced log_uniform n=5000 | 29.7 µs | **29.1 µs** | 32.1 µs |
+
+n=200 cheap batches are flat across factors (splits bottom out at the
+same leaves). The cheap n=5000 cost is real (−28 % vs ov=8) but stays far
+ahead of rayon (29.9 µs vs ~70 µs); `Workload::Custom(n)` pins any factor
+for workloads that want the cheap side. Balanced, stream, IO and
+horizontal suites re-measured clean (±1 %) — the factor only feeds the
+`Unbalanced`/`Custom` dispatch path.
 
 ### Graceful Shutdown
 

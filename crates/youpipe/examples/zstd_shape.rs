@@ -25,10 +25,12 @@
     clippy::cast_sign_loss
 )]
 
-use std::cell::Cell;
-use std::hint::black_box as bb;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::{
+    cell::Cell,
+    hint::black_box as bb,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 
 use rayon::prelude::*;
 use youpipe::{Workload, pipe_ref};
@@ -105,7 +107,15 @@ fn run(n: usize, rounds: usize, libs_fn: impl Fn() -> Vec<(&'static str, Job)>) 
             libs.reverse();
         }
         for (name, job) in &mut libs {
-            let (ms, _) = run_job(job.as_mut(), if r == 0 { 3 } else { 1 }, 500);
+            let (ms, _) = run_job(
+                job.as_mut(),
+                if r == 0 {
+                    3
+                } else {
+                    1
+                },
+                500,
+            );
             match results.iter_mut().find(|(n2, _)| n2 == name) {
                 Some((_, v)) => v.push(ms / 1e6),
                 None => results.push((name, vec![ms / 1e6])),
@@ -115,7 +125,11 @@ fn run(n: usize, rounds: usize, libs_fn: impl Fn() -> Vec<(&'static str, Job)>) 
     for (name, v) in &results {
         let mut v = v.clone();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!("  {name:<20} median={:.3} ms  rounds={:?}", v[v.len() / 2], v);
+        println!(
+            "  {name:<20} median={:.3} ms  rounds={:?}",
+            v[v.len() / 2],
+            v
+        );
     }
 }
 
@@ -196,10 +210,10 @@ fn summarize_instr(iter_start_us: u64, iter_end_us: u64, label: &str) {
     let ramp_p50 = rows[n / 2].0;
     let late: Vec<String> = rows
         .iter()
-        .filter(|(f, _, _, _)| *f > 1000)
+        .filter(|(f, ..)| *f > 1000)
         .map(|(f, _, id, c)| format!("    LATE id={id} first={f}µs count={c}"))
         .collect();
-    let idle_early = rows.iter().filter(|(_, l, _, _)| l + 1000 < dur).count();
+    let idle_early = rows.iter().filter(|(_, l, ..)| l + 1000 < dur).count();
     println!(
         "  [{label}] threads={n} dur={dur}µs ramp(p50)={ramp_p50}µs busy_at_end(>1ms margin)={}",
         n - idle_early
@@ -240,8 +254,9 @@ fn main() {
                                 let docs = gen_docs(n, 32);
                                 move || {
                                     let t = Instant::now();
-                                    let r: Vec<u64> =
-                                        pipe_ref(&docs).map(|&(x, it)| bb(cpu_work(x, it))).collect();
+                                    let r: Vec<u64> = pipe_ref(&docs)
+                                        .map(|&(x, it)| bb(cpu_work(x, it)))
+                                        .collect();
                                     finish(r, t)
                                 }
                             }) as Job,
@@ -252,8 +267,10 @@ fn main() {
                                 let docs = gen_docs(n, 32);
                                 move || {
                                     let t = Instant::now();
-                                    let r: Vec<u64> =
-                                        docs.par_iter().map(|&(x, it)| bb(cpu_work(x, it))).collect();
+                                    let r: Vec<u64> = docs
+                                        .par_iter()
+                                        .map(|&(x, it)| bb(cpu_work(x, it)))
+                                        .collect();
                                     finish(r, t)
                                 }
                             }) as Job,
@@ -273,14 +290,17 @@ fn main() {
                         let docs = gen_docs(n, 32);
                         move || {
                             let t = Instant::now();
-                            let r: Vec<u64> =
-                                docs.par_iter().map(|&(x, it)| bb(cpu_work(x, it))).collect();
+                            let r: Vec<u64> = docs
+                                .par_iter()
+                                .map(|&(x, it)| bb(cpu_work(x, it)))
+                                .collect();
                             finish(r, t)
                         }
                     }) as Job,
                 )];
                 for f in [1usize, 2, 4, 8, 16, 32, 64, 128] {
-                    let name: &'static str = Box::leak(format!("youpipe Custom({f})").into_boxed_str());
+                    let name: &'static str =
+                        Box::leak(format!("youpipe Custom({f})").into_boxed_str());
                     libs.push((
                         name,
                         Box::new({
@@ -322,8 +342,10 @@ fn main() {
                                 let docs = gen_docs_shaped(n, 32, sigma, cap);
                                 move || {
                                     let t = Instant::now();
-                                    let v: Vec<u64> =
-                                        docs.par_iter().map(|&(x, it)| bb(cpu_work(x, it))).collect();
+                                    let v: Vec<u64> = docs
+                                        .par_iter()
+                                        .map(|&(x, it)| bb(cpu_work(x, it)))
+                                        .collect();
                                     finish(v, t)
                                 }
                             }) as Job,
@@ -347,7 +369,15 @@ fn main() {
                         libs.reverse();
                     }
                     for (name, job) in &mut libs {
-                        let (ns, _) = run_job(job.as_mut(), if r == 0 { 3 } else { 1 }, 400);
+                        let (ns, _) = run_job(
+                            job.as_mut(),
+                            if r == 0 {
+                                3
+                            } else {
+                                1
+                            },
+                            400,
+                        );
                         match results.iter_mut().find(|(n2, _)| n2 == name) {
                             Some((_, v)) => v.push(ns / 1e6),
                             None => results.push((name, vec![ns / 1e6])),
@@ -357,7 +387,11 @@ fn main() {
                 for (name, v) in &results {
                     let mut v = v.clone();
                     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    println!("  {name:<14} median={:.3} ms  rounds={:?}", v[v.len() / 2], v);
+                    println!(
+                        "  {name:<14} median={:.3} ms  rounds={:?}",
+                        v[v.len() / 2],
+                        v
+                    );
                 }
             }
         },
@@ -392,6 +426,6 @@ fn main() {
         },
         _ => {
             println!("unknown mode {mode:?}; see module docs for main|sweep|shape|instr");
-        }
+        },
     }
 }

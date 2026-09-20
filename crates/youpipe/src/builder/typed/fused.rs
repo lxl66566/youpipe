@@ -4,7 +4,7 @@ use std::{
     num::NonZeroUsize,
     panic, ptr,
     sync::{
-        Mutex,
+        Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -624,6 +624,9 @@ where
     }
 
     #[inline]
+    /// # Safety
+    ///
+    /// Nothing to drop for a sink-only strategy.
     unsafe fn cleanup_success_chunk(&self, _start: usize, _end: usize) {
         // No-op: `for_each` allocates no output buffer; the failed chunk's
         // `ForEachGuard` already dropped its own unread input tail inside
@@ -1549,13 +1552,24 @@ const LOW_OVERSPLIT_ITEMS_PER_THREAD: usize = 1024;
 /// dispatch overhead). `4` (128 leaves on 32 cores) is the sweet spot.
 const BALANCED_OVERSPLIT: usize = 4;
 
-/// Oversplit factor for `Workload::Unbalanced`: fixed at `8`, independent of
-/// batch size. Unlike `Balanced`, the whole point is that an idle worker must
-/// find a stealable leaf even when the batch is small — the per-node dispatch
-/// overhead is the price of tail-latency insurance on a skewed workload (the
-/// adaptive `Balanced` path would drop to `1` below
-/// [`LOW_OVERSPLIT_ITEMS_PER_THREAD`]).
-const UNBALANCED_OVERSPLIT: usize = 8;
+/// Oversplit factor for `Workload::Unbalanced`. Unlike `Balanced`, the whole
+/// point is that an idle worker must find a stealable leaf even when the
+/// batch is small — the per-node dispatch overhead is the price of
+/// tail-latency insurance on a skewed workload (the adaptive `Balanced`
+/// path would drop to `1` below [`LOW_OVERSPLIT_ITEMS_PER_THREAD`]).
+///
+/// Runtime-overridable (`YOUPIPE_OVERSPLIT`) so A/B benchmarks compare the
+/// same binary — compile-time flips change code layout enough on their own
+/// to swing tight benchmarks by tens of percent.
+fn unbalanced_oversplit() -> usize {
+    static FACTOR: OnceLock<usize> = OnceLock::new();
+    *FACTOR.get_or_init(|| {
+        std::env::var("YOUPIPE_OVERSPLIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32)
+    })
+}
 
 /// Oversplit factor for the fork/join tree, adapting to batch size.
 ///
@@ -1571,7 +1585,7 @@ fn workload_oversplit(n: usize, num_threads: usize, workload: Workload) -> usize
                 BALANCED_OVERSPLIT
             }
         },
-        Workload::Unbalanced => UNBALANCED_OVERSPLIT,
+        Workload::Unbalanced => unbalanced_oversplit(),
         Workload::Custom(factor) => factor.get(),
     }
 }
@@ -2715,6 +2729,9 @@ where
     }
 
     #[inline]
+    /// # Safety
+    ///
+    /// Nothing to drop for a sink-only strategy.
     unsafe fn cleanup_success_chunk(&self, _start: usize, _end: usize) {
         // No-op: sink-only, nothing to clean (mirrors `SinkStrategy`).
     }

@@ -1057,8 +1057,16 @@ fn test_for_each_unbalanced_workload() {
 // oversplit path: concurrent drivers contend for the injector and each
 // other's deques while the CountLatch accounting must stay exact.
 fn test_unbalanced_multi_driver_stress() {
-    const ITERS: usize = if cfg!(miri) { 50 } else { 2_000 };
-    const N: usize = if cfg!(miri) { 32 } else { 1_000 };
+    const ITERS: usize = if cfg!(miri) {
+        50
+    } else {
+        2_000
+    };
+    const N: usize = if cfg!(miri) {
+        32
+    } else {
+        1_000
+    };
     let data: Vec<u64> = (0..N as u64).collect();
     std::thread::scope(|s| {
         for _ in 0..4 {
@@ -1081,10 +1089,7 @@ fn test_unbalanced_multi_driver_stress() {
                             .for_each(move |x: u64| {
                                 s2.fetch_add(x, Ordering::Relaxed);
                             });
-                        assert_eq!(
-                            sum.load(Ordering::Relaxed),
-                            (N as u64) * (N as u64 - 1) / 2
-                        );
+                        assert_eq!(sum.load(Ordering::Relaxed), (N as u64) * (N as u64 - 1) / 2);
                     }
                 }
             });
@@ -1592,4 +1597,167 @@ fn test_max_compute_workers_constant() {
     // The public constant must mirror what ComputePool::new actually clamps
     // to (511 on 64-bit) — README examples rely on it.
     assert_eq!(youpipe::MAX_COMPUTE_WORKERS, 511);
+}
+
+// ── Unbalanced failure-path drop accounting ──
+//
+// The Unbalanced workload fans the batch out as per-chunk trees
+// (`hybrid_dispatch`). On batch failure the driver must clean each
+// successful chunk's executed range exactly once while failed chunks clean
+// themselves inside the recursion's guards. These tests pin that accounting
+// with per-item Drop counters on both input and output.
+//
+// Determinism: the failing item is the LAST item of the batch. Everything
+// before it completed its composed closure, so exactly `n − 1` outputs were
+// ever written; any double-drop or mis-scoped cleanup moves the counters off
+// these exact totals.
+
+/// Burn ~200 ns/item so the batch is big enough to exercise deep chunk
+/// trees (n = 64k over 32 chunks ≈ 2k items per chunk).
+fn unbalanced_burn(x: u64) -> u64 {
+    let mut r = x;
+    let iters: u32 = if cfg!(miri) {
+        4
+    } else {
+        2_000
+    };
+    for _ in 0..iters {
+        r = r.wrapping_mul(7).wrapping_add(13);
+    }
+    r
+}
+
+// Test-side counters/durations are bench-scale (≪ 2^32), so the u64→usize
+// narrowing below cannot lose bits on any realistic target.
+#[allow(clippy::cast_possible_truncation)]
+#[test]
+fn test_unbalanced_panic_drop_accounting() {
+    struct InCounter {
+        drops: Arc<AtomicUsize>,
+        val: u64,
+    }
+    impl Drop for InCounter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    struct OutCounter {
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for OutCounter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let n: u64 = if cfg!(miri) {
+        2_000
+    } else {
+        65_536
+    };
+    let in_drops = Arc::new(AtomicUsize::new(0));
+    let out_drops = Arc::new(AtomicUsize::new(0));
+    let (ic, oc) = (in_drops.clone(), out_drops.clone());
+    let items: Vec<InCounter> = (0..n)
+        .map(|i| InCounter {
+            drops: ic.clone(),
+            val: i,
+        })
+        .collect();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        pipe(items)
+            .with_workload(Workload::Unbalanced)
+            .map(move |d: InCounter| {
+                // The failing item is the LAST of the whole batch: any leaf
+                // still holding earlier items will finish them (they do not
+                // panic), so exactly `n-1` outputs are ever written,
+                // deterministically, regardless of chunk execution order.
+                assert!(d.val != n - 1, "unbalanced panic boom");
+                let v = unbalanced_burn(d.val);
+                // `d` (the input) drops here, inside the composed closure,
+                // after the check — so on panic the guard drops it instead.
+                drop(d);
+                v
+            })
+            .map(move |_v: u64| OutCounter { drops: oc.clone() })
+            .collect()
+    }));
+    assert!(result.is_err(), "panic must propagate");
+
+    // Inputs: all n consumed by their closures (the panicking one included).
+    assert_eq!(
+        in_drops.load(Ordering::Relaxed),
+        n as usize,
+        "every input must drop exactly once"
+    );
+    // Outputs: exactly n-1 were ever written (item n-1 never produced one).
+    // Panic-path cleanup is best-effort for *stolen siblings* (documented
+    // single-tree behaviour, see `TryStrategy`): subtrees stolen from the
+    // panicking chunk's tree complete successfully but are skipped by the
+    // unwinding owner, so up to one chunk's worth of outputs may leak. The
+    // hard guarantees under test: everything the cleanup *does* touch drops
+    // exactly once (no double-drop → `dropped ≤ n-1`), and the leak stays
+    // confined to the panicking chunk (→ `dropped ≥ n-1-chunk_span`, where
+    // chunk_span is one top-level chunk's max range).
+    let dropped = out_drops.load(Ordering::Relaxed);
+    let chunk_span = n.div_ceil(32) as usize;
+    assert!(
+        dropped <= (n - 1) as usize,
+        "outputs must never double-drop (dropped {dropped} > {})",
+        n - 1
+    );
+    assert!(
+        dropped >= (n as usize - 1).saturating_sub(chunk_span),
+        "leak must stay inside the panicking chunk (dropped {dropped},          lower bound {})",
+        (n as usize - 1) - chunk_span
+    );
+}
+
+#[allow(clippy::cast_possible_truncation)]
+#[test]
+fn test_unbalanced_try_collect_err_drop_accounting() {
+    // Same accounting through the try_collect failure path (op `Err`, not a
+    // panic): successful chunks/halves are cleaned by the driver, the failing
+    // chunk's already-written prefix by the recursion's internal cleanup.
+    struct OutCounter {
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for OutCounter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let n: u64 = if cfg!(miri) {
+        2_000
+    } else {
+        65_536
+    };
+    let out_drops = Arc::new(AtomicUsize::new(0));
+    let oc = out_drops.clone();
+
+    let r: Result<Vec<OutCounter>, &str> = pipe(0..n)
+        .with_workload(Workload::Unbalanced)
+        .try_map(move |v: u64| {
+            if v == n - 1 {
+                Err("terminal failure")
+            } else {
+                Ok(v)
+            }
+        })
+        .map(move |v: u64| {
+            std::hint::black_box(unbalanced_burn(v));
+            OutCounter { drops: oc.clone() }
+        })
+        .try_collect();
+    assert!(r.is_err(), "the Err item must short-circuit the batch");
+
+    // Identical totals to the panic variant: n-1 outputs ever written, each
+    // dropped exactly once.
+    assert_eq!(
+        out_drops.load(Ordering::Relaxed),
+        (n - 1) as usize,
+        "every written output must drop exactly once on Err"
+    );
 }
