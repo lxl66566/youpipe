@@ -139,9 +139,28 @@ latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
   [1Ki, 1Mi] 对 `buffer_size` 配得极大的场景（buffer > 1Mi）没有防护，
   至少应 debug_assert 或文档标注上界推导。
 
-### 10. （非性能，顺带记录）`ordered()` + `expand()` panic
+### 10. （非性能，顺带记录）`ordered()` + `expand()` panic（2026-10 设计分析）
 
 可用 `(seq, sub_seq)` 子序号支持展开保序，解除当前组合禁用。属 API 能力项。
+2026-10 深入设计后确认三条硬约束，后续实现前必须先解决：
+
+- **空展开组不可信令（阻断项）**：`(seq, sub, end_of_group)` 方案里 `end` 标志只能
+  附着在组内最后一个条目上；`expand` 返回空 `Vec` 时该组**没有任何消息**可携带
+  完成信号。后果：collector 从第一个空组起无法推进前缀 flush，退化为 close 时
+  `flush_remaining` 全量排序——正确但 (a) 剩余流全量缓冲（内存），(b) 固定容量
+  reorder ring 会被静默丢弃（数据丢失）。channel 元组必须携带 T，控制消息需要
+  enum 化 payload（下游 stage 全链路加分支）或 side channel（无法穿越 typestate）。
+  唯一完好方案是 **expand 后链路改批量 payload**（channel 携带 `(seq, Vec<N>)`，
+  空组=空 Vec 消息，天然支持嵌套 expand 保序，ReorderBuffer 直接复用），但
+  `ordered` 是运行时 flag、批量与否是编译期类型——需把 `ordered` 提为 typestate
+  （`.ordered()` 必须先于 `.expand()` 调用）或双 API。
+- **多层 expand 需要完整路径**：两级 expand 的全局序是 `(seq, sub1, sub2)` 字典序，
+  3 字段 tag 丢 `sub1`；批量 payload 方案无此问题（嵌套即展平）。
+- **泛型约束坑**：`Fn(I, &mut Vec<N>)` 参数位不约束 `N`（E0207），
+  需 `ExpandStage<Prev, F, N>` 结构体泛型承载（expand_emit 已这么做了）。
+
+若做批量 payload 方案，注意与 #6（crossfire park 40 B ArcWaker）叠加后每组的
+channel hop 数减少，是顺带收益。
 ---
 
 ## 已证伪方向（勿重复尝试）
