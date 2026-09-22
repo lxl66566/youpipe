@@ -217,6 +217,12 @@ buffer and writing at known indices instead of the `Vec`-merge fallback.
 indexed fast path — it builds and reduces per-split partial `Vec`s, so the
 gap is structural, not a tuning artifact. rayon 1.12.)
 
+The owned + filter caliber (`youpipe_try_filter_owned`, `MAY_FILTER == true`
+→ the range-tree path) was added 2026-09 together with its port off the last
+`Vec::split_off` tree: **−18.3 % @ 10K, −19.9 % @ 100K** (5 interleaved
+rounds; the 100K base side had one outlier round that inflated its spread —
+every post-change round beat every pre-change round).
+
 ### `for_each()` vs rayon (`sync_for_each`, cpu_heavy per item, borrowed input)
 
 | Size | youpipe `for_each` | rayon `for_each` |
