@@ -78,6 +78,23 @@ let words: Vec<String> = lines.stream()
 assert_eq!(words.len(), 3);
 ```
 
+`.expand(f)` allocates one `Vec` per input item. For expand-heavy loads the
+push-style `.expand_emit(|item, out| …)` appends outputs to a per-worker
+scratch buffer that is cleared and reused across items — zero steady-state
+allocation, same output semantics:
+
+```rust
+use youpipe::prelude::*;
+
+let lines: Vec<String> = vec!["a b".into(), "c".into()];
+let words: Vec<String> = lines.stream()
+    .expand_emit(|line: String, out: &mut Vec<String>| {
+        out.extend(line.split_whitespace().map(String::from));
+    })
+    .run();
+assert_eq!(words.len(), 3);
+```
+
 `.with_cancel(token)` checks a [`CancellationToken`] in the feeder, every
 stage worker, and every bridge, once per iteration. In-flight items drain to
 completion; no new items are accepted after `token.cancel()`:

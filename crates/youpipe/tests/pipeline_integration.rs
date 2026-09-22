@@ -1419,6 +1419,48 @@ fn test_stage_options_buffer_override_runs() {
 }
 
 #[test]
+fn test_stream_expand_emit() {
+    // Push-style expansion must produce exactly the same outputs as the
+    // owned-Vec API, including empty groups and a downstream stage.
+    let items: Vec<i32> = (0..10).collect();
+    let mut result = stream(items.clone())
+        .expand_emit(|x: i32, out: &mut Vec<i32>| {
+            if x % 3 != 0 {
+                out.push(x);
+                out.push(x * 10);
+            } // multiples of 3 expand to nothing
+        })
+        .stage(|x: i32| x + 1)
+        .run();
+    result.sort_unstable();
+    let mut expected: Vec<i32> = items
+        .iter()
+        .filter(|x| **x % 3 != 0)
+        .flat_map(|x| [x + 1, x * 10 + 1])
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn test_stream_expand_emit_with_workers() {
+    use youpipe::StageOptions;
+
+    let r: Vec<u32> = stream(0..50u32)
+        .expand_emit_with(StageOptions::new().workers(2), |x, out: &mut Vec<u32>| {
+            for i in 0..=x {
+                out.push(i);
+            }
+        })
+        .run();
+    assert_eq!(
+        r.len(),
+        (0..50u32).map(|x| x as usize + 1).sum::<usize>(),
+        "expand_emit_with dropped items"
+    );
+}
+
+#[test]
 fn test_stage_options_expand_with_workers() {
     use youpipe::StageOptions;
 

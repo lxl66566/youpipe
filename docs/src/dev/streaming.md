@@ -60,6 +60,14 @@ trusted as-is: the `crossfire >= 3.1.20` pin (crates/youpipe/Cargo.toml)
 carries the upstream fix (issue #70) for the spurious-`Closed` race that once
 required a confirming blocking `recv` after every `Closed`.
 
+Expansion workers (`spawn_expand_stage`) take the user closure push-style
+(`Fn(I, &mut Vec<N>)`) and own one scratch `Vec` per worker, cleared per
+item: the `expand_emit` API runs allocation-free in the steady state,
+while the owned-`Vec` `expand` API is a thin wrapper that mallocs per item
+(see the `expand_heavy` bench notes in benchmarks.md — the malloc share of
+wall time is small under glibc's tcache, but the API removes it
+deterministically and keeps allocator jitter out of tails).
+
 The async terminal collectors (`drain_*_async` in `state/stream.rs`) use the
 awaited analogue — one `recv().await` per burst, `try_recv` in between —
 because tokio's coarse timer wheel batch-completes same-duration timeouts, so

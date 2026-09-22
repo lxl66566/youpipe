@@ -278,16 +278,23 @@ fn spawn_stage<I, O, Tx, R>(
     drop(tx);
 }
 
-/// Like [`spawn_stage`] but expands each input into 1..N outputs via `expand`.
+/// Like [`spawn_stage`] but expands each input into 0..N outputs via `expand`.
 /// Each expanded item inherits the parent's `seq` so the collector can group
 /// expansions from the same input.
+///
+/// `expand` is push-style (`Fn(I, &mut Vec<N>)` appending outputs): each
+/// worker owns one scratch `Vec`, cleared per item and reused across items,
+/// so the steady state performs zero heap allocation. The owned-`Vec`
+/// [`StreamPipe::expand`] API is a thin wrapper over this shape and pays one
+/// `malloc` + `free` per input item (verified by the counting-allocator
+/// test in `tests/expand_alloc.rs`).
 #[allow(clippy::needless_pass_by_value)] // runs inside a `pool.submit(move …)`
 fn spawn_expand_stage<I, N, Tx, R>(
     ctx: &StreamCtx<'_, R>,
     rx: Receiver<(u64, I)>,
     tx: Tx,
     parallelism: usize,
-    expand: impl Fn(I) -> Vec<N> + Send + Sync + 'static,
+    expand: impl Fn(I, &mut Vec<N>) + Send + Sync + 'static,
 ) where
     I: Send + Unpin + 'static,
     N: Send + Unpin + 'static,
@@ -302,17 +309,36 @@ fn spawn_expand_stage<I, N, Tx, R>(
             let tx = tx.clone();
             let worker_cancel = ctx.cancel.clone();
             move || {
+                // Per-worker scratch buffer, reused across items (cleared
+                // per item): expand-heavy loads pay zero steady-state
+                // allocation instead of one `Vec` per input.
+                let mut buf: Vec<N> = Vec::new();
+                // Expand `item` into the scratch buffer and forward the
+                // outputs. Returns false when the downstream channel closed
+                // mid-group (unforwarded outputs are dropped by the next
+                // `clear` — the worker is on its abort path anyway).
+                let mut forward = |seq: u64, item: I| -> bool {
+                    buf.clear();
+                    expand(item, &mut buf);
+                    let mut open = true;
+                    for n in buf.drain(..) {
+                        if tx.send((seq, n)).is_err() {
+                            open = false;
+                            break;
+                        }
+                    }
+                    open
+                };
                 'outer: loop {
                     // Anchor + burst-drain, same shape as `spawn_stage`.
                     let Ok((seq, item)) = rx.recv() else { break };
                     if cancel_active(worker_cancel.as_ref()) {
                         break;
                     }
-                    for n in expand(item) {
-                        if tx.send((seq, n)).is_err() {
-                            break;
-                        }
-                    }
+                    // Downstream closed mid-group: fall through to the
+                    // burst loop, whose `Closed` / send-failure handling
+                    // terminates the worker (same shape as `spawn_stage`).
+                    let _ = forward(seq, item);
                     loop {
                         let (seq, item) = match rx.try_recv() {
                             Ok(v) => v,
@@ -322,10 +348,8 @@ fn spawn_expand_stage<I, N, Tx, R>(
                         if cancel_active(worker_cancel.as_ref()) {
                             break 'outer;
                         }
-                        for n in expand(item) {
-                            if tx.send((seq, n)).is_err() {
-                                break 'outer;
-                            }
+                        if !forward(seq, item) {
+                            break 'outer;
                         }
                     }
                 }
@@ -619,14 +643,21 @@ pub struct SyncStage<Prev, F> {
     pub(super) opts: StageOptions,
 }
 
-/// 1-to-N expansion stage: `Fn(O) -> Vec<N>`. Each input item produces zero or
-/// more outputs; expanded items inherit the parent's `seq` for ordered
-/// collection.
+/// 1-to-N expansion stage: `Fn(O, &mut Vec<N>)` (push-style — appends zero
+/// or more outputs to a per-worker reused scratch buffer). Expanded items
+/// inherit the parent's `seq` so the collector can group expansions from the
+/// same input.
+///
+/// The `N` parameter exists (alongside the opaque `F`) so the
+/// `StageSpawn` impl can constrain `N` via the self type: an
+/// argument-position `&mut Vec<N>` in a where clause alone does not constrain
+/// type parameters (E0207), unlike the old output-position `-> Vec<N>`.
 #[derive(Clone)]
-pub struct ExpandStage<Prev, F> {
+pub struct ExpandStage<Prev, F, N> {
     pub(super) prev: Prev,
     pub(super) f: F,
     pub(super) opts: StageOptions,
+    _marker: PhantomData<fn() -> N>,
 }
 
 /// Async stage: `Fn(O) -> Future<Output = N>`, runs as `io_concurrency` tasks
@@ -1256,10 +1287,10 @@ where
         self.prev.has_expand()
     }
 }
-impl<Prev, F, In, N> StageSpawn<In> for ExpandStage<Prev, F>
+impl<Prev, F, In, N> StageSpawn<In> for ExpandStage<Prev, F, N>
 where
     Prev: StageSpawn<In>,
-    F: Fn(Prev::Out) -> Vec<N> + Send + Sync + 'static,
+    F: Fn(Prev::Out, &mut Vec<N>) + Send + Sync + 'static,
     In: Send + Unpin + 'static,
     Prev::Out: Send + Unpin + 'static,
     N: Send + Unpin + 'static,
@@ -2034,17 +2065,24 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// Append a 1-to-N expansion stage: `Fn(O) -> Vec<N>`. Each input item
     /// produces zero or more outputs (like `flat_map`); expanded items inherit
     /// the parent's sequence tag for ordered collection.
+    ///
+    /// This owned-`Vec` signature pays one `malloc` + `free` per input item.
+    /// For expand-heavy loads prefer the push-style [`Self::expand_emit`],
+    /// which reuses a per-worker scratch buffer (zero steady-state
+    /// allocation).
     #[allow(clippy::type_complexity)] // typestate builder return type; the
     // `impl Fn` + nested `ExpandStage` + `R` param are inherent to the design
     // and not helpfully decomposable.
     pub fn expand<N>(
         self,
         f: impl Fn(O) -> Vec<N> + Send + Sync + 'static,
-    ) -> StreamPipe<ExpandStage<S, impl Fn(O) -> Vec<N> + Send + Sync + 'static>, I, N, R>
+    ) -> StreamPipe<ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>, I, N, R>
     where
         N: Send + Unpin + 'static,
     {
-        self.expand_with(StageOptions::new(), f)
+        self.expand_emit_with(StageOptions::new(), move |item, out| {
+            out.append(&mut f(item));
+        })
     }
 
     /// [`Self::expand`] with per-stage tuning — see [`StageOptions`].
@@ -2055,7 +2093,62 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
         self,
         opts: StageOptions,
         f: impl Fn(O) -> Vec<N> + Send + Sync + 'static,
-    ) -> StreamPipe<ExpandStage<S, impl Fn(O) -> Vec<N> + Send + Sync + 'static>, I, N, R>
+    ) -> StreamPipe<ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>, I, N, R>
+    where
+        N: Send + Unpin + 'static,
+    {
+        self.expand_emit_with(opts, move |item, out| {
+            out.append(&mut f(item));
+        })
+    }
+
+    /// Append a push-style 1-to-N expansion stage: `Fn(O, &mut Vec<N>)`
+    /// appends zero or more outputs to a caller-visible scratch buffer. The
+    /// stage clears and reuses one buffer per worker across items, so the
+    /// steady state performs **zero heap allocation** — unlike the
+    /// owned-`Vec` [`Self::expand`], which mallocs per input item.
+    ///
+    /// Output semantics are identical to [`Self::expand`]: items keep
+    /// emission order within each input's group and inherit the parent's
+    /// sequence tag.
+    ///
+    /// ```rust
+    /// use youpipe::stream;
+    ///
+    /// // Tokenize with one reused scratch Vec per worker: odd inputs
+    /// // expand to nothing, evens to two words each.
+    /// let words: Vec<u64> = stream(0..100)
+    ///     .expand_emit(|x: u64, out: &mut Vec<u64>| {
+    ///         if x % 2 == 0 {
+    ///             out.push(x);
+    ///             out.push(x * 10);
+    ///         }
+    ///     })
+    ///     .run();
+    /// assert_eq!(words.len(), 100);
+    /// ```
+    #[allow(clippy::type_complexity)] // typestate builder return type; the
+    // `impl Fn` + nested `ExpandStage` + `R` param are inherent to the design
+    // and not helpfully decomposable.
+    pub fn expand_emit<N>(
+        self,
+        f: impl Fn(O, &mut Vec<N>) + Send + Sync + 'static,
+    ) -> StreamPipe<ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>, I, N, R>
+    where
+        N: Send + Unpin + 'static,
+    {
+        self.expand_emit_with(StageOptions::new(), f)
+    }
+
+    /// [`Self::expand_emit`] with per-stage tuning — see [`StageOptions`].
+    #[allow(clippy::type_complexity)] // typestate builder return type; the
+    // `impl Fn` + nested `ExpandStage` + `R` param are inherent to the design
+    // and not helpfully decomposable.
+    pub fn expand_emit_with<N>(
+        self,
+        opts: StageOptions,
+        f: impl Fn(O, &mut Vec<N>) + Send + Sync + 'static,
+    ) -> StreamPipe<ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>, I, N, R>
     where
         N: Send + Unpin + 'static,
     {
@@ -2065,6 +2158,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
                 prev: self.stages,
                 f,
                 opts,
+                _marker: PhantomData,
             },
             config: self.config,
             cancel: self.cancel,

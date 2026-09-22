@@ -42,6 +42,12 @@ required-features = ["tokio-runtime"]
 harness = false
 name    = "channel_bench"
 
+# Expand-heavy microbenchmarks: owned-Vec vs push-style expansion, with
+# rayon flat_map/flat_map_iter anchors. See the bench file's module docs.
+[[bench]]
+harness = false
+name    = "expand"
+
 [[bench]]
 harness           = false
 name              = "io_async"

@@ -313,6 +313,38 @@ per-run setup cost (feeder, channel allocation, runtime entry) is a
 larger fraction of the ~9 ms total, so tokio's simpler spawn-per-item model
 still leads there.
 
+### Expand-Heavy — owned `Vec` vs push-style expansion (`expand_heavy`)
+
+Matrix: fan-out ∈ {4, 64} × cost ∈ {cheap, cpu} at 10 K inputs; throughput
+counts output elements. `owned_vec` = `expand(Fn -> Vec)` (one malloc +
+free per input item), `push_emit` = `expand_emit(Fn(I, &mut Vec))` (per-worker
+reused scratch buffer); rayon `flat_map` / `flat_map_iter` rows are the
+external anchors for the two shapes.
+
+Verdict (2026-10, single-session interleaved runs of the `fanout=4/cost=cheap`
+pair — 12 alternating rounds, `taskset 1-31`):
+
+- **Allocation evidence is deterministic** (counting global allocator,
+  `tests/expand_alloc.rs`): `expand` performs ≥ 1 `malloc` per input item
+  (1024 items → ≥ 1024 allocations); `expand_emit` performs a constant
+  independent of item count (8× the inputs adds ≤ a couple of output-`Vec`
+  growth reallocs).
+- **Wall clock: the win is bounded by the malloc/channel cost ratio, and on
+  glibc it is small.** With glibc's per-thread tcache absorbing same-size
+  small frees (~50–100 ns per input), the eliminated malloc is minor against
+  the ~250 ns per *output* channel handoff — paired-round medians showed
+  push ahead by ~2.5 % at `fanout=4/cost=cheap`, inside a ±20 %
+  environmental noise floor (per-round deltas flipped sign; the session's
+  load average included the benches themselves). The original premise that
+  allocator traffic *dominates* expand-heavy loads is **falsified for
+  glibc** — it only holds under allocators without thread caches, or when
+  expansions are large enough to bypass tcache bins.
+- High fan-out amortizes the per-input malloc over more outputs; the
+  structural gap to rayon in this group is the streaming engine's channel
+  infrastructure (see `mixed_load` above and todo #1), not the expansion
+  API shape.
+
+
 ### Channel Throughput
 Two-thread ping-pong (1 producer, 1 consumer, `u64`), all bounded rows at
 capacity 256. Caliber note (2026-10 fix): the old table compared bounded
