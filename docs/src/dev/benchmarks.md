@@ -47,8 +47,14 @@ through CLI flags so both sides measure identically even across historical
 revisions with different in-file defaults, and each (round, side) gets its
 own `CRITERION_HOME` so aggregation only ever reads fresh
 `new/estimates.json` files. `compare.py` reduces each id to the median of
-its per-round medians and calls a delta "stable" only when it exceeds the
-observed round-to-round spread with every round leaning the same way.
+its per-round medians and grades every delta with two signals: *stable*
+(the delta clearly exceeds the observed round-to-round spread with every
+round leaning the same way) and *dominant* (the `dom b` column — how many
+of the na×nb cross-side round pairs side b won; full separation survives a
+single outlier round, which the spread scale cannot: one slow round inflates
+a side's spread to ~30 % and buried a real −19.9 % improvement as `noise`,
+with the improved side winning all 25/25 pairwise rounds).
+`--fail-on-regression` trips on stable-or-dominant regressions.
 
 ```sh
 # full two-sided A/B, 3 interleaved rounds (both sides build once)

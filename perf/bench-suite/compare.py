@@ -11,9 +11,16 @@ criterion's accumulated `base/`/`change/` dirs silently compare against stale
 runs and produce phantom regressions.
 
 Per id we take each round's median estimate, then the median across rounds
-per side. The verdict heuristic uses the spread of per-round medians as the
-noise scale: a delta is only called a real change when it clearly exceeds
-the larger side's round-to-round spread.
+per side. Two complementary verdict signals:
+
+* **spread scale**: a delta is `*stable*` only when it clearly exceeds the
+  larger side's round-to-round spread with every round leaning the same way.
+* **dominance** (the `dom b` column): how many of the na×nb cross-side round
+  pairs side b wins. Full separation — one side faster in *every* pairwise
+  round comparison — is a rank-sum-grade signal that survives a single
+  outlier round, which the spread scale cannot: one slow round inflates a
+  side's spread to ~30% and buries a real −20% change as `noise` even though
+  the other side won every round. Such deltas are flagged `*dominant*`.
 """
 
 from __future__ import annotations
@@ -70,7 +77,7 @@ def main() -> int:
         type=float,
         default=None,
         metavar="PCT",
-        help="exit 1 if any stable regression worse than PCT%%",
+        help="exit 1 if any stable-or-dominant regression worse than PCT%%",
     )
     args = ap.parse_args()
 
@@ -123,39 +130,51 @@ def main() -> int:
             stable = abs(delta) > noise and all(
                 abs(rr) > noise and (rr > 0) == (delta > 0) for rr in round_ratios
             )
+            # Dominance: pairwise round wins across sides (Mann-Whitney grade).
+            # `wins` counts (a-round, b-round) pairs where the b round is
+            # faster; full separation (0 or total) is what upgrades a verdict.
+            total = len(ra) * len(rb)
+            wins = sum(1 for x in ra for y in rb if y < x)
+            dominant = (wins == total or wins == 0) and abs(delta) > NOISE_PCT
             rows.append((ident, ra, rb, med_a, med_b, delta, spread_a, spread_b,
-                         noise, stable))
-
+                         noise, stable, wins, total, dominant))
         rows.sort(key=lambda r: -abs(r[5]))
         print(f"\n## {a_label} → {b_label}  "
               f"({len(round_dirs)} interleaved rounds, median-of-round-medians; "
               f"Δ>0 = {b_label} slower)\n")
-        print("| id | rounds(a) | rounds(b) | med a | med b | Δ% | spread a/b % | verdict |")
-        print("|---|---|---|---|---|---|---|---|")
-        for ident, ra, rb, med_a, med_b, delta, sa, sb, noise, stable in rows:
-            verdict = (
-                ("REGRESSION" if delta > 0 else "improvement") + ("*stable*" if stable else "")
-                if abs(delta) > noise else "noise"
-            )
-            if stable and delta > 0 and args.fail_on_regression is not None \
+        print("| id | rounds(a) | rounds(b) | med a | med b | Δ% | spread a/b % "
+              "| dom b | verdict |")
+        print("|---|---|---|---|---|---|---|---|---|")
+        for ident, ra, rb, med_a, med_b, delta, sa, sb, noise, stable, wins, total, dominant in rows:
+            if abs(delta) > noise:
+                verdict = ("REGRESSION" if delta > 0 else "improvement") \
+                    + ("*stable*" if stable else "")
+            elif dominant:
+                # every round of one side beat every round of the other, yet the
+                # median delta sits inside the outlier-inflated spread scale
+                verdict = ("REGRESSION" if delta > 0 else "improvement") + "*dominant*"
+            else:
+                verdict = "noise"
+            if (stable or dominant) and delta > 0 \
+                    and args.fail_on_regression is not None \
                     and delta > args.fail_on_regression:
                 any_regression = True
             print(f"| {ident} | {'/'.join(fmt_ns(x) for x in ra)} "
                   f"| {'/'.join(fmt_ns(x) for x in rb)} "
                   f"| {fmt_ns(med_a)} | {fmt_ns(med_b)} | {delta:+.1f} "
-                  f"| {sa:.1f}/{sb:.1f} | {verdict} |")
-
+                  f"| {sa:.1f}/{sb:.1f} | {wins}/{total} | {verdict} |")
         tsv = args.outdir / f"compare-{a_label}-{b_label}.tsv"
         with tsv.open("w") as f:
             f.write("id\tmed_a_ns\tmed_b_ns\tdelta_pct\tspread_a_pct\tspread_b_pct\t"
-                    "rounds_a_ns\trounds_b_ns\n")
-            for ident, ra, rb, med_a, med_b, delta, sa, sb, _, _ in rows:
+                    "dom_wins\tdom_total\trounds_a_ns\trounds_b_ns\n")
+            for ident, ra, rb, med_a, med_b, delta, sa, sb, _, _, wins, total, _ in rows:
                 f.write(f"{ident}\t{med_a}\t{med_b}\t{delta:.3f}\t{sa:.2f}\t{sb:.2f}\t"
+                        f"{wins}\t{total}\t"
                         f"{'\t'.join(map(str, ra))}\t{'\t'.join(map(str, rb))}\n")
         print(f"\n(wrote {tsv})")
 
     if any_regression:
-        print("\nFAIL: stable regression beyond threshold")
+        print("\nFAIL: stable-or-dominant regression beyond threshold")
         return 1
     return 0
 
