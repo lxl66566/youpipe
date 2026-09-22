@@ -179,7 +179,11 @@ for i in "${!LABELS[@]}"; do
     bins=$(cd "$dir" && cargo bench --no-run --message-format=json 2>/dev/null \
         | python3 -c '
 import json, sys
-bin_args = [a for a in (sys.argv[1] if len(sys.argv) > 1 else "").split(",") if a]
+# `${BENCH_TARGETS[*]}` arrives space-separated (bash array join), so split on
+# commas AND/OR whitespace — the original comma-only split silently matched
+# nothing when more than one -B was passed ("no bench binaries for side ...").
+import re as _re
+bin_args = [a for a in _re.split(r"[,\s]+", sys.argv[1] if len(sys.argv) > 1 else "") if a]
 for line in sys.stdin:
     try: m = json.loads(line)
     except ValueError: continue

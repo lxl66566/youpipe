@@ -98,8 +98,8 @@
   streaming 数据面出现大量 size=40 分配。归因：crossfire `blocking_tx/rx` 的
   `o_waker: Option<ArcWaker>` 每次调用从 `None` 起步，spin 失败进入 park 前调
   `ArcWaker::new_blocking()`（`Arc` 头 16 B + `WakerInner` 24 B = 40 B）；
-  upstream 把整条 waker 缓存链路注释掉了（见下，git 考古 2026-10，fork 仓库
-  /root/programs/fork/crossfire-rs）。注意：3.1.20 里 `WakerCache` 整体在
+  upstream 把整条 waker 缓存链路注释掉了。**完整考古（时间线、四个 ordering bug
+  前科、逐项风险评估、patch 蓝图）见 `dev/crossfire-waker-cache.md`**；
   `waker.rs` L312-399 的块注释内，**不是活代码**；唯一存活的是 collections.rs
   的 `ArcCell`（#[allow(dead_code)]）与 trait 里的方法名疤痕 `cancel_reuse_waker`。
 - **upstream 意图与历史（git 考古）**：缓存本是真实生效的优化——b7d259d
