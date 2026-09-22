@@ -308,13 +308,34 @@ larger fraction of the ~9 ms total, so tokio's simpler spawn-per-item model
 still leads there.
 
 ### Channel Throughput
+Two-thread ping-pong (1 producer, 1 consumer, `u64`), all bounded rows at
+capacity 256. Caliber note (2026-10 fix): the old table compared bounded
+crossfire against **unbounded** `std::sync::mpsc::channel` — the unbounded
+channel does no capacity accounting and never blocks the producer, so that
+column was not a like-for-like row. Rows are now named by caliber
+(`*_bounded`/`*_unbounded`, `*_mpmc`/`*_mpsc`); numbers are medians of 5
+interleaved rounds, `taskset 1-31` — the 1P1C shape is placement-sensitive
+(unpinned runs collapse up to −58 %), so pinning is mandatory for this group.
 
-| Size | crossfire    | crossbeam-channel | std_mpsc     |
-| ---- | ------------ | ----------------- | ------------ |
-| 10K  | 55.7 Melem/s | 25.1 Melem/s      | 66.9 Melem/s |
-| 100K | 77.2 Melem/s | 24.8 Melem/s      | 85.1 Melem/s |
+| Size | youpipe_mpmc | youpipe_mpsc | crossbeam_bounded | std_mpsc_bounded | std_mpsc_unbounded |
+| ---- | ------------ | ------------ | ----------------- | ---------------- | ------------------ |
+| 10K  | 58 Melem/s   | 35 Melem/s   | 26 Melem/s        | 41 Melem/s        | 65 Melem/s         |
+| 100K | 85 Melem/s   | 44 Melem/s   | 26 Melem/s        | 58 Melem/s        | 92 Melem/s         |
 
-(2026-09-05 rerun, crossfire 3.1.20.)
+Readings:
+
+- Same-caliber bounded-MPSC: `std sync_channel` beats crossfire's mpsc flavor
+  by ~17–31 % in this uncontended 1P1C shape. The MPSC-flavored collector
+  channel was adopted from **in-pipeline** profiling under N-producer
+  contention (recv-side CAS dominates there, see `handoff/channel.rs`); this
+  microbench has no recv-side contention, so it measures the pure
+  cache-line-transfer/wake path instead. Follow-up in `docs/todo.md`: A/B
+  `std sync_channel` as the collector channel inside the real pipeline.
+- The inter-stage MPMC channel (crossfire, 85 Melem/s at 100K) beats every
+  bounded alternative here — the "nothing left to squeeze" conclusion for
+  the middle channels stands (see scheduler.md).
+- `std_mpsc_unbounded` keeps its historical role as the no-backpressure
+  ceiling reference only.
 
 ### hotpath instrumentation round (2026-09)
 
