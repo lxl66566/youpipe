@@ -9,12 +9,15 @@
 //!
 //! Counting is filtered by allocation size (72 bytes = the nine-`u64` temp
 //! `Vec` of an owned group; the per-worker scratch buffer grows through
-//! 32/64/128-byte capacities, so it never matches) because the data plane has
-//! a scheduling-dependent background allocator: crossfire's blocking
-//! send/recv parks allocate a 40-byte `ArcWaker` per contended call
-//! (`o_waker` starts as `None` on every call; the upstream waker cache is
-//! commented out). Unfiltered counts are therefore nondeterministic under
-//! backpressure — see the crossfire waker entry in `docs/todo.md`.
+//! 32/64/128-byte capacities, so it never matches). Counting itself is
+//! atomics-only: a locking histogram (Mutex+BTreeMap) self-deadlocks —
+//! inserting a bucket allocates while the lock is held and std's Mutex is
+//! not reentrant.
+//!
+//! Unfiltered counts are therefore nondeterministic under backpressure —
+//! a 2-stage pipeline measured 17/387/2 wakers across three consecutive
+//! runs — see the crossfire waker entry in `docs/todo.md` for the full
+//! attribution.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},

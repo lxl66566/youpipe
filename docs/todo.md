@@ -95,14 +95,20 @@
 ### 6. crossfire 阻塞路径的每次 park 40 B `ArcWaker` 分配（2026-10 新发现）
 
 - **现状**：`tests/expand_alloc.rs` 调试期间用 size 直方图定位：饱和/背压下
-  streaming 数据面每 item 级出现 size=40 分配（8192 item 的 run 计 11222 次）。
-  归因：crossfire `blocking_tx/rx` 的 `o_waker: Option<ArcWaker>` 每次调用从
-  `None` 起步，spin 失败进入 park 前调 `ArcWaker::new_blocking()`（`Arc` +
-  `WakerInner` = 40 B）；upstream 把 `cache_waker` 注释掉了
-  （crossfire 3.1.20 `blocking_tx.rs` L146）。调度相关：无竞争时完全不出现，
-  饱和稳态时≈每 item 一次 malloc+free。
-- **影响**：这既是每 item 分配流量（与已关闭的 expand push-API 工作同类但规模更大——40 B vs
-  32 B，且通道侧覆盖**所有** stage 间 hop），也可能是尾延迟抖动源。
+  streaming 数据面出现大量 size=40 分配。归因：crossfire `blocking_tx/rx` 的
+  `o_waker: Option<ArcWaker>` 每次调用从 `None` 起步，spin 失败进入 park 前调
+  `ArcWaker::new_blocking()`（`Arc` 头 16 B + `WakerInner` 24 B = 40 B）；
+  upstream 把 `cache_waker` 注释掉了（crossfire 3.1.20 `blocking_tx.rs` L146、
+  `blocking_rx.rs` L99，`WakerCache` 设施本身还在 `waker.rs` L365）。
+- **量化（2026-10 size 直方图，临时 example 复测）**：无竞争快阶段下每次 run
+  仅 2-4 次（fast path `try_send` 完全绕过 waker）；背压下爆发且高度调度依赖
+  ——同 pipeline 三连 run 分别 17/387/2 次（双峰抖动，这就是无过滤计数测试
+  不可复现的原因）；expand fanout-9（8192 入 → 73728 出，2 个 hop）稳态
+  1654-2653 次/run，是全 pipeline 第一大分配类（第二名仅 45×32B scratch 增长）。
+  极限逼近每 contended send/recv 尝试一次（含 double-check 假唤醒的重试）。
+- **影响**：这是背压下的第一分配流量来源，覆盖**所有** stage 间 hop（对比：已关闭的
+  expand push-API 只消除 stage 函数内部的 Vec 分配），且调度依赖的双峰计数
+  本身就是潜在尾延迟抖动源。
 - **方向**：
   1. 先量化：hotpath/计数分配器下测 `stream_pipeline` 全家族的 40 B 分配率；
   2. 修补选项：给 upstream 提 waker 复用 patch（per-Sender/Receiver 缓存——
