@@ -118,7 +118,11 @@ fn num_cpus() -> usize {
 
 fn bench_pure_io_async(c: &mut Criterion) {
     let mut group = c.benchmark_group("io_async_pure");
-    for size in [200_usize, 500] {
+    // 200/500 anchor the latency-dominated regime (<= 1 item per consumer
+    // at io_concurrency 512); 2000 adds a steady-state row where each consumer
+    // task processes several items — the regime the async consumers'
+    // burst-drain recv loop targets.
+    for size in [200_usize, 500, 2000] {
         let tasks = skewed_io(size);
         group.throughput(Throughput::Elements(size as u64));
 
@@ -246,7 +250,11 @@ fn bench_pure_io_async(c: &mut Criterion) {
 
 fn bench_mixed_cpu_io(c: &mut Criterion) {
     let mut group = c.benchmark_group("io_async_mixed");
-    for size in [200_usize, 500] {
+    // 200/500 anchor the latency-dominated regime (<= 1 item per consumer
+    // at io_concurrency 512); 2000 adds a steady-state row where each consumer
+    // task processes several items — the regime the async consumers'
+    // burst-drain recv loop targets.
+    for size in [200_usize, 500, 2000] {
         let items: Vec<((u64, u32), Duration)> = skewed_cpu(size)
             .into_iter()
             .zip(skewed_io(size).into_iter().map(|(_, d)| d))
