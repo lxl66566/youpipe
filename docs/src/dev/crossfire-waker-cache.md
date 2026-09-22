@@ -245,3 +245,50 @@ impl WakerCache {
 - **不修 upstream**：与 todo #10 的批量 payload（channel 携带 `(seq, Vec<N>)`）合流，每 hop 的 park 次数按批大小摊薄，40B 流量同比例下降；
 - **collector 侧换 `std sync_channel`**（todo #5 联动）：暴露面缩小到 stage 间 MPMC；
 - upstream 拒收 patch 则 fork 到 `crates/youpipe-crossfire`（与 `youpipe-concurrent-queue` 同策略，保持可 diff 维护）。
+
+## 7. 落地验证（2026-10，已合入）
+
+> 结论先行：**已按 §6 备选路径 fork 落地**（`crates/youpipe-crossfire`，源分支 `waker-cache`），并按实测修正了蓝图的两处假设。40B 分配峰值降 90–97%，墙钟 A/B 中性（在对照行标定的噪声带内），价值兑现为卫生性 + 可测性——与 §5 预测一致。
+
+### 7.1 fork 与 patch
+
+上游补丁在 `/root/programs/fork/crossfire-rs` 分支 `waker-cache`（基线 6f761e0 = 3.1.20 + 两笔上游后续修复），五个提交：
+
+| 提交 | 内容 |
+| --- | --- |
+| `ba71d40` | 复活 `WakerCache`（去 `<P>` 泛型）+ Tx/Rx 字段 + `reg_waker_blocking(&WakerCache)` + 两个 wake-success 出口 push（§4.1 蓝图） |
+| `7dab8f7` / `f29ab77` | crossbeam `try_push_oneshot`/`push_with_ptr` 补 `# Safety` 文档（满足 unsafe 边界文档规则；注意须紧贴 fn 放置，中间的 attribute 会阻断规则的注释回扫） |
+| `374c312` | **修蓝图遗漏**：`RegistrySend for RegistryMulti` 与 `RegistrySingle` 两个方向的 `cache_waker` 实现——trait 默认是 no-op，缺失时对应 handle 永不入池 |
+| `5bb6ccf` | **修正原设计**：tx wake-success 出口去掉 `is_full()` 门，无条件 push |
+
+vendored 副本 `crates/youpipe-crossfire/` 与 fork 分支逐字节一致（`diff -r` 验证），manifest 自含（lints、dev-deps 同 upstream，另加 `missing_safety_doc = "allow"`，同 youpipe-concurrent-queue 策略）。
+
+### 7.2 两处对蓝图的实测修正（重要经验）
+
+1. **§4.3 的 "is_full() 门是有意为之" 被实测证伪**。出口流量插桩（hit/miss/push + 各出口计数）显示：fanout-9 expand 场景下 89% 的 waker 丢失发生在 wake-success 但 channel 瞬时不满的出口（唤醒方腾出的空位多于一个，自己发送后又没填满）。原论证"下一轮大概率走 fast path"在饱和场景恰好不成立——miss 计数本身就是反证。去掉门后单槽缓存让**同一个 waker 循环服务数千 episode**（插桩 run 实测 hit=1643 / miss=239），40B 计数从 ~1000–1800/run 再降到 62–255/run。代价仅是每 episode 一次 CAS。
+2. **蓝图漏写 `RegistrySend` / `RegistrySingle` 的 `cache_waker` 实现**。trait 默认方法体是空的；只复活 `RegistryRecv for RegistryMulti` 时插桩显示 push=0 / hit=0——tx 侧（背压主战场）完全没接上，缓存形同虚设。教训：复活被注释的调用点时，**trait 默认实现会静默吞掉缺失的 impl**，必须插桩确认数据真的流起来，不能只看编译通过。
+
+### 7.3 验收数据
+
+探针（临时 example，size-40 计数分配器，与 §1.2 同 workload shape，各 5 run）：
+
+| 场景 | 3.1.20（before） | fork（after） |
+| --- | --- | --- |
+| 双快 stage | 2–4 | 2–18 |
+| 背压 | 2–20（历史尖峰 387） | 1–18（尖峰消失） |
+| expand fanout-9 | 17–2461（高位 ~2000） | **62–255**（峰值 −90~−97%） |
+
+残余 = fast-cancel 出口（`cancel_reuse_waker` / `cancel_waker` 的 take+drop，§2 图中 push 点 B），与 miss 计数精确线性相关（txcdrop 4–207 ↔ miss 10–240）。要消掉它需把缓存句柄穿透 `ChannelShared::sender_double_check`（registry 拿不到 per-handle 缓存），即 §4.1 说的"第二步"；预期残余再降一个数量级（240→~30/run），暂不做。
+
+### 7.4 墙钟 A/B（`bench_ab.sh`，3+5 轮交错，taskset 1-31）
+
+- **streaming 大 N 行**（waker 高频场景）一致小幅改善：`stream_pipeline/single_stage_ordered/100000` −4.1%（9/9 dominant）、`expand_heavy/push_emit_fanout=64/cheap` −5.0%（9/9）、`mixed_load/youpipe_stream_cpu` −1.2~−1.9%；
+- **channel 微基准**（1P1C）：`youpipe_mpmc/10000` +6.3% dominant、`youpipe_mpmc/100000` +152%（模式翻转）。**base-vs-base 校准**显示 `mpmc/100000` 同 binary 自身双峰（base 侧三轮 1.38/1.20/3.01 ms）、`mpsc/100000` 校准噪声 ±8.6%——两行都不能作回归证据；
+- **rayon 对照行**（不经过 crossfire）+7~10% 稳定偏移：本次 A/B 的跨二进制布局噪声带标定，上述 youpipe 行 ±5% 级的波动都在带内；
+- 结论：**墙钟中性**——无超出噪声带的回归，也无显著提升，与 §5 "<1% 墙钟，价值在卫生 + 可测性" 的预测吻合。
+
+### 7.5 后续待办
+
+- miri（tree-borrows）跑 upstream test-suite + youpipe 集成测试（§4.2 验证要求，本次按约定跳过）；loom 覆盖 push→pop→re-reg→fire 交错；
+- 向 upstream 提 PR（作者留的 `// XXX, it's possible to reuse the waker` 正是这个切入点）；拒收则维持 fork；
+- `expand_alloc.rs` 的按尺寸过滤可考虑收紧，但 40B 档未归零（fast-cancel 残余），无过滤断言仍会 flaky。

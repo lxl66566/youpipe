@@ -92,53 +92,13 @@
   send 无自旋窗口、park 策略不同，低深度背压场景可能反而回退。
 - **验证**：`stream_pipeline` 全家族 + `mixed_load` 隔离交替 A/B。
 
-### 6. crossfire 阻塞路径的每次 park 40 B `ArcWaker` 分配（2026-10 新发现）
+### 6. crossfire 阻塞路径的每次 park 40 B `ArcWaker` 分配（✅ 已落地，2026-10）
 
-- **现状**：`tests/expand_alloc.rs` 调试期间用 size 直方图定位：饱和/背压下
-  streaming 数据面出现大量 size=40 分配。归因：crossfire `blocking_tx/rx` 的
-  `o_waker: Option<ArcWaker>` 每次调用从 `None` 起步，spin 失败进入 park 前调
-  `ArcWaker::new_blocking()`（`Arc` 头 16 B + `WakerInner` 24 B = 40 B）；
-  upstream 把整条 waker 缓存链路注释掉了。**完整考古（时间线、四个 ordering bug
-  前科、逐项风险评估、patch 蓝图）见 `dev/crossfire-waker-cache.md`**；
-  `waker.rs` L312-399 的块注释内，**不是活代码**；唯一存活的是 collections.rs
-  的 `ArcCell`（#[allow(dead_code)]）与 trait 里的方法名疤痕 `cancel_reuse_waker`。
-- **upstream 意图与历史（git 考古）**：缓存本是真实生效的优化——b7d259d
-  (2025-07-07) "Add cache for LockedWaker in blocking context"：per-Tx/Rx
-  `WakerCache`（ArcCell），fast-cancel 与 wake-success 两类出口都 push。
-  2025-07-18 加 direct copy（sender 带 `*const T` payload park，`on_recv` 替它
-  try_send，"lower the failure order"）→ `WakerInner<P>` 带 payload 泛型。
-  2026-01-17 因 miri UB（issue #54）disable direct copy，次日 re-enable，
-  最终 fb1af1e (2026-05-14, 进 3.1.20) 永久移除 direct copy 并去掉 `P` 泛型——
-  缓存与 payload 泛型纠缠（`WakerCache<*const T>`），作为**附带损伤**被整体
-  块注释（字段、调用点、trait stub、实现全灭），并非缓存本身有 bug。
-- **量化（2026-10 size 直方图，临时 example 复测）**：无竞争快阶段下每次 run
-  仅 2-4 次（fast path `try_send` 完全绕过 waker）；背压下爆发且高度调度依赖
-  ——同 pipeline 三连 run 分别 17/387/2 次（双峰抖动，这就是无过滤计数测试
-  不可复现的原因）；expand fanout-9（8192 入 → 73728 出，2 个 hop）稳态
-  1654-2653 次/run，是全 pipeline 第一大分配类（第二名仅 45×32B scratch 增长）。
-  极限逼近每 contended send/recv 尝试一次（含 double-check 假唤醒的重试）。
-- **影响**：这是背压下的第一分配流量来源，覆盖**所有** stage 间 hop（对比：已关闭的
-  expand push-API 只消除 stage 函数内部的 Vec 分配），且调度依赖的双峰计数
-  本身就是潜在尾延迟抖动源。
-- **方向**：
-  1. 先量化：hotpath/计数分配器下测 `stream_pipeline` 全家族的 40 B 分配率；
-  2. 修补选项（git 考古后明确可行，约 30 行 patch）：从块注释复活 `WakerCache`，
-     去掉 `P` 泛型（`reset(payload)` → 已存在的 `reset()`/`reset_init()`）；
-     Tx/Rx 重新持有 `waker_cache` 字段；`reg_waker_blocking` 的 else 分支
-     `new_blocking()` 改为从缓存 pop（注释里保留的旧签名即此意图）；出口 push。
-     风险评估：`push` 的 `weak_count==0 && strong_count==1` 门是承重不变量，
-     当前所有出口均满足（wake-success 前弱引用已被 `pop_first` 摘除；fast-cancel
-     走 `_clear_wakers`；abandon 路径 waker 直接 drop 不入缓存），复用等价于
-     重新 `Arc::new`；seq 由注册表在 mutex 下盖戳，与分配复用正交（无 ABA）；
-     `reset_init` 的 Relaxed 论证可扩展到复用（weak_count==0 ⇒ 无并发观察者）。
-     但 upstream waker 生命周期有历史 bug（issue #14/#22/#34），patch 需过
-     miri+loom。youpipe 侧形态理想：`SyncSender::clone` → 每 worker 独享 Tx
-     → 缓存天然单线程、`update_thread_handle` 形同虚设。可先提 upstream，
-     不接受再走 fork（与 youpipe-concurrent-queue 同策略）；
-  3. 与 #5 联动：若换 `std sync_channel` 做 collector，此问题只影响 stage 间
-     MPMC，缩小暴露面。
-- **验证**：`expand_heavy` + `stream_pipeline` 隔离交替 A/B + 计数分配器
-  size 直方图（40 B 档消失）。
+- **结果**：已按 fork 路径落地——`crates/youpipe-crossfire`（源：`/root/programs/fork/crossfire-rs` 分支 `waker-cache`），复活 per-handle 单槽 `WakerCache`（设计 A）。验收与实测细节见 `dev/crossfire-waker-cache.md` §7；设计空间完整分析（A/C/B/E 对比、事实清单 F1–F15）见 `dev/crossfire-waker-designs.md`。
+- **验收读数**：expand fanout-9 的 40B 分配从稳态 ~2000/run（高位 1654–2653）降至 **62–255/run**（峰值 −90~−97%）；背压尖峰（387/run）消失，无竞争场景维持个位数。残余为 fast-cancel 出口（需把缓存句柄穿透 `ChannelShared::sender_double_check`，即"第二步"，暂不做）。
+- **墙钟 A/B**（`bench_ab.sh` 交错 3+5 轮）：streaming 大 N 行一致 −1~−5%（dominant 8-9/9）；channel 微基准的 +6~+152% 行经 base-vs-base 校准证实为该行固有的双峰/噪声（rayon 对照行自身偏移 +7~10%）。结论：**墙钟中性，无回归**——价值兑现为分配卫生 + 尾部扰动源消除 + 测试面扩大，与预期（<1% 墙钟）一致。
+- **两处对考古蓝图的实测修正**（已记入 §7.2）：① `is_full()` 门在饱和场景恰好漏掉 89% 的 wake-success 出口，去掉后同一 waker 循环服务数千 episode；② `RegistrySend`/`RegistrySingle` 的 `cache_waker` impl 缺失时 trait 默认 no-op 会静默吞掉整条 tx 侧回收链——复活注释代码必须插桩验证数据真的流起来。
+- **待办**：miri（tree-borrows）+ loom 验证（§4.2 要求，落地时按约定跳过）；向 upstream 提 PR（设计 C——per-thread 不死 waker——是更优的 upstream 提案，A 是最小修复/本地已落地形态）；`expand_alloc.rs` 可收紧按尺寸过滤阈值，但 40B 未归零，无过滤断言仍会 flaky。
 ---
 
 ## P2
