@@ -94,11 +94,11 @@
 
 ### 6. crossfire 阻塞路径的每次 park 40 B `ArcWaker` 分配（✅ 已落地，2026-10）
 
-- **结果**：已按 fork 路径落地——`crates/youpipe-crossfire`（源：`/root/programs/fork/crossfire-rs` 分支 `waker-cache`），复活 per-handle 单槽 `WakerCache`（设计 A）。验收与实测细节见 `dev/crossfire-waker-cache.md` §7；设计空间完整分析（A/C/B/E 对比、事实清单 F1–F15）见 `dev/crossfire-waker-designs.md`。
-- **验收读数**：expand fanout-9 的 40B 分配从稳态 ~2000/run（高位 1654–2653）降至 **62–255/run**（峰值 −90~−97%）；背压尖峰（387/run）消失，无竞争场景维持个位数。残余为 fast-cancel 出口（需把缓存句柄穿透 `ChannelShared::sender_double_check`，即"第二步"，暂不做）。
-- **墙钟 A/B**（`bench_ab.sh` 交错 3+5 轮）：streaming 大 N 行一致 −1~−5%（dominant 8-9/9）；channel 微基准的 +6~+152% 行经 base-vs-base 校准证实为该行固有的双峰/噪声（rayon 对照行自身偏移 +7~10%）。结论：**墙钟中性，无回归**——价值兑现为分配卫生 + 尾部扰动源消除 + 测试面扩大，与预期（<1% 墙钟）一致。
-- **两处对考古蓝图的实测修正**（已记入 §7.2）：① `is_full()` 门在饱和场景恰好漏掉 89% 的 wake-success 出口，去掉后同一 waker 循环服务数千 episode；② `RegistrySend`/`RegistrySingle` 的 `cache_waker` impl 缺失时 trait 默认 no-op 会静默吞掉整条 tx 侧回收链——复活注释代码必须插桩验证数据真的流起来。
-- **待办**：miri（tree-borrows）+ loom 验证（§4.2 要求，落地时按约定跳过）；向 upstream 提 PR（设计 C——per-thread 不死 waker——是更优的 upstream 提案，A 是最小修复/本地已落地形态）；`expand_alloc.rs` 可收紧按尺寸过滤阈值，但 40B 未归零，无过滤断言仍会 flaky。
+- **结果**：已按 fork 路径落地——`crates/youpipe-crossfire`（源：`/root/programs/fork/crossfire-rs` 分支 `waker-tl`），per-thread 不死 waker + 全局 seq 戳标记队列项（设计 C，取代先落地的设计 A/`waker-cache` 分支）。验收与实测细节见 `dev/crossfire-waker-designs.md` §11；考古与设计 A 的落地记录见 `dev/crossfire-waker-cache.md` §7；设计空间完整分析（A/C/B/E 对比、事实清单 F1–F15）见 `dev/crossfire-waker-designs.md`。
+- **验收读数**：expand fanout-9 的 40B 分配从 upstream 稳态 ~2000/run 降至 A 的 62–433/run，再降至 C 的**稳态 1/run**（结构性归零：总量 104 次/run 对 73,728 item）；背压、无竞争场景同样归 1。C 无 fast-cancel 残余（无出口概念），`expand_alloc.rs` 的按尺寸过滤已可考虑收紧。
+- **对蓝图的三处修正**（已记入 designs §11.2）：① `close()` 也必须做 seq 检查，否则会把别处现役 waiter 盖成 Closed（虚假 Disconnect）；② seq 戳源改全局计数器——per-registry 计数器数值可碰撞，会让陈旧项冒充现役偷 fire；③ `_clear_wakers` 维持节点 seq 语义（entry-seq 反而少摘陈旧项）。
+- **验证状态**：fork check/test 全绿（新增 2 个 C 专属单测），upstream test-suite 串行 334/334；youpipe 全套测试 + 50 轮 pipeline_integration 压测全绿。**一次未复现挂起**（与 fork test-suite 并发高负载下多线程停在通道 park，66 次复跑零复现）——见 designs §11.5。
+- **待办**：miri（tree-borrows）+ loom 验证（§10 要求；上述未复现挂起使其升级为必须项）；向 upstream 提 PR（C 形态即 `waker-tl` 分支，A 分支保留为 fallback）；`expand_alloc.rs` 收紧过滤阈值。
 ---
 
 ## P2

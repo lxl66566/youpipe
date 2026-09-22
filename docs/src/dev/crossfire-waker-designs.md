@@ -413,3 +413,72 @@ notify_one:      if waiters > 0 { epoch += 1; futex_wake(&epoch, 1) }
    - 线程退出残留：T1 退出后残留 weak 被 pop，upgrade 失败路径不 panic。
 3. **直方图**：`tests/expand_alloc.rs` 复测，40B 档预期从背压下千级塌缩到 ≈ 线程数（A 预期 ≈ handle 数，二者同数量级，均可用同一断言）。
 4. **性能**：同 binary 交错 A/B（`bench_ab.sh`），预期与考古 §5 一致——<1% 墙钟、关注 p99 方差；A 与 C 互相对比的差额（episode 元数据开销）预计在噪声内，若 C 显著更好是加分项。
+
+---
+
+## 11. 落地验证（2026-10，design C 已合入，取代 A）
+
+> 结论先行：**C 按本文蓝图落地并反超 A 的验收读数**——expand fanout-9 的 40B 分配从 A 的 62–433/run（同轮实测 233–433）降到**稳态 1/run**（每 run 常数级 ≈ 新线程 TL 槽），背压场景同样归 1；改动面与 §5.8 预期一致（2 个文件，调用方零改动）。落地过程中发现蓝图的三处遗漏/修正，见 §11.2。
+
+### 11.1 fork 与落地形态
+
+fork 分支 `waker-tl`（基线 = `waker-cache` 分支的 HEAD，保留 crossbeam 安全文档两提交），三个提交：
+
+| 提交 | 内容 |
+| --- | --- |
+| `8ee2341` | 还原设计 A（四文件回到 upstream 6f761e0 字节态），使 C 直接对 upstream 出 diff |
+| `a8c731b` | **设计 C 本体**：TL 不死 waker + 队列项 `(Weak, seq)` + pop/close 的陈旧项跳过 |
+| `ee91652` | `NonNull::from(Box::leak)` 安全化（与 vendored 副本逐字节对齐） |
+
+vendored `crates/youpipe-crossfire/src/` 与分支 `diff -r` 逐字节一致；`WakerCache`/`ArcCell` 维持死亡（§9 表格预期）。
+
+### 11.2 对蓝图的三处修正（实测/推演发现）
+
+1. **`close()` 也必须做 seq 检查**（蓝图 §5.8 只列了 `pop_first`/`pop_again`）。`RegistryMulti::close` 会清空整个队列；对"已在别处重臂"的不死节点调 `close_wake()` 会把 Waiting→Closed 盖在**另一个 channel 的现役 waiter** 上，醒来后表现为虚假 `Disconnected`——这是正确性 bug 而非良性假唤醒。同构处理：seq 不匹配跳过。已加针对性单测（`test_registry_multi_close_skips_stale_entries`）。
+2. **seq 戳源从 per-registry 计数器改为全局 `AtomicU32`**。蓝图 §5.4 假设重臂后的 seq（ch2 计数器值）≠ 陈旧项的 seq（ch1 计数器值），但两个计数器只各自单调、数值互不相关——流水线里两侧计数器大致同步推进时**数值相等并不罕见**，相等即陈旧项冒充现役、偷走一次 fire（§5.4 的 stall 场景复活）。全局计数器使戳全进程唯一，"不匹配"严格等价于"已重臂"；单 registry 队列内戳仍严格递增，`_clear_wakers` 的排序逻辑与 `fire()` 的 last_seq 界 unchanged。代价：每 episode 一次被 mutex 保护的 `fetch_add`（futex 级成本下可忽略）。fork 单测中两处绝对 seq 断言改为相对断言。
+3. **`_clear_wakers` 维持节点当前 seq 语义**（蓝图标注"可选改用 entry seq"——不改）。推演结论：entry-seq 在"episode 内重复注册后 fast-cancel"的交错下反而少摘一个陈旧项；节点 seq 语义的残留全部有界（fire 时被 seq-tag 跳过，同 §5.7-1 良性清单）。
+
+### 11.3 验收数据（探针同 §1.2 方法，8192 输入 × 5 连 run，同轮双测）
+
+| 场景 | upstream 3.1.20 | 设计 A（同轮实测） | **设计 C** |
+| --- | --- | --- | --- |
+| 双快 stage | 2–4 | 1–107 | 1–30（含首轮 TL 预热） |
+| 背压 | 2–20（尖峰 387） | 14–17 | **1–3** |
+| expand fanout-9 | 高位 ~2000 | 233–433 | **1（5/5 run）** |
+
+C 的 40B 档在稳态**结构性归零**（总量 104 次/run，对 73,728 个 item）；A 的 fast-cancel 残余（"第二步" plumbing）在 C 里没有存在前提——无出口概念，天然覆盖（§5.9 表格预期兑现）。
+
+### 11.4 墙钟 A/B（base = A@HEAD，side = C@工作树，交错 3 轮）
+
+`target/bench-ab/waker-tl/compare-base-tl.tsv`（expand + async_vs_tokio + mixed_load + channel_bench，taskset 1-31）。
+
+**youpipe 行（waker 高频场景）一致偏改善：**
+
+| id | med A | med C | Δ% | dom C |
+| --- | --- | --- | --- | --- |
+| channel_throughput/youpipe_mpmc/10000 | 187.9 µs | 173.6 µs | −7.6 | 9/9（spread 4.1/1.4，stable） |
+| channel_throughput/youpipe_mpsc/100000 | 2.396 ms | 2.086 ms | −12.9 | 9/9 |
+| channel_throughput/youpipe_mpmc/100000 | 1.98 ms | 1.231 ms | −37.8 | 9/9（base 侧双峰 79% spread，快/慢模式翻转，非真实变化） |
+| stream_pipeline/single_stage_unordered/100000 | 28.92 ms | 26.74 ms | −7.5 | 8/9 |
+| stream_pipeline/single_stage_unordered/1000 | 287.4 µs | 279.2 µs | −2.8 | 9/9 |
+| mixed_load/youpipe_stream_cpu/* | — | — | ±0.5 | noise |
+
+**控制行（不经过 crossfire）标定本轮噪声带——base 侧系统性偏慢：**
+
+| id | Δ% | verdict |
+| --- | --- | --- |
+| channel_throughput/std_mpsc_unbounded/100000 | **−42.4** | improvement*stable*（纯 std 通道） |
+| expand_heavy/rayon_flat_map_iter_fanout=64/cpu | **−12.5** | improvement*stable*（spread 3.2/2.4） |
+| expand_heavy/rayon_flat_map_iter_fanout=4/cpu | −4.4 | improvement*stable* |
+| mixed_load/rayon_par_iter/* | −0.3~−0.8 | noise |
+
+**回归检查**：无 stable 回归行（`std_mpsc_bounded/100000` +40.9% 为 131% spread 的双峰噪声；`multi_stage_2/100000` +3.5%、`push_emit_fanout=4/cpu` +5.4% 均 noise verdict）。
+
+**结论**：youpipe 行 −3~−13% 的改善方向与幅度都在本轮控制行标定的会话级噪声带内（跨二进制布局效应，方向恰好有利于 tl 侧），**墙钟判定为中性偏正、不可归因**——与 §10-4 预期（A/C 差额在噪声内）一致。C 的兑现价值仍是 §11.3 的分配结构性归零；无回归则是放行依据。
+
+### 11.5 验证状态与遗留
+
+- fork：`cargo check`（default/tokio/async_std/trace_log/compat）零警告；`cargo test --release` 16+43 全绿（新增 2 个 C 专属单测：跨 registry 重臂后 fire 跳过陈旧项、close 不误伤）；upstream test-suite（tokio）并行 317/334、串行 **334/334 全过**（并行失败为已知 Drop 计数竞态）。
+- youpipe：`cargo test --release` 全绿（含 15 轮全套 + 50 轮 pipeline_integration 压测）；clippy/fmt 零警告。**一次未复现挂起**：首轮全套测试与 fork 串行 test-suite 并发跑时，多个测试线程停在阻塞通道 park 上（形态像丢唤醒），杀掉后 66 次复跑零复现——归因存疑（高负载饥饿 vs 真实竞态窗口），**miri/loom 待办（同 §10 验证计划）升级为必须项**。
+- miri（tree-borrows）+ loom：仍未跑（todo #6）；C 的核对重点是 N1（TL 初始化与首次注册的 hb）与 seq-tag 跳过路径。
+- upstream PR：C 形态（2 文件、调用方零改动、无新协议）即本分支；A 分支保留为 fallback。

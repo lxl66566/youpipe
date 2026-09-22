@@ -249,6 +249,8 @@ impl WakerCache {
 ## 7. 落地验证（2026-10，已合入）
 
 > 结论先行：**已按 §6 备选路径 fork 落地**（`crates/youpipe-crossfire`，源分支 `waker-cache`），并按实测修正了蓝图的两处假设。40B 分配峰值降 90–97%，墙钟 A/B 中性（在对照行标定的噪声带内），价值兑现为卫生性 + 可测性——与 §5 预测一致。
+>
+> **2026-10 后记**：设计 A 已被设计 C（per-thread 不死 waker，见 [crossfire-waker-designs.md](crossfire-waker-designs.md) §5/§11）**取代**——vendored 副本现跟踪 fork 分支 `waker-tl`，40B 档稳态归 1/run（A 残留 62–433/run 的 fast-cancel 出口在 C 下无存在前提）。本节保留作为 A 的落地记录与蓝图修正经验。
 
 ### 7.1 fork 与 patch
 
