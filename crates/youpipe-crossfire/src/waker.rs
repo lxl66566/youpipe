@@ -1,11 +1,14 @@
 //use crate::collections::ArcCell;
+#[cfg(feature = "loom")]
+// loom replaces the atomics with model-checked ones; everything else (Arc,
+// Weak, Thread) stays real — only synchronization is under model checking.
+use loom::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::ops::Deref;
-use std::sync::{
-    atomic::{AtomicU32, AtomicU8, Ordering},
-    Arc, Weak,
-};
+#[cfg(not(feature = "loom"))]
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::*;
 use std::thread;
 
@@ -94,8 +97,17 @@ impl ArcWaker {
     pub fn weak(&self) -> Weak<WakerInner> {
         Arc::downgrade(&self.0)
     }
+
+    /// Clone sharing the same node. Test-only: model tests inject one
+    /// per-thread node and hand it to several loom threads.
+    #[cfg(any(test, feature = "loom"))]
+    #[inline(always)]
+    pub(crate) fn clone_node(&self) -> Self {
+        Self(self.0.clone())
+    }
 }
 
+#[cfg(not(feature = "loom"))]
 thread_local! {
     // Design C: the wake target of a blocking context is thread::current(),
     // which never changes — so the waker node belongs to the thread, not to an
@@ -115,6 +127,7 @@ thread_local! {
 /// Clone the immortal per-thread blocking waker, re-armed for a new episode.
 /// Costs two uncontended Arc refcount ops — no allocation after the thread's
 /// first contended episode.
+#[cfg(not(feature = "loom"))]
 #[inline(always)]
 pub(crate) fn tl_blocking_waker() -> ArcWaker {
     BLOCKING_WAKER.with(|inner| {
@@ -122,6 +135,17 @@ pub(crate) fn tl_blocking_waker() -> ArcWaker {
         waker.reset();
         waker
     })
+}
+
+#[cfg(feature = "loom")]
+#[inline(always)]
+pub(crate) fn tl_blocking_waker() -> ArcWaker {
+    // TLS is not modeled under loom (its single-thread lifetime is covered by
+    // miri); loom tests exercise the node identity and re-arm protocol with
+    // explicitly injected per-thread nodes instead.
+    let waker = ArcWaker::new_blocking();
+    waker.reset();
+    waker
 }
 
 #[derive(Debug)]
@@ -440,5 +464,34 @@ mod tests {
         use std::mem::size_of;
         println!("wakertype {}", size_of::<ThinWaker>());
         println!("waker inner {}", size_of::<WakerInner>());
+    }
+
+    #[test]
+    fn test_tl_blocking_waker_identity() {
+        // The thread-local slot hands out the same node on every episode and
+        // keeps it alive between episodes (strong count never drops to zero).
+        let w1 = tl_blocking_waker();
+        let node = w1.0.clone(); // TL slot + w1 + node = 3
+        assert_eq!(Arc::strong_count(&node), 3);
+        assert_eq!(w1.get_state(), WakerState::Init as u8);
+        drop(w1);
+        // Episode over: only the TL slot and our probe reference remain.
+        assert_eq!(Arc::strong_count(&node), 2);
+
+        // Next episode: same node, re-armed to Init even from Woken.
+        node.state.store(WakerState::Woken as u8, Ordering::SeqCst);
+        let w2 = tl_blocking_waker();
+        assert!(Arc::ptr_eq(&node, &w2.0));
+        assert_eq!(Arc::strong_count(&node), 3); // TL slot + node + w2
+        assert_eq!(w2.get_state(), WakerState::Init as u8);
+    }
+
+    #[test]
+    fn test_tl_blocking_waker_nodes_differ_across_threads() {
+        // Each thread owns its own immortal node.
+        let main_node = tl_blocking_waker().0.clone();
+        let t = std::thread::spawn(|| tl_blocking_waker().0.clone());
+        let other_node = t.join().expect("join");
+        assert!(!Arc::ptr_eq(&main_node, &other_node));
     }
 }

@@ -6,15 +6,42 @@ use crate::flavor::{Flavor, FlavorImpl};
 use crate::tokio_task_id;
 use crate::trace_log;
 use crate::waker::*;
-use parking_lot::Mutex;
+#[cfg(feature = "loom")]
+// loom has no compiler_fence; a full fence is its modeled superset.
+use loom::sync::atomic::fence as compiler_fence;
+#[cfg(feature = "loom")]
+use loom::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
+#[cfg(feature = "loom")]
+// loom's Mutex is the modeled equivalent; parking_lot's raw futex calls are
+// opaque to the model and would hide interleavings.
+use loom::sync::{Mutex, MutexGuard};
+#[cfg(all(not(feature = "loom"), not(miri)))]
+use parking_lot::{Mutex, MutexGuard};
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::sync::{
-    atomic::{compiler_fence, AtomicU32, AtomicU8, AtomicUsize, Ordering},
-    Arc, Weak,
-};
+#[cfg(not(feature = "loom"))]
+use std::sync::atomic::{compiler_fence, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
+#[cfg(all(not(feature = "loom"), miri))]
+// Miri cannot interpret parking_lot_core's futex path on Windows
+// (GetModuleHandleA); std::sync is natively supported by the interpreter.
+use std::sync::{Mutex, MutexGuard};
 use std::task::{Context, Poll};
+
+// The mutex flavors differ only in lock()'s return: parking_lot hands out the
+// guard directly, std (miri builds) and loom wrap it in a LockResult.
+#[cfg(not(any(feature = "loom", miri)))]
+#[inline(always)]
+fn reg_lock(inner: &Mutex<RegistryMultiInner>) -> MutexGuard<'_, RegistryMultiInner> {
+    inner.lock()
+}
+
+#[cfg(any(feature = "loom", miri))]
+#[inline(always)]
+fn reg_lock(inner: &Mutex<RegistryMultiInner>) -> MutexGuard<'_, RegistryMultiInner> {
+    inner.lock().unwrap()
+}
 
 // pub(crate) on type alias does not matter, mpmc::List alias works because RegistryMulti is pub
 
@@ -263,7 +290,13 @@ impl RegistryRecv for RegistrySingle {
 // global counter makes stamps unique process-wide, so a stamp mismatch always
 // means "re-armed since this entry was pushed". Uniqueness comes from the RMW
 // itself; the registry mutex publication orders the subsequent set_seq/push.
+#[cfg(not(feature = "loom"))]
 static REG_STAMP: AtomicU32 = AtomicU32::new(1);
+#[cfg(feature = "loom")]
+loom::lazy_static! {
+    // Re-initialized for every loom model run.
+    static ref REG_STAMP: AtomicU32 = AtomicU32::new(1);
+}
 
 struct RegistryMultiInner {
     // Each entry records the stamp it was registered under. A node whose
@@ -317,7 +350,7 @@ impl RegistryMulti {
     fn reg_waker(&self, waker: &ArcWaker) {
         let weak = waker.weak();
         {
-            let mut guard = self.inner.lock();
+            let mut guard = reg_lock(&self.inner);
             let seq = REG_STAMP.fetch_add(1, Ordering::Relaxed);
             guard.seq = seq;
             waker.set_seq(seq);
@@ -405,7 +438,7 @@ impl RegistryMulti {
             return None;
         }
         {
-            let mut guard = self.inner.lock();
+            let mut guard = reg_lock(&self.inner);
             if flag & MULTI_HAS_SELECT > 0 {
                 for select in &guard.selectors {
                     select.wake();
@@ -454,7 +487,7 @@ impl RegistryMulti {
             return None;
         }
         {
-            let mut guard = self.inner.lock();
+            let mut guard = reg_lock(&self.inner);
             let mut has_pop = false;
             loop {
                 if let Some((weak, seq)) = guard.queue.pop_front() {
@@ -525,7 +558,7 @@ impl RegistryMulti {
                 }
             }};
         }
-        let mut guard = self.inner.lock();
+        let mut guard = reg_lock(&self.inner);
         if let Some(entry) = guard.queue.pop_front() {
             if process!(guard, entry) {
                 if guard.queue.is_empty() {
@@ -581,7 +614,7 @@ impl Registry for RegistryMulti {
 
     #[inline(always)]
     fn close(&self) {
-        let mut guard = self.inner.lock();
+        let mut guard = reg_lock(&self.inner);
         for selector in &guard.selectors {
             selector.wake();
         }
@@ -604,7 +637,7 @@ impl Registry for RegistryMulti {
     /// return waker queue size
     #[inline]
     fn len(&self) -> usize {
-        let guard = self.inner.lock();
+        let guard = reg_lock(&self.inner);
         guard.queue.len()
     }
 
@@ -757,7 +790,7 @@ impl RegistryRecv for RegistryMulti {
     #[inline(always)]
     fn reg_select_waker(&self, channel_id: usize, waker: &Arc<SelectWaker>) -> bool {
         trace_log!("{}: reg for select", self._tag);
-        let mut guard = self.inner.lock();
+        let mut guard = reg_lock(&self.inner);
         if guard.selectors.is_empty() {
             self.state.store(guard.check_waker() | MULTI_HAS_SELECT, Ordering::SeqCst);
         }
@@ -767,7 +800,7 @@ impl RegistryRecv for RegistryMulti {
 
     #[inline(always)]
     fn cancel_select_waker(&self, waker: &Arc<SelectWaker>) {
-        let mut guard = self.inner.lock();
+        let mut guard = reg_lock(&self.inner);
         if let Some((i, _)) = guard.selectors.iter().enumerate().find(|&(_, entry)| entry.eq(waker))
         {
             guard.selectors.remove(i);
@@ -1100,5 +1133,380 @@ mod tests {
         assert_eq!(reg1.len(), 0);
         // close() must not stamp Closed on a node waiting elsewhere.
         assert_eq!(node.get_state(), WakerState::Waiting as u8);
+    }
+
+    // Design C under miri/tree-borrows: the real thread-local path (lazy init,
+    // first registration, spurious-wakeup re-arm, cross-registry re-arm with
+    // real park/unpark, thread-exit residue) exercised with real threads.
+    // The write-once ThinWaker handle (N1) is what tree-borrows checks here.
+
+    #[test]
+    fn test_tl_waker_rearm_reuses_node_across_registrations() {
+        // One thread, one episode with an internal spurious wakeup, driven
+        // through the real reg_waker_blocking protocol (None -> Some branch).
+        let reg = Arc::new(<RegistryMulti as RegistryRecv>::new());
+        let t = {
+            let reg = reg.clone();
+            std::thread::spawn(move || {
+                let mut o_waker: Option<ArcWaker> = None;
+                <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+                let first_seq = o_waker.as_ref().expect("waker").get_seq();
+
+                // Spurious wakeup inside the episode: re-arm without a new node.
+                <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+                let waker = o_waker.as_ref().expect("waker");
+                assert!(waker.get_seq() > first_seq);
+                // Duplicate entries pointing at the same node are the existing
+                // F3 behavior; the older one is stale after the re-arm.
+                assert_eq!(reg.len(), 2);
+                assert_eq!(waker.get_state(), WakerState::Init as u8);
+                reg.commit_waiting(&o_waker);
+            })
+        };
+        t.join().expect("join");
+
+        // fire() must skip the stale duplicate and wake the current entry.
+        let r = reg.fire();
+        assert!(r.is_done() || r == WakeResult::Next);
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn test_rearmed_node_not_stolen_by_old_registry() {
+        // The design docs' 5.4 stall interleaving end-to-end with real
+        // park/unpark: T1 leaves an entry on reg1, re-arms on reg2 and parks;
+        // T2 waits on reg1. Firing reg1 must skip T1's stale entry and wake
+        // T2; T1 is only woken by reg2's own fire.
+        use std::sync::mpsc::channel;
+        let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+        let reg2 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+
+        let (tx1, rx1) = channel();
+        let t1 = {
+            let reg1 = reg1.clone();
+            let reg2 = reg2.clone();
+            std::thread::spawn(move || {
+                let mut o_waker: Option<ArcWaker> = None;
+                <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg1, &mut o_waker);
+                // Episode 1 ends: the node survives in the thread-local slot.
+                o_waker.take();
+
+                let mut o_waker: Option<ArcWaker> = None;
+                <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg2, &mut o_waker);
+                let state = reg2.commit_waiting(&o_waker);
+                tx1.send(()).expect("send");
+                if state == WakerState::Waiting as u8 {
+                    std::thread::park();
+                }
+                assert_eq!(o_waker.as_ref().expect("waker").get_state(), WakerState::Woken as u8);
+            })
+        };
+
+        let (tx2, rx2) = channel();
+        let t2 = {
+            let reg1 = reg1.clone();
+            std::thread::spawn(move || {
+                let mut o_waker: Option<ArcWaker> = None;
+                <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg1, &mut o_waker);
+                let state = reg1.commit_waiting(&o_waker);
+                tx2.send(()).expect("send");
+                if state == WakerState::Waiting as u8 {
+                    std::thread::park();
+                }
+                assert_eq!(o_waker.as_ref().expect("waker").get_state(), WakerState::Woken as u8);
+            })
+        };
+
+        rx1.recv().expect("t1 committed");
+        rx2.recv().expect("t2 committed");
+        // Both waiters are Waiting: fire() skips T1's stale entry and wakes T2.
+        assert_eq!(reg1.fire(), WakeResult::Woken);
+        // T1's node is still armed on reg2; reg2's own event wakes it.
+        assert_eq!(reg2.fire(), WakeResult::Woken);
+        t1.join().expect("join t1");
+        t2.join().expect("join t2");
+    }
+
+    #[test]
+    fn test_thread_exit_residue_popped_without_panic() {
+        // The thread-local slot drops the node at thread exit; the weak
+        // entries left in the queue must take the existing dead-node path
+        // (upgrade failure) on both fire() and close().
+        let reg = Arc::new(<RegistryMulti as RegistryRecv>::new());
+        let t = {
+            let reg = reg.clone();
+            std::thread::spawn(move || {
+                let mut o_waker: Option<ArcWaker> = None;
+                <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+                reg.commit_waiting(&o_waker);
+                // Return without cancelling: the episode is abandoned and the
+                // thread exits, dropping the immortal node with it.
+            })
+        };
+        t.join().expect("join");
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg.fire(), WakeResult::Next);
+        reg.close();
+        assert_eq!(reg.len(), 0);
+    }
+}
+
+// Model-checked tests for design C. Run with:
+//   cargo test --lib --release --features loom loom_ -- --nocapture
+//
+// TLS is not modeled (see tl_blocking_waker's loom branch): the modeled
+// object is the node identity + re-arm protocol, so per-thread nodes are
+// injected explicitly. Parking itself is not simulated either — unpark/park
+// correctness is std's contract — instead the observable effects of fire()
+// and close() (the returned WakeResult and the waker state machine) are
+// asserted deterministically after the interleaving, which loom enumerates
+// in full. Spin-based fake parking does not work under loom: a path where
+// the scheduler keeps picking the spinner is legal, so any bounded spin
+// loop would fail spuriously.
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+
+    fn wait_committed(phase: &AtomicUsize) {
+        while phase.load(Ordering::SeqCst) == 0 {
+            loom::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn loom_cross_registry_stale_entry_skipped_by_fire() {
+        // The design docs' 5.4 stall interleaving: T1 leaves an entry on reg1,
+        // re-arms on reg2 and commits; T2 fires reg1 with a fresh waiter
+        // waiting. The re-arm is fully published before the fire (the barrier
+        // gives fire's relaxed seq read a happens-before edge to the re-arm's
+        // set_seq), so the stale entry is skipped deterministically.
+        loom::model(|| {
+            let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let reg2 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let committed1 = Arc::new(AtomicUsize::new(0));
+            let committed3 = Arc::new(AtomicUsize::new(0));
+
+            // T1's per-thread node, injected explicitly; kept alive by the
+            // main thread so the weak entries stay upgradable after T1 ends.
+            let node = ArcWaker::new_blocking();
+
+            let t1 = {
+                let reg1 = reg1.clone();
+                let reg2 = reg2.clone();
+                let committed1 = committed1.clone();
+                let node = node.clone_node();
+                loom::thread::spawn(move || {
+                    // Episode on reg1, then re-arm on reg2.
+                    reg1.reg_waker(&node);
+                    node.reset();
+                    reg2.reg_waker(&node);
+                    node.commit_waiting();
+                    committed1.store(1, Ordering::SeqCst);
+                })
+            };
+
+            let t3 = {
+                let reg1 = reg1.clone();
+                let committed3 = committed3.clone();
+                loom::thread::spawn(move || {
+                    let other = ArcWaker::new_blocking();
+                    reg1.reg_waker(&other);
+                    other.commit_waiting();
+                    committed3.store(1, Ordering::SeqCst);
+                    other
+                })
+            };
+
+            wait_committed(&committed3);
+            wait_committed(&committed1);
+            // fire() must skip the stale entry and wake the fresh waiter.
+            assert_eq!(reg1.fire(), WakeResult::Woken);
+            let other = t3.join().unwrap();
+            assert_eq!(other.get_state(), WakerState::Woken as u8);
+            // The skip means the node waiting on reg2 was not touched at all.
+            assert_eq!(node.get_state(), WakerState::Waiting as u8);
+
+            // Its own registry's event wakes it normally.
+            assert_eq!(reg2.fire(), WakeResult::Woken);
+            t1.join().unwrap();
+            assert_eq!(node.get_state(), WakerState::Woken as u8);
+            // The stale entry may remain when `other` sat at the queue head
+            // (the wake returned Woken before reaching it); the next fire
+            // skips it (the barrier keeps the seq read fresh) and drains.
+            assert_eq!(reg1.fire(), WakeResult::Next);
+            assert_eq!(reg1.len(), 0);
+        });
+    }
+
+    #[test]
+    fn loom_fire_vs_rearm_race_recovers_within_one_event() {
+        // The known narrow window (design docs 3.4): the re-arm's set_seq and
+        // fire's seq read sit under different mutexes with no hb edge, so a
+        // relaxed read may still observe the pre-re-arm stamp and the stale
+        // entry steals one fire. loom enumerates that interleaving too; the
+        // contract asserted here is the bounded recovery: the delayed waiter
+        // is woken by the very next event, and nothing is ever Closed.
+        loom::model(|| {
+            let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let reg2 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let committed1 = Arc::new(AtomicUsize::new(0));
+            let committed3 = Arc::new(AtomicUsize::new(0));
+
+            let node = ArcWaker::new_blocking();
+
+            let t1 = {
+                let reg1 = reg1.clone();
+                let reg2 = reg2.clone();
+                let committed1 = committed1.clone();
+                let node = node.clone_node();
+                loom::thread::spawn(move || {
+                    reg1.reg_waker(&node);
+                    node.reset();
+                    reg2.reg_waker(&node);
+                    node.commit_waiting();
+                    committed1.store(1, Ordering::SeqCst);
+                })
+            };
+
+            let t3 = {
+                let reg1 = reg1.clone();
+                let committed3 = committed3.clone();
+                loom::thread::spawn(move || {
+                    let other = ArcWaker::new_blocking();
+                    reg1.reg_waker(&other);
+                    other.commit_waiting();
+                    committed3.store(1, Ordering::SeqCst);
+                    other
+                })
+            };
+
+            // Only the fresh waiter is barriered before the fire; the re-arm
+            // races it freely.
+            wait_committed(&committed3);
+            assert_eq!(reg1.fire(), WakeResult::Woken);
+            let other = t3.join().unwrap();
+            if other.get_state() != WakerState::Woken as u8 {
+                // The stale entry stole this fire: its node got the wake.
+                assert_eq!(node.get_state(), WakerState::Woken as u8);
+                // Recovery is one event away.
+                assert_eq!(reg1.fire(), WakeResult::Woken);
+            }
+            assert_eq!(other.get_state(), WakerState::Woken as u8);
+
+            wait_committed(&committed1);
+            let r = reg2.fire();
+            assert!(r == WakeResult::Woken || r == WakeResult::Next);
+            t1.join().unwrap();
+            // Never Closed; woken by reg2's event or by the stolen fire above.
+            assert_eq!(node.get_state(), WakerState::Woken as u8);
+            assert!(reg1.len() <= 1);
+        });
+    }
+
+    #[test]
+    fn loom_close_skips_stale_entry_and_keeps_foreign_waiter_intact() {
+        // close() on reg1 must not stamp Closed on the node that is currently
+        // Waiting on reg2 (that would surface as a spurious Disconnect
+        // there), while the reg1-local waiter still gets its Closed.
+        loom::model(|| {
+            let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let reg2 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let committed1 = Arc::new(AtomicUsize::new(0));
+            let committed3 = Arc::new(AtomicUsize::new(0));
+
+            let node = ArcWaker::new_blocking();
+
+            let t1 = {
+                let reg1 = reg1.clone();
+                let reg2 = reg2.clone();
+                let committed1 = committed1.clone();
+                let node = node.clone_node();
+                loom::thread::spawn(move || {
+                    reg1.reg_waker(&node);
+                    node.reset();
+                    reg2.reg_waker(&node);
+                    node.commit_waiting();
+                    committed1.store(1, Ordering::SeqCst);
+                })
+            };
+
+            let t3 = {
+                let reg1 = reg1.clone();
+                let committed3 = committed3.clone();
+                loom::thread::spawn(move || {
+                    let other = ArcWaker::new_blocking();
+                    reg1.reg_waker(&other);
+                    other.commit_waiting();
+                    committed3.store(1, Ordering::SeqCst);
+                    other
+                })
+            };
+
+            wait_committed(&committed1);
+            wait_committed(&committed3);
+            reg1.close();
+            let other = t3.join().unwrap();
+            // The live reg1 waiter was closed-woken.
+            assert_eq!(other.get_state(), WakerState::Closed as u8);
+            // The stale entry was skipped: the node waiting on reg2 is still
+            // exactly Waiting, not spuriously Disconnected.
+            assert_eq!(node.get_state(), WakerState::Waiting as u8);
+            // Its own registry's event wakes it normally.
+            assert_eq!(reg2.fire(), WakeResult::Woken);
+            t1.join().unwrap();
+            assert_eq!(node.get_state(), WakerState::Woken as u8);
+            assert_eq!(reg1.len(), 0);
+        });
+    }
+
+    #[test]
+    fn loom_thread_exit_residue_is_popped_safely() {
+        // The node dies with its thread; the weak entry left in the queue
+        // must take the dead-node upgrade path on every pop site.
+        loom::model(|| {
+            let reg = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let t = {
+                let reg = reg.clone();
+                loom::thread::spawn(move || {
+                    let mut o_waker: Option<ArcWaker> = None;
+                    <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+                    reg.commit_waiting(&o_waker);
+                    // Thread exits without cancelling the episode.
+                })
+            };
+            t.join().unwrap();
+            assert_eq!(reg.fire(), WakeResult::Next);
+            reg.close();
+            assert_eq!(reg.len(), 0);
+        });
+    }
+
+    #[test]
+    fn loom_spurious_rearm_duplicate_entry_fire_wakes_current() {
+        // A spurious wakeup re-arms through the Some branch, leaving a
+        // duplicate entry; fire() must skip the stale duplicate and wake the
+        // current registration.
+        loom::model(|| {
+            let reg = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let committed = Arc::new(AtomicUsize::new(0));
+            let t = {
+                let reg = reg.clone();
+                let committed = committed.clone();
+                loom::thread::spawn(move || {
+                    let mut o_waker: Option<ArcWaker> = None;
+                    <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+                    // Spurious wakeup inside the episode: re-arm, no new node.
+                    <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+                    reg.commit_waiting(&o_waker);
+                    committed.store(1, Ordering::SeqCst);
+                    o_waker
+                })
+            };
+            wait_committed(&committed);
+            assert_eq!(reg.fire(), WakeResult::Woken);
+            let o_waker = t.join().unwrap();
+            assert_eq!(o_waker.as_ref().unwrap().get_state(), WakerState::Woken as u8);
+            assert_eq!(reg.len(), 0);
+        });
     }
 }

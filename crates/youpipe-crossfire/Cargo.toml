@@ -48,12 +48,18 @@ pointers        = "0"
 tokio           = { version = "1", features = ["time", "rt"], optional = true }
 async-std       = { version = "1", optional = true }
 log             = { version = "0.4", optional = true }
+# Model-checked waker tests (dep-only, enabled by the `loom` feature).
+# Deliberately feature-gated instead of RUSTFLAGS="--cfg loom": that would
+# leak the cfg into dependencies carrying their own cfg(loom) test shims
+# without the loom crate linked (e.g. event-listener).
+loom = { version = "0.7", optional = true }
 
+# Diverges from the fork manifest: no `captains-log` — it assumes a unix
+# libc and fails to compile on Windows (the fork dropped it too).
 [dev-dependencies]
 log         = "0"
 tokio       = { version = "1", features = ["time", "sync", "rt-multi-thread", "rt", "macros"] }
 smol        = "2"
-captains-log = "0"
 
 [features]
 default = []
@@ -69,6 +75,9 @@ async_std = ["dep:async-std"]
 
 # for test workflow debugging
 trace_log = ["dep:log"]
+
+# Model-checked waker tests: cargo test -p youpipe-crossfire --features loom --lib -- loom_
+loom = ["dep:loom"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -93,6 +102,8 @@ new_without_default     = "allow"
 result_unit_err         = "allow"
 
 [lints.rust]
-# `loom` etc. are not used by this fork; silence the workspace-level
-# unexpected_cfgs gate for upstream's cfg surface.
+# `loom` is switched by the cargo feature here (unlike youpipe's rustflag
+# convention), so src only uses `cfg(feature = "loom")`; docsrs comes from
+# rustdoc-args. Silence the workspace-level unexpected_cfgs gate for
+# upstream's cfg surface.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(docsrs)"] }

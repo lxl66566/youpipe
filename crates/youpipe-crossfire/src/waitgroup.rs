@@ -1360,7 +1360,6 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use captains_log::{recipe, ConsoleTarget, Level};
     use std::thread;
 
     #[test]
@@ -1418,7 +1417,6 @@ mod tests {
 
     #[test]
     fn test_waitgroup_ptr() {
-        recipe::console_logger(ConsoleTarget::Stdout, Level::Trace).test().build().expect("log");
         let inner = Box::new(WaitGroupInner::new((), 1));
         assert_eq!(inner.count(SeqCst), 1);
         assert_eq!(State::new(inner.state.load(Ordering::SeqCst)).waker_flag(), 0);
@@ -1461,7 +1459,6 @@ mod tests {
 
     #[test]
     fn test_waitgroup_inner() {
-        recipe::console_logger(ConsoleTarget::Stdout, Level::Trace).test().build().expect("log");
         let inner = WaitGroupInner::new((), 1);
         assert_eq!(inner.count(SeqCst), 1);
         assert_eq!(State::new(inner.state.load(Ordering::SeqCst)).waker_flag(), 0);
