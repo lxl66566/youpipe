@@ -128,6 +128,148 @@ fn test_owned_filter_panic_drop_accounting() {
     );
 }
 
+/// `Err` short-circuit through the owned try+filter range tree
+/// (`fused_try_filter_collect`): the failing leaf drops its unread input tail,
+/// every other range is consumed, so all `n` inputs drop exactly once; the
+/// outputs written before the failure (a scheduling-independent set when the
+/// failing item is last) drop with the discarded partial `Vec`s.
+#[allow(clippy::cast_possible_truncation)]
+#[test]
+fn test_try_filter_collect_err_drop_accounting() {
+    struct InCounter {
+        drops: Arc<AtomicUsize>,
+        val: u64,
+    }
+    impl Drop for InCounter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    struct OutCounter {
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for OutCounter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let n: u64 = if cfg!(miri) {
+        2_000
+    } else {
+        65_536
+    };
+    let in_drops = Arc::new(AtomicUsize::new(0));
+    let out_drops = Arc::new(AtomicUsize::new(0));
+    let (ic, oc) = (in_drops.clone(), out_drops.clone());
+    let items: Vec<InCounter> = (0..n)
+        .map(|i| InCounter {
+            drops: ic.clone(),
+            val: i,
+        })
+        .collect();
+
+    let r: Result<Vec<OutCounter>, &str> = pipe(items)
+        .try_map(move |d: InCounter| {
+            // Fail on the LAST item: every earlier output is written
+            // deterministically, regardless of leaf execution order.
+            if d.val == n - 1 {
+                Err("terminal failure")
+            } else {
+                Ok(d.val)
+            }
+        })
+        .filter(|&v: &u64| v % 3 == 0)
+        .map(move |_v: u64| OutCounter { drops: oc.clone() })
+        .try_collect();
+    assert!(r.is_err(), "the Err item must short-circuit the batch");
+
+    assert_eq!(
+        in_drops.load(Ordering::Relaxed),
+        n as usize,
+        "every input must drop exactly once on Err"
+    );
+    // Survivors of the filter among 0..n-1 (the failing item never outputs).
+    let expected_out = (0..n - 1).filter(|v| v % 3 == 0).count();
+    assert_eq!(
+        out_drops.load(Ordering::Relaxed),
+        expected_out,
+        "every written output must drop exactly once on Err"
+    );
+}
+
+/// Panic path through the same tree: the unwinding leaf's `FilterGuard`
+/// drops its unread tail and `join` waits out the siblings (their ranges
+/// consume fully), so all inputs drop exactly once. The output count is
+/// scheduling-dependent — waited-out sibling subtrees may complete and drop
+/// whole `Vec`s — so only the no-double-drop bound is asserted.
+#[allow(clippy::cast_possible_truncation)]
+#[test]
+fn test_try_filter_collect_panic_drop_accounting() {
+    struct InCounter {
+        drops: Arc<AtomicUsize>,
+        val: u64,
+    }
+    impl Drop for InCounter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    struct OutCounter {
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for OutCounter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let n: u64 = if cfg!(miri) {
+        2_000
+    } else {
+        65_536
+    };
+    let in_drops = Arc::new(AtomicUsize::new(0));
+    let out_drops = Arc::new(AtomicUsize::new(0));
+    let (ic, oc) = (in_drops.clone(), out_drops.clone());
+    let panic_at = n / 3;
+    let items: Vec<InCounter> = (0..n)
+        .map(|i| InCounter {
+            drops: ic.clone(),
+            val: i,
+        })
+        .collect();
+
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _ = pipe(items)
+            .try_map(move |d: InCounter| {
+                assert!(d.val != panic_at, "boom");
+                Ok::<u64, &str>(d.val)
+            })
+            .filter(|&v: &u64| v % 3 == 0)
+            .map(move |_v: u64| OutCounter { drops: oc.clone() })
+            .try_collect();
+    }));
+    assert!(
+        r.is_err(),
+        "panic must propagate through the try filter tree"
+    );
+
+    assert_eq!(
+        in_drops.load(Ordering::Relaxed),
+        n as usize,
+        "every input must drop exactly once on panic"
+    );
+    // Every written output drops exactly once: at most one output per
+    // surviving item other than the panicking one (which never outputs).
+    let max_out = (0..n).filter(|&v| v != panic_at && v % 3 == 0).count();
+    let dropped = out_drops.load(Ordering::Relaxed);
+    assert!(
+        dropped <= max_out,
+        "outputs must never double-drop (dropped {dropped} > {max_out})"
+    );
+}
+
 #[test]
 fn test_try_map_ok() {
     let result = pipe(0..100)

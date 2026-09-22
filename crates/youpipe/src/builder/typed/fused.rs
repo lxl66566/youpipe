@@ -1210,8 +1210,8 @@ where
 // cardinality (every item either succeeds or aborts the whole pipeline with an
 // error). This lets us pre-allocate the output `Slots<R>` and write results at
 // known indices — the same zero-allocation strategy `par_index_collect` uses
-// for infallible pipelines. The `Vec`-merge path (`join_fused_try_collect`)
-// remains the fallback for chains containing `Filter`.
+// for infallible pipelines. The range-tree path (`fused_try_filter_collect`)
+// serves chains containing `Filter`.
 
 /// Recursive divide-and-conquer for fallible stages. Returns `Err(e)` on the
 /// first error; on error, all init output slots in the error branch are
@@ -1719,40 +1719,56 @@ impl SplitPlan {
 // merges them all on the single driver thread; that structural merge cost
 // outweighs the ramp-up win for every batch size measured.
 
+/// RAII guard that drops the unread input tail on unwind — shared by the
+/// infallible ([`filter_leaf`]) and fallible ([`filter_try_leaf`]) filter
+/// leaves. The output half is elided because each leaf's `Vec` drops itself.
+///
+/// `pos` tracks the consumed-iteration count: items `..pos` were moved out
+/// of their slots (uninit), item `pos` was moved into the stage chain and is
+/// gone with it, `input[pos+1..]` is still init and must be dropped.
+struct FilterGuard<'a, T> {
+    input: &'a [T],
+    pos: usize,
+}
+
+impl<T> FilterGuard<'_, T> {
+    /// Drop the still-init tail `input[pos+1..]`. Runs on both the unwind
+    /// path (`Drop`) and the fallible leaf's `Err` short-circuit — item `pos`
+    /// was consumed by the stage call either way.
+    ///
+    /// # Safety
+    ///
+    /// `pos` must reflect the leaf's iteration counter at the call point;
+    /// every slot in `(pos, len)` must hold a live `T`.
+    unsafe fn drop_tail(&self) {
+        let in_live = self.input.as_ptr();
+        // SAFETY: see the contract above; `pos` items were `ptr::read` out.
+        unsafe {
+            for j in (self.pos + 1)..self.input.len() {
+                ptr::drop_in_place(in_live.add(j).cast_mut());
+            }
+        }
+    }
+}
+
+impl<T> Drop for FilterGuard<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: `pos` reflects the consumed-iteration count at the unwind
+        // point.
+        unsafe { self.drop_tail() };
+    }
+}
+
 /// Consume `input` sequentially, applying `stages` and collecting surviving
 /// outputs into a fresh `Vec`.
 ///
-/// Panic safety: a `FilterGuard` drops the unread input tail on unwind — the
-/// input-half mirror of `LeafGuard` (there is no shared output buffer; the
-/// leaf's `Vec` drops naturally).
+/// Panic safety: a [`FilterGuard`] drops the unread input tail on unwind
+/// (there is no shared output buffer; the leaf's `Vec` drops naturally).
 fn filter_leaf<T, S>(input: &[T], stages: &S) -> Vec<S::Output>
 where
     T: Send,
     S: FusedStage<T>,
 {
-    /// RAII guard that drops the unread input tail on unwind — identical to
-    /// `ForEachGuard` (see `par_for_each_leaf`); the output half is elided
-    /// because the leaf's `Vec` drops itself.
-    struct FilterGuard<'a, T> {
-        input: &'a [T],
-        pos: usize,
-    }
-
-    impl<T> Drop for FilterGuard<'_, T> {
-        fn drop(&mut self) {
-            // SAFETY: `pos` reflects the consumed-iteration count at the
-            // unwind point. Items `..pos` were moved out (uninit); item `pos`
-            // was moved into `stages` and is gone; `input[pos+1..]` is still
-            // init and must be dropped.
-            unsafe {
-                let in_live = self.input.as_ptr();
-                for j in (self.pos + 1)..self.input.len() {
-                    ptr::drop_in_place(in_live.add(j).cast_mut());
-                }
-            }
-        }
-    }
-
     let in_ptr = input.as_ptr();
     let n = input.len();
 
@@ -1845,47 +1861,131 @@ where
     out
 }
 
-/// Recursive merge-based collect for fallible fused stages. Short-circuits on
-/// the first `Err`; on success honours `Filter` (drops `None` items).
+/// Fallible counterpart of [`filter_leaf`]: consume `input` sequentially,
+/// applying `stages` (which may filter) and collecting surviving outputs into
+/// a fresh `Vec`. Short-circuits on the first `Err`.
 ///
-/// Uses the `Vec`-merge path rather than the index-based fast path because
-/// fallible + filter pipelines cannot assume fixed output cardinality. The
-/// infallible/no-filter fast path is reserved for `Pipe::collect`.
+/// On `Err`, outputs produced so far drop with `out` and the unread input
+/// tail drops via [`FilterGuard::drop_tail`] (item `pos` was consumed by
+/// `try_apply`); the guard runs the same cleanup on **panic** (unwind).
+fn filter_try_leaf<T, S>(input: &[T], stages: &S) -> Result<Vec<S::Output>, S::Error>
+where
+    T: Send,
+    S: FusedTryStage<T>,
+{
+    let in_ptr = input.as_ptr();
+    let n = input.len();
+
+    let mut out = Vec::new();
+    let mut g = FilterGuard { input, pos: 0 };
+
+    while g.pos < n {
+        let i = g.pos;
+        // SAFETY: disjoint index; slot i is init. The read moves the item out
+        // of the slot, leaving it uninit — never re-read.
+        let item = unsafe { ptr::read(in_ptr.add(i)) };
+        match stages.try_apply(item) {
+            Ok(Some(o)) => out.push(o),
+            Ok(None) => {},
+            Err(e) => {
+                // Short-circuit: same tail cleanup the guard would do on
+                // unwind, then disarm it so `Drop` does not double-clean.
+                // `out` drops with the return — outputs are discarded on
+                // `Err`.
+                // SAFETY: `pos == i`; slots `(i, n)` are still init.
+                unsafe { g.drop_tail() };
+                std::mem::forget(g);
+                return Err(e);
+            },
+        }
+        g.pos = i + 1;
+    }
+
+    // Success: disarm the cleanup Drop.
+    std::mem::forget(g);
+    Ok(out)
+}
+
+/// Fallible counterpart of [`par_filter_rec`]: recursive range-based
+/// collect over a shared [`Slots`] input. Each leaf claims the disjoint range
+/// `[start, end)` and produces its own `Vec`; internal nodes concatenate.
+/// Short-circuits on the first `Err`.
+///
+/// On `Err` every input slot is already gone — the failing leaf dropped its
+/// unread tail, and `pool.join` waits out the sibling, which either consumed
+/// its whole range or dropped its tail the same way — so the root's
+/// `drop(input)` needs no per-slot cleanup. Panics propagate through
+/// `join`'s `halt_unwinding`/`resume_unwind` with the same property (the
+/// unwinding leaf's guard drops its tail; the waited-out sibling's `Vec`
+/// drops naturally), mirroring [`par_filter_rec`].
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn join_fused_try_collect<S, T, E>(
+fn par_filter_try_rec<T, S>(
     pool: &ComputePool,
-    mut items: Vec<T>,
+    input: &Slots<T>,
+    start: usize,
+    end: usize,
     stages: &S,
     splits_left: usize,
-) -> Result<Vec<S::Output>, E>
+) -> Result<Vec<S::Output>, S::Error>
 where
-    S: FusedTryStage<T, Error = E> + Sync,
     T: Send,
+    S: FusedTryStage<T> + Sync,
     S::Output: Send,
-    E: Send,
+    S::Error: Send,
 {
-    if splits_left == 0 || items.len() <= 1 {
-        let mut out = Vec::with_capacity(items.len());
-        for item in items {
-            if let Some(o) = stages.try_apply(item)? {
-                out.push(o);
-            }
-        }
-        return Ok(out);
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: this leaf owns the disjoint range `[start, end)`
+        // exclusively; the slots are init.
+        let in_slice = unsafe { input.as_slice(start, end) };
+        return filter_try_leaf(in_slice, stages);
     }
-    let mid = items.len() / 2;
-    let right = items.split_off(mid);
-    let (left_r, right_r) = pool.join(
-        || join_fused_try_collect(pool, items, stages, splits_left - 1),
-        || join_fused_try_collect(pool, right, stages, splits_left - 1),
+    let mid = start + (end - start) / 2;
+    let (l, r) = pool.join(
+        || par_filter_try_rec(pool, input, start, mid, stages, splits_left - 1),
+        || par_filter_try_rec(pool, input, mid, end, stages, splits_left - 1),
     );
-    match (left_r, right_r) {
+    match (l, r) {
         (Ok(mut l), Ok(r)) => {
             l.extend(r);
             Ok(l)
         },
+        // The sibling's Ok `Vec` (if any) drops here with the match arm —
+        // outputs are discarded once the batch has failed.
         (Err(e), _) | (_, Err(e)) => Err(e),
     }
+}
+
+/// Drive the fallible filter-chain collect over an owned batch with the
+/// single range-based tree — the counterpart of [`fused_filter_collect`] for
+/// `MAY_FILTER` `try_collect` chains, which cannot use the index-based fast
+/// path (output cardinality is unknown up front).
+///
+/// Replaced the old `Vec::split_off` tree (one allocation + memcpy per
+/// internal node); the range tree moves each surviving item exactly once,
+/// into its leaf's `Vec` — the same measured −6…−9 % shape as the infallible
+/// port (see [`fused_filter_collect`]).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn fused_try_filter_collect<T, S>(
+    items: Vec<T>,
+    stages: &S,
+    splits: usize,
+    pool: &ComputePool,
+) -> Result<Vec<S::Output>, S::Error>
+where
+    T: Send,
+    S: FusedTryStage<T> + Sync,
+    S::Output: Send,
+    S::Error: Send,
+{
+    let n = items.len();
+    debug_assert!(n > 0);
+    let input = Slots::from_vec(items);
+    let out = par_filter_try_rec(pool, &input, 0, n, stages, splits);
+    // Input fully consumed on both arms (success: every slot read → uninit;
+    // failure: tails dropped by the leaves/guards): freeing just drops the
+    // buffer.
+    drop(input);
+    out
 }
 
 // ── Pipe (data-first fused pipeline) ──
@@ -2495,7 +2595,7 @@ where
 
         let plan = SplitPlan::new(n, num_threads, self.config.workload);
         if S::MAY_FILTER {
-            join_fused_try_collect(pool, items, &stages, plan.depth)
+            fused_try_filter_collect(items, &stages, plan.depth, pool)
         } else {
             // Fast path: no filter → output cardinality == input cardinality.
             // Pre-allocate the output buffer and write at known indices,
@@ -3151,7 +3251,8 @@ where
 }
 
 /// Borrowed-input merge-based collect for fallible fused stages — counterpart
-/// of [`join_fused_try_collect`] over index ranges.
+/// of [`fused_try_filter_collect`] over index ranges (the input is a shared
+/// slice, so no `Slots` reinterpretation is needed).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn join_fused_try_collect_by_ref<'i, S, E, F>(
     pool: &ComputePool,
@@ -3326,7 +3427,7 @@ where
     }
     let plan = SplitPlan::new(n, num_threads, workload);
     if S::MAY_FILTER {
-        join_fused_try_collect(pool, items, &stages, plan.depth)
+        fused_try_filter_collect(items, &stages, plan.depth, pool)
     } else {
         let op = FusedTryOp(stages);
         par_index_try_collect(items, &op, plan, pool)

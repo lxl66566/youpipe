@@ -167,7 +167,7 @@ pub trait FusedStage<T> {
 `.collect()` uses it as a compile-time switch: when `false`, the stage chain is
 driven by the index-based `Slots` fast path via the `RangeOp` wrapper `FusedOp`
 (output cardinality equals input cardinality, branch-free leaf loop); when
-`true`, it falls back to the per-leaf-`Vec` merge path (`join_fused_collect`).
+`true`, it falls back to the range-tree merge path (`fused_filter_collect`).
 The `apply_pure` fast path is what keeps the leaf vectorizable — it never
 constructs an `Option`.
 
@@ -175,8 +175,8 @@ constructs an `Option`.
 `Result<Option<Output>, Error>`): `TryMap` threads `Result` via `?`,
 `InfallibleChain` adapts an infallible `FusedStage` chain to `FusedTryStage` at
 the `.try_map()` boundary, and `MapErr` converts the error type. Driven by
-`join_fused_try_collect` (always the `Vec`-merge path, since fallible +
-filtering can't assume fixed cardinality).
+`fused_try_filter_collect` when the chain filters (fallible + filtering can't
+assume fixed cardinality), or the index-based fast path otherwise.
 
 ### `Pipe::collect()` / `TryPipe::try_collect()` — Execution
 
@@ -218,8 +218,10 @@ impl<S, I, O> Pipe<S, I, O> {
   (+16…30 % at 10k–100k, A/B-measured), while the erased dispatcher compiles
   once and its ~`num_threads` indirect calls per run are far off the hot
   path.
-- **`MAY_FILTER == true`** — `join_fused_collect` recursively halves the `Vec`,
-  each leaf filters into a per-leaf `Vec`, results merged by `extend`.
+- **`MAY_FILTER == true`** — `fused_filter_collect` claims disjoint ranges of a
+  shared `Slots` input, each leaf filters into a per-leaf `Vec`, results merged
+  by `extend`. (Replaced the old `Vec::split_off` tree — one allocation +
+  memcpy per internal node — measured −6…−9 % at 100 k.)
 
 `.try_collect()` dispatches on `S::MAY_FILTER`:
 
@@ -232,8 +234,12 @@ impl<S, I, O> Pipe<S, I, O> {
   a panic outranks it, mirroring the tree path's unwind-through-match
   semantics). Measured (criterion, 32-core): −48 % @ 10 k, −17 % @ 100 k vs
   the previous single-tree path.
-- **`MAY_FILTER == true`** — `join_fused_try_collect` (Vec-merge fallback),
-  short-circuiting on the first `Err` via `?` and honouring `Filter`.
+- **`MAY_FILTER == true`** — `fused_try_filter_collect`, the fallible
+  counterpart of `fused_filter_collect` (shared `Slots` + range tree, per-leaf
+  `Vec` merge), short-circuiting on the first `Err` and honouring `Filter`.
+  Replaced the last `Vec::split_off` tree here: measured −18 % at 10 k /
+  −20 % at 100 k on `try_collect/youpipe_try_filter_owned` (5 interleaved
+  rounds, 32-core).
 
 #### `Pipe::for_each()` / `ScopedPipe::for_each()` — Side-Effect Terminal
 
