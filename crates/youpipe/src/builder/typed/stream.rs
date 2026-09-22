@@ -1593,6 +1593,21 @@ where
 /// Spawn `io_concurrency` async consumer tasks that read `a_in_rx`, apply `f`,
 /// and forward to a fresh async output channel; returns that output channel.
 ///
+/// NOTE(perf): do NOT reshape the per-item `rx.recv().await` loop below into
+/// the sync workers' anchor + burst-drain shape (`try_recv` burst between
+/// awaited recvs, as `spawn_stage` does). Attempted (2026-09, 32-core,
+/// `bench_ab.sh` 5 interleaved rounds, `io_async_pure/youpipe_async` and
+/// `io_async_mixed/youpipe_mixed_async` at 200/500 and a 2000-item
+/// steady-state row): every cell within ±0.5 %, spreads <1 % — a pure wash,
+/// while the sync port of the same shape measured −5…−14 %. Mechanism:
+/// crossfire's `MAsyncRx::recv` polls `try_recv` FIRST and only registers a
+/// waker (after a bounded spin) when the queue is empty — so an awaited
+/// `recv()` on a non-empty queue never pays the waker round-trip the burst
+/// loop was meant to amortize. What remains is only the future-poll envelope
+/// per item (tens of ns), invisible under ms-scale IO latencies. The async
+/// terminal collectors (`drain_*_async`) keep their burst loops — they are
+/// sole consumers of an MPSC ring where the shape measured real wins.
+///
 /// This is the consumer fan-out half of an async stage, shared by both entry
 /// points: `AsyncStage::spawn_for_async` (the `spawn` path — `a_in_rx` arrives
 /// directly from `prev.spawn_for_async`) and `spawn_async_consumers` (the

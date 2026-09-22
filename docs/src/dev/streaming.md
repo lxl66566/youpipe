@@ -60,6 +60,20 @@ trusted as-is: the `crossfire >= 3.1.20` pin (crates/youpipe/Cargo.toml)
 carries the upstream fix (issue #70) for the spurious-`Closed` race that once
 required a confirming blocking `recv` after every `Closed`.
 
+The async terminal collectors (`drain_*_async` in `state/stream.rs`) use the
+awaited analogue — one `recv().await` per burst, `try_recv` in between —
+because tokio's coarse timer wheel batch-completes same-duration timeouts, so
+one wake often finds several items already queued.
+
+The async **stage consumers** (`spawn_async_consumers_body`) deliberately keep
+the plain per-item `rx.recv().await` loop: porting the burst shape there
+measured a pure wash (±0.5 %, spreads <1 %, `io_async_pure`/`io_async_mixed`
+at 200/500/2000, 5 interleaved rounds). Mechanism: crossfire's
+`MAsyncRx::recv` polls `try_recv` first and only registers a waker (after a
+bounded spin) when the queue is empty, so an awaited recv on a non-empty queue
+never pays the waker round-trip the burst loop would amortize — see the
+`NOTE(perf)` on `spawn_async_consumers_body`.
+
 The burst phase is what keeps multi-worker stages civil on the MPMC ring:
 when `k` workers contend on one input channel, the burst winners drain the
 backlog while the laggards park at the anchor — the contending population
