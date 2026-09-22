@@ -207,6 +207,27 @@ fn bench_try_collect(c: &mut Criterion) {
             },
         );
 
+        // Owned + filter caliber: routes to the range-based filter tree
+        // (`fused_try_filter_collect`) instead of the index fast path — the
+        // A/B row for that tree. Owned input (like `youpipe_filter_map_owned`):
+        // the clone is paid identically on both sides of any A/B.
+        group.bench_with_input(
+            BenchmarkId::new("youpipe_try_filter_owned", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    black_box(
+                        youpipe::pipe(data.clone())
+                            .try_map(|x: u64| -> Result<u64, &'static str> { Ok(x + 1) })
+                            .filter(|&x: &u64| x % 3 == 0)
+                            .map(|x| x * 2)
+                            .try_collect()
+                            .unwrap(),
+                    )
+                });
+            },
+        );
+
         // rayon equivalent: Result-carrying chain collected into a Result —
         // the short-circuiting counterpart of youpipe's try_map/try_collect
         // (a plain map chain would give rayon a cheaper closure).
