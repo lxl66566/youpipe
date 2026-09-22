@@ -44,7 +44,6 @@ use std::time::{Duration, Instant};
 /// ```
 pub struct Rx<F: Flavor> {
     pub(crate) shared: Arc<ChannelShared<F>>,
-    pub(crate) waker_cache: WakerCache,
     // Remove the Sync marker to prevent being put in Arc
     _phan: PhantomData<Cell<()>>,
 }
@@ -80,7 +79,7 @@ impl<F: Flavor> From<AsyncRx<F>> for Rx<F> {
 impl<F: Flavor> Rx<F> {
     #[inline(always)]
     pub(crate) fn new(shared: Arc<ChannelShared<F>>) -> Self {
-        Self { shared, waker_cache: WakerCache::new(), _phan: Default::default() }
+        Self { shared, _phan: Default::default() }
     }
 
     #[inline(always)]
@@ -97,7 +96,7 @@ impl<F: Flavor> Rx<F> {
         macro_rules! on_recv_waker {
             () => {{
                 trace_log!("rx: recv {:?}", o_waker);
-                self.recvs.cache_waker(o_waker.take(), &self.waker_cache);
+                //                self.recvs.cache_waker(o_waker, &self.waker_cache);
             }};
         }
         macro_rules! try_recv {
@@ -124,7 +123,7 @@ impl<F: Flavor> Rx<F> {
         }
         let mut state;
         'MAIN: loop {
-            shared.recvs.reg_waker_blocking(&mut o_waker, &self.waker_cache);
+            shared.recvs.reg_waker_blocking(&mut o_waker);
             // NOTE: special API before we park
             // because Miri is not happy about ArrayQueue pop ordering, which is not SeqCst
             if let Some(item) = shared.inner.try_recv_final() {

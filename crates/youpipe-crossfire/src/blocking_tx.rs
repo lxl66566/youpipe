@@ -46,7 +46,6 @@ use std::time::{Duration, Instant};
 /// ```
 pub struct Tx<F: Flavor> {
     pub(crate) shared: Arc<ChannelShared<F>>,
-    pub(crate) waker_cache: WakerCache,
     // Remove the Sync marker to prevent being put in Arc
     _phan: PhantomData<Cell<()>>,
 }
@@ -82,7 +81,7 @@ impl<F: Flavor> From<AsyncTx<F>> for Tx<F> {
 impl<F: Flavor> Tx<F> {
     #[inline]
     pub(crate) fn new(shared: Arc<ChannelShared<F>>) -> Self {
-        Self { shared, waker_cache: WakerCache::new(), _phan: Default::default() }
+        Self { shared, _phan: Default::default() }
     }
 
     /// Return true if the other side has closed
@@ -130,20 +129,13 @@ impl<F: Flavor> Tx<F> {
                 if shared.is_full() {
                     // It's for 8x1, 16x1.
                     std::thread::yield_now();
+                    // self.senders.cache_waker(o_waker, &self.waker_cache);
                 }
-                // Recycle unconditionally. The historical is_full() gate
-                // (b7d259d: "if not full, next round likely takes the fast
-                // path") leaks the dominant exit under real saturation: in a
-                // fanout-9 expand pipeline ~75% of wake-success sends exited
-                // with the channel drained-but-refilling, dropping the waker
-                // and forcing a fresh 40-byte ArcWaker per contended send.
-                // A cached waker costs one bounded slot per handle instead.
-                self.senders.cache_waker(o_waker.take(), &self.waker_cache);
                 return Ok(())
             };
         }
         loop {
-            self.senders.reg_waker_blocking(&mut o_waker, &self.waker_cache);
+            self.senders.reg_waker_blocking(&mut o_waker);
             // For nx1 (more likely congest), need to reset backoff
             // to allow more yield to receivers.
             // For nxn (the backoff is already complete), wait a little bit.

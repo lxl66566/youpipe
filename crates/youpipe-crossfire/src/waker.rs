@@ -1,4 +1,4 @@
-use crate::collections::ArcCell;
+//use crate::collections::ArcCell;
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::ops::Deref;
@@ -96,6 +96,34 @@ impl ArcWaker {
     }
 }
 
+thread_local! {
+    // Design C: the wake target of a blocking context is thread::current(),
+    // which never changes — so the waker node belongs to the thread, not to an
+    // episode or a handle. The `ThinWaker` handle is written exactly once,
+    // here, before any publication (issue #14's stale-handle race cannot
+    // exist). Re-arming between episodes only touches `state` (via reset())
+    // and `seq` (under the registry mutex). Registry queues hold weak refs;
+    // after thread exit they fail to upgrade, which is the existing
+    // dead-node path.
+    static BLOCKING_WAKER: Arc<WakerInner> = Arc::new(WakerInner {
+        seq: AtomicU32::new(0),
+        state: AtomicU8::new(WakerState::Init as u8),
+        waker: UnsafeCell::new(ThinWaker::Blocking(thread::current())),
+    });
+}
+
+/// Clone the immortal per-thread blocking waker, re-armed for a new episode.
+/// Costs two uncontended Arc refcount ops — no allocation after the thread's
+/// first contended episode.
+#[inline(always)]
+pub(crate) fn tl_blocking_waker() -> ArcWaker {
+    BLOCKING_WAKER.with(|inner| {
+        let waker = ArcWaker::from_arc(inner.clone());
+        waker.reset();
+        waker
+    })
+}
+
 #[derive(Debug)]
 pub(crate) enum ThinWaker {
     Async(Waker),
@@ -156,12 +184,12 @@ impl WakerInner {
 
     #[inline(always)]
     pub fn reset(&self) {
-        // From the object pool to reset value,
-        // we should use SeqCst store to clear the cache of other cores
-        // (conservative option for the pool-reuse path, see 70859d0;
-        //  the in-episode reset_init may stay Relaxed: no concurrent
-        //  observer can exist there because push() only recycles wakers
-        //  with weak_count == 0 && strong_count == 1)
+        // Cross-episode re-arm of the immortal per-thread blocking waker.
+        // SeqCst store (conservative option, 70859d0): the previous episode's
+        // Woken/Closed state may sit in other cores' store buffers, and no
+        // registry mutex publication has happened yet for this episode. The
+        // in-episode reset_init stays Relaxed — it is ordered by the upcoming
+        // registry mutex publication.
         self.state.store(WakerState::Init as u8, Ordering::SeqCst);
     }
 
@@ -313,47 +341,82 @@ impl WakerInner {
     }
 }
 
-/// Per-handle single-slot cache of `WakerInner` for blocking contexts.
-///
-/// Revived from b7d259d ("Add cache for LockedWaker in blocking context"),
-/// de-genericized after direct copy (and its `<P>` payload) was removed in
-/// fb1af1e — the cache itself was collateral damage, not a disproven design.
-///
-/// Safety rests on one invariant enforced by `push`: a waker is recycled
-/// only when no other reference exists in the whole process
-/// (`weak_count == 0 && strong_count == 1`), making reuse observably
-/// equivalent to a fresh `Arc::new`. `ArcCell::pop` is a SeqCst swap, so
-/// the `update_thread_handle` / `reset` writes run under exclusive
-/// ownership; the next observer (a firing thread) can only appear after
-/// re-registration inside the registry mutex, which provides the
-/// happens-before edge.
-pub struct WakerCache(ArcCell<WakerInner>);
+/*
+impl<T> WakerInner<*const T> {
+    #[inline(always)]
+    fn get_payload(&self) -> *const T {
+        *self.get_payload_mut()
+    }
 
-impl WakerCache {
+    #[inline(always)]
+    pub fn wake_or_copy<F: FlavorImpl<Item = T>>(&self, flavor: &F) -> WakeResult {
+        // This is after we get waker from waker_registry, which already happen before relationship.
+        // both >= WakerState::Waiting is certain
+        let mut state = self.get_state_relaxed();
+        loop {
+            if state >= WakerState::Woken as u8 {
+                return WakeResult::Skip;
+            } else if state == WakerState::Waiting as u8 {
+                let p = self.get_payload();
+                if p.is_null() {
+                    self.state.store(WakerState::Woken as u8, Ordering::SeqCst);
+                    self.get_waker().wake_by_ref();
+                    return WakeResult::Woken;
+                }
+                state = if let Some(true) = flavor.try_send_oneshot(p) {
+                    WakerState::Done as u8
+                } else {
+                    WakerState::Woken as u8
+                };
+                self.state.store(state, Ordering::SeqCst);
+                self.get_waker().wake_by_ref();
+                if state == WakerState::Done as u8 {
+                    return WakeResult::Sent;
+                } else {
+                    return WakeResult::Woken;
+                }
+            } else {
+                match self.state.compare_exchange_weak(
+                    WakerState::Init as u8,
+                    WakerState::Woken as u8,
+                    Ordering::SeqCst,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        self.get_waker().wake_by_ref();
+                        return WakeResult::Next;
+                    }
+                    Err(s) => {
+                        state = s;
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct WakerCache<P: Copy>(ArcCell<WakerInner<P>>);
+
+impl<P: Copy> WakerCache<P> {
     #[inline(always)]
     pub(crate) fn new() -> Self {
         Self(ArcCell::new())
     }
 
     #[inline(always)]
-    pub fn new_blocking(&self) -> ArcWaker {
+    pub fn new_blocking(&self, payload: P) -> ArcWaker<P> {
         if let Some(inner) = self.0.pop() {
             inner.update_thread_handle();
-            inner.reset();
-            return ArcWaker::from_arc(inner);
+            inner.reset(payload);
+            return ArcWaker::<P>::from_arc(inner);
         }
-        ArcWaker::new_blocking()
+        ArcWaker::new_blocking(payload)
     }
 
     #[inline(always)]
-    pub(crate) fn push(&self, waker: ArcWaker) {
+    pub(crate) fn push(&self, waker: ArcWaker<P>) {
         debug_assert!(waker.get_state() >= WakerState::Woken as u8);
         let a = waker.to_arc();
-        // The load-bearing gate: only recycle wakers nobody else can reach.
-        // Weak refs live only in the registry queues; on every push site the
-        // waker was either fired (weak consumed by upgrade in pop_first) or
-        // fast-cancelled (_clear_wakers removed it). Failing the gate is
-        // always benign — the waker is simply dropped, as before.
         if Arc::weak_count(&a) == 0 && Arc::strong_count(&a) == 1 {
             self.0.try_put(a);
         }
@@ -365,6 +428,7 @@ impl WakerCache {
         !self.0.exists()
     }
 }
+*/
 
 #[cfg(test)]
 mod tests {
