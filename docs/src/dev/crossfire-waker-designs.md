@@ -430,7 +430,7 @@ fork 分支 `waker-tl`（基线 = `waker-cache` 分支的 HEAD，保留 crossbea
 | `a8c731b` | **设计 C 本体**：TL 不死 waker + 队列项 `(Weak, seq)` + pop/close 的陈旧项跳过 |
 | `ee91652` | `NonNull::from(Box::leak)` 安全化（与 vendored 副本逐字节对齐） |
 
-vendored `crates/youpipe-crossfire/src/` 与分支 `diff -r` 逐字节一致；`WakerCache`/`ArcCell` 维持死亡（§9 表格预期）。
+上表为当时的提交序列；分支后来重写为直接基于 master 的线性历史，当前 HEAD = master + 8 提交：`d53c9bd`（C 本体）、`c74d6bc`（NonNull 安全化）、`098b76e`（miri 路径测试 ×5）、`2aa1b0c`（loom 模型 ×5 + `feature = "loom"` 门控）、`5d13d1d`（科普文档 `docs/waker-tl.md`），以及为 Windows 可移植性追加的 `f77428c`（Safety 文档回填 fork）/`b14d3a2`（移除 captains-log dev-dep，其 unix libc 假设挡 Windows 编译）/`cec6948`（registry mutex 在 miri 下切 `std::sync`）。vendored `crates/youpipe-crossfire/src/` 与分支 HEAD `diff -r` 逐字节一致；`WakerCache`/`ArcCell` 维持死亡（§9 表格预期）。
 
 ### 11.2 对蓝图的三处修正（实测/推演发现）
 
@@ -479,6 +479,20 @@ C 的 40B 档在稳态**结构性归零**（总量 104 次/run，对 73,728 个 
 ### 11.5 验证状态与遗留
 
 - fork：`cargo check`（default/tokio/async_std/trace_log/compat）零警告；`cargo test --release` 16+43 全绿（新增 2 个 C 专属单测：跨 registry 重臂后 fire 跳过陈旧项、close 不误伤）；upstream test-suite（tokio）并行 317/334、串行 **334/334 全过**（并行失败为已知 Drop 计数竞态）。
-- youpipe：`cargo test --release` 全绿（含 15 轮全套 + 50 轮 pipeline_integration 压测）；clippy/fmt 零警告。**一次未复现挂起**：首轮全套测试与 fork 串行 test-suite 并发跑时，多个测试线程停在阻塞通道 park 上（形态像丢唤醒），杀掉后 66 次复跑零复现——归因存疑（高负载饥饿 vs 真实竞态窗口），**miri/loom 待办（同 §10 验证计划）升级为必须项**。
-- miri（tree-borrows）+ loom：仍未跑（todo #6）；C 的核对重点是 N1（TL 初始化与首次注册的 hb）与 seq-tag 跳过路径。
+- youpipe：`cargo test --release` 全绿（含 15 轮全套 + 50 轮 pipeline_integration 压测）；clippy/fmt 零警告。**一次未复现挂起**：首轮全套测试与 fork 串行 test-suite 并发跑时，多个测试线程停在阻塞通道 park 上（形态像丢唤醒），杀掉后 66 次复跑零复现——归因存疑（高负载饥饿 vs 真实竞态窗口），miri/loom 验证（§11.6）未发现对应反例。
+
+### 11.6 miri + loom 验证结论（2026-09，fork `cec6948` 起 vendored 同步）
+
+**miri（tree-borrows，`-Zmiri-ignore-leaks`）**：
+
+- fork / vendored `youpipe-crossfire --lib`：**21 全绿**（Windows 本机；Linux 交叉确认见下）——含 5 个 TL 路径测试（TL 槽身份与强计数、跨线程节点相异、假唤醒重臂重复项被 fire 跳过、§5.4 交错的真 park/unpark 端到端、线程退出残留弱引用走既有死节点路径）。tree-borrows 核对点 N1（TL 惰性初始化的 write-once `ThinWaker` 句柄先于任何注册发布）由此覆盖。
+- youpipe 侧新增集成测试 `crates/youpipe/tests/handoff_channel.rs`（8 个，miri 下 2.8s）：经 `handoff::channel` 公共 API 端到端驱动阻塞 send 满 park+唤醒、阻塞 recv 空 park+唤醒、park 中对端 drop 的两个断连方向、mpsc send 满、**close-vs-重臂陈旧项的端到端交错**（ch1 陈旧 entry + ch2 现役 waiter，ch1 关闭不得虚假 Disconnect）、多线程竞争收发（miri 下 3P×2C×8 item）、`park_timeout` 超时/提前唤醒路径（超时 API 不在包装层暴露，经 dev-dep 直连 crossfire）。已纳入 `perf/verify/miri.sh`。
+
+**loom（`--features loom`，LOOM_MAX_PREEMPTIONS=2）**：vendored 自带 5 模型全绿，已纳入 `perf/verify/loom.sh`。测试有效性经过突变验证：临时禁用三处 seq 比较后，前三个模型（跨 registry 陈旧 fire、close 跳过、重复项重臂）全部失败——模型真的能抓住 seq 机制失效。
+
+**已知残留的定性**：重臂与 fire 的 seq Relaxed 传播窄窗口（两把锁间无 hb 边，fire 可能读到重臂前旧戳、陈旧项偷走一次 fire）经 `loom_fire_vs_rearm_race_recovers_within_one_event` 枚举确认**真实可达且良性**：有界恢复（下一事件唤醒）、绝不 Closed；不可用内存序修复（两步操作无法原子化），也无需修复。§11.5 的一次未复现挂起无对应 miri/loom 反例，维持"高负载饥饿"归因。
+
+**youpipe 层不新增 loom 模型的理由**：`handoff/channel.rs` 包装层（~400 行）是无同步状态机的薄封装（错误枚举映射 + 类型包装 + clone 转发），没有可交错的原语；协议交错的模型检查由 vendored crate 内 5 模型承担，youpipe 侧可观察行为由 `handoff_channel.rs` 在真实线程 + miri 下覆盖；`handoff/notify.rs` 等真正含同步原语的文件已有各自模型（testing.md）。
+
+**Windows 可移植性接缝**（详见 testing.md）：vendored 的 `reg_lock` 接缝在 `cfg(miri)` 下切 `std::sync::Mutex`（parking_lot 的 Windows futex 路径 miri 不可解释，同 youpipe-sys 的 shim 理由）；`captains-log` dev-dep（unix libc 假设）已从 fork 与 vendored 双侧移除——fork 由此恢复 Windows 本机全量可测。
 - upstream PR：C 形态（2 文件、调用方零改动、无新协议）即本分支；A 分支保留为 fallback。

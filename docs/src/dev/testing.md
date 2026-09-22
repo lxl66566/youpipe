@@ -5,8 +5,8 @@ Canonical runners (they reap stale miri processes, apply per-binary
 timeouts and the required flag combinations):
 
 ```sh
-perf/verify/miri.sh            # lib + all integration binaries
-perf/verify/loom.sh            # youpipe models + vendored queue models
+perf/verify/miri.sh            # lib + integration binaries + vendored crossfire lib
+perf/verify/loom.sh            # youpipe + vendored queue + vendored crossfire models
 ```
 
 The `youpipe-sys` crate (workspace member `crates/youpipe-sys`) provides a
@@ -23,6 +23,20 @@ unified `Mutex`/`Condvar`/atomics API via
 Windows foreign function Miri cannot emulate, whereas the std primitives are
 natively supported by the interpreter. The unified API lets callers write
 `mutex.lock()` once and stay transparent to which backend is active.
+
+The vendored `youpipe-crossfire` crate solves the same miri portability
+problem with a lighter seam: its sources must stay byte-identical to the
+fork repo, so instead of a newtype shim its `waker_registry.rs` picks the
+mutex type by `cfg` (`parking_lot` normally, `std::sync` under `cfg(miri)`,
+`loom::sync` under the `loom` feature) and a `reg_lock` helper absorbs the
+`LockResult` shape difference. That crate's dev-dependency `captains-log`
+was also dropped (both sides) — its unix libc assumptions failed the
+Windows build of the test profile — so `perf/verify/miri.sh` runs the
+vendored lib tests (`-p youpipe-crossfire --lib`) on every platform. The
+handoff layer's blocking send/recv paths over that waker are exercised
+end-to-end by `tests/handoff_channel.rs` (park/wake both directions,
+disconnect-while-parked, the close-vs-rearm stale-entry interleaving,
+`park_timeout`, multi-threaded contention), also part of `miri.sh`.
 
 The pool's synchronization cores (`pool/sleep.rs`, `pool/latch.rs`,
 `pool/sleep_mask.rs`, `handoff/notify.rs`) source their atomics, locks, and
@@ -41,6 +55,17 @@ primitives directly with `loom::thread`:
 # rationale) is the ecosystem-standard loom switch, matching crossbeam and
 # the vendored youpipe-concurrent-queue.
 RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
+```
+
+The vendored `youpipe-crossfire` is the one deliberate exception to the
+rustflag convention: its waker-registry models (`mod loom_tests` in
+`waker_registry.rs`) are gated on the `loom` **cargo feature** instead.
+`--cfg loom` would leak into dependencies that carry their own `cfg(loom)`
+test shims without the loom crate linked (e.g. event-listener), so that
+crate gates explicitly and `loom.sh` runs it without RUSTFLAGS:
+
+```sh
+LOOM_MAX_PREEMPTIONS=2 cargo test -p youpipe-crossfire --features loom --lib -- loom_
 ```
 
 What the models cover:

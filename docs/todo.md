@@ -92,13 +92,13 @@
   send 无自旋窗口、park 策略不同，低深度背压场景可能反而回退。
 - **验证**：`stream_pipeline` 全家族 + `mixed_load` 隔离交替 A/B。
 
-### 6. crossfire 阻塞路径的每次 park 40 B `ArcWaker` 分配（✅ 已落地，2026-10）
+### 6. crossfire 阻塞路径的每次 park 40 B `ArcWaker` 分配（✅ 已落地；miri/loom 验证完成）
 
 - **结果**：已按 fork 路径落地——`crates/youpipe-crossfire`（源：`/root/programs/fork/crossfire-rs` 分支 `waker-tl`），per-thread 不死 waker + 全局 seq 戳标记队列项（设计 C，取代先落地的设计 A/`waker-cache` 分支）。验收与实测细节见 `dev/crossfire-waker-designs.md` §11；考古与设计 A 的落地记录见 `dev/crossfire-waker-cache.md` §7；设计空间完整分析（A/C/B/E 对比、事实清单 F1–F15）见 `dev/crossfire-waker-designs.md`。
 - **验收读数**：expand fanout-9 的 40B 分配从 upstream 稳态 ~2000/run 降至 A 的 62–433/run，再降至 C 的**稳态 1/run**（结构性归零：总量 104 次/run 对 73,728 item）；背压、无竞争场景同样归 1。C 无 fast-cancel 残余（无出口概念），`expand_alloc.rs` 的按尺寸过滤已可考虑收紧。
 - **对蓝图的三处修正**（已记入 designs §11.2）：① `close()` 也必须做 seq 检查，否则会把别处现役 waiter 盖成 Closed（虚假 Disconnect）；② seq 戳源改全局计数器——per-registry 计数器数值可碰撞，会让陈旧项冒充现役偷 fire；③ `_clear_wakers` 维持节点 seq 语义（entry-seq 反而少摘陈旧项）。
-- **验证状态**：fork check/test 全绿（新增 2 个 C 专属单测），upstream test-suite 串行 334/334；youpipe 全套测试 + 50 轮 pipeline_integration 压测全绿。**一次未复现挂起**（与 fork test-suite 并发高负载下多线程停在通道 park，66 次复跑零复现）——见 designs §11.5。
-- **待办**：miri（tree-borrows）+ loom 验证（§10 要求；上述未复现挂起使其升级为必须项）；向 upstream 提 PR（C 形态即 `waker-tl` 分支，A 分支保留为 fallback）；`expand_alloc.rs` 收紧过滤阈值。
+- **验证状态**：fork check/test 全绿（新增 2 个 C 专属单测），upstream test-suite 串行 334/334；youpipe 全套测试 + 50 轮 pipeline_integration 压测全绿。**miri（tree-borrows）+ loom 已完成**（designs §11.6）：vendored lib 21 测试 + youpipe 集成测试 `handoff_channel.rs`（8 个：park/唤醒、断连、close-vs-重臂、超时、竞争）进 `perf/verify/miri.sh`；5 个 loom 模型（seq 突变验证可抓失效）进 `perf/verify/loom.sh`；seq 传播窄窗口经 loom 枚举确认可达且良性（绝不 Closed）。**一次未复现挂起**无对应反例，维持高负载饥饿归因。
+- **待办**：向 upstream 提 PR（C 形态即 `waker-tl` 分支，A 分支保留为 fallback）；`expand_alloc.rs` 收紧过滤阈值。
 ---
 
 ## P2
