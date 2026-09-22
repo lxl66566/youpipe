@@ -82,6 +82,10 @@ youpipe-sys      = { path = "../youpipe-sys", version = "0.5" }
 [dev-dependencies]
 criterion         = "0.8"
 crossbeam-channel = "0.5"
+# Direct access for tests/handoff_channel.rs: the timeout park variants
+# (send_timeout/recv_timeout) of the vendored waker protocol are not
+# re-exported by the handoff wrapper.
+crossfire         = { package = "youpipe-crossfire", path = "../youpipe-crossfire", version = "0.5" }
 futures           = "0.3"
 rayon             = "1"
 tokio             = { version = "1", features = [

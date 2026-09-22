@@ -19,3 +19,10 @@ RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
 
 echo "==> vendored youpipe-concurrent-queue loom models"
 RUSTFLAGS="--cfg loom" timeout 600 cargo test -p youpipe-concurrent-queue --test loom
+
+echo "==> vendored youpipe-crossfire loom models (waker registry)"
+# No RUSTFLAGS here: crossfire gates its models on the `loom` cargo feature
+# (a --cfg loom rustflag would leak into dependencies that carry cfg(loom)
+# test shims without the loom crate linked, e.g. event-listener).
+LOOM_MAX_PREEMPTIONS=${LOOM_MAX_PREEMPTIONS:-2} \
+    timeout 600 cargo test -p youpipe-crossfire --features loom --lib --release -- loom_
