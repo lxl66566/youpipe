@@ -49,6 +49,13 @@ and `YOUPIPE_CHUNK_SLACK` (extra top-level chunks; overrides the adaptive
 for slack it cannot use — see the scheduler notes in the developer
 guide).
 
+The worker idle backoff windows are runtime-overridable too:
+`YOUPIPE_SPIN_ROUNDS` (busy-spin rounds before yielding, default 32) and
+`YOUPIPE_YIELD_ROUNDS` (yield rounds before the condvar park, default 32).
+The defaults are A/B-tuned on the reference 32-core machine — widening or
+narrowing them measured as global regressions there (history in `sleep.rs`)
+— so treat them as experiment knobs for heterogeneous machines, not
+tuning levers with known upside.
 ## Worker budget across stages (streaming)
 
 `compute_workers` is a **budget**, not a thread count. The runner first

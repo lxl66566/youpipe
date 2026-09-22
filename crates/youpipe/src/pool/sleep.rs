@@ -5,6 +5,8 @@
 //! Atomics/Mutex/Condvar/yield come from `youpipe-sys` so `--cfg loom`
 //! can swap them for simulated ones.
 
+use std::sync::OnceLock;
+
 use youpipe_sys::{AtomicUsize, CachePadded, Condvar, Mutex, Ordering, fence, thread_yield};
 
 use super::{latch::CoreLatch, sleep_mask::SleepMask};
@@ -217,36 +219,21 @@ struct WorkerSleepState {
 pub(crate) struct IdleState {
     worker_index: usize,
     rounds: u32,
+    /// Backoff thresholds, snapshotted from [`IdleTuning`] when the idle
+    /// episode began (one relaxed load per episode, none per round — see
+    /// [`IdleTuning`]).
+    tuning: IdleTuning,
     jobs_counter: JobsEventCounter,
 }
 
-/// Idle rounds spent busy-spinning (the `pause` instruction) before yielding
-/// the OS thread.
-///
-/// Stolen `join` work typically arrives within microseconds. A `sched_yield`
-/// here costs ~1 µs *and* may migrate the worker off its warm core (dropping
-/// its cache), and with ~400 k idle rounds per 100 k-item run
-/// (hotpath-measured) that syscall overhead was the dominant gap vs rayon,
-/// which also busy-spins before yielding. Burn a little CPU instead — the pool
-/// parks for real one round past `ROUNDS_UNTIL_SLEEPY`, so long-idle CPU cost
-/// stays bounded.
-///
-/// Measured (32-core, A/B vs the all-yield predecessor): `sync_cpu_heavy`
-/// youpipe `pipe().map().collect()` improved −14 % @ 10 k, −18 % @ 100 k;
-/// `pipeline_fusion` and `sync_lightweight` improved −5…−13 %. (The 1 k batch
-/// used to hit a serial short-circuit and never reach here; that heuristic was
-/// later removed — see `prefers_serial` in `builder/typed/fused.rs`.)
-///
-/// Widening the spin window further (A/B tried 128 in 2026-06) regressed
-/// everything by +20-36 %: 32 workers all spinning burn enough coherence
-/// traffic on the deque / counter cache lines to throttle the cores, and the
-/// longer pause window delays the first round of `find_work` after a stolen
-/// job arrives. 32 stays the sweet spot.
+/// Default busy-spin rounds before the yield phase — see [`IdleTuning::spin`]
+/// for the measurement history; 32 is the tuned sweet spot.
 const ROUNDS_SPIN: u32 = 32;
-/// Idle rounds spent in `sched_yield` (cooperate but stay runnable) after the
-/// busy-spin phase. At this round the worker announces "sleepy" (bumps the JEC
-/// so a later poster can detect it), yields once more, and then the next idle
-/// round falls through to the actual `condvar` park in `sleep()`.
+/// Idle rounds spent in `sched_yield` (cooperate but stay runnable) between
+/// the end of the busy-spin phase and the "sleepy" announcement. At the
+/// sleepy round the worker bumps the JEC (so a later poster can detect it),
+/// yields once more, and the next idle round falls through to the actual
+/// `condvar` park in `sleep()`.
 ///
 /// Widening the yield window (A/B tried 64 and 96 in 2026-06) lifted the
 /// 10 k and 1 M `sync_lightweight` cases by 5-30 % — workers stay runnable
@@ -255,7 +242,83 @@ const ROUNDS_SPIN: u32 = 32;
 /// variants (especially `_cold`) by 4-12 % because the longer yield window
 /// keeps workers in syscall overhead during the closure's intra-iter idle
 /// rounds. 32 (matching rayon) stays the global sweet spot.
-const ROUNDS_UNTIL_SLEEPY: u32 = ROUNDS_SPIN + 32;
+const ROUNDS_YIELD: u32 = 32;
+
+/// Backoff thresholds for one idle episode: busy-spin rounds, then yield
+/// rounds, then a real `condvar` park.
+///
+/// Defaults (`ROUNDS_SPIN` / `ROUNDS_YIELD`, both 32) are A/B-tuned on the
+/// reference 32-core machine — see each constant's doc for the measured
+/// regressions outside 32/32; do not retune without interleaved A/B evidence.
+/// They are runtime-overridable via `YOUPIPE_SPIN_ROUNDS` /
+/// `YOUPIPE_YIELD_ROUNDS` so heterogeneous machines (and same-binary A/B —
+/// the established methodology, see `YOUPIPE_OVERSPLIT`) can experiment
+/// without recompiling: recompiles swing tight benchmarks by tens of percent
+/// from pure code-layout noise.
+///
+/// `no_work_found` runs once per idle round, so the values live in
+/// [`IdleState`] (snapshotted once per episode via a `OnceLock`) — plain
+/// field reads, no atomic on the per-round path, and plain data for loom to
+/// model.
+#[derive(Clone, Copy, Default)]
+struct IdleTuning {
+    /// Idle rounds spent busy-spinning (the `pause` instruction) before
+    /// yielding the OS thread.
+    ///
+    /// Stolen `join` work typically arrives within microseconds. A
+    /// `sched_yield` here costs ~1 µs *and* may migrate the worker off its
+    /// warm core (dropping its cache), and with ~400 k idle rounds per
+    /// 100 k-item run (hotpath-measured) that syscall overhead was the
+    /// dominant gap vs rayon, which also busy-spins before yielding. Burn a
+    /// little CPU instead — the pool parks for real past the sleepy round,
+    /// so long-idle CPU cost stays bounded.
+    ///
+    /// Measured (32-core, A/B vs the all-yield predecessor): `sync_cpu_heavy`
+    /// youpipe `pipe().map().collect()` improved −14 % @ 10 k, −18 % @ 100 k;
+    /// `pipeline_fusion` and `sync_lightweight` improved −5…−13 %.
+    ///
+    /// Widening further (A/B tried 128 in 2026-06) regressed everything by
+    /// +20-36 %: 32 workers all spinning burn enough coherence traffic on
+    /// the deque / counter cache lines to throttle the cores, and the longer
+    /// pause window delays the first round of `find_work` after a stolen job
+    /// arrives.
+    spin: u32,
+    /// Yield-phase rounds (see [`ROUNDS_YIELD`]'s history for the 32/64/96
+    /// A/B).
+    yield_rounds: u32,
+}
+
+impl IdleTuning {
+    /// The round at which the worker announces "sleepy": spin + yield
+    /// rounds have elapsed.
+    fn sleepy_round(self) -> u32 {
+        self.spin + self.yield_rounds
+    }
+
+    #[cfg(test)]
+    fn fixed(spin: u32, yield_rounds: u32) -> Self {
+        Self { spin, yield_rounds }
+    }
+
+    fn from_env() -> Self {
+        static TUNING: OnceLock<IdleTuning> = OnceLock::new();
+        *TUNING.get_or_init(|| Self {
+            spin: env_rounds("YOUPIPE_SPIN_ROUNDS", ROUNDS_SPIN),
+            yield_rounds: env_rounds("YOUPIPE_YIELD_ROUNDS", ROUNDS_YIELD),
+        })
+    }
+}
+
+fn env_rounds(key: &str, default: u32) -> u32 {
+    parse_rounds(std::env::var(key).ok().as_deref(), default)
+}
+
+/// Parse an optional override value; missing or malformed falls back to the
+/// tuned default (a malformed value must not silently zero a backoff
+/// window).
+fn parse_rounds(raw: Option<&str>, default: u32) -> u32 {
+    raw.and_then(|v| v.parse().ok()).unwrap_or(default)
+}
 
 impl Sleep {
     pub(crate) fn new(n_threads: usize) -> Sleep {
@@ -273,6 +336,9 @@ impl Sleep {
         IdleState {
             worker_index,
             rounds: 0,
+            // One snapshot per idle episode: `no_work_found` below reads
+            // plain fields per round — no atomics on the backoff path.
+            tuning: IdleTuning::from_env(),
             jobs_counter: JobsEventCounter::DUMMY,
         }
     }
@@ -294,15 +360,16 @@ impl Sleep {
         latch: &CoreLatch,
         has_injected_jobs: impl FnOnce() -> bool,
     ) {
-        if idle.rounds < ROUNDS_SPIN {
+        let sleepy = idle.tuning.sleepy_round();
+        if idle.rounds < idle.tuning.spin {
             // Busy-spin phase: stay on-core, keep cache warm, no syscall.
             std::hint::spin_loop();
             idle.rounds += 1;
-        } else if idle.rounds < ROUNDS_UNTIL_SLEEPY {
+        } else if idle.rounds < sleepy {
             // Yield phase: cooperate with the OS scheduler but stay runnable.
             thread_yield();
             idle.rounds += 1;
-        } else if idle.rounds == ROUNDS_UNTIL_SLEEPY {
+        } else if idle.rounds == sleepy {
             idle.jobs_counter = self.announce_sleepy();
             idle.rounds += 1;
             thread_yield();
@@ -483,8 +550,33 @@ impl IdleState {
     }
 
     fn wake_partly(&mut self) {
-        self.rounds = ROUNDS_UNTIL_SLEEPY;
+        self.rounds = self.tuning.sleepy_round();
         self.jobs_counter = JobsEventCounter::DUMMY;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Missing, malformed, and out-of-range overrides must all fall back to
+    /// the tuned default — a typo in `YOUPIPE_SPIN_ROUNDS` must not silently
+    /// zero (or blow up) the backoff window.
+    #[test]
+    fn parse_rounds_falls_back_to_default() {
+        assert_eq!(parse_rounds(None, 32), 32);
+        assert_eq!(parse_rounds(Some(""), 32), 32);
+        assert_eq!(parse_rounds(Some("not-a-number"), 32), 32);
+        assert_eq!(parse_rounds(Some("-1"), 32), 32);
+        assert_eq!(parse_rounds(Some("128"), 32), 128);
+        assert_eq!(parse_rounds(Some("0"), 32), 0);
+    }
+
+    #[test]
+    fn sleepy_round_is_spin_plus_yield() {
+        assert_eq!(IdleTuning::fixed(32, 32).sleepy_round(), 64);
+        assert_eq!(IdleTuning::fixed(0, 8).sleepy_round(), 8);
+        assert_eq!(IdleTuning::fixed(4, 0).sleepy_round(), 4);
     }
 }
 
@@ -527,7 +619,7 @@ mod loom_tests {
                 // Skipping start_looking would violate the sleeping ≤
                 // inactive invariant and underflow `awake_but_idle_threads`.
                 let mut idle = s2.start_looking(0);
-                idle.rounds = ROUNDS_UNTIL_SLEEPY + 1;
+                idle.rounds = idle.tuning.sleepy_round() + 1;
                 idle.jobs_counter = s2.announce_sleepy();
                 let parked = |qs: &Arc<AtomicUsize>| qs.load(Ordering::SeqCst) > 0;
                 s2.sleep(&mut idle, &l2, || parked(&q2));
@@ -560,7 +652,7 @@ mod loom_tests {
             let q2 = Arc::clone(&queue);
             loom::thread::spawn(move || {
                 let mut idle = s2.start_looking(0);
-                idle.rounds = ROUNDS_UNTIL_SLEEPY + 1;
+                idle.rounds = idle.tuning.sleepy_round() + 1;
                 idle.jobs_counter = s2.announce_sleepy();
                 s2.sleep(&mut idle, &l2, || q2.load(Ordering::SeqCst) > 0);
                 s2.work_found();
@@ -596,7 +688,7 @@ mod loom_tests {
                 handles.push(loom::thread::spawn(move || {
                     let latch = CoreLatch::new();
                     let mut idle = s2.start_looking(worker as usize);
-                    idle.rounds = ROUNDS_UNTIL_SLEEPY + 1;
+                    idle.rounds = idle.tuning.sleepy_round() + 1;
                     idle.jobs_counter = s2.announce_sleepy();
                     s2.sleep(&mut idle, &latch, || q2.load(Ordering::SeqCst) > 0);
                     s2.work_found();

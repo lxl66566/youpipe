@@ -131,13 +131,7 @@ latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
 风险：线程数失控（用户以为池已销毁）；至少在 rustdoc 与 tuning.md 把
 「紧循环请预建池」的警示提级。
 
-### 9. 空闲自旋窗口的外部旋钮
-
-`ROUNDS_SPIN = 32` / `ROUNDS_UNTIL_SLEEPY = 64` 是 2026-06 单机（32 核 Zen）
-调出的全局甜点，加宽/收窄均测过回退。可仿照 `YOUPIPE_OVERSPLIT` 增加运行时
-env 旋钮，方便异构机器调优而不改代码。低优先。
-
-### 10. ReorderBuffer 微优化（仅在有场景时做）
+### 9. ReorderBuffer 微优化（仅在有场景时做）
 
 - `Slot` 为 seq + occupied + `MaybeUninit`（u64 项时 24 B/槽）：可把 occupied
   编码进 seq 高位，密度 +33%，大窗口时缓存友好；
@@ -145,7 +139,7 @@ env 旋钮，方便异构机器调优而不改代码。低优先。
   [1Ki, 1Mi] 对 `buffer_size` 配得极大的场景（buffer > 1Mi）没有防护，
   至少应 debug_assert 或文档标注上界推导。
 
-### 11. （非性能，顺带记录）`ordered()` + `expand()` panic
+### 10. （非性能，顺带记录）`ordered()` + `expand()` panic
 
 可用 `(seq, sub_seq)` 子序号支持展开保序，解除当前组合禁用。属 API 能力项。
 ---
