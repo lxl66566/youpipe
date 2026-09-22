@@ -1,0 +1,98 @@
+# Fork of crossfire (https://github.com/frostyplanet/crossfire-rs)
+# vendored into youpipe.
+#
+# Provenance: local fork repo at /root/programs/fork/crossfire-rs,
+# branch `waker-cache` (commit ba71d40, "waker: Revive the blocking-context
+# WakerCache (de-genericized)") — upstream 3.1.20 plus the re-enabled
+# per-handle blocking waker cache. Upstream commented the whole cache chain
+# out in fb1af1e as collateral damage of removing direct copy (the cache's
+# `<P>` payload generic died with it); it was never disproven. Under
+# backpressure the cache removes the 40-byte `ArcWaker` allocation per
+# contended park attempt — the single largest allocation class in youpipe's
+# streaming data plane under saturation (94–96% of all allocations in the
+# expand fanout-9 profile). Full archaeology, safety argument and the
+# weak_count/strong_count recycling gate:
+# docs/src/dev/crossfire-waker-cache.md.
+#
+# The package is renamed so it can never be confused with the crates.io
+# release; call sites keep importing `crossfire` via the dependency alias
+# in youpipe's Cargo.toml (lib name stays `crossfire`).
+[package]
+name         = "youpipe-crossfire"
+version      = "0.5.0"
+authors      = ["plan <frostyplanet@gmail.com>"]
+edition      = "2021"
+# Aligned with the youpipe workspace MSRV (upstream: 1.79) — see the note
+# in youpipe-concurrent-queue's manifest.
+rust-version = "1.85"
+description  = "channels for async and threads (youpipe fork)"
+license      = "Apache-2.0"
+homepage     = "https://github.com/frostyplanet/crossfire-rs"
+repository   = "https://github.com/frostyplanet/crossfire-rs"
+documentation = "https://docs.rs/crossfire"
+keywords     = ["async", "non-blocking", "lock-free", "channel"]
+categories   = ["concurrency", "data-structures"]
+exclude      = ["/ci/*", "/bors.toml"]
+readme       = "README.md"
+
+[lib]
+bench = false
+name  = "crossfire"
+
+[dependencies]
+crossbeam-utils = "0.8"
+futures-core    = "0.3"
+parking_lot     = "0"
+smallvec        = "1"
+pointers        = "0"
+tokio           = { version = "1", features = ["time", "rt"], optional = true }
+async-std       = { version = "1", optional = true }
+log             = { version = "0.4", optional = true }
+
+[dev-dependencies]
+log         = "0"
+tokio       = { version = "1", features = ["time", "sync", "rt-multi-thread", "rt", "macros"] }
+smol        = "2"
+captains-log = "0"
+
+[features]
+default = []
+
+# Enable compat model for v2.x API
+compat = []
+
+# This will enable timeout function
+tokio = ["dep:tokio"]
+
+# This will enable timeout function
+async_std = ["dep:async-std"]
+
+# for test workflow debugging
+trace_log = ["dep:log"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Upstream's own lints, kept as-is to stay diffable against the fork repo;
+# missing_safety_doc added for the same reason as youpipe-concurrent-queue's
+# (upstream unsafe helpers carry no # Safety docs; the four ptr-push entry
+# points we touched do have them now).
+[lints.clippy]
+bool_assert_comparison   = "allow"
+nonnull_unchecked_on_box_ptr = "allow"
+missing_safety_doc     = "allow"
+new_ret_no_self         = "allow"
+needless_range_loop     = "allow"
+type_complexity         = "allow"
+needless_return         = "allow"
+mut_from_ref            = "allow"
+transmute_ptr_to_ref    = "allow"
+len_without_is_empty    = "allow"
+new_without_default     = "allow"
+result_unit_err         = "allow"
+
+[lints.rust]
+# `loom` etc. are not used by this fork; silence the workspace-level
+# unexpected_cfgs gate for upstream's cfg surface.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(docsrs)"] }

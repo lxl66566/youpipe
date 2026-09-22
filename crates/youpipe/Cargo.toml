@@ -66,9 +66,14 @@ required-features = ["tokio-runtime"]
 # and resolves the registry crate at that requirement instead (must be
 # published first; `cargo publish` refuses to ship a mismatched pair).
 concurrent-queue = { package = "youpipe-concurrent-queue", path = "../youpipe-concurrent-queue", version = "0.5" }
-# >= 3.1.20: fixed spurious try_recv Disconnected under load (upstream
-# issue #70) — earlier 3.1.x silently loses items in a try_recv+recv mix.
-crossfire        = "3.1.20"
+# Vendored fork (crates/youpipe-crossfire) of crossfire 3.1.20 with the
+# blocking-context waker cache re-enabled (upstream commented it out in
+# fb1af1e as collateral damage of removing direct copy): without it every
+# contended park allocates a 40-byte ArcWaker — the dominant allocation
+# class in the streaming data plane under backpressure. Base 3.1.20 also
+# carries the issue #70 fix (spurious try_recv Disconnected under load).
+# See docs/src/dev/crossfire-waker-cache.md.
+crossfire        = { package = "youpipe-crossfire", path = "../youpipe-crossfire", version = "0.5" }
 hotpath          = { version = "0.24", optional = true }
 st3              = { package = "youpipe-st3", path = "../youpipe-st3", version = "0.5" }
 tokio            = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"], optional = true }
