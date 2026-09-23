@@ -24,8 +24,11 @@ engine gives every stage its own workers connected by bounded channels: sync
 stages share the compute pool, async stages multiplex `io_concurrency` tasks
 over a tokio runtime, and results reach the collector in completion order.
 Fused wins on per-item overhead; streaming wins whenever stages must be
-separate units (async IO, backpressure, fences, cancellation). Internals are
-covered in the [developer guide](../dev/design.md).
+separate units (async IO, backpressure, fences, cancellation). The two are
+not mutually exclusive: a `stream()` chain of only plain `.stage()`s (no
+cancel/pins/fences/expand) transparently executes on the fused core — you
+get fused performance with the streaming API. Internals are covered in the
+[developer guide](../dev/design.md).
 
 ## When youpipe is the wrong tool
 

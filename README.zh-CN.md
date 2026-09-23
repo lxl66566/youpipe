@@ -9,7 +9,8 @@ youpipe 是一个高性能、数据优先、支持混合 CPU 负载与流式异�
 - `Pipe` — 编译期融合的 CPU 链。`.map().filter().map()` 编译为每个工作线程上
   单一的单态化闭包，不产生任何中间分配。
 - `StreamPipe` — 基于通道的流式处理，覆盖融合无法处理的场景：异步 IO、
-  Cancellation、fence、一对多展开等。
+  Cancellation、fence、一对多展开等。纯同步链（仅 `.stage()`、无 pin）在
+  `.run()` 时自动融合到 fused 核心执行——用 streaming API 拿到 fused 性能。
 
 工作窃取调度器采用 rayon 风格的 `st3` LIFO 双端队列 + 紧凑原子休眠计数器，
 兼顾均衡与不均衡负载。`scope()` 支持借用栈上局部数据的非 `'static` 闭包。

@@ -2,13 +2,17 @@ use std::{cell::Cell, marker::PhantomData, num::NonZeroUsize, sync::Arc};
 #[cfg(feature = "tokio-runtime")]
 use std::{future::Future, sync::OnceLock};
 
+use super::{
+    fused::fused_pass_collect,
+    traits::{FusedOp, Identity, RangeOp},
+};
 #[cfg(feature = "tokio-runtime")]
 use crate::handoff::{
     AsyncReceiver, AsyncRecvItem, MpscAsyncReceiver, async_channel, mpsc_async_channel,
     sync_async_channel,
 };
 use crate::{
-    builder::config::PipelineConfig,
+    builder::config::{PipelineConfig, Workload},
     executor::compute::ComputePool,
     handoff::{
         MpscReceiver, Receiver, RecvItem, SendItem, SyncSender, TryRecvError, channel::channel,
@@ -522,6 +526,9 @@ impl StageOptions {
     /// and to the liveness budget remaining after upstream stages' grants —
     /// see the [Worker budget semantics](#worker-budget-semantics-workers)
     /// section above.
+    ///
+    /// Pinning `workers` or `buffer` also opts a pure-sync chain out of the
+    /// fused pass-through — see [`StreamPipe::run`].
     #[must_use]
     pub fn workers(mut self, n: usize) -> Self {
         self.workers = NonZeroUsize::new(n);
@@ -610,11 +617,16 @@ pub struct StreamPipe<S = StreamStart, I = (), O = (), R: AsyncRuntime = Default
 pub struct StreamStart;
 
 /// Data-first entry point for a streaming pipeline. Stages chained via
-/// `.stage()` / `.stage_async()` are connected by channels at `.run()` time.
+/// `.stage()` / `.stage_async()` are connected by channels at `.run()` time —
+/// useful for backpressure-aware flows, async IO stages, fences between
+/// stages, or cooperative cancellation.
 ///
-/// Unlike the fused [`crate::Pipe`], a `StreamPipe` always materialises each
-/// stage's output through a channel — useful for backpressure-aware flows,
-/// async IO stages, fences between stages, or cooperative cancellation.
+/// A chain of only `.stage()`s (no `expand`/`fence`/`stage_async`, no
+/// `with_cancel`, no worker/buffer pins) is semantically a fused
+/// [`pipe`](crate::pipe) chain: `run()` detects this at the type level and
+/// executes one composed pass on the fused index core — no channels, feeder,
+/// or collector. See [`StreamPipe::run`] for the behavioural differences of
+/// that fast path.
 pub fn stream<I, It>(items: It) -> StreamPipe<StreamStart, I, I, DefaultRuntime>
 where
     It: IntoIterator<Item = I>,
@@ -772,6 +784,43 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     /// half way through pipeline setup.
     fn has_async_stage(&self) -> bool {
         false
+    }
+
+    /// Attempt a **fused pass-through** execution: compose the whole chain
+    /// into a single [`RangeOp`] and collect `items` on the fused index core
+    /// (hybrid dispatch + zero-copy [`Slots`](super::slots::Slots)) —
+    /// skipping the streaming infrastructure entirely (feeder, k channels,
+    /// stage workers, seq tagging, collector drain).
+    ///
+    /// Eligibility is compile-time by impl set: only `StreamStart` and
+    /// `SyncStage` override this; an `ExpandStage` / `FenceLink` /
+    /// `AsyncStage` anywhere in the chain keeps the default (`Err`) and the
+    /// run takes the streaming path. A `SyncStage` whose `StageOptions` pin
+    /// `workers` / `buffer` also declines — those pins express per-stage
+    /// topology with no fused equivalent.
+    ///
+    /// The composition threads through this method's `OP` generic: each
+    /// `SyncStage` wraps the downstream op with its own closure
+    /// ([`FuseCompose`]), so `StreamStart` receives `f_k ∘ … ∘ f_1` and
+    /// executes `fused_pass_collect` on it. The chain is only *borrowed*
+    /// (`&self`) so the streaming fallback stays intact; `Err` hands
+    /// `items` back for its feeder.
+    ///
+    /// Cancellation must be excluded by the caller (the fused core has no
+    /// cancel checks) — see `StreamPipe::try_run`.
+    fn fuse_exec<OP>(
+        &self,
+        downstream: OP,
+        items: Vec<In>,
+        workload: Workload,
+        pool: &ComputePool,
+    ) -> Result<Vec<OP::Out>, Vec<In>>
+    where
+        OP: RangeOp<Self::Out>,
+    {
+        // Not eligible: give the items back for the streaming feeder.
+        let _ = (downstream, workload, pool);
+        Err(items)
     }
 
     /// Spawn with an async feeder receiver. Called by [`StreamPipe::run`]
@@ -1133,6 +1182,29 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     }
 }
 
+/// `next ∘ f`: this stage's closure applied first, then the already-composed
+/// downstream op — the composition unit of the [`StageSpawn::fuse_exec`]
+/// recursion. Holds `f` by reference (the chain is only borrowed for the
+/// pass-through attempt) and `next` by value (each level owns everything
+/// composed below it).
+struct FuseCompose<'a, OP, F> {
+    f: &'a F,
+    next: OP,
+}
+
+impl<X, M, OP, F> RangeOp<X> for FuseCompose<'_, OP, F>
+where
+    OP: RangeOp<M>,
+    F: Fn(X) -> M + Sync,
+{
+    type Out = OP::Out;
+
+    #[inline]
+    fn apply(&self, item: X) -> Self::Out {
+        self.next.apply((self.f)(item))
+    }
+}
+
 // StreamStart: identity spawn — returns rx unchanged.
 impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
     type Out = I;
@@ -1147,6 +1219,20 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
 
     fn first_consumer_is_async(&self) -> Option<bool> {
         None
+    }
+
+    fn fuse_exec<OP>(
+        &self,
+        downstream: OP,
+        items: Vec<I>,
+        workload: Workload,
+        pool: &ComputePool,
+    ) -> Result<Vec<OP::Out>, Vec<I>>
+    where
+        OP: RangeOp<I>,
+    {
+        // The recursion bottomed out: `downstream` IS the composed chain.
+        Ok(fused_pass_collect(items, &downstream, workload, pool))
     }
 
     #[cfg(feature = "tokio-runtime")]
@@ -1285,6 +1371,35 @@ where
 
     fn has_expand(&self) -> bool {
         self.prev.has_expand()
+    }
+
+    fn fuse_exec<OP>(
+        &self,
+        downstream: OP,
+        items: Vec<In>,
+        workload: Workload,
+        pool: &ComputePool,
+    ) -> Result<Vec<OP::Out>, Vec<In>>
+    where
+        OP: RangeOp<M>,
+    {
+        // Pinned `workers`/`buffer` express per-stage topology (worker
+        // division, output-channel backpressure) a fused pass-through has no
+        // equivalent for — decline so the pins keep taking effect.
+        // (`io_concurrency` is ignored by sync stages in the streaming path
+        // too, so pinning it alone does not need to decline.)
+        if self.opts.workers.is_some() || self.opts.buffer.is_some() {
+            return Err(items);
+        }
+        self.prev.fuse_exec(
+            FuseCompose {
+                f: &self.f,
+                next: downstream,
+            },
+            items,
+            workload,
+            pool,
+        )
     }
 }
 impl<Prev, F, In, N> StageSpawn<In> for ExpandStage<Prev, F, N>
@@ -1882,7 +1997,9 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     }
 
     /// Attach a [`CancellationToken`] for cooperative cancellation. Feeder,
-    /// stage workers, and bridges all check the token per iteration.
+    /// stage workers, and bridges all check the token per iteration. A
+    /// cancelled-or-not token always opts the chain out of the fused
+    /// pass-through (see [`run`](Self::run)).
     #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
@@ -2389,6 +2506,28 @@ where
     /// optionally reorders by sequence tag if `.ordered()` was called, and
     /// drains the final receiver into a `Vec`.
     ///
+    /// # Fused pass-through
+    ///
+    /// When the chain is exclusively `.stage()`s — no `expand` / `fence` /
+    /// `stage_async`, no [`with_cancel`](Self::with_cancel), no
+    /// [`with_compute_workers`](Self::with_compute_workers) pin, no per-stage
+    /// [`workers`](StageOptions::workers) / [`buffer`](StageOptions::buffer)
+    /// pin — `run()` composes the stages into one `g ∘ f` pass and executes
+    /// it on the fused index core (hybrid dispatch, zero-copy slots), the
+    /// same core `pipe(..).map().collect()` uses. Behavioural differences vs
+    /// the streaming topology:
+    ///
+    /// - **No backpressure**: peak memory is the input + output `Vec`s, not bounded by
+    ///   `buffer_size`.
+    /// - **Unordered output becomes input order** (within the "any order" contract); `.ordered()`
+    ///   output is identical either way.
+    /// - **Stage panics propagate to the caller** after partial-state cleanup, instead of aborting
+    ///   the process.
+    ///
+    /// Pins opt the chain out (they express per-stage topology the fused
+    /// core cannot honour); [`for_each`](Self::for_each) never takes the
+    /// pass-through (its drain runs on the calling thread).
+    ///
     /// # Panics
     ///
     /// Panics if `.ordered()` is combined with `.expand()` (see
@@ -2470,7 +2609,35 @@ where
     /// # Panics
     ///
     /// Same programming-error panics as [`run`](Self::run).
-    pub fn try_run(self) -> std::io::Result<Vec<O>> {
+    pub fn try_run(mut self) -> std::io::Result<Vec<O>> {
+        // Fused pass-through: a chain of pure, unpinned `SyncStage`s without
+        // cancellation is semantically `pipe(items).map(f1)….map(fk).collect()`
+        // — run it on the fused index core instead of the streaming
+        // infrastructure (feeder job, k channels, stage workers, seq tagging,
+        // collector drain). `.ordered()` stays eligible: the pass-through
+        // output IS input order, exactly the `ordered()` contract.
+        //
+        // A pinned `with_compute_workers` budget declines: the fused core has
+        // no notion of "cap stage concurrency on a larger pool" — the
+        // streaming path is the only one that honours the cap without paying
+        // ~ms transient-pool construction per `run()`. Same "explicit pin ⇒
+        // no pass-through" policy as per-stage `StageOptions::workers` pins.
+        if self.cancel.is_none() && !self.config.compute_workers_pinned {
+            let pool = self
+                .compute_pool
+                .as_ref()
+                .unwrap_or_else(|| ComputePool::global());
+            let items = std::mem::take(&mut self.items);
+            match self
+                .stages
+                .fuse_exec(FusedOp(Identity), items, self.config.workload, pool)
+            {
+                Ok(out) => return Ok(out),
+                // Chain not pass-through-eligible: restore the items and take
+                // the streaming path below.
+                Err(items) => self.items = items,
+            }
+        }
         self.try_exec(VecCollector)
     }
 

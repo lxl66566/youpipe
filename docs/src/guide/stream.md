@@ -39,6 +39,17 @@ let mut total = 0u64;
 stream(0..10_000).stage(|x: u64| x * 2).for_each(|x| total += x);
 ```
 
+**Fused pass-through.** When the chain is only `.stage()`s (no `expand` /
+`fence` / `stage_async`, no `with_cancel`, no `with_compute_workers` or
+per-stage `workers`/`buffer` pin), `.run()` detects it at the type level and
+executes the composed chain on the fused core — the same engine `pipe()`
+uses, with no channels or feeder at all. Consequences: no backpressure (peak
+memory is input + output, not bounded by `buffer_size`), unordered output
+becomes input order, and stage panics propagate to the caller instead of
+aborting the process. `.ordered()` output is identical either way. Add any
+streaming-only feature (a pin, `with_cancel`, a fence…) to opt back into the
+channel topology.
+
 ## Fences
 
 By default, stages overlap: stage 2 starts consuming as soon as stage 1

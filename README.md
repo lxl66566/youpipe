@@ -10,7 +10,9 @@ whole chain. Two pipeline engines cover different regimes:
 - `Pipe` — compile-time fused CPU chains. `.map().filter().map()` becomes a
   single monomorphized closure per worker with no intermediate allocations.
 - `StreamPipe` — channel-backed streaming for cases fusion cannot cover:
-  async IO, cancellation, fences, 1-to-N expansion, and more.
+  async IO, cancellation, fences, 1-to-N expansion, and more. Pure sync
+  chains (`.stage()`s only, unpinned) auto-fuse onto the fused core at
+  `.run()` — fused performance with the streaming API.
 
 A rayon-style work-stealing scheduler (`st3` LIFO deque + packed atomic
 sleep counters) handles balanced and unbalanced loads. `scope()` supports

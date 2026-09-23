@@ -14,7 +14,7 @@ use std::hint;
 /// `Vec` merge in `join_fused_collect` instead. This invariant is what makes
 /// `Slots::drop_range` sound over arbitrary sub-ranges in the panic cleanup:
 /// every output slot the leaf visits is unconditionally written.
-pub(super) trait RangeOp<T>: Sync {
+pub trait RangeOp<T>: Sync {
     type Out: Send;
     fn apply(&self, item: T) -> Self::Out;
 }

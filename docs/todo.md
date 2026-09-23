@@ -14,26 +14,33 @@
 
 ## P0
 
-### 1. 纯同步链的 fused 直通（streaming 引擎最大结构性开销）
+### 1. 纯同步链的 fused 直通（✅ 已落地，2026-09）
 
-- **现状**：`stream(v).stage(f).run()` 语义上 ≡ `pipe(v).map(f).collect()`（1:1
-  映射、无 filter），却付出完整流式基础设施：k 条 channel、worker job 提交、
-  feeder、seq 打包、collector drain。证据：`mixed_load/youpipe_stream_cpu`
-  1K ≈ 317 µs vs rayon 37 µs（`benches/mixed_load.rs`，单 sync stage 纯 CPU）——
-  差距几乎全是基础设施，而非引擎。
-- **方案**：`StreamPipe::try_exec` 前在类型层面检测「链 = 连续 `SyncStage`，
-  无 `expand`/`fence`/`AsyncStage`/`with_cancel`」→ 组合 `g∘f` 直接走
-  `par_index_collect`（hybrid dispatch + Slots 零拷贝）。多级连续 sync stage
-  一并合成。
-- **语义变化（需 docs 同步）**：
-  - 失去 stage 间 backpressure（峰值内存 = 输入+输出，不再被 buffer 截断）；
-  - unordered 模式输出从完成序变为输入序（"任意序"合同内，但对用户可见）；
-  - stage panic 从 abort（worker `AbortIfPanic`）变为向调用者传播（改善，但
-    是行为变化）；
-  - `StageOptions::workers`/`buffer` pin 在直通下失效——建议显式 pin 时不直通，
-    保持用户预期。
-- **验证**：`mixed_load`、`stream_pipeline` 全家族（含 with_fence/ordered/cancel
-  负例确认不直通）。
+- **结果**：`try_run` 在类型层面检测「链 = 连续未 pin 的 `SyncStage`，无
+  expand/fence/AsyncStage，无 `with_cancel`，无 `with_compute_workers` pin」→
+  `StageSpawn::fuse_exec` 沿递归把链组成 `g∘f`（`FuseCompose`，闭包按引用）
+  → `fused_pass_collect`（= `Pipe::collect` 的 serial 短路 + hybrid dispatch
+  + Slots 零拷贝）。实现无需 specialization：组合算子的类型经 trait 方法的
+  `OP` 泛型穿递归；非 sync 节点保持默认 `Err(items)`，链以 `&self` 借用故
+  可无损回退流式路径。
+- **运行时排除**（类型看不见的）：`with_cancel`（fused 核心无 cancel 检查）；
+  `with_compute_workers` pin（pin 语义是「在大池上限制 stage 并发」，fused
+  核心无此概念——`test_compute_workers_pin_survives_compute_pool` 会挂；顺带
+  避免 ~ms transient 池）；各级 `StageOptions::workers/buffer` pin。`.ordered()`
+  **不排除**：直通输出即输入序，恰是 ordered 合同。
+- **语义变化**（已写入 rustdoc 与 docs/src/guide/stream.md）：失去 backpressure
+  （峰值内存 = 输入+输出）；unordered 输出从完成序变输入序；stage panic 从
+  abort 变为向调用者传播；`for_each` 不直通（调用者线程 FnMut drain）。
+- **实测**（perf/bench-suite 3 轮隔离交错 A/B，32 核）：
+  `mixed_load/youpipe_stream_cpu` 1K **310.5 µs → 9.98 µs（−96.8%）**、
+  100K **30.45 ms → 139.3 µs（−99.5%）**（9/9 轮占优）；stream_pipeline 的
+  single/multi/ordered 全家族同幅度；负例 `with_fence` 与 rayon 锚点纯噪声；
+  fused 家族（sync_vs_rayon）全噪声无回归。直通后 1K 比 rayon 快 −75%（9.98
+  vs 39.9 µs）；100K 慢 +51%（139 vs 92 µs）系口径差：mixed_load 的 youpipe
+  案例每轮 fresh owned 输入（warm_clone），rayon 借用常驻共享切片——借入口径
+  的 fused（`sync_cpu_heavy/youpipe_par_map`）在同一 work 函数下为 52 µs。
+- **验证**：新增 6 个集成测试（等价性含 ordered/serial 短路、零 stage 恒等、
+  panic 传播=直通激活正例、cancel/pin 排除负例）；全量测试 + clippy 绿。
 
 ### 2. ≥2M 大批量 fused collect 带宽差距归因并收窄
 

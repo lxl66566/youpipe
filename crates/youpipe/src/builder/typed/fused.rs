@@ -322,6 +322,36 @@ where
     output.into_vec()
 }
 
+/// Fused-core entry for the streaming pass-through
+/// (`StageSpawn::fuse_exec`): collect `op` over `items` exactly like
+/// `Pipe::collect` does for a no-filter chain — trivial-batch serial
+/// shortcut, then `SplitPlan` + hybrid-dispatch index core.
+///
+/// Streaming callers reach this only after the pass-through eligibility
+/// guards passed (pure `SyncStage` chain, no cancellation, no per-stage
+/// pins), so the `Vec`-in/`Vec`-out contract here is the whole story.
+pub(super) fn fused_pass_collect<T, R, OP>(
+    items: Vec<T>,
+    op: &OP,
+    workload: Workload,
+    pool: &ComputePool,
+) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    OP: RangeOp<T, Out = R>,
+{
+    let n = items.len();
+    let num_threads = pool.num_workers();
+    if prefers_serial(n, num_threads) {
+        // Same trivial path as `Pipe::collect`: plain sequential map, no
+        // output-buffer machinery.
+        return items.into_iter().map(|item| op.apply(item)).collect();
+    }
+    let plan = SplitPlan::new(n, num_threads, workload);
+    par_index_collect(items, op, plan, pool)
+}
+
 // ── Hybrid flat/tree top-level dispatch ──
 //
 // Hypothesis: the single-tree `par_index_rec` grows parallelism one level at a

@@ -378,6 +378,104 @@ fn test_stream_multi_stage() {
     assert_eq!(result, expected);
 }
 
+// ── Fused pass-through: pure SyncStage chains run on the fused core ──
+
+/// A pure sync chain's pass-through output must equal both the sequential
+/// composition and the equivalent fused `pipe().map().collect()` — across
+/// the serial shortcut (n = 1), the hybrid-dispatch range (n = 10_000), and
+/// `.ordered()` (whose input-order contract the pass-through satisfies
+/// trivially).
+#[test]
+fn test_stream_fused_pass_through_equivalence() {
+    let f = |x: u64| cpu_heavy(x).wrapping_add(1);
+    let g = |x: u64| x.wrapping_mul(3);
+
+    for n in [1, 2, 10_000] {
+        let items: Vec<u64> = (0..n).collect();
+        let expected: Vec<u64> = items.iter().map(|&x| g(f(x))).collect();
+
+        let fused = pipe(items.clone()).map(f).map(g).collect();
+        assert_eq!(fused, expected, "fused baseline (n = {n})");
+
+        let pass = stream(items.clone()).stage(f).stage(g).run();
+        assert_eq!(pass, expected, "pass-through output (n = {n})");
+
+        let ordered = stream(items).stage(f).stage(g).ordered().run();
+        assert_eq!(ordered, expected, "ordered pass-through (n = {n})");
+    }
+}
+
+/// A zero-stage chain (`StreamStart`) also takes the pass-through; the
+/// result is the input verbatim.
+#[test]
+fn test_stream_no_stage_pass_through_identity() {
+    let items: Vec<u32> = (0..100).collect();
+    assert_eq!(stream(items.clone()).run(), items);
+}
+
+/// Stage panics propagate to the `run()` caller on the pass-through (the
+/// fused core cleans up partial state and resumes the unwind) instead of
+/// the streaming path's process abort. Catching the unwind here doubles as
+/// proof the pass-through is active for this chain shape — a streaming-path
+/// stage panic would abort the whole test process.
+#[test]
+fn test_stream_pass_through_panic_propagates() {
+    let result = std::panic::catch_unwind(|| {
+        stream(0..1000u64)
+            .stage(|x| x + 1)
+            .stage(|x: u64| {
+                assert!(x != 500, "stage boom");
+                x * 2
+            })
+            .run()
+    });
+    assert!(result.is_err(), "stage panic must propagate to the caller");
+}
+
+/// `with_cancel` disables the pass-through: a pre-cancelled token must
+/// truncate the output. The fused core has no cancel checks, so honouring
+/// the token proves the streaming path ran.
+#[test]
+fn test_stream_pass_through_cancel_excluded() {
+    use youpipe::CancellationToken;
+
+    let token = CancellationToken::new();
+    token.cancel();
+    let r = stream(0..10_000u32)
+        .with_cancel(token)
+        .stage(|x| x + 1)
+        .run();
+    assert!(r.len() < 10_000, "cancelled run must abort early");
+}
+
+/// A `StageOptions::workers` pin disables the pass-through: the pinned
+/// budget must cap stage concurrency (the fused core would use the whole
+/// pool). Mirrors `test_compute_workers_pin_survives_compute_pool`.
+#[test]
+#[cfg_attr(miri, ignore)] // wall-clock-based concurrency probing
+fn test_stream_pass_through_stage_pin_excluded() {
+    use youpipe::StageOptions;
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (a, p) = (active.clone(), peak.clone());
+    let r = stream(0..200u64)
+        .stage_with(StageOptions::new().workers(2), move |x| {
+            let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+            p.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            a.fetch_sub(1, Ordering::SeqCst);
+            x + 1
+        })
+        .run();
+    assert_eq!(r.len(), 200);
+    assert!(
+        peak.load(Ordering::SeqCst) <= 2,
+        "pinned stage workers must cap concurrency, observed peak {}",
+        peak.load(Ordering::SeqCst)
+    );
+}
+
 #[test]
 fn test_stream_with_fence_chunked() {
     let items: Vec<i32> = (0..100).collect();

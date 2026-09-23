@@ -43,6 +43,10 @@ the data-first `stream(items)` builder assembles a `StreamPipe` whose stages are
 linked by MPMC channels at `.run()` time. The two engines are deliberately
 separate (work-stealing join vs channel handoff) — see the `StreamPipe`
 section of [core-types.md](core-types.md#streampipe--streaming-multi-stage-pipeline).
+The bridge goes both ways: a `stream()` chain of only plain `.stage()`s is
+type-level-detected at `.run()` and executed as one composed pass on the
+fused core (no channels, feeder, or collector) — see
+[streaming.md](streaming.md#fused-pass-through-pure-sync-chains).
 
 ### Non-`'static` Lifetime Support
 

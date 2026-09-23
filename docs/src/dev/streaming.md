@@ -1,5 +1,48 @@
 # Data Transfer, Ordering & Fences
 
+## Fused pass-through (pure sync chains)
+
+`stream(v).stage(f1)….stage(fk).run()` is semantically identical to
+`pipe(v).map(f1)….map(fk).collect()` when every stage is a plain `SyncStage`.
+`try_run` detects this shape and skips the whole streaming topology (feeder
+job, k channels, stage workers, seq tagging, collector drain), executing one
+composed `g ∘ f` pass on the fused index core (`fused_pass_collect` → hybrid
+dispatch + zero-copy slots). Measured on `mixed_load/youpipe_stream_cpu`
+(3-round isolated interleaved A/B, 32 cores): 1 K **310.5 µs → 9.98 µs**,
+100 K **30.45 ms → 139.3 µs** — the streaming infrastructure is gone;
+what remains is the fused core's own level (vs rayon 39.9/92.3 µs at the
+same shapes).
+
+Mechanism — no specialization needed:
+
+- `StageSpawn::fuse_exec(&self, downstream: OP, items, workload, pool)` is a
+  trait method whose `OP` generic carries the composed op type through the
+  recursion: each `SyncStage` wraps `downstream` with its own closure
+  (`FuseCompose` = `next ∘ f`, closure held by reference), and `StreamStart`
+  executes `fused_pass_collect` on the fully composed op.
+- Eligibility is the impl set: only `StreamStart`/`SyncStage` override
+  `fuse_exec`; `ExpandStage`/`FenceLink`/`AsyncStage` keep the default
+  `Err(items)`, so any non-sync link falls back to streaming. `&self` keeps
+  the chain intact for that fallback (the `Err` variant hands `items` back).
+
+Runtime guards (things the type cannot see):
+
+- `with_cancel` ⇒ no pass-through (the fused core has no cancel checks).
+- `with_compute_workers` pin ⇒ no pass-through: the pin caps stage
+  concurrency on a larger pool, and the fused core has no notion of "use
+  only N threads of a pool" (`test_compute_workers_pin_survives_compute_pool`
+  fails otherwise). Also avoids ~ms transient-pool construction per run.
+- Per-stage `StageOptions::workers`/`buffer` pins ⇒ no pass-through — same
+  policy, the pins express per-stage topology with no fused equivalent.
+- `.ordered()` stays **eligible**: pass-through output IS input order.
+
+Semantic changes vs the streaming path (documented in `StreamPipe::run`):
+no backpressure (peak memory = input + output `Vec`s), unordered output
+becomes input order (within the any-order contract), stage panics propagate
+to the caller after partial-state cleanup instead of aborting the process.
+`for_each` never passes through (its drain is a caller-thread `FnMut`).
+
+---
 
 ### MPMC Channels (`channel.rs`)
 
