@@ -66,9 +66,14 @@ required-features = ["tokio-runtime"]
 # and resolves the registry crate at that requirement instead (must be
 # published first; `cargo publish` refuses to ship a mismatched pair).
 concurrent-queue = { package = "youpipe-concurrent-queue", path = "../youpipe-concurrent-queue", version = "0.5" }
-# >= 3.1.20: fixed spurious try_recv Disconnected under load (upstream
-# issue #70) — earlier 3.1.x silently loses items in a try_recv+recv mix.
-crossfire        = "3.1.20"
+# Vendored fork (crates/youpipe-crossfire) of crossfire 3.1.20 with a
+# per-thread immortal blocking waker (design C): without it every contended
+# park allocates a 40-byte ArcWaker — the dominant allocation class in the
+# streaming data plane under backpressure. Base 3.1.20 also carries the
+# issue #70 fix (spurious try_recv Disconnected under load).
+# See docs/src/dev/crossfire-waker-designs.md (design C) and
+# docs/src/dev/crossfire-waker-cache.md (archaeology; superseded design A).
+crossfire        = { package = "youpipe-crossfire", path = "../youpipe-crossfire", version = "0.5" }
 hotpath          = { version = "0.24", optional = true }
 st3              = { package = "youpipe-st3", path = "../youpipe-st3", version = "0.5" }
 tokio            = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"], optional = true }
@@ -77,6 +82,10 @@ youpipe-sys      = { path = "../youpipe-sys", version = "0.5" }
 [dev-dependencies]
 criterion         = "0.8"
 crossbeam-channel = "0.5"
+# Direct access for tests/handoff_channel.rs: the timeout park variants
+# (send_timeout/recv_timeout) of the vendored waker protocol are not
+# re-exported by the handoff wrapper.
+crossfire         = { package = "youpipe-crossfire", path = "../youpipe-crossfire", version = "0.5" }
 futures           = "0.3"
 rayon             = "1"
 tokio             = { version = "1", features = [

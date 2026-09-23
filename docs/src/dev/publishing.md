@@ -12,6 +12,7 @@ on relative paths while published builds resolve registry versions.
 | `youpipe-sys` | `crates/youpipe-sys` | yes |
 | `youpipe-st3` | `crates/youpipe-st3` | yes (fork of upstream st3) |
 | `youpipe-concurrent-queue` | `crates/youpipe-concurrent-queue` | yes (fork of upstream concurrent-queue) |
+| `youpipe-crossfire` | `crates/youpipe-crossfire` | yes (fork of upstream crossfire, per-thread blocking waker) |
 | `youpipe-criterion-perf-counters` | `crates/youpipe-criterion-perf-counters` | no (bench-only tool dep) |
 | `youpipe-bench-counter` | `crates/youpipe-bench-counter` | no (`publish = false`) |
 | `youpipe-bench-file-encrypt` | `crates/youpipe-bench-file-encrypt` | no |
@@ -46,6 +47,7 @@ currently `0.5`):
 
 ```sh
 cargo publish -p youpipe-concurrent-queue
+cargo publish -p youpipe-crossfire
 cargo publish -p youpipe-st3
 cargo publish -p youpipe-sys
 cargo publish -p youpipe                            # last: depends on all above

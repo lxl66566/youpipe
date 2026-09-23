@@ -39,7 +39,7 @@
 
 - **现状**：horizontal `cpu_balanced` 1M 打平后，2M rayon 领先 +14%、4M +12%
   （38 vs ~34 GB/s 输出吞吐）。`dev/benchmarks.md` "Reading the results" 明确
-  标注 *unattributed*（输出槽位索引 / 派发流量 / 分配器行为均未排除）。
+  标注 _unattributed_（输出槽位索引 / 派发流量 / 分配器行为均未排除）。
 - **方向**：
   1. 先归因再动手：perf counter（cache-misses/cycles/instr-per-elem）+
      `perf record` 对比 rayon 同口径；
@@ -83,62 +83,23 @@
 
 ### 5. 终端 collector 通道 in-pipeline A/B：`std sync_channel` vs crossfire mpsc
 
-  2026-10）显示无竞争 1P1C 形状下 `std::sync::mpsc::sync_channel(256)` 比当前
-  collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s）。
-  当初切 MPSC 的依据是 in-pipeline profiling（N 生产者竞争下 recv 侧 CAS 主导，
-  见 handoff/channel.rs），微基准无法复现该竞争，两者口径不同、并不矛盾。
+2026-10）显示无竞争 1P1C 形状下 `std::sync::mpsc::sync_channel(256)` 比当前
+collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s）。
+当初切 MPSC 的依据是 in-pipeline profiling（N 生产者竞争下 recv 侧 CAS 主导，
+见 handoff/channel.rs），微基准无法复现该竞争，两者口径不同、并不矛盾。
+
 - **方向**：在真实 pipeline 里 A/B 把 collector 通道换成 `sync_channel`
   （`SyncSender: Clone` 满足多生产者，`RecvItem` 抽象已就位）。注意 std 阻塞
   send 无自旋窗口、park 策略不同，低深度背压场景可能反而回退。
 - **验证**：`stream_pipeline` 全家族 + `mixed_load` 隔离交替 A/B。
 
-### 6. crossfire 阻塞路径的每次 park 40 B `ArcWaker` 分配（2026-10 新发现）
+### 6. crossfire 阻塞路径的每次 park 40 B `ArcWaker` 分配（✅ 已落地；miri/loom 验证完成）
 
-- **现状**：`tests/expand_alloc.rs` 调试期间用 size 直方图定位：饱和/背压下
-  streaming 数据面出现大量 size=40 分配。归因：crossfire `blocking_tx/rx` 的
-  `o_waker: Option<ArcWaker>` 每次调用从 `None` 起步，spin 失败进入 park 前调
-  `ArcWaker::new_blocking()`（`Arc` 头 16 B + `WakerInner` 24 B = 40 B）；
-  upstream 把整条 waker 缓存链路注释掉了。**完整考古（时间线、四个 ordering bug
-  前科、逐项风险评估、patch 蓝图）见 `dev/crossfire-waker-cache.md`**；
-  `waker.rs` L312-399 的块注释内，**不是活代码**；唯一存活的是 collections.rs
-  的 `ArcCell`（#[allow(dead_code)]）与 trait 里的方法名疤痕 `cancel_reuse_waker`。
-- **upstream 意图与历史（git 考古）**：缓存本是真实生效的优化——b7d259d
-  (2025-07-07) "Add cache for LockedWaker in blocking context"：per-Tx/Rx
-  `WakerCache`（ArcCell），fast-cancel 与 wake-success 两类出口都 push。
-  2025-07-18 加 direct copy（sender 带 `*const T` payload park，`on_recv` 替它
-  try_send，"lower the failure order"）→ `WakerInner<P>` 带 payload 泛型。
-  2026-01-17 因 miri UB（issue #54）disable direct copy，次日 re-enable，
-  最终 fb1af1e (2026-05-14, 进 3.1.20) 永久移除 direct copy 并去掉 `P` 泛型——
-  缓存与 payload 泛型纠缠（`WakerCache<*const T>`），作为**附带损伤**被整体
-  块注释（字段、调用点、trait stub、实现全灭），并非缓存本身有 bug。
-- **量化（2026-10 size 直方图，临时 example 复测）**：无竞争快阶段下每次 run
-  仅 2-4 次（fast path `try_send` 完全绕过 waker）；背压下爆发且高度调度依赖
-  ——同 pipeline 三连 run 分别 17/387/2 次（双峰抖动，这就是无过滤计数测试
-  不可复现的原因）；expand fanout-9（8192 入 → 73728 出，2 个 hop）稳态
-  1654-2653 次/run，是全 pipeline 第一大分配类（第二名仅 45×32B scratch 增长）。
-  极限逼近每 contended send/recv 尝试一次（含 double-check 假唤醒的重试）。
-- **影响**：这是背压下的第一分配流量来源，覆盖**所有** stage 间 hop（对比：已关闭的
-  expand push-API 只消除 stage 函数内部的 Vec 分配），且调度依赖的双峰计数
-  本身就是潜在尾延迟抖动源。
-- **方向**：
-  1. 先量化：hotpath/计数分配器下测 `stream_pipeline` 全家族的 40 B 分配率；
-  2. 修补选项（git 考古后明确可行，约 30 行 patch）：从块注释复活 `WakerCache`，
-     去掉 `P` 泛型（`reset(payload)` → 已存在的 `reset()`/`reset_init()`）；
-     Tx/Rx 重新持有 `waker_cache` 字段；`reg_waker_blocking` 的 else 分支
-     `new_blocking()` 改为从缓存 pop（注释里保留的旧签名即此意图）；出口 push。
-     风险评估：`push` 的 `weak_count==0 && strong_count==1` 门是承重不变量，
-     当前所有出口均满足（wake-success 前弱引用已被 `pop_first` 摘除；fast-cancel
-     走 `_clear_wakers`；abandon 路径 waker 直接 drop 不入缓存），复用等价于
-     重新 `Arc::new`；seq 由注册表在 mutex 下盖戳，与分配复用正交（无 ABA）；
-     `reset_init` 的 Relaxed 论证可扩展到复用（weak_count==0 ⇒ 无并发观察者）。
-     但 upstream waker 生命周期有历史 bug（issue #14/#22/#34），patch 需过
-     miri+loom。youpipe 侧形态理想：`SyncSender::clone` → 每 worker 独享 Tx
-     → 缓存天然单线程、`update_thread_handle` 形同虚设。可先提 upstream，
-     不接受再走 fork（与 youpipe-concurrent-queue 同策略）；
-  3. 与 #5 联动：若换 `std sync_channel` 做 collector，此问题只影响 stage 间
-     MPMC，缩小暴露面。
-- **验证**：`expand_heavy` + `stream_pipeline` 隔离交替 A/B + 计数分配器
-  size 直方图（40 B 档消失）。
+- **结果**：已按 fork 路径落地——`crates/youpipe-crossfire`（源：`/root/programs/fork/crossfire-rs` 分支 `waker-tl`），per-thread 不死 waker + 全局 seq 戳标记队列项（设计 C，取代先落地的设计 A/`waker-cache` 分支）。验收与实测细节见 `dev/crossfire-waker-designs.md` §11；考古与设计 A 的落地记录见 `dev/crossfire-waker-cache.md` §7；设计空间完整分析（A/C/B/E 对比、事实清单 F1–F15）见 `dev/crossfire-waker-designs.md`。
+- **验收读数**：expand fanout-9 的 40B 分配从 upstream 稳态 ~2000/run 降至 A 的 62–433/run，再降至 C 的**稳态 1/run**（结构性归零：总量 104 次/run 对 73,728 item）；背压、无竞争场景同样归 1。C 无 fast-cancel 残余（无出口概念），`expand_alloc.rs` 的按尺寸过滤已可考虑收紧。
+- **对蓝图的三处修正**（已记入 designs §11.2）：① `close()` 也必须做 seq 检查，否则会把别处现役 waiter 盖成 Closed（虚假 Disconnect）；② seq 戳源改全局计数器——per-registry 计数器数值可碰撞，会让陈旧项冒充现役偷 fire；③ `_clear_wakers` 维持节点 seq 语义（entry-seq 反而少摘陈旧项）。
+- **验证状态**：fork check/test 全绿（新增 2 个 C 专属单测），upstream test-suite 串行 334/334；youpipe 全套测试 + 50 轮 pipeline_integration 压测全绿。**miri（tree-borrows）+ loom 已完成**（designs §11.6）：vendored lib 21 测试 + youpipe 集成测试 `handoff_channel.rs`（8 个：park/唤醒、断连、close-vs-重臂、超时、竞争）进 `perf/verify/miri.sh`；5 个 loom 模型（seq 突变验证可抓失效）进 `perf/verify/loom.sh`；seq 传播窄窗口经 loom 枚举确认可达且良性（绝不 Closed）。**一次未复现挂起**无对应反例，维持高负载饥饿归因。
+
 ---
 
 ## P2
@@ -187,6 +148,7 @@ latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
 
 若做批量 payload 方案，注意与 #6（crossfire park 40 B ArcWaker）叠加后每组的
 channel hop 数减少，是顺带收益。
+
 ---
 
 ## 已证伪方向（勿重复尝试）
@@ -196,7 +158,7 @@ channel hop 数减少，是顺带收益。
 
 - **driver 偷已注入 chunk** 的三个变体（claim-flag / pop-any / pop-requeue）：
   破坏 injector FIFO（stream 正确性的隐式全局依赖）或 `counter==0 ⇒ JobRef
-  全部消费` 不变量（UAF / 全池死锁）。安全形态只有 reserve chunk（现状）。
+全部消费` 不变量（UAF / 全池死锁）。安全形态只有 reserve chunk（现状）。
 - **flat 顶层派发**：小中 N 赢、大 N 单注入器争用崩盘；hybrid 是定论。
 - **cost-EMA 自适应 chunk 数 / execute-time split-back**：门条件在稳态几乎
   不同时成立（实测 1 次/进程），机制零命中即删。

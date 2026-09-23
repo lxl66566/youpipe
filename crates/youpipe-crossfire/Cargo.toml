@@ -1,0 +1,113 @@
+# Fork of crossfire (https://github.com/frostyplanet/crossfire-rs)
+# vendored into youpipe.
+#
+# Provenance: local fork repo at /root/programs/fork/crossfire-rs,
+# branch `waker-tl` @ e8e21f1 ("waker: loom model checking for the waker
+# registry", on top of 665095b "waker: u64 registration stamps and unified
+# QueueEntry stale check", on top of 541e0fc "waker: Per-thread immortal
+# blocking waker with seq-tagged queue entries"). `src/` is byte-identical
+# to that commit (git archive waker-tl, verified with diff -r) — the
+# fork's uncommitted working-tree changes are deliberately NOT included.
+#
+# Design C: the blocking wake target is thread::current(), which never
+# changes, so the waker node lives in a thread_local and is only re-armed
+# between episodes; registry queue entries carry a global seq stamp so a
+# stale entry left by a re-armed node is skipped on fire/close. This removes
+# the 40-byte `ArcWaker` allocation per contended park attempt — the single
+# largest allocation class in youpipe's streaming data plane under
+# saturation (94–96% of all allocations in the expand fanout-9 profile) —
+# and supersedes design A (branch `waker-cache`, per-handle WakerCache).
+# Design/acceptance record: docs/todo.md #6.
+#
+# The package is renamed so it can never be confused with the crates.io
+# release; call sites keep importing `crossfire` via the dependency alias
+# in youpipe's Cargo.toml (lib name stays `crossfire`).
+[package]
+name         = "youpipe-crossfire"
+version      = "0.5.0"
+authors      = ["plan <frostyplanet@gmail.com>"]
+edition      = "2021"
+# Aligned with the youpipe workspace MSRV (upstream: 1.79) — see the note
+# in youpipe-concurrent-queue's manifest.
+rust-version = "1.85"
+description  = "channels for async and threads (youpipe fork)"
+license      = "Apache-2.0"
+homepage     = "https://github.com/frostyplanet/crossfire-rs"
+repository   = "https://github.com/frostyplanet/crossfire-rs"
+documentation = "https://docs.rs/crossfire"
+keywords     = ["async", "non-blocking", "lock-free", "channel"]
+categories   = ["concurrency", "data-structures"]
+exclude      = ["/ci/*", "/bors.toml"]
+readme       = "README.md"
+
+[lib]
+bench = false
+name  = "crossfire"
+
+[dependencies]
+crossbeam-utils = "0.8"
+futures-core    = "0.3"
+parking_lot     = "0"
+smallvec        = "1"
+pointers        = "0"
+tokio           = { version = "1", features = ["time", "rt"], optional = true }
+async-std       = { version = "1", optional = true }
+log             = { version = "0.4", optional = true }
+# Model-checked waker tests (dep-only, enabled by the `loom` feature).
+# Deliberately feature-gated instead of RUSTFLAGS="--cfg loom": that would
+# leak the cfg into dependencies carrying their own cfg(loom) test shims
+# without the loom crate linked (e.g. event-listener).
+loom = { version = "0.7", optional = true }
+
+# Diverges from the fork manifest: no `captains-log` — it assumes a unix
+# libc and fails to compile on Windows (the fork dropped it too).
+[dev-dependencies]
+log         = "0"
+tokio       = { version = "1", features = ["time", "sync", "rt-multi-thread", "rt", "macros"] }
+smol        = "2"
+
+[features]
+default = []
+
+# Enable compat model for v2.x API
+compat = []
+
+# This will enable timeout function
+tokio = ["dep:tokio"]
+
+# This will enable timeout function
+async_std = ["dep:async-std"]
+
+# for test workflow debugging
+trace_log = ["dep:log"]
+
+# Model-checked waker tests: cargo test -p youpipe-crossfire --features loom --lib -- loom_
+loom = ["dep:loom"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Upstream's own lints, kept as-is to stay diffable against the fork repo;
+# missing_safety_doc added for the same reason as youpipe-concurrent-queue's
+# (upstream unsafe helpers carry no # Safety docs).
+[lints.clippy]
+bool_assert_comparison   = "allow"
+nonnull_unchecked_on_box_ptr = "allow"
+missing_safety_doc     = "allow"
+new_ret_no_self         = "allow"
+needless_range_loop     = "allow"
+type_complexity         = "allow"
+needless_return         = "allow"
+mut_from_ref            = "allow"
+transmute_ptr_to_ref    = "allow"
+len_without_is_empty    = "allow"
+new_without_default     = "allow"
+result_unit_err         = "allow"
+
+[lints.rust]
+# `loom` is switched by the cargo feature here (unlike youpipe's rustflag
+# convention), so src only uses `cfg(feature = "loom")`; docsrs comes from
+# rustdoc-args. Silence the workspace-level unexpected_cfgs gate for
+# upstream's cfg surface.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(docsrs)"] }

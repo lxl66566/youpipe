@@ -44,7 +44,7 @@ export MIRIFLAGS=${MIRIFLAGS:--Zmiri-tree-borrows -Zmiri-ignore-leaks}
 if [[ -n ${MIRI_TARGETS:-} ]]; then
     TARGETS=($MIRI_TARGETS)
 else
-    TARGETS=(lib doc compute_pool pipeline_integration scope_integration)
+    TARGETS=(lib doc compute_pool handoff_channel pipeline_integration scope_integration)
 fi
 
 run_target() { # name -> cargo args on stdout
@@ -66,4 +66,19 @@ for t in "${TARGETS[@]}"; do
     fi
     echo "==> $t done in $((SECONDS - start))s"
 done
+
+# ── 3. vendored crossfire's lib tests: the design-C waker protocol under
+#       tree-borrows. Not a workspace default member, so it needs an
+#       explicit -p. Its registry mutex routes to std::sync under cfg(miri)
+#       (parking_lot's Windows futex path is not miri-interpretable), so
+#       this runs on every platform.
+echo "==> cargo miri test -p youpipe-crossfire --lib $*"
+start=$SECONDS
+# shellcheck disable=SC2086
+if ! timeout "$TIMEOUT_SECS" cargo miri test -p youpipe-crossfire --lib -- "$@"; then
+    echo "==> FAILED (or timed out after ${TIMEOUT_SECS}s): youpipe-crossfire lib" >&2
+    overall=1
+fi
+echo "==> youpipe-crossfire lib done in $((SECONDS - start))s"
+
 exit $overall
