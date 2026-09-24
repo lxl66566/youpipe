@@ -26,6 +26,11 @@ use crate::{
     },
 };
 
+// miri has no `movnti` semantics; other arches lack the intrinsics — both
+// fall back to plain stores (see `nt_store`).
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+use core::arch::x86_64::{_mm_sfence, _mm_stream_si64};
+
 type PanicPayload = Box<dyn Any + Send>;
 
 // ── Pool resolution for the fused path ──
@@ -158,6 +163,118 @@ where
     }
 }
 
+// ── Non-temporal output stores for fused-collect leaves ──
+
+/// Whether fused-collect leaves write eligible 8-byte outputs with
+/// non-temporal (streaming) stores instead of plain `ptr::write`.
+/// Runtime-overridable via `YOUPIPE_NT_STORE` (any value other than "0"
+/// enables; default off) — same-binary A/B methodology as
+/// `YOUPIPE_ONPOOL_HYBRID`. A/B scripts must pass the literal "0" for the
+/// off side: a first run passing `YOUPIPE_NT_STORE=off` silently enabled
+/// NT on both sides and measured +0 % everywhere.
+///
+/// Mechanism: streaming stores bypass the cache hierarchy, so a
+/// write-once/never-read output buffer (`.collect()` whose `Vec` the
+/// consumer only drops) costs no read-for-ownership traffic and evicts
+/// nothing from L3. The flip side: the lines go straight to DRAM, so a
+/// consumer that reads the output right after collect pays the full miss
+/// — opt-in, not a default.
+///
+/// Measured (2026-09-25, horizontal `cpu_balanced`, 6 alternating
+/// process pairs × 2 internal rounds, taskset 1–31, rayon column as
+/// drift control ±0.2 %): youpipe 100 K +10 %, 1 M +15 %, 2 M +15 %,
+/// 4 M +18 % wall time; 1 K/10 K ±2 % (output fits cache — nothing to
+/// bypass). Knob-on youpipe beats rayon at 2 M (0.82 vs 0.83 ms) and
+/// 4 M (1.57 vs 1.68 ms), reversing the former −12…−14 % deficit (the
+/// P0 "≥2 M bandwidth gap" — see docs/src/dev/benchmarks.md
+/// "NT-store attribution").
+///
+/// Eligibility (`R` exactly 8 bytes, aligned ≥ 8) is a compile-time
+/// constant, so other types compile the NT branch below away entirely;
+/// eligible types pay one initialized-`OnceLock` load + branch per leaf
+/// (a chunk, not an item).
+fn nt_store_enabled<R>() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    const fn eligible<R>() -> bool {
+        size_of::<R>() == 8 && align_of::<R>() >= 8
+    }
+    if !eligible::<R>() {
+        return false;
+    }
+    *ENABLED.get_or_init(|| std::env::var("YOUPIPE_NT_STORE").is_ok_and(|v| v != "0"))
+}
+
+/// Write one output slot with a streaming (non-temporal) store — x86_64
+/// `movnti` (SSE2 baseline); plain `ptr::write` under miri / other arches.
+///
+/// Bitwise-moves `val` through an `i64`: Rust moves are bitwise
+/// relocations, so this is indistinguishable from `ptr::write` for any
+/// 8-byte type; `mem::forget` hands drop responsibility to the
+/// destination slot (exactly one drop on every path).
+///
+/// NT stores are weakly ordered — a later release-store (latch `set`) does
+/// NOT publish them to other threads. Every exit of an NT leaf must run
+/// [`nt_fence`] (via [`NtFenceOnDrop`]) before the leaf's completion
+/// becomes visible. The ordering chain: NT stores → `sfence` → latch
+/// `set` (`SeqCst` swap, `pool::latch`) → waiter `Acquire` probe →
+/// reader. Same-thread read-back (panic-cleanup `drop_in_place` of the
+/// partial range) needs no fence: loads are never reordered with older
+/// stores to the same location from the same thread.
+///
+/// # Safety
+///
+/// * `out_ptr` must be valid for one `R` write, exclusively owned, and
+///   8-byte aligned (guaranteed by [`nt_store_enabled`] eligibility plus
+///   the slot array layout: base aligned to `align_of::<R>() ≥ 8`, slots
+///   exactly 8 bytes).
+// A real call frame per 8-byte slot would swamp the store itself.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+unsafe fn nt_store<R>(out_ptr: *mut R, val: R) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    {
+        // SAFETY: eligibility makes the i64 reinterpretation a bitwise move.
+        unsafe {
+            let bits = ptr::read(ptr::addr_of!(val).cast::<i64>());
+            std::mem::forget(val);
+            _mm_stream_si64(out_ptr.cast::<i64>(), bits);
+        }
+    }
+    #[cfg(any(not(target_arch = "x86_64"), miri))]
+    // SAFETY: plain fallback store, same contract as `ptr::write`.
+    unsafe {
+        ptr::write(out_ptr, val)
+    }
+}
+
+/// Order prior streaming stores before all subsequent stores (the
+/// completion signal); no-op where NT stores are unavailable.
+#[allow(clippy::inline_always)] // one instruction; a call would cost more
+#[inline(always)]
+fn nt_fence() {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: `sfence` has no preconditions beyond x86_64 SSE2.
+    unsafe {
+        _mm_sfence();
+    }
+}
+
+/// Runs [`nt_fence`] on drop — the NT leaf's fence for every exit at
+/// once: normal scope end (success) and panic unwind. Declare it after
+/// the leaf's cleanup guard: reverse-order unwind drops the fence first,
+/// then the guard's partial-output drops; the success path drops it at
+/// the `if` block's end, before the leaf returns into the latch-setting
+/// callers (`par_index_rec`'s `join` / `hybrid_dispatch`'s `CountLatch`).
+struct NtFenceOnDrop;
+
+impl Drop for NtFenceOnDrop {
+    #[inline]
+    fn drop(&mut self) {
+        nt_fence();
+    }
+}
+
 /// Process `[start, end)` sequentially on the current thread.
 ///
 /// Panic safety uses a stack-local `LeafGuard` whose `Drop` runs only on
@@ -239,13 +356,30 @@ where
         written: 0,
     };
 
-    while g.written < n {
-        let i = g.written;
-        // SAFETY: disjoint index; slot i is init (input) / uninit (output).
-        let item = unsafe { ptr::read(in_ptr.add(i)) };
-        let out = op.apply(item);
-        unsafe { ptr::write(out_ptr.add(i), out) };
-        g.written = i + 1;
+    // The NT branch stays a separate loop copy: keeping the plain loop
+    // untouched preserves its codegen (register-allocated `written`,
+    // auto-vectorization for vectorizable ops) when the knob is off.
+    if nt_store_enabled::<R>() {
+        let _fence = NtFenceOnDrop;
+        while g.written < n {
+            let i = g.written;
+            // SAFETY: same disjoint-index discipline as the plain loop
+            // below; `nt_store`'s alignment/size requirements come from
+            // `nt_store_enabled`'s eligibility check.
+            let item = unsafe { ptr::read(in_ptr.add(i)) };
+            let out = op.apply(item);
+            unsafe { nt_store(out_ptr.add(i), out) };
+            g.written = i + 1;
+        }
+    } else {
+        while g.written < n {
+            let i = g.written;
+            // SAFETY: disjoint index; slot i is init (input) / uninit (output).
+            let item = unsafe { ptr::read(in_ptr.add(i)) };
+            let out = op.apply(item);
+            unsafe { ptr::write(out_ptr.add(i), out) };
+            g.written = i + 1;
+        }
     }
 
     // Success: disarm the cleanup Drop.
@@ -2732,14 +2866,30 @@ where
         written: 0,
     };
 
-    while g.written < n {
-        let i = g.written;
-        // SAFETY: disjoint index; the input slot is shared and read in place
-        // (no move-out, nothing becomes uninit).
-        let item = unsafe { &*in_ptr.add(i) };
-        let out = op.apply(item);
-        unsafe { ptr::write(out_ptr.add(i), out) };
-        g.written = i + 1;
+    // Separate NT loop copy — see `par_index_leaf` for why the plain loop
+    // stays untouched.
+    if nt_store_enabled::<R>() {
+        let _fence = NtFenceOnDrop;
+        while g.written < n {
+            let i = g.written;
+            // SAFETY: same in-place input borrow as the plain loop below;
+            // `nt_store`'s alignment/size requirements come from
+            // `nt_store_enabled`'s eligibility check.
+            let item = unsafe { &*in_ptr.add(i) };
+            let out = op.apply(item);
+            unsafe { nt_store(out_ptr.add(i), out) };
+            g.written = i + 1;
+        }
+    } else {
+        while g.written < n {
+            let i = g.written;
+            // SAFETY: disjoint index; the input slot is shared and read in place
+            // (no move-out, nothing becomes uninit).
+            let item = unsafe { &*in_ptr.add(i) };
+            let out = op.apply(item);
+            unsafe { ptr::write(out_ptr.add(i), out) };
+            g.written = i + 1;
+        }
     }
 
     // Success: disarm the cleanup Drop.
