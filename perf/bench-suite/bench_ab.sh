@@ -217,6 +217,11 @@ if [[ ${#FILTERS[@]} -eq 0 ]]; then
 else
     COMBINED=$(IFS='|'; echo "(${FILTERS[*]})")
 fi
+if (( PER_ID )) && [[ ${#FILTERS[@]} -eq 0 ]]; then
+    echo "WARNING: -1 without explicit filters degrades to ONE combined pass per" >&2
+    echo "         round (criterion cannot enumerate ids); pass the id list for true" >&2
+    echo "         per-id isolation — the 100K fused family requires it." >&2
+fi
 
 run_one() { # label bin round filter
     local label=$1 bin=$2 round=$3 filter=$4
@@ -269,7 +274,11 @@ for (( r=0; r<ROUNDS; r++ )); do
                 # isolated per-id: every filter gets its own criterion run
                 # (non-matching binaries exit in ~50ms). This is the mode the
                 # 100K-fused family needs — see benchmarks.md.
-                for f in "${FILTERS[@]:-'.*'}"; do
+                # NOTE: the default must NOT be quoted — `${FILTERS[@]:-'.*'}`
+                # passes the literal string `'.*'` (quotes included), which
+                # matches no bench id and silently runs a no-op A/B (found
+                # 2026-07: three "green" rounds with empty compare tables).
+                for f in "${FILTERS[@]:-.*}"; do
                     run_one "$label" "$bin" "$round" "$f" || fail=1
                 done
             else
