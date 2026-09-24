@@ -623,10 +623,13 @@ bar's absolute value is ratio × that number.
   1 M (+1 %), then rayon pulls ahead at 2 M (+14 %) and 4 M (+12 %) —
   above ~1 M the batches (≥ 32 MB of R+W buffer traffic) leave the
   cache-resident regime and rayon's collect path sustains ~38 GB/s where
-  youpipe's holds ~34 GB/s. 2026-09-25 attribution: the gap is the plain
-  output stores' read-for-ownership + L3 pollution — non-temporal leaf
-  stores (`YOUPIPE_NT_STORE`, see "NT-store attribution" below) close and
-  reverse it (2 M 0.82 vs rayon 0.83 ms, 4 M 1.57 vs 1.68 ms).
+  youpipe's holds ~34 GB/s. Resolved 2026-09-25 by two same-day
+  attributions (see "NT-store attribution" and "Attributing the 2M/4M
+  fused-collect gap" below): the dominant term is the plain output
+  stores' read-for-ownership + L3 pollution — non-temporal leaf stores
+  (`YOUPIPE_NT_STORE`) close and reverse the gap (2 M 0.82 vs rayon
+  0.83 ms, 4 M 1.57 vs 1.68 ms); a secondary worker park/wake
+  occupancy loss (~1-4 pt, causal via the spin-rounds knob) remains.
   Before the `num_cpus` cache (2026-09-05), rayon won 1K and 1M — the 1K
   loss was ~50 µs of cgroup-reading `available_parallelism` syscalls per
   run, not scheduling overhead. Equal-chunk hand-threading is 10–60×
@@ -686,6 +689,74 @@ sides and measured +0 % everywhere; (2) two pairs of a prior run were
 polluted by background build load (rayon control drifted +4–14 %),
 which only per-pair pairing + the control column exposed — pooled
 medians alone would have read it as a win/loss.
+## Attributing the 2M/4M fused-collect gap (2026-09-25)
+
+Single-shape single-library runs of the horizontal binary itself
+(`--libs X --batches N`, taskset 1-31, A-B-A-B interleaved; iteration counts
+from the JSON `iters` field normalize whole-process `perf stat`). Machine:
+16 physical / 32 SMT threads, 32 MB shared L3 + 32 × 1 MB L2.
+
+**Wall caliber the attribution targets**: 2M youpipe 1.011 / rayon 0.928 ms
+(+9.0 %), 4M 2.003 / 1.784 ms (+12.3 %) in the morning session; a parallel
+same-binary session (alignment A/B) measured +13…+14 % @ 2M and +12 % @ 4M.
+Later the same day both sides drifted +25 % absolute with the gap compressed
+to +1…+3.5 % — the youpipe deficit is a fixed µs-scale per-iteration cost,
+so it looms large exactly when compute is fast (see the frequency note in
+"Reading the results" history). Counter ratios below are from that drifted
+session and are frequency-robust.
+
+| per-iteration counter (2M / 4M) | youpipe / rayon | verdict |
+| --- | --- | --- |
+| cycles | 0.86 / 0.90 | youpipe burns *fewer* core-cycles |
+| instructions | 0.96 / 0.96 | same work, youpipe slightly leaner |
+| L1D-miss → L2 accesses (`l2_cache_req_stat.dc_access_in_l2`) | 1.00 / 0.97 | parity |
+| store RFOs into L2 (`l2_request_g1.change_to_x`) | 0.94 / 0.78 | parity or better |
+| demand DRAM fills (`ls_dmnd_fills_from_sys.dram_io_near+far`) | 0.53 / 0.73 | both trivial (see below) |
+| L1D TLB misses hitting L2 (`ls_l1_d_tlb_miss.all_l2_miss`) | 0.44 / 0.55 | parity or better |
+| task-clock (busy CPUs of 31, 2M) | **26.7 vs 30.7** | **the gap** |
+| context-switches / iteration (2M) | **99–102 vs 13–19** | park/wake churn |
+| cpu-migrations / iteration (2M) | **7.6–8.0 vs 0.5** | parked workers land on cold cores |
+| page-faults / iteration | 42.5 vs 43.2 | allocator parity |
+
+**Falsified premise — "≥ 32 MB leaves the cache-resident regime"**: demand
+DRAM fills measure 2–9 K lines per iteration against 256 K/512 K lines
+touched (≤ 1.7 %). The 64 MB combined L2+L3 hierarchy absorbs the whole
+32–64 MB R+W working set in the bench's steady state on this machine, for
+both libraries. This predicts (and the parallel experiments confirmed) that
+non-temporal stores and chunk-boundary alignment cannot move this gap: the
+NT-store A/B showed no improvement, and the `YOUPIPE_ALIGN_CHUNKS` A/B
+measured ±0.3 %.
+
+**Occupancy, not throughput** — `perf record` (999 Hz, dwarf) shows 94.3 %
+of youpipe's on-core samples in `par_index_rec_by_ref` (the leaf loop; the
+scheduler, injector, and latch never reach 0.2 %), versus rayon's 90.2 % in
+its `bridge` leaf plus ~4.4 % in `join_context`/`with_handle` spinning.
+youpipe executes its (slightly fewer) instructions with *fewer* total
+core-cycles yet finishes later: the missing time is spent halted. Idle
+workers exhaust the 32-spin + 32-yield round window and condvar-park;
+waking them costs futex latencies and lands them on migrated cores, ~4 of
+31 CPUs' worth of average occupancy per iteration ≈ the +12–15 % wall gap.
+Rayon buys its win by never parking mid-iteration — burning +11–16 % more
+cycles (spin) per iteration than youpipe.
+
+**Causal check (same-binary knob A/B)**: `YOUPIPE_SPIN_ROUNDS=2048
+YOUPIPE_YIELD_ROUNDS=2048` (workers stay hot across the inter-iteration
+gap) improves youpipe at every shape — 1M −7.5 % → −11.9 %, 2M −2.3 % →
+−5.8 %, 4M +3.5 % → +2.3 % vs rayon — confirming park/wake as a real cost,
+but also that it is only worth 1.2–4.4 pt of the ~13 pt gap in that
+session. Widening the window indiscriminately burns idle CPU (the
+`ROUNDS_SPIN` history), so the open lever is structural: keep workers
+across a batch's back-to-back iterations (or shave the tail chunk) instead
+of stretching the idle window.
+
+Harness note: attribution initially used a standalone runner
+(`youpipe-bench`'s `horizontal-counters`, same workload); its wall times
+proved layout-lottery-bound (youpipe 0.94–1.31 ms across binaries, rayon
+0.87–1.13 ms, consistent with the documented ±30 % code-layout noise), and
+a per-iteration console write in its timing loop widened the
+inter-iteration gap enough to triple youpipe's context switches (+30 %
+wall) — both pitfalls are now documented in the runner's source, and all
+conclusive numbers above come from the layout-canonical horizontal binary.
 
 ## Perf-event counter measurement (`crates/youpipe-bench`)
 

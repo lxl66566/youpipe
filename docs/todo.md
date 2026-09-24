@@ -85,6 +85,27 @@ collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s�
 
 ---
 
+### 5. fused 批次间 worker 泊车/唤醒占用亏损（NT store 收窄后的残余项）
+
+- **现状**（2026-09-25 归因，详见 `dev/benchmarks.md` "Attributing the
+  2M/4M fused-collect gap"）：cpu_balanced 大批量上 youpipe 每迭代 cycles/
+  指令均少于 rayon 却壁钟更慢——task-clock 26.7 vs 30.7（/31 CPU）、上下文
+  切换 99 vs 13–19/迭代、迁移 7.6 vs 0.5/迭代：空闲工人泊车 + futex 唤醒 +
+  落冷核；rayon 靠全程自旋保温（多烧 +11–16% cycles）。同 binary 旋钮因果
+  验证：`YOUPIPE_SPIN_ROUNDS=YOUPIPE_YIELD_ROUNDS=2048` 各 shape 一致改善，
+  但只救回 1–4 pt（NT store 另行救回 ~13 pt 并反超，见 P2 #8）。
+- **方向**（结构性手段；勿拉长全局自旋窗口——`ROUNDS_SPIN` 历史 +20–36% 回退）：
+  1. 背靠背批次（bench 循环、流式多批次）下「下一批将至」提示 / 短窗口热身，
+     让工人跨迭代保温；
+  2. 尾部 straggler 细化：末段更细粒度 oversplit（动态，非 cost-EMA 路线，
+     该路线已两次证伪）；
+  3. 1M 打平而 2M 落后的边界为何不随占用亏损移动，未解释；NT 默认档落定后
+     复查。
+- **验证**：`cpu_balanced` 1M/2M/4M 隔离 A/B + `horizontal-counters`
+  （youpipe-bench）复查 task-clock / ctx-switch / migration。
+
+---
+
 ## P2
 
 ### 5. 池 worker 核绑定（affinity）实验
