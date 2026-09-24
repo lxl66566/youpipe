@@ -16,27 +16,9 @@
 
 ---
 
-## P0
-
-### 1. ≥2M 大批量 fused collect 带宽差距归因并收窄
-
-- **现状**：horizontal `cpu_balanced` 1M 打平后，2M rayon 领先 +14%、4M +12%
-  （38 vs ~34 GB/s 输出吞吐）。`dev/benchmarks.md` "Reading the results" 明确
-  标注 _unattributed_（输出槽位索引 / 派发流量 / 分配器行为均未排除）。
-- **方向**：
-  1. 先归因再动手：perf counter（cache-misses/cycles/instr-per-elem）+
-     `perf record` 对比 rayon 同口径；
-  2. 候选实验：叶子输出写非临时 store（≥32 MB R+W 流量、写后不回读，
-     NT store 可绕过缓存污染）；chunk 边界缓存行对齐（现为 `n/num_chunks`
-     任意切，破坏向量化叶子的对齐前提）；`Slots::uninit` 的 first-touch /
-     分配器路径。
-- **验证**：`cpu_balanced` 1M/2M/4M 隔离 A/B（horizontal 扩展轴已有）。
-
----
-
 ## P1
 
-### 2. zstd_shape 残余差距与 slack 档位边界
+### 1. zstd_shape 残余差距与 slack 档位边界
 
 - **现状**：latecomer slack + 两档 tier 后，heavy-tail n=2000 已领先 rayon
   −6.5…−10%，但 capped +1…+4%、uniform +1…+8% 仍落后；wide tier 边界
@@ -50,7 +32,7 @@
 - **验证**：`zstd_shape` 全形状 × 多 seed + `cpu_unbalanced`（cheap 侧回退
   监控）。
 
-### 3. 终端 collector 通道 in-pipeline A/B：`std sync_channel` vs crossfire mpsc
+### 2. 终端 collector 通道 in-pipeline A/B：`std sync_channel` vs crossfire mpsc
 
 2026-10）显示无竞争 1P1C 形状下 `std::sync::mpsc::sync_channel(256)` 比当前
 collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s）。
@@ -62,7 +44,7 @@ collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s�
   send 无自旋窗口、park 策略不同，低深度背压场景可能反而回退。
 - **验证**：`stream_pipeline` 全家族 + `mixed_load` 隔离交替 A/B。
 
-### 4. on-pool hybrid 的 chunk 分发走 driver 本地 deque（实验）
+### 3. on-pool hybrid 的 chunk 分发走 driver 本地 deque（实验）
 
 - **现状**（2026-07 `YOUPIPE_ONPOOL_HYBRID` 旋钮 A/B，5 轮交错）：on-pool
   大批量 hybrid `nested_single/100K` −3.5 %，但 `nested_saturated/100K`
@@ -81,7 +63,7 @@ collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s�
 
 ---
 
-### 5. （正确性存疑）`pipeline_integration` 间歇性挂死：未定位的丢唤醒窗口
+### 4. （正确性存疑）`pipeline_integration` 间歇性挂死：未定位的丢唤醒窗口
 
 - **现状**（2026-09 复现记录，详见 `dev/crossfire-waker-designs.md` §12.4）：
   `cargo test --release --test pipeline_integration` 单测试二进制循环
@@ -105,21 +87,21 @@ collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s�
 
 ## P2
 
-### 6. 池 worker 核绑定（affinity）实验
+### 5. 池 worker 核绑定（affinity）实验
 
 latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
 100 µs–1.7 ms 是残余 straggler 的根源，属内核调度行为。可选：per-worker
 `pthread_setaffinity` 配置项（默认关闭），在 zstd_shape/unbalanced 上 A/B。
 风险：与用户 `taskset` 冲突、跨 NUMA 迁移损失、库越权管理拓扑。
 
-### 7. transient pool 复用缓存
+### 6. transient pool 复用缓存
 
 `with_compute_workers(n≠ncpus)` / `with_oversubscribe` 每次终端调用建池
 拆池（~ms 级，`ExecPool::Owned`）。可做进程内按尺寸的小 LRU 缓存。
 风险：线程数失控（用户以为池已销毁）；至少在 rustdoc 与 tuning.md 把
 「紧循环请预建池」的警示提级。
 
-### 8. （非性能，顺带记录）`ordered()` + `expand()` panic（2026-10 设计分析）
+### 7. （非性能，顺带记录）`ordered()` + `expand()` panic（2026-10 设计分析）
 
 可用 `(seq, sub_seq)` 子序号支持展开保序，解除当前组合禁用。属 API 能力项。
 2026-10 深入设计后确认三条硬约束，后续实现前必须先解决：
@@ -141,6 +123,17 @@ latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
 
 若做批量 payload 方案，注意与 crossfire per-thread waker（设计 C，
 `dev/crossfire-waker-designs.md` §11）叠加后每组的 channel hop 数减少，是顺带收益。
+
+### 8. NT store 默认档位（原「≥2M 带宽差距」项的收尾决策）
+
+- **现状**：`YOUPIPE_NT_STORE=1`（fused collect 叶子输出非临时 store）实测
+  cpu_balanced 100K/1M/2M/4M +10/+15/+15/+18%，默认 off——输出写后立读的
+  形状会把 cache hit 换成 DRAM round-trip。归因与数据：`dev/benchmarks.md`
+  "NT-store attribution"。
+- **方向**：决定默认档位——保持纯 opt-in、按输出字节数/缓存几何自动启用，
+  或作为 collect Options 暴露；需要「写后立读」形状的回归数据支撑。
+- **验证**：horizontal `cpu_balanced` 全档 + criterion fused 家族隔离交替
+  （100K 家族塌缩陷阱）。
 
 ---
 

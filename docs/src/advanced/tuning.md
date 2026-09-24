@@ -56,6 +56,17 @@ The defaults are A/B-tuned on the reference 32-core machine — widening or
 narrowing them measured as global regressions there (history in `sleep.rs`)
 — so treat them as experiment knobs for heterogeneous machines, not
 tuning levers with known upside.
+
+The fused `.collect()` output-store policy is runtime-overridable too:
+`YOUPIPE_NT_STORE=1` writes eligible 8-byte outputs with non-temporal
+(streaming) stores that bypass the cache hierarchy. For write-once
+outputs that are only dropped after collect (≥ ~1 M items / 8 MB+) this
+removes read-for-ownership traffic and L3 pollution — measured +15–18 %
+wall time on 1–4 M-item balanced-map batches, reversing the former
+rayon deficit there (data in the developer guide's benchmarks notes) —
+while outputs read right after collect trade a cache hit for a DRAM
+round-trip, hence the default-off. Below ~100 K items the output fits
+cache and the knob is a no-op (±2 %).
 ## Worker budget across stages (streaming)
 
 `compute_workers` is a **budget**, not a thread count. The runner first

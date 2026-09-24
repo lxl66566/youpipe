@@ -623,8 +623,10 @@ bar's absolute value is ratio × that number.
   1 M (+1 %), then rayon pulls ahead at 2 M (+14 %) and 4 M (+12 %) —
   above ~1 M the batches (≥ 32 MB of R+W buffer traffic) leave the
   cache-resident regime and rayon's collect path sustains ~38 GB/s where
-  youpipe's holds ~34 GB/s. Whether the youpipe gap is output-slot
-  indexing, dispatch traffic, or allocator behavior is unattributed.
+  youpipe's holds ~34 GB/s. 2026-09-25 attribution: the gap is the plain
+  output stores' read-for-ownership + L3 pollution — non-temporal leaf
+  stores (`YOUPIPE_NT_STORE`, see "NT-store attribution" below) close and
+  reverse it (2 M 0.82 vs rayon 0.83 ms, 4 M 1.57 vs 1.68 ms).
   Before the `num_cpus` cache (2026-09-05), rayon won 1K and 1M — the 1K
   loss was ~50 µs of cgroup-reading `available_parallelism` syscalls per
   run, not scheduling overhead. Equal-chunk hand-threading is 10–60×
@@ -649,6 +651,41 @@ bar's absolute value is ratio × that number.
   sync+async chains beat hand-written tokio channel plumbing by up to 23 %
   at the larger batches (fewer tasks, pooled scheduling, mixed-mode
   channels) and beat rayon by ~10× once IO blocks its workers.
+
+### NT-store attribution (2026-09-25): the ≥2 M gap was output RFO
+
+Hypothesis (resolved P0): the collect output buffer is written once and
+never read (the bench only black-boxes and drops it), so every 64 B line
+pays a read-for-ownership plus L3 pollution before its DRAM writeback.
+The fused leaves therefore grew a runtime knob: `YOUPIPE_NT_STORE=1`
+writes eligible 8-byte outputs with `movnti` streaming stores (x86_64
+SSE2 baseline; eligibility is compile-time, the store is a scalar
+drop-in for the leaf's scalar store loop; `sfence` orders the weak NT
+stores before every leaf exit — success and unwind — ahead of the
+completion latch's release). Default off: a consumer that reads the
+output right after collect trades a cache hit for a DRAM round-trip.
+
+A/B: horizontal `cpu_balanced`, same binary, two processes alternating
+(the knob is a process-level `OnceLock`), 6 pairs × `--rounds 2`
+(forward+reversed internal rounds), `taskset -c 1-31`, pooled medians
+with per-pair pairing and the rayon column as drift control:
+
+| n | youpipe off→on (ms) | delta | rayon control |
+| --- | --- | --- | --- |
+| 1 K | 0.010 → 0.010 | −1 % | ±0 % |
+| 10 K | 0.012 → 0.012 | +2 % | ±0 % |
+| 100 K | 0.053 → 0.048 | +10 % | ±0 % |
+| 1 M | 0.48 → 0.41 | +15 % | ±0 % |
+| 2 M | 0.95 → 0.82 | +15 % | ±0 % |
+| 4 M | 1.91 → 1.57 | +18 % | ±0 % |
+
+Raw JSON under `target/horizontal/nt_ab2/` (not committed). Two
+methodology notes: (1) the knob treats any value other than "0" as ON —
+a first A/B attempt passing `YOUPIPE_NT_STORE=off` enabled NT on both
+sides and measured +0 % everywhere; (2) two pairs of a prior run were
+polluted by background build load (rayon control drifted +4–14 %),
+which only per-pair pairing + the control column exposed — pooled
+medians alone would have read it as a win/loss.
 
 ## Perf-event counter measurement (`crates/youpipe-bench`)
 
