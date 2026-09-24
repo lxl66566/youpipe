@@ -1,3 +1,7 @@
+// miri has no `movnti` semantics; other arches lack the intrinsics — both
+// fall back to plain stores (see `nt_store`).
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+use core::arch::x86_64::{_mm_sfence, _mm_stream_si64};
 use std::{
     any::Any,
     marker::PhantomData,
@@ -25,11 +29,6 @@ use crate::{
         unwind,
     },
 };
-
-// miri has no `movnti` semantics; other arches lack the intrinsics — both
-// fall back to plain stores (see `nt_store`).
-#[cfg(all(target_arch = "x86_64", not(miri)))]
-use core::arch::x86_64::{_mm_sfence, _mm_stream_si64};
 
 type PanicPayload = Box<dyn Any + Send>;
 
@@ -121,6 +120,7 @@ fn par_index_rec<T, R, OP>(
     end: usize,
     op: &OP,
     splits_left: usize,
+    nt: bool,
 ) -> Result<(), PanicPayload>
 where
     T: Send,
@@ -133,13 +133,13 @@ where
         // init, output[start..end) is fully uninit.
         let in_slice = unsafe { input.as_slice(start, end) };
         let out_slice = unsafe { output.as_mut_slice(start, end) };
-        par_index_leaf(in_slice, out_slice, op);
+        par_index_leaf(in_slice, out_slice, op, nt);
         return Ok(());
     }
     let mid = start + (end - start) / 2;
     let (l, r) = pool.join(
-        || par_index_rec(pool, input, output, start, mid, op, splits_left - 1),
-        || par_index_rec(pool, input, output, mid, end, op, splits_left - 1),
+        || par_index_rec(pool, input, output, start, mid, op, splits_left - 1, nt),
+        || par_index_rec(pool, input, output, mid, end, op, splits_left - 1, nt),
     );
     match (l, r) {
         (Ok(()), Ok(())) => Ok(()),
@@ -165,44 +165,85 @@ where
 
 // ── Non-temporal output stores for fused-collect leaves ──
 
+/// Process-wide NT-store policy, parsed once from `YOUPIPE_NT_STORE`:
+/// unset → `Auto`, `"0"` → force off, `"1"` → force on. Any other value
+/// panics at first use — the previous any-non-"0"-means-on semantics once
+/// read `YOUPIPE_NT_STORE=off` as ON on both sides of an A/B and measured
+/// +0 % everywhere; failing loudly turns that trap into an immediate
+/// error (see docs/src/dev/benchmarks.md "NT-store attribution").
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NtStorePolicy {
+    /// Never use NT stores.
+    Off,
+    /// Always use NT stores for eligible outputs.
+    On,
+    /// NT stores for collect outputs of at least [`NT_AUTO_MIN_BYTES`]
+    /// (the default).
+    Auto,
+}
+
+/// [`NtStorePolicy::Auto`]'s threshold: whole-batch output bytes from which
+/// non-temporal stores are a measured win in *both* consumer shapes
+/// (write-only drop and immediate read-back). Fixed, not probed from cache
+/// geometry: the win is per-line RFO elimination, and below the threshold
+/// (100 K items = 0.8 MB: +9–11 %) gains shrink toward the ±2 % noise floor
+/// where the balance gets machine-dependent.
+const NT_AUTO_MIN_BYTES: usize = 8 << 20;
+
+fn nt_store_policy() -> NtStorePolicy {
+    static POLICY: OnceLock<NtStorePolicy> = OnceLock::new();
+    *POLICY.get_or_init(|| match std::env::var("YOUPIPE_NT_STORE") {
+        Err(_) => NtStorePolicy::Auto,
+        Ok(v) => match v.as_str() {
+            "0" => NtStorePolicy::Off,
+            "1" => NtStorePolicy::On,
+            other => panic!(
+                "YOUPIPE_NT_STORE: invalid value {other:?} (leave unset for auto, \"0\" to force \
+                 off, \"1\" to force on)"
+            ),
+        },
+    })
+}
+
 /// Whether fused-collect leaves write eligible 8-byte outputs with
 /// non-temporal (streaming) stores instead of plain `ptr::write`.
-/// Runtime-overridable via `YOUPIPE_NT_STORE` (any value other than "0"
-/// enables; default off) — same-binary A/B methodology as
-/// `YOUPIPE_ONPOOL_HYBRID`. A/B scripts must pass the literal "0" for the
-/// off side: a first run passing `YOUPIPE_NT_STORE=off` silently enabled
-/// NT on both sides and measured +0 % everywhere.
 ///
 /// Mechanism: streaming stores bypass the cache hierarchy, so a
 /// write-once/never-read output buffer (`.collect()` whose `Vec` the
 /// consumer only drops) costs no read-for-ownership traffic and evicts
-/// nothing from L3. The flip side: the lines go straight to DRAM, so a
-/// consumer that reads the output right after collect pays the full miss
-/// — opt-in, not a default.
+/// nothing from L3. The expected flip side — a consumer reading the output
+/// right after collect pays a DRAM round-trip instead of a cache hit —
+/// measured NOT to bite: horizontal `cpu_balanced_readback` (fold over the
+/// output inside the timed region), same-binary two-process A/B, 5
+/// alternating pairs × 2 rounds, rayon drift control ±0.5 %, NT-on
+/// +11…+15 % wall at 100 K–4 M (both tables in docs/src/dev/benchmarks.md
+/// "NT-store attribution"). The parallel phase's RFO elimination outweighs
+/// the consumer's prefetched sequential read-back, hence the `Auto`
+/// default. Write-once shape: +9/+12/+14/+18 % at 100 K/1 M/2 M/4 M
+/// (NT-on also beats rayon at 2 M and 4 M, reversing the former
+/// −12…−14 % deficit); 1 K/10 K ±2 % (output fits cache — nothing to
+/// bypass), which is what the 8 MiB auto threshold leaves off.
 ///
-/// Measured (2026-09-25, horizontal `cpu_balanced`, 6 alternating
-/// process pairs × 2 internal rounds, taskset 1–31, rayon column as
-/// drift control ±0.2 %): youpipe 100 K +10 %, 1 M +15 %, 2 M +15 %,
-/// 4 M +18 % wall time; 1 K/10 K ±2 % (output fits cache — nothing to
-/// bypass). Knob-on youpipe beats rayon at 2 M (0.82 vs 0.83 ms) and
-/// 4 M (1.57 vs 1.68 ms), reversing the former −12…−14 % deficit (the
-/// P0 "≥2 M bandwidth gap" — see docs/src/dev/benchmarks.md
-/// "NT-store attribution").
+/// Decision inputs: the process policy (env, cached) and the
+/// *whole-batch* output size — resolved once per collect call in
+/// `par_index_collect*` and threaded down as a leaf `bool`, because a
+/// leaf only sees its own chunk and would undercount the batch.
 ///
 /// Eligibility (`R` exactly 8 bytes, aligned ≥ 8) is a compile-time
 /// constant, so other types compile the NT branch below away entirely;
-/// eligible types pay one initialized-`OnceLock` load + branch per leaf
-/// (a chunk, not an item).
-fn nt_store_enabled<R>() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-
+/// eligible types pay one initialized-`OnceLock` load per collect call.
+fn nt_store_enabled<R>(output_items: usize) -> bool {
     const fn eligible<R>() -> bool {
         size_of::<R>() == 8 && align_of::<R>() >= 8
     }
     if !eligible::<R>() {
         return false;
     }
-    *ENABLED.get_or_init(|| std::env::var("YOUPIPE_NT_STORE").is_ok_and(|v| v != "0"))
+    match nt_store_policy() {
+        NtStorePolicy::Off => false,
+        NtStorePolicy::On => true,
+        NtStorePolicy::Auto => output_items.saturating_mul(size_of::<R>()) >= NT_AUTO_MIN_BYTES,
+    }
 }
 
 /// Write one output slot with a streaming (non-temporal) store — x86_64
@@ -224,10 +265,9 @@ fn nt_store_enabled<R>() -> bool {
 ///
 /// # Safety
 ///
-/// * `out_ptr` must be valid for one `R` write, exclusively owned, and
-///   8-byte aligned (guaranteed by [`nt_store_enabled`] eligibility plus
-///   the slot array layout: base aligned to `align_of::<R>() ≥ 8`, slots
-///   exactly 8 bytes).
+/// * `out_ptr` must be valid for one `R` write, exclusively owned, and 8-byte aligned (guaranteed
+///   by [`nt_store_enabled`] eligibility plus the slot array layout: base aligned to
+///   `align_of::<R>() ≥ 8`, slots exactly 8 bytes).
 // A real call frame per 8-byte slot would swamp the store itself.
 #[allow(clippy::inline_always)]
 #[inline(always)]
@@ -293,7 +333,7 @@ impl Drop for NtFenceOnDrop {
 /// LLVM, which is what unlocks the same per-item throughput rayon's
 /// `par_iter().collect()` achieves.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn par_index_leaf<T, R, OP>(input: &[T], output: &mut [R], op: &OP)
+fn par_index_leaf<T, R, OP>(input: &[T], output: &mut [R], op: &OP, nt: bool)
 where
     T: Send,
     R: Send,
@@ -358,8 +398,8 @@ where
 
     // The NT branch stays a separate loop copy: keeping the plain loop
     // untouched preserves its codegen (register-allocated `written`,
-    // auto-vectorization for vectorizable ops) when the knob is off.
-    if nt_store_enabled::<R>() {
+    // auto-vectorization for vectorizable ops) when NT is off.
+    if nt {
         let _fence = NtFenceOnDrop;
         while g.written < n {
             let i = g.written;
@@ -421,6 +461,7 @@ where
     let strategy = CollectStrategy {
         output: &output,
         op,
+        nt: nt_store_enabled::<R>(n),
     };
     let result = hybrid_dispatch(
         pool,
@@ -691,6 +732,10 @@ where
 struct CollectStrategy<'a, R, OP> {
     output: &'a Slots<R>,
     op: &'a OP,
+    /// Whole-batch NT decision (see [`nt_store_enabled`]) — a leaf only
+    /// sees its own chunk, so the auto tier must be resolved against the
+    /// full output size by the driver.
+    nt: bool,
 }
 
 impl<T, R, OP> HybridStrategy<Slots<T>> for CollectStrategy<'_, R, OP>
@@ -710,7 +755,16 @@ where
         end: usize,
         splits: usize,
     ) -> Result<(), PanicPayload> {
-        par_index_rec(pool, input, self.output, start, end, self.op, splits)
+        par_index_rec(
+            pool,
+            input,
+            self.output,
+            start,
+            end,
+            self.op,
+            splits,
+            self.nt,
+        )
     }
 
     #[inline]
@@ -725,7 +779,7 @@ where
         // are uninit.
         let in_slice = unsafe { input.as_slice(start, end) };
         let out_slice = unsafe { self.output.as_mut_slice(start, end) };
-        par_index_leaf(in_slice, out_slice, self.op);
+        par_index_leaf(in_slice, out_slice, self.op, self.nt);
         Ok(())
     }
 
@@ -1066,15 +1120,13 @@ where
     let first_pool_chunk = usize::from(driver_participates);
     // Small batches (`chunk_splits == 0`) on-pool keep the single tree.
     // Measured 2026-07 on `sync_nested_on_pool` (32 cores):
-    //   * `nested_saturated/1K` +430 % under hybrid (recompile A/B): P
-    //     concurrent nested batches flood the global injector with ~P×P
-    //     tiny chunks, and every driver's stealing wait then pops through
-    //     that one contended MPMC — the same single-injector collapse that
-    //     sank flat dispatch at large N. The tree distributes via local
-    //     deques + peer stealing instead.
-    //   * `nested_single/1K` +3 % under hybrid (recompile A/B): with P−1
-    //     workers parked, the tree's incremental local-deque pushes (one
-    //     wake per join) edge out the inject_batch wake cascade.
+    //   * `nested_saturated/1K` +430 % under hybrid (recompile A/B): P concurrent nested batches
+    //     flood the global injector with ~P×P tiny chunks, and every driver's stealing wait then
+    //     pops through that one contended MPMC — the same single-injector collapse that sank flat
+    //     dispatch at large N. The tree distributes via local deques + peer stealing instead.
+    //   * `nested_single/1K` +3 % under hybrid (recompile A/B): with P−1 workers parked, the tree's
+    //     incremental local-deque pushes (one wake per join) edge out the inject_batch wake
+    //     cascade.
     // Large batches keep the hybrid path: same-binary knob A/B
     // (`YOUPIPE_ONPOOL_HYBRID`, 5 interleaved rounds) shows
     // `nested_single/100K` −3.5 % (25/25 dominant) — ramp-up dominates and
@@ -2880,7 +2932,7 @@ where
 /// Panic safety: `RefLeafGuard` drops only the init `output[..written]` slots
 /// (a borrowed input is always init and never ours to drop).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn par_index_leaf_by_ref<'i, E, R, OP>(input: &'i [E], output: &mut [R], op: &OP)
+fn par_index_leaf_by_ref<'i, E, R, OP>(input: &'i [E], output: &mut [R], op: &OP, nt: bool)
 where
     OP: RangeOp<&'i E, Out = R>,
 {
@@ -2919,7 +2971,7 @@ where
 
     // Separate NT loop copy — see `par_index_leaf` for why the plain loop
     // stays untouched.
-    if nt_store_enabled::<R>() {
+    if nt {
         let _fence = NtFenceOnDrop;
         while g.written < n {
             let i = g.written;
@@ -2961,6 +3013,7 @@ fn par_index_rec_by_ref<'i, E, R, OP>(
     end: usize,
     op: &OP,
     splits_left: usize,
+    nt: bool,
 ) -> Result<(), PanicPayload>
 where
     E: Sync,
@@ -2973,13 +3026,13 @@ where
         // `output[start..end)` is uninit.
         let in_slice = unsafe { input.get_unchecked(start..end) };
         let out_slice = unsafe { output.as_mut_slice(start, end) };
-        par_index_leaf_by_ref(in_slice, out_slice, op);
+        par_index_leaf_by_ref(in_slice, out_slice, op, nt);
         return Ok(());
     }
     let mid = start + (end - start) / 2;
     let (l, r) = pool.join(
-        || par_index_rec_by_ref(pool, input, output, start, mid, op, splits_left - 1),
-        || par_index_rec_by_ref(pool, input, output, mid, end, op, splits_left - 1),
+        || par_index_rec_by_ref(pool, input, output, start, mid, op, splits_left - 1, nt),
+        || par_index_rec_by_ref(pool, input, output, mid, end, op, splits_left - 1, nt),
     );
     match (l, r) {
         (Ok(()), Ok(())) => Ok(()),
@@ -3008,6 +3061,8 @@ where
 struct CollectByRefStrategy<'a, R, OP> {
     output: &'a Slots<R>,
     op: &'a OP,
+    /// Whole-batch NT decision — see [`CollectStrategy::nt`].
+    nt: bool,
 }
 
 impl<'i, E, R, OP> HybridStrategy<&'i [E]> for CollectByRefStrategy<'_, R, OP>
@@ -3027,7 +3082,16 @@ where
         end: usize,
         splits: usize,
     ) -> Result<(), PanicPayload> {
-        par_index_rec_by_ref(pool, input, self.output, start, end, self.op, splits)
+        par_index_rec_by_ref(
+            pool,
+            input,
+            self.output,
+            start,
+            end,
+            self.op,
+            splits,
+            self.nt,
+        )
     }
 
     #[inline]
@@ -3041,7 +3105,7 @@ where
         // `[start, end)` exclusively. Input is shared + init; output uninit.
         let in_slice = unsafe { input.get_unchecked(start..end) };
         let out_slice = unsafe { self.output.as_mut_slice(start, end) };
-        par_index_leaf_by_ref(in_slice, out_slice, self.op);
+        par_index_leaf_by_ref(in_slice, out_slice, self.op, self.nt);
         Ok(())
     }
 
@@ -3080,6 +3144,7 @@ where
     let strategy = CollectByRefStrategy {
         output: &output,
         op,
+        nt: nt_store_enabled::<R>(n),
     };
     // The dispatcher's input handle is the slice reference itself.
     let result = hybrid_dispatch(
@@ -3801,6 +3866,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::pipe_ref;
 
     /// Pool resolution precedence + the compute-workers semantics that the
     /// fused setters promise (an earlier version silently ignored the budget:
@@ -3978,5 +4044,42 @@ mod tests {
             .try_collect();
         let expected: Vec<i32> = (1..=1000).collect();
         assert_eq!(result.unwrap(), expected);
+    }
+
+    /// `nt_store_enabled`'s Auto tier: threshold math and eligibility. Runs
+    /// under the default env (unset = Auto); On/Off are process-global
+    /// (OnceLock) and stay covered by the horizontal A/B instead.
+    #[test]
+    fn test_nt_store_auto_decision() {
+        // Eligible 8-byte type: below / at / above the whole-batch threshold.
+        let t = NT_AUTO_MIN_BYTES / size_of::<u64>();
+        assert!(!nt_store_enabled::<u64>(0));
+        assert!(!nt_store_enabled::<u64>(t - 1));
+        assert!(nt_store_enabled::<u64>(t));
+        assert!(nt_store_enabled::<u64>(usize::MAX));
+        // Ineligible sizes / alignments never take the NT path.
+        assert!(!nt_store_enabled::<u32>(usize::MAX));
+        assert!(!nt_store_enabled::<(u64, u64)>(usize::MAX));
+    }
+
+    /// A whole-batch output at the Auto threshold actually exercises the NT
+    /// leaf path (streaming stores + `sfence` publication) end-to-end and
+    /// stays bit-correct, for both the owned and borrowed collect cores.
+    /// `not(miri)`: 1M interpreted iterations would dominate the miri run,
+    /// and under miri `nt_store` is a plain `ptr::write` anyway.
+    #[cfg(not(miri))]
+    #[test]
+    fn test_collect_nt_auto_threshold_correct() {
+        let n = NT_AUTO_MIN_BYTES / size_of::<u64>();
+        let data: Vec<u64> = (0..n as u64).collect();
+        let f = |x: u64| x.wrapping_mul(3).wrapping_add(1);
+        let expected: u64 = (0..n as u64).map(f).sum();
+
+        let owned: Vec<u64> = pipe(data.clone()).map(f).collect();
+        assert_eq!(owned.len(), n);
+        assert_eq!(owned.iter().copied().sum::<u64>(), expected);
+
+        let borrowed: Vec<u64> = pipe_ref(&data).map(|&x| f(x)).collect();
+        assert_eq!(borrowed.iter().copied().sum::<u64>(), expected);
     }
 }
