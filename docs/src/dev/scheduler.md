@@ -331,8 +331,8 @@ regresses +2…+4 pt — per-chunk dispatch overhead dominates once chunks
 get small.
 
 Hence two tiers (`unbalanced_chunk_slack`): slack 8, upgraded to 16 when
-`n / (num_threads + 16) ≥ 64` (`ZSTD_SHAPE_N` on the example sweeps the
-boundary). Cheap skewed/log-uniform n=5000 lands in the wide tier and
+`n / (num_threads + 16) ≥ UNBALANCED_SLACK_WIDE_MIN_PER_CHUNK`
+(`ZSTD_SHAPE_N` on the example sweeps the boundary). Cheap skewed/log-uniform n=5000 lands in the wide tier and
 pays +1.5…+5 % (µs-scale absolute, still >2× ahead of rayon) — the same
 trade-off face `UNBALANCED_OVERSPLIT` 8→32 already accepted; n=200
 stays narrow and clean. Guards: narrow tier is bit-identical to the old
@@ -347,6 +347,43 @@ alike, 6-seed). Straggler cost and throughput cost are not in the same
 league; the latecomer-slack approach above attacks the straggler side
 without giving up SMT throughput. Also rejected: flat slack 32/64
 (uniform n=2000 +3 % — per-chunk overhead returns at small chunks).
+
+#### Wide-tier boundary scan (accepted: 64 → 48)
+
+The 64 boundary was interpolated between two measured points, so a
+dedicated scan pinned it down (2026-09, criterion `zstd_shape` extended
+with `ZSTD_SHAPE_NS`/`ZSTD_SEEDS` id-grid overrides): n ∈ {2000, 3000,
+4000} = 42/63/85 items per wide chunk (31-thread bench taskset) × 3
+shapes × 6 seeds × 3 interleaved same-binary rounds of flat
+`YOUPIPE_CHUNK_SLACK` 8 vs 16.
+
+Measurement lesson: round 1's slack-16 pass ran ~25 % slower than its
+slack-8 neighbour — a co-tenant build; the env knob cannot affect
+rayon, yet that pass's rayon ids drifted the same way. Pass-level
+machine state biases naive side-vs-side deltas, so the decision signal
+pairs each youpipe id with the same pass's rayon id and compares the
+two ratios (`(yp16/ry16)/(yp8/ry8)`); the rayon cross-side ratio
+doubles as a live drift detector.
+
+| items/chunk | heavy-tail | capped | uniform | verdict |
+|---|---|---|---|---|
+| 42 (n=2000) | −1.2 % (4/6) | +0.5 % (3/6) | −0.4 % (5/6) | neutral — stays narrow |
+| 63 (n=3000) | −3.0 % (4/6) | −1.4 % (5/6) | −0.3 % (3/6) | wide favored |
+| 85 (n=4000) | −2.2 % (3/6) | −0.2 % (3/6) | −1.0 % (6/6) | wide (already default) |
+
+(seed medians of the drift-cancelled tier delta; (k/6) = seeds where
+the wide tier's round-median is faster.) The earlier "+2…+4 pt"
+n=2000 wide regression did not reproduce — per-seed tier deltas swing
+±26 pt there, pure chunk-boundary luck. n=3000 flipping to wide closes
+the heavy-tail vs-rayon gap from +8.6 % to +2.5 % (seed medians).
+Hence the boundary 64 → 48: the [48, 64) items/chunk band goes wide,
+42-chunk batches stay narrow. Guards: every cheap-side family keeps its
+tier bit-for-bit (cpu_unbalanced n=200 → 4/chunk, n=5000 → 106/chunk;
+fused 200/1000 → 4/21 — none crosses 48), and on the reference
+31/32-thread machine the default `zstd_shape` n=2000 ids stay narrow
+(42 items/chunk), so no guard bench changes behavior. The per-chunk
+boundary is machine-independent by design — a smaller pool holds
+proportionally more items per chunk and may cross into the wide tier.
 
 ### Graceful Shutdown
 

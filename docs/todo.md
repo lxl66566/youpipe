@@ -18,19 +18,18 @@
 
 ## P1
 
-### 1. zstd_shape 残余差距与 slack 档位边界
+### 1. zstd_shape 残余差距（capped/uniform 落后）
 
-- **现状**：latecomer slack + 两档 tier 后，heavy-tail n=2000 已领先 rayon
-  −6.5…−10%，但 capped +1…+4%、uniform +1…+8% 仍落后；wide tier 边界
-  `UNBALANCED_SLACK_WIDE_MIN_PER_CHUNK = 64` 是在实测 42（n=2000 差）与
-  83（n=4000 好）之间拍的，边界本身未扫描。
-- **方向**：
-  1. 边界扫描（32/48/64/96，多 seed，同 binary `YOUPIPE_CHUNK_SLACK`）；
-  2. capped 形状的残余是重尾 spread（4.2 pt）而非均值——考虑 chunk 内条目
-     乱序化或第三档，但注意 cost-EMA 类自适应已两次证伪（见 scheduler.md），
-     不要再走运行时成本估计路线。
-- **验证**：`zstd_shape` 全形状 × 多 seed + `cpu_unbalanced`（cheap 侧回退
-  监控）。
+- **现状**：wide-tier 边界已扫描并落地 64→48（2026-09，scheduler.md
+  "Wide-tier boundary scan"：42 items/chunk 中性、63/chunk wide 全形状
+  占优，heavy-tail n=3000 vs-rayon 差距 +8.6%→+2.5%）。残余：capped
+  +1…+2%、uniform +4…+6%、heavy-tail n=2000（narrow）~+1% 仍落后 rayon。
+- **方向**：capped 形状的残余是重尾 spread（4.2 pt）而非均值——考虑 chunk 内条目
+  乱序化或第三档，但注意 cost-EMA 类自适应已两次证伪（见 scheduler.md），
+  不要再走运行时成本估计路线。
+- **验证**：`zstd_shape` 全形状 × 多 seed（criterion bench 已支持
+  `ZSTD_SEEDS`/`ZSTD_SHAPE_NS` id 网格透传）；cheap 侧档位经算术核对
+  不随边界变化（cpu_unbalanced n=200/5000 均未跨 48）。
 
 ### 2. 终端 collector 通道 in-pipeline A/B：`std sync_channel` vs crossfire mpsc
 
