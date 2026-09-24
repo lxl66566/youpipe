@@ -159,6 +159,27 @@ impl Registry {
         }
     }
 
+    /// Push a batch of jobs onto the calling worker's local deque with ONE
+    /// sleep notification for the whole batch — the batched counterpart of
+    /// [`Self::inject_or_push`] (which notifies per job). Falls back to
+    /// [`Self::inject_batch`] when the caller is not a worker of this
+    /// registry, mirroring `inject_or_push`'s TLS check.
+    ///
+    /// Batched notification matters under saturation: P concurrent on-pool
+    /// drivers each dispatching a `num_threads`-sized batch through per-job
+    /// notifications would hammer the shared JEC counter (one SeqCst RMW per
+    /// job) — the convergence the local-deque dispatch exists to remove.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(crate) fn push_local_batch(&self, jobs: impl ExactSizeIterator<Item = JobRef>) {
+        let wt = WorkerThread::current();
+        if !wt.is_null() && unsafe { (*wt).registry_id() } == self.id() {
+            // SAFETY: wt is the current thread's WorkerThread of this registry.
+            unsafe { (*wt).push_batch(jobs) };
+        } else {
+            self.inject_batch(jobs);
+        }
+    }
+
     /// Inject a job from outside the pool.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn inject(&self, job_ref: JobRef) {
@@ -382,6 +403,43 @@ impl WorkerThread {
             },
             // Local deque full → spill to the injector (see LOCAL_DEQUE_CAPACITY).
             Err(overflow) => self.registry.inject(overflow),
+        }
+    }
+
+    /// Push a batch of jobs onto the local deque with ONE sleep notification
+    /// for the whole batch (see [`Registry::push_local_batch`]); individual
+    /// overflow jobs spill to the injector.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called by the thread that owns this `WorkerThread` (TLS
+    /// contract): `self.worker` is a single-producer deque.
+    pub(crate) unsafe fn push_batch(&self, jobs: impl Iterator<Item = JobRef>) {
+        // Read before the first push: the empty→nonempty transition sizes the
+        // wake cascade exactly like `inject_batch` does.
+        let queue_was_empty = self.worker.is_empty();
+        let mut pushed = 0usize;
+        for job in jobs {
+            if let Err(overflow) = self.worker.push(job) {
+                // Local deque full → spill this job to the injector (see
+                // LOCAL_DEQUE_CAPACITY). Stealers may drain concurrently, so
+                // each later job retries the local deque instead of the whole
+                // tail spilling. Cold path: capacity is 256 while the hybrid
+                // batch is ≤ num_threads + chunk_slack.
+                self.registry.inject(overflow);
+            } else {
+                pushed += 1;
+            }
+        }
+        if pushed > 0 {
+            // One JEC increment after all deque writes — a sleepy worker that
+            // observes it aborts parking and re-searches via `find_work`,
+            // whose steal scan covers every peer deque (the same protocol
+            // the per-job `push` relies on).
+            #[allow(clippy::cast_possible_truncation)]
+            self.registry
+                .sleep
+                .new_internal_jobs(pushed as u32, queue_was_empty);
         }
     }
 

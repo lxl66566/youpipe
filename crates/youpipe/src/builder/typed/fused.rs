@@ -936,15 +936,32 @@ impl<IN: ?Sized + Sync> Job for ChunkJob<IN> {
 /// spinning) driver at the cost of parallelism when workers ARE available.
 const ASSIST_RESERVE_CHUNKS: usize = 1;
 
-/// Whether on-pool callers may take the hybrid dispatcher (large batches
-/// only — see the regime comment in `hybrid_dispatch`). Runtime-overridable
-/// (`YOUPIPE_ONPOOL_HYBRID=0` forces the pre-hybrid single tree for every
-/// on-pool caller) so A/B benchmarks compare the same binary: recompiles
-/// swing tight benchmarks by tens of percent through pure code-layout
-/// shifts (the established methodology — see `YOUPIPE_OVERSPLIT`).
-fn onpool_hybrid() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("YOUPIPE_ONPOOL_HYBRID").is_ok_and(|v| v != "0"))
+/// Which dispatch surface on-pool hybrid callers use (large batches only —
+/// see the regime comment in `hybrid_dispatch`). Runtime-overridable via
+/// `YOUPIPE_ONPOOL_HYBRID` so A/B benchmarks compare the same binary:
+/// recompiles swing tight benchmarks by tens of percent through pure
+/// code-layout shifts (the established methodology — see
+/// `YOUPIPE_OVERSPLIT`). A/B scripts must pin each side's value (`0`, `1`,
+/// `2`); any other non-"0" value means level 1, the pre-levels semantics.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnpoolHybrid {
+    /// Every on-pool caller takes the pre-hybrid single tree.
+    Off,
+    /// Chunks dispatched through the global injector (wake cascade).
+    Injector,
+    /// The on-pool driver pushes its chunks onto its OWN local LIFO deque;
+    /// peers steal them from the FIFO end instead of all funnelling through
+    /// the one global injector (st3 semantics, same as `join`'s B branch).
+    LocalDeque,
+}
+
+fn onpool_hybrid_mode() -> OnpoolHybrid {
+    static MODE: OnceLock<OnpoolHybrid> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("YOUPIPE_ONPOOL_HYBRID").as_deref() {
+        Err(_) | Ok("0") => OnpoolHybrid::Off,
+        Ok("2") => OnpoolHybrid::LocalDeque,
+        Ok(_) => OnpoolHybrid::Injector,
+    })
 }
 
 /// Hybrid top-level dispatcher. Splits `[0, n)` into `num_chunks` contiguous
@@ -1071,7 +1088,8 @@ where
     // as they did through the `par_*_rec` calls; op failures return through
     // the erased boundary, which the call sites already downcast (the
     // `Op(Box<TryFailure<E>>)` shape is the try strategies' own).
-    if owner.is_some() && (driver_participates || !onpool_hybrid()) {
+    let mode = onpool_hybrid_mode();
+    if owner.is_some() && (driver_participates || mode == OnpoolHybrid::Off) {
         return unsafe { (strategy.run_chunk)(strategy.ctx, pool, input, 0, n, plan.depth) };
     }
     // From here on every on-pool caller is in the large-batch regime with the
@@ -1129,15 +1147,30 @@ where
     // `jobs[..injected_len]` get JobRefs.
     let injected_len = jobs.len() - reserve;
 
-    // Inject pool chunks: a single JEC increment + a single wake cascade.
-    // Every idle worker pops a chunk on its next `find_work`. The JobRefs are
-    // produced lazily from the boxed slice (no intermediate `Vec<JobRef>`
-    // allocation).
+    // Dispatch pool chunks. Off-pool (and `Injector` level): one injector
+    // batch — a single JEC increment + a single wake cascade; every idle
+    // worker pops a chunk on its next `find_work`. `LocalDeque` level
+    // (on-pool only): the driver pushes the whole batch onto its OWN local
+    // LIFO deque, so P concurrent nested batches distribute across P deques
+    // instead of converging on the one global MPMC — the distributed
+    // dispatch surface that keeps the single tree flat under saturation.
+    // The driver's own wait consumes from the LIFO end while peers steal
+    // from the FIFO end, so driver and stealers never touch the same slot;
+    // overflow beyond the deque capacity spills to the injector. Consumption
+    // semantics are identical on every surface: each JobRef's `execute`
+    // decrements the latch from within, so `counter == 0` still implies
+    // every JobRef was fully consumed (the driver's own wait pops its chunks
+    // exactly like `join`'s B branch). The JobRefs are produced lazily from
+    // the boxed slice (no intermediate `Vec<JobRef>` allocation).
     let registry = pool.registry();
     let job_refs = jobs[..injected_len]
         .iter()
         .map(|j| unsafe { JobRef::new(ptr::from_ref(j)) });
-    registry.inject_batch(job_refs);
+    if mode == OnpoolHybrid::LocalDeque && owner.is_some() {
+        registry.push_local_batch(job_refs);
+    } else {
+        registry.inject_batch(job_refs);
+    }
 
     // Run chunk 0 inline on the driver thread, concurrently with the pool
     // (only when `driver_participates`; otherwise `driver_end == 0` and the
