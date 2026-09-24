@@ -81,23 +81,45 @@ collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s�
 
 ---
 
+### 5. （正确性存疑）`pipeline_integration` 间歇性挂死：未定位的丢唤醒窗口
+
+- **现状**（2026-09 复现记录，详见 `dev/crossfire-waker-designs.md` §12.4）：
+  `cargo test --release --test pipeline_integration` 单测试二进制循环
+  （无外部负载、90 s 超时判定）下间歇挂死：waker 设计 C（vendored HEAD）
+  20 轮第 16 轮挂、设计 B（`waker-intrusive` vendor 快照）20 轮第 7 轮挂，
+  另有 10 轮全套循环内 1 次（多测试并发）——**与 crossfire waker 实现无关**
+  （两种实现均复现，共享的是通道语义层），属预存在问题。每轮 ~5–15% 概率。
+- **形态**（gdb 全线程回溯，两次挂起一致）：池 worker 停在 crossfire mpmc
+  `Tx::send` 满 park、消费端停 `MpscReceiver::recv` park、
+  `test_hybrid_dispatch_spin_wait_stress` 停 `LockLatch::wait`；挂起时全部
+  线程 futex wait（无 CPU 消耗），通道对端不消费也不被唤醒的死锁形态。
+- **排除项**：crossfire waker 的 C 与 B 两个实现；两实现的 miri
+  （tree-borrows）+ loom 协议验证均无反例（designs §11.6 / §12.1）。
+- **方向**：① `timeout`+gdb 循环复现，重点查 `hybrid_dispatch`/LockLatch
+  唤醒与 stage 通道 close/drop 的时序、以及多通道 episode 的唤醒配对；
+  ② youpipe 侧补"多通道 select + 池 sleep"交错的 loom 模型；③ 不排除测试
+  自身（spin_wait_stress 与其余测试并发抢核导致的长饥饿尾巴）。
+- **验证**：归因后复现轮转绿；`perf/verify` 脚本长循环稳定性。
+
+---
+
 ## P2
 
-### 5. 池 worker 核绑定（affinity）实验
+### 6. 池 worker 核绑定（affinity）实验
 
 latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
 100 µs–1.7 ms 是残余 straggler 的根源，属内核调度行为。可选：per-worker
 `pthread_setaffinity` 配置项（默认关闭），在 zstd_shape/unbalanced 上 A/B。
 风险：与用户 `taskset` 冲突、跨 NUMA 迁移损失、库越权管理拓扑。
 
-### 6. transient pool 复用缓存
+### 7. transient pool 复用缓存
 
 `with_compute_workers(n≠ncpus)` / `with_oversubscribe` 每次终端调用建池
 拆池（~ms 级，`ExecPool::Owned`）。可做进程内按尺寸的小 LRU 缓存。
 风险：线程数失控（用户以为池已销毁）；至少在 rustdoc 与 tuning.md 把
 「紧循环请预建池」的警示提级。
 
-### 7. （非性能，顺带记录）`ordered()` + `expand()` panic（2026-10 设计分析）
+### 8. （非性能，顺带记录）`ordered()` + `expand()` panic（2026-10 设计分析）
 
 可用 `(seq, sub_seq)` 子序号支持展开保序，解除当前组合禁用。属 API 能力项。
 2026-10 深入设计后确认三条硬约束，后续实现前必须先解决：

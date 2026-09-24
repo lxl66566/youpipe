@@ -23,5 +23,7 @@
 - [Work-stealing scheduler](dev/scheduler.md)
 - [Streaming data plane](dev/streaming.md)
 - [Verification: miri and loom](dev/testing.md)
+- [Vendored crossfire: blocking-waker designs](dev/crossfire-waker-designs.md)
+- [Vendored crossfire: waker-cache archaeology](dev/crossfire-waker-cache.md)
 - [Benchmarks and methodology](dev/benchmarks.md)
 - [Publishing](dev/publishing.md)
