@@ -581,17 +581,18 @@ fn bench_fused_oversubscribe(c: &mut Criterion) {
 // unbalanced batches (see docs/src/dev/scheduler.md "flat top-level
 // dispatch" for the 2026-09 experiment this was distilled from).
 //
-// Deterministic Box-Muller over a fixed-seed LCG — same construction as the
-// /tmp repro used during the experiment, so historical numbers remain
-// comparable.
+// Deterministic Box-Muller over an LCG — same construction as the /tmp repro
+// used during the 2026-09 experiment, so historical numbers remain
+// comparable. The seed is caller-supplied: heavy-tail results are
+// chunk-boundary lucky, so verdicts need the per-seed id grid below.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
-fn generate_lognormal_tasks(n: usize, sigma: f64, cap_bytes: f64) -> Vec<(u64, u32)> {
+fn generate_lognormal_tasks(n: usize, sigma: f64, cap_bytes: f64, seed: u64) -> Vec<(u64, u32)> {
     const ITERS_PER_BYTE: usize = 32;
-    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut seed = seed;
     let mut next_f64 = || {
         seed = seed
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -608,47 +609,81 @@ fn generate_lognormal_tasks(n: usize, sigma: f64, cap_bytes: f64) -> Vec<(u64, u
         .collect()
 }
 
+/// Historical repro seed — also the default of `ZSTD_SEED` on the example.
+const ZSTD_SHAPE_SEED: u64 = 0x2545_f491_4f6c_dd1d;
+
+/// Comma-separated env list (e.g. `ZSTD_SEEDS=1,2,3`). `None` when unset or
+/// not fully parseable — a partially parsed list would silently shrink the
+/// scan grid and produce empty A/B tables.
+fn env_list<T: std::str::FromStr>(name: &str) -> Option<Vec<T>> {
+    let list: Vec<T> = std::env::var(name)
+        .ok()?
+        .split(',')
+        .map(|s| s.trim().parse())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    (!list.is_empty()).then_some(list)
+}
+
 fn bench_zstd_shape(c: &mut Criterion) {
     let mut group = c.benchmark_group("zstd_shape");
     // heavy-tail: max item exceeds a worker's fair share (straggler regime);
     // capped: everything far below fair share (pure throughput regime);
     // uniform: sigma=0, every item ~25 µs (park/wake-handoff regime).
+    //
+    // `ZSTD_SHAPE_NS` / `ZSTD_SEEDS` (comma lists) expand the id grid for
+    // slack-tier boundary scans: heavy-tail wall time is chunk-boundary
+    // lucky, so ids carry `_n<n>_s<seed>` suffixes and every A/B side sees
+    // the identical task set per seed. Unset -> the historical single-seed
+    // n=2000 ids, byte-identical to pre-scan runs.
+    let ns: Vec<usize> = env_list("ZSTD_SHAPE_NS").unwrap_or_else(|| vec![2000]);
+    let seeds: Vec<u64> = env_list("ZSTD_SEEDS").unwrap_or_else(|| vec![ZSTD_SHAPE_SEED]);
+    let default_grid = ns == [2000] && seeds == [ZSTD_SHAPE_SEED];
     for (shape, sigma, cap) in [
         ("heavy_tail", 1.5, 2.0 * 1024.0 * 1024.0),
         ("capped", 1.5, 256.0 * 1024.0),
         ("uniform", 0.0, 2.0 * 1024.0 * 1024.0),
     ] {
-        let tasks = generate_lognormal_tasks(2000, sigma, cap);
+        for &n in &ns {
+            for &seed in &seeds {
+                let tasks = generate_lognormal_tasks(n, sigma, cap, seed);
+                let id = if default_grid {
+                    shape.to_string()
+                } else {
+                    format!("{shape}_n{n}_s{seed}")
+                };
 
-        group.throughput(Throughput::Elements(tasks.len() as u64));
+                group.throughput(Throughput::Elements(tasks.len() as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("youpipe_unbalanced", shape),
-            &tasks,
-            |b, tasks| {
-                b.iter(|| {
-                    let r = pipe_ref(tasks)
-                        .with_workload(Workload::Unbalanced)
-                        .map(|&(x, iters)| bb(cpu_work_variable(x, iters)))
-                        .collect();
-                    bb(r)
-                });
-            },
-        );
+                group.bench_with_input(
+                    BenchmarkId::new("youpipe_unbalanced", id.as_str()),
+                    &tasks,
+                    |b, tasks| {
+                        b.iter(|| {
+                            let r = pipe_ref(tasks)
+                                .with_workload(Workload::Unbalanced)
+                                .map(|&(x, iters)| bb(cpu_work_variable(x, iters)))
+                                .collect();
+                            bb(r)
+                        });
+                    },
+                );
 
-        group.bench_with_input(
-            BenchmarkId::new("rayon_par_iter", shape),
-            &tasks,
-            |b, tasks| {
-                b.iter(|| {
-                    let r: Vec<u64> = tasks
-                        .par_iter()
-                        .map(|&(x, iters)| bb(cpu_work_variable(x, iters)))
-                        .collect();
-                    bb(r)
-                });
-            },
-        );
+                group.bench_with_input(
+                    BenchmarkId::new("rayon_par_iter", id.as_str()),
+                    &tasks,
+                    |b, tasks| {
+                        b.iter(|| {
+                            let r: Vec<u64> = tasks
+                                .par_iter()
+                                .map(|&(x, iters)| bb(cpu_work_variable(x, iters)))
+                                .collect();
+                            bb(r)
+                        });
+                    },
+                );
+            }
+        }
     }
     group.finish();
 }
