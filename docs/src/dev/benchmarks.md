@@ -722,12 +722,19 @@ session and are frequency-robust.
 DRAM fills measure 2–9 K lines per iteration against 256 K/512 K lines
 touched (≤ 1.7 %). The 64 MB combined L2+L3 hierarchy absorbs the whole
 32–64 MB R+W working set in the bench's steady state on this machine, for
-both libraries. This predicts (and the parallel experiments confirmed) that
-non-temporal stores and chunk-boundary alignment cannot move this gap: the
-NT-store A/B showed no improvement, and the `YOUPIPE_ALIGN_CHUNKS` A/B
-measured ±0.3 %.
+both libraries. Chunk-boundary alignment indeed cannot move the gap
+(`YOUPIPE_ALIGN_CHUNKS` A/B ±0.3 %, falsified). The NT-store prediction was
+**wrong** — corrected the same day by the causal same-binary A/B ("NT-store
+attribution" above): +15–18 % wall at 1–4 M, gap reversed. The NT "no
+improvement" observed during this attribution session was the invalid
+both-sides-on round (the knob treats any value other than "0" as ON; the
+off side had passed the literal string "off"). Lesson: core-side counter
+parity (demand fills, L2 RFO counts) does not capture the store path's
+ownership/writeback latency that NT bypasses — a same-binary causal knob
+outranks counter-based exclusion.
 
-**Occupancy, not throughput** — `perf record` (999 Hz, dwarf) shows 94.3 %
+**Occupancy deficit — a real but secondary component** — `perf record`
+(999 Hz, dwarf) shows 94.3 %
 of youpipe's on-core samples in `par_index_rec_by_ref` (the leaf loop; the
 scheduler, injector, and latch never reach 0.2 %), versus rayon's 90.2 % in
 its `bridge` leaf plus ~4.4 % in `join_context`/`with_handle` spinning.
@@ -735,9 +742,13 @@ youpipe executes its (slightly fewer) instructions with *fewer* total
 core-cycles yet finishes later: the missing time is spent halted. Idle
 workers exhaust the 32-spin + 32-yield round window and condvar-park;
 waking them costs futex latencies and lands them on migrated cores, ~4 of
-31 CPUs' worth of average occupancy per iteration ≈ the +12–15 % wall gap.
-Rayon buys its win by never parking mid-iteration — burning +11–16 % more
-cycles (spin) per iteration than youpipe.
+31 CPUs' worth of average occupancy per iteration — matching the +12–15 %
+wall-gap *shape* and initially read as the whole gap. The NT-store A/B
+showed the store path dominates (~13 pt); occupancy is worth a measured
+1–4 pt on top (causal spin-knob check below) and the two partially overlap
+(NT shortens leaf duration, which also shortens the straggler tail that
+wake latency gates). Rayon avoids the loss by never parking mid-iteration —
+burning +11–16 % more cycles (spin) per iteration than youpipe.
 
 **Causal check (same-binary knob A/B)**: `YOUPIPE_SPIN_ROUNDS=2048
 YOUPIPE_YIELD_ROUNDS=2048` (workers stay hot across the inter-iteration
