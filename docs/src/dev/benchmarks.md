@@ -376,7 +376,8 @@ pair — 12 alternating rounds, `taskset 1-31`):
   expansions are large enough to bypass tcache bins.
 - High fan-out amortizes the per-input malloc over more outputs; the
   structural gap to rayon in this group is the streaming engine's channel
-  infrastructure (see `mixed_load` above and todo #1), not the expansion
+  infrastructure (see `mixed_load` above — since solved for pure sync chains
+  by the fused pass-through, see `guide/stream.md`), not the expansion
   API shape.
 
 
