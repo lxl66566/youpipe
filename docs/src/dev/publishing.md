@@ -17,6 +17,7 @@ on relative paths while published builds resolve registry versions.
 | `youpipe-crossfire` | `crates/youpipe-crossfire` | yes (fork of upstream crossfire, per-thread blocking waker) |
 | `youpipe-criterion-perf-counters` | `crates/youpipe-criterion-perf-counters` | no (bench-only tool dep) |
 | `youpipe-bench` | `crates/youpipe-bench` | no (`publish = false`; opt-in lab benches) |
+| `youpipe-gungraun` | `crates/youpipe-gungraun` | no (`publish = false`; deterministic Ir benches) |
 
 ## Path + version dual dependencies
 

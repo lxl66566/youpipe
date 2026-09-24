@@ -167,7 +167,8 @@ and run once. For rigorous, repeatable measurements see:
 
 - `../../crates/youpipe-bench` — the opt-in lab bench crate (perf-event
   counters, real-disk file-encrypt, hotpath profiling driver; maintainer/
-  perf work, not didactic).
+  perf work, not didactic), plus `../../crates/youpipe-gungraun` for
+  deterministic instruction-count benches.
 
   | Target | What it does |
   |---|---|

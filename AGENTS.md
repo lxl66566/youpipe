@@ -32,7 +32,7 @@ temperature: 0
 
 详情请参考 mdbook（docs/src/SUMMARY.md，`mdbook build docs` 构建）。
 
-- Workspace 布局：根目录是 virtual workspace（只有清单与共享配置），`youpipe` 主 crate 在 `crates/youpipe`（含 src/benches/tests/examples），其余子 crate 也都在 `crates/` 下——`youpipe-sys`（miri/loom 透明原语层，util 的 sys shims + CachePadded）、两个 fork（`youpipe-st3`、`youpipe-concurrent-queue`，原 vendor 目录）、`youpipe-criterion-perf-counters` 和 lab bench crate `youpipe-bench`（perf-event 计数器 + file-encrypt + hotpath-profile 多 target 一包，`publish = false`，用 `-p` 显式选择）。`perf/` 只放非 crate 的方法论文档与脚本。workspace 内部依赖用 path+version 双声明：本地走 path，发布后走 crates.io 版本（见 docs/publishing.md）。主 crate 的 README 用 symlink 指向仓库根 README（cargo package 会解引用）。
+- Workspace 布局：根目录是 virtual workspace（只有清单与共享配置），`youpipe` 主 crate 在 `crates/youpipe`（含 src/benches/tests/examples），其余子 crate 也都在 `crates/` 下——`youpipe-sys`（miri/loom 透明原语层，util 的 sys shims + CachePadded）、两个 fork（`youpipe-st3`、`youpipe-concurrent-queue`，原 vendor 目录）、`youpipe-criterion-perf-counters`、lab bench crate `youpipe-bench`（perf-event 计数器 + file-encrypt + hotpath-profile 多 target 一包）与确定性 Ir bench `youpipe-gungraun`（valgrind 计数，需 gungraun-runner）。bench crate 均 `publish = false`，用 `-p` 显式选择。`perf/` 只放非 crate 的方法论文档与脚本。workspace 内部依赖用 path+version 双声明：本地走 path，发布后走 crates.io 版本（见 docs/publishing.md）。主 crate 的 README 用 symlink 指向仓库根 README（cargo package 会解引用）。
   - `cargo build/test/clippy` 默认只覆盖 youpipe + youpipe-sys（default-members）；fork 与 bench 用 `-p`/`--workspace` 显式选择。
   - fork crate 的源码必须与 fork 仓库保持可 diff：不要手改（各目录的 rustfmt.toml 已 ignore）；clippy 警告用其自身清单的 `[lints]` 压制。
 - CPU 负载任务：rayon 架构在各种 balanced/unbalanced 负载下的综合表现都很好，这里直接采用 rayon 的调度器核心，详见 `crates/youpipe/src/pool/`。

@@ -661,6 +661,53 @@ Verdict:
   when the absolute count is tiny; no counter is uniformly most stable
   (ref-cycles was worst for youpipe lightweight).
 
+## Deterministic instruction counts (`crates/youpipe-gungraun`)
+
+`crates/youpipe-gungraun` counts executed instructions under the Valgrind
+simulator (gungraun, the iai-callgrind successor) instead of sampling hardware
+counters — one run per benchmark, no clock, no statistics. Where the perf-event
+counter rows above still show 0.5–3 % cross-run CV on pool benches (scheduling
+leaks into even instruction counters on a real machine), the valgrind
+simulator's serialized scheduler removes that source entirely:
+
+| shape | worst run-to-run Ir drift |
+| --- | --- |
+| youpipe channel rows (MPMC / MPSC ping-pong) | **0** — exact to the instruction |
+| crossbeam channel row | **0** |
+| std `sync_channel` row | ±0.04 % |
+| fused `pipe` rows | 0 .. 0.003 % |
+| rayon rows | ±0.06 % (timer-based idle sleeps) |
+| `stream` rows | ±0.02 % |
+
+Methodology essentials (full details in the crate's Readme):
+
+- **Count-all-threads caliber.** gungraun's default per-function Callgrind
+  toggle is per-thread state — pool workers never enter the bench function and
+  are invisible (measured: a 100 K `pipe().collect()` counted only ~26 kIr of
+  driver dispatch). The benches therefore run `EntryPoint::None` +
+  `--collect-atstart=yes` and report **process totals**; every row of a group
+  executes identical setup (`both_pools()` spawns a 4-worker youpipe pool and
+  a 4-worker rayon pool even where a row uses neither) so the fixed offset
+  cancels in `compare_by_id` deltas. Read deltas, not absolutes.
+- **Pinned 4-worker pools** on both sides: default pools size to
+  `available_parallelism()`, which would make counts host-dependent. The
+  pinned pools still exercise the full dispatch/steal/wake surface.
+- **No async stages**: tokio timers make counts time-dependent.
+- Regression gating: `--save-baseline=main` / `--baseline=main
+  --callgrind-limits='ir=2%'` exits 3 on regression — with the drift above, 2 %
+  is comfortably tight and one run suffices (vs 3–5 interleaved criterion
+  rounds for the same confidence).
+
+First readings (process totals, deltas are the signal): cpu_heavy 1 K —
+youpipe +8.7 % Ir vs rayon (the known fixed dispatch cost); cpu_heavy 100 K —
+youpipe −2.3 %; light 100 K — youpipe −8 % vs rayon, +21 % vs sequential;
+`stream` single-stage pass-through +3 % vs sequential at 10 K.
+
+```sh
+cargo bench -p youpipe-gungraun            # ~1 min, all three bench files
+cargo bench -p youpipe-gungraun -- --save-baseline=main
+```
+
 ## Lab bench crate layout (`crates/youpipe-bench`)
 
 The four former standalone bench crates were consolidated (2026-10) into one

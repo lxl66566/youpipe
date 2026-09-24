@@ -1,0 +1,55 @@
+# Deterministic, machine-independent instruction-count benches for youpipe,
+# built on gungraun (the iai-callgrind successor): each benchmark runs exactly
+# once under the Valgrind simulator and reports executed instruction counts
+# (Ir) — a property of the binary + input, not of machine temperature, CPU
+# frequency or background load. Where the criterion suite needs interleaved
+# A/B rounds to fight ±10 % wall-clock drift, this crate just counts.
+#
+# Requires Linux + valgrind >= 3.20 and a gungraun-runner binary version-
+# matched to the `gungraun` dev-dependency:
+#
+#   cargo install --version 0.19.4 gungraun-runner
+#   cargo bench -p youpipe-gungraun                # everything
+#   cargo bench -p youpipe-gungraun --bench fused -- --list
+#
+# See Readme.md for methodology and what is deliberately NOT measured here.
+[package]
+name         = "youpipe-gungraun"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+description  = "Deterministic valgrind-instruction-count benches for youpipe (pinned-size pools, youpipe vs rayon vs sequential)"
+publish      = false
+
+[lib]
+# Keep cargo bench from running the lib's (empty) unittest target, which
+# would choke on runner arguments like --save-baseline.
+bench = false
+
+# `test = false` keeps `cargo test --workspace` from executing the benches on
+# hosts without valgrind; they only run under `cargo bench`.
+[[bench]]
+harness = false
+name    = "fused"
+test    = false
+
+[[bench]]
+harness = false
+name    = "channel"
+test    = false
+
+[[bench]]
+harness = false
+name    = "stream"
+test    = false
+
+[dependencies]
+rayon = "1"
+youpipe = { path = "../youpipe", default-features = false }
+
+[dev-dependencies]
+crossbeam-channel = "0.5"
+gungraun          = "0.19.4"
+
+# Lab bench (publish = false): intentionally not inheriting the workspace lint set.
+[lints]

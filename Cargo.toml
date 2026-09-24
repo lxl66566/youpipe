@@ -6,6 +6,7 @@ members         = [
   "crates/youpipe-concurrent-queue",
   "crates/youpipe-crossfire",
   "crates/youpipe-criterion-perf-counters",
+  "crates/youpipe-gungraun",
   "crates/youpipe-st3",
   "crates/youpipe-sys",
 ]
@@ -41,8 +42,14 @@ unexpected_cfgs       = { level = "warn", check-cfg = ["cfg(loom)"] }
 unsafe_code           = "allow"
 unused_qualifications = "warn"
 
+# Debug symbols and no stripping for the gungraun benches: Callgrind
+# attributes instruction counts to source symbols, so the bench targets
+# must ship them (strip must stay off explicitly in case `[profile
+# release]` ever gains `strip`).
 [profile.bench]
 codegen-units = 1
+debug       = true
+strip       = false
 
 # Single codegen unit for release builds. A project whose value proposition is
 # per-item throughput cannot tolerate the code-layout lottery that
