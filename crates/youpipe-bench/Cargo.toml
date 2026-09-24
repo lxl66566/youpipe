@@ -60,5 +60,10 @@ name = "file-encrypt"
 name              = "hotpath-profile"
 required-features = ["hotpath"]
 
+# Attribution runner: interleaved youpipe/rayon cpu_balanced shape with CSV
+# per-iteration times (perf stat / perf record sessions) + allocator/VMA probe.
+[[bin]]
+name = "horizontal-counters"
+
 # Lab bench (publish = false): intentionally not inheriting the workspace lint set.
 [lints]

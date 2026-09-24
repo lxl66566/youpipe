@@ -29,6 +29,13 @@ struct Config {
     out: String,
     /// Only run scenarios whose name contains one of these substrings.
     scenarios: Vec<String>,
+    /// Only run libraries whose name is in this list (empty = all). Lets a
+    /// single library run under whole-process counters (`perf stat`) for
+    /// per-side attribution without cross-library pollution.
+    libs: Vec<String>,
+    /// Only run batches whose `n` is in this list (empty = all). Pairs with
+    /// `--libs` for single-shape counter sessions.
+    batches: Vec<usize>,
 }
 
 fn parse_args() -> Config {
@@ -39,6 +46,8 @@ fn parse_args() -> Config {
         warmup_rest: 2,
         out: "target/horizontal/results.json".to_owned(),
         scenarios: Vec::new(),
+        libs: Vec::new(),
+        batches: Vec::new(),
     };
     // Drop cargo's own `--bench <name>` passthrough pair, if present.
     let mut raw: Vec<String> = std::env::args().skip(1).collect();
@@ -61,6 +70,12 @@ fn parse_args() -> Config {
             "--out" => cfg.out = val("--out"),
             "--scenarios" => {
                 cfg.scenarios = val("--scenarios").split(',').map(str::to_owned).collect();
+            },
+            "--libs" => {
+                cfg.libs = val("--libs").split(',').map(str::to_owned).collect();
+            },
+            "--batches" => {
+                cfg.batches = val("--batches").split(',').map(|s| s.parse().expect("n")).collect();
             },
             other => panic!("unknown arg: {other}"),
         }
@@ -327,12 +342,16 @@ struct ResultRec {
     n: usize,
     /// Per-round per-iteration times, nanoseconds.
     rounds_ns: Vec<f64>,
+    /// Per-round timed-iteration counts (window length / mean, exactly).
+    iters: Vec<usize>,
 }
 
 /// Run `job` for `warmup` untimed iterations, then loop until `measure_ms`
 /// has elapsed, averaging the per-iteration times (each timed internally so
-/// setup stays out of the measurement).
-fn measure(job: &mut Job, warmup: usize, measure_ms: u128) -> f64 {
+/// setup stays out of the measurement). Returns `(mean_ns, iters)` — the
+/// iteration count feeds per-iteration normalization of whole-process perf
+/// counters (see `youpipe-bench`'s attribution runs).
+fn measure(job: &mut Job, warmup: usize, measure_ms: u128) -> (f64, usize) {
     for _ in 0..warmup {
         job();
     }
@@ -343,7 +362,7 @@ fn measure(job: &mut Job, warmup: usize, measure_ms: u128) -> f64 {
         total_ns += job();
         iters += 1;
     }
-    total_ns / iters as f64
+    (total_ns / iters as f64, iters)
 }
 
 fn run_all(cfg: &Config) -> Vec<ResultRec> {
@@ -372,27 +391,37 @@ fn run_all(cfg: &Config) -> Vec<ResultRec> {
                 continue;
             }
             for batch in &mut sc.batches {
+                if !cfg.batches.is_empty() && !cfg.batches.contains(&batch.n) {
+                    continue;
+                }
                 // ABCABC interleaving: reverse the library order on odd rounds
                 // to cancel position bias.
+                let selected: Vec<&mut (String, Job)> = batch
+                    .libs
+                    .iter_mut()
+                    .filter(|(lib, _)| cfg.libs.is_empty() || cfg.libs.contains(lib))
+                    .collect();
                 let iter: Box<dyn Iterator<Item = &mut (String, Job)>> = if round % 2 == 0 {
-                    Box::new(batch.libs.iter_mut())
+                    Box::new(selected.into_iter())
                 } else {
-                    Box::new(batch.libs.iter_mut().rev())
+                    Box::new(selected.into_iter().rev())
                 };
                 for (lib, job) in iter {
-                    let ns = measure(job, warmup, cfg.measure_ms);
+                    let (ns, iters) = measure(job, warmup, cfg.measure_ms);
                     eprintln!(
-                        "  {:<16} n={:<7} {:<22} {:>10.2} ms",
+                        "  {:<16} n={:<7} {:<22} {:>10.2} ms ({} iters)",
                         sc.name,
                         batch.n,
                         lib,
-                        ns / 1e6
+                        ns / 1e6,
+                        iters
                     );
                     recs.push(ResultRec {
                         scenario: sc.name,
                         lib: lib.clone(),
                         n: batch.n,
                         rounds_ns: vec![ns],
+                        iters: vec![iters],
                     });
                 }
             }
@@ -406,6 +435,7 @@ fn run_all(cfg: &Config) -> Vec<ResultRec> {
             .find(|m| m.scenario == r.scenario && m.lib == r.lib && m.n == r.n)
         {
             m.rounds_ns.extend(r.rounds_ns);
+            m.iters.extend(r.iters);
         } else {
             merged.push(r);
         }
@@ -440,14 +470,21 @@ fn write_json(cfg: &Config, recs: &[ResultRec]) -> std::io::Result<()> {
             .map(|v| format!("{v:.1}"))
             .collect::<Vec<_>>()
             .join(", ");
+        let iters_str = r
+            .iters
+            .iter()
+            .map(|v| format!("{v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let _ = writeln!(
             out,
             "{{\"scenario\": \"{}\", \"lib\": \"{}\", \"n\": {}, \"rounds_ns\": [{}], \
-             \"median_ns\": {m:.1}}}{}",
+             \"iters\": [{}], \"median_ns\": {m:.1}}} {}",
             r.scenario,
             r.lib,
             r.n,
             rounds_str,
+            iters_str,
             if i + 1 == recs.len() {
                 ""
             } else {
