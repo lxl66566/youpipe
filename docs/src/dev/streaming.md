@@ -152,6 +152,14 @@ introduction.
    for tests / ergonomic callers.)
 3. `flush_remaining()` collects whatever is still outstanding (e.g. on disconnect) and returns it sorted by `seq` — the only path that pays for a comparison sort
 
+Slot layout: each slot is one `u64` tag + the `MaybeUninit` item, with
+`occupied` folded into the tag (`seq.wrapping_add(1)`; `0` = unoccupied) —
+16 B per slot for `u64` items instead of the 24 B a `seq + bool + item`
+layout costs (+50 % window density, half the bytes read per slot probe in
+the flush scan; `test_slot_density` guards the layout). Measured on
+`stream_pipeline/single_stage_ordered`: 1K −8.3 % (25/25 dominant, 5-round
+isolated interleaved A/B); 100K noise (the family's ±20 % round drift).
+
 Capacity contract: because of the bitmask mapping, the number of simultaneously outstanding (un-flushed) items must stay below the slot count or two distinct `seq`s alias the same slot and the older item is dropped. Callers size the buffer to at least the maximum out-of-order window; the streaming collectors clamp it to `[1 Ki, 1 Mi]` slots.
 
 ---

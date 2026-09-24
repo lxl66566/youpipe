@@ -1,8 +1,19 @@
 use std::mem::MaybeUninit;
 
+/// Slot tag encoding: `seq.wrapping_add(1)`, so `0` marks an unoccupied
+/// slot and every real seq (including `0` itself) maps to a non-zero tag.
+/// Packing `occupied` into the tag keeps a slot at `max(8, size_of::<T>())`
+/// bytes — for `u64` items that is 16 B instead of the 24 B a
+/// `seq + bool + MaybeUninit` layout costs, i.e. +50 % window density and
+/// half the bytes read per slot probe in the flush scan.
+///
+/// `wrapping_add` keeps the encoding total: only `seq == u64::MAX` maps to
+/// tag 0, which would make that one slot look unoccupied — sequence numbers
+/// count flushed items and never approach `u64::MAX` in practice.
+const UNOCCUPIED: u64 = 0;
+
 struct Slot<T> {
-    seq: u64,
-    occupied: bool,
+    tag: u64,
     item: MaybeUninit<T>,
 }
 
@@ -54,8 +65,7 @@ impl<T> ReorderBuffer<T> {
         if self.slots.is_empty() {
             self.slots = (0..=self.mask)
                 .map(|_| Slot {
-                    seq: 0,
-                    occupied: false,
+                    tag: UNOCCUPIED,
                     item: MaybeUninit::uninit(),
                 })
                 .collect();
@@ -94,19 +104,21 @@ impl<T> ReorderBuffer<T> {
         // still buffered (the slot write + read-back is the 3 stores + 2 loads
         // + len bookkeeping the fast path avoids).
         let slot = &mut self.slots[idx];
-        if slot.occupied {
-            // Capacity precondition violated: a different seq aliases this
-            // slot. The old item is dropped to avoid a leak. See the type-level
-            // doc for the capacity contract.
+        let tag = seq.wrapping_add(1);
+        if slot.tag != UNOCCUPIED {
+            // Occupied slot: either a duplicate seq (single-item-per-seq
+            // contract, e.g. `expand`) or — with a different tag — the
+            // capacity precondition violated (outstanding window >
+            // capacity, two seqs aliasing one slot). The older item is
+            // dropped to avoid a leak; see the type-level doc.
             debug_assert_ne!(
-                slot.seq, seq,
+                slot.tag, tag,
                 "duplicate seq {seq} — ReorderBuffer is single-item-per-seq; use without `expand`"
             );
             unsafe { slot.item.assume_init_drop() };
             self.len -= 1;
         }
-        slot.occupied = true;
-        slot.seq = seq;
+        slot.tag = tag;
         slot.item.write(item);
         self.len += 1;
         self.flush_ready_into(sink);
@@ -133,13 +145,15 @@ impl<T> ReorderBuffer<T> {
             // See `insert_into` for why truncation is harmless.
             #[allow(clippy::cast_possible_truncation)]
             let idx = (self.next_expected as usize) & self.mask;
-            if !self.slots[idx].occupied || self.slots[idx].seq != self.next_expected {
+            // One 8-byte tag read covers both the occupied flag and the seq
+            // match (`tag == next_expected + 1`).
+            if self.slots[idx].tag != self.next_expected.wrapping_add(1) {
                 break;
             }
             let slot = &mut self.slots[idx];
-            // SAFETY: slot is occupied and init (checked above).
+            // SAFETY: slot is occupied and init (tag matched above).
             let item = unsafe { slot.item.assume_init_read() };
-            slot.occupied = false;
+            slot.tag = UNOCCUPIED;
             self.len -= 1;
             self.next_expected += 1;
             sink(item);
@@ -149,10 +163,11 @@ impl<T> ReorderBuffer<T> {
     pub fn flush_remaining(&mut self) -> Vec<T> {
         let mut items: Vec<(u64, T)> = Vec::with_capacity(self.len);
         for slot in &mut self.slots {
-            if slot.occupied {
+            if slot.tag != UNOCCUPIED {
                 let item = unsafe { slot.item.assume_init_read() };
-                slot.occupied = false;
-                items.push((slot.seq, item));
+                let seq = slot.tag - 1;
+                slot.tag = UNOCCUPIED;
+                items.push((seq, item));
             }
         }
         items.sort_by_key(|(seq, _)| *seq);
@@ -177,9 +192,9 @@ impl<T> ReorderBuffer<T> {
 
     pub fn reset(&mut self) {
         for slot in &mut self.slots {
-            if slot.occupied {
+            if slot.tag != UNOCCUPIED {
                 unsafe { slot.item.assume_init_drop() };
-                slot.occupied = false;
+                slot.tag = UNOCCUPIED;
             }
         }
         self.len = 0;
@@ -190,7 +205,7 @@ impl<T> ReorderBuffer<T> {
 impl<T> Drop for ReorderBuffer<T> {
     fn drop(&mut self) {
         for slot in &mut self.slots {
-            if slot.occupied {
+            if slot.tag != UNOCCUPIED {
                 unsafe { slot.item.assume_init_drop() };
             }
         }
@@ -313,5 +328,15 @@ mod tests {
         assert_eq!(out.iter().copied().skip(50).collect::<Vec<_>>(), vec![
             500, 510, 520, 530
         ]);
+    }
+
+    /// The `tag` packing must keep a slot at `max(8, size_of::<T>())` bytes
+    /// — the whole point of folding `occupied` into the tag (16 B vs 24 B
+    /// for `u64` items, +50 % window density). Guards against a field
+    /// re-introduction regressing the layout.
+    #[test]
+    fn test_slot_density() {
+        // 8 B tag + 8 B item, no padding — the `seq + bool` layout cost 24 B.
+        assert_eq!(size_of::<Slot<u64>>(), 16);
     }
 }

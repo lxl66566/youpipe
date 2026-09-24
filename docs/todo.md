@@ -140,13 +140,16 @@ latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
 风险：线程数失控（用户以为池已销毁）；至少在 rustdoc 与 tuning.md 把
 「紧循环请预建池」的警示提级。
 
-### 9. ReorderBuffer 微优化（仅在有场景时做）
+### 9. ReorderBuffer 微优化（✅ 已落地，2026-07）
 
-- `Slot` 为 seq + occupied + `MaybeUninit`（u64 项时 24 B/槽）：可把 occupied
-  编码进 seq 高位，密度 +33%，大窗口时缓存友好；
-- 容量预置条件（同刻 outstanding > capacity 时**静默丢弃**）：当前 clamp
-  [1Ki, 1Mi] 对 `buffer_size` 配得极大的场景（buffer > 1Mi）没有防护，
-  至少应 debug_assert 或文档标注上界推导。
+- **Slot tag 打包**：`occupied` 折叠进 `seq.wrapping_add(1)` 的 u64 tag
+  （`0` = 空槽），`u64` 项的槽密度 24 B → 16 B（+50 %），flush 扫描的槽探测
+  从 16 B 读降到 8 B；`test_slot_density` 锁布局。实测
+  `stream_pipeline/single_stage_ordered` 1K **−8.3 %（25/25 dominant，5 轮
+  隔离交错 A/B）**，100K 噪声（该家族 ±20 % 轮间漂移）。
+- **容量预置条件**：占用槽覆写路径（duplicate seq 或 capacity 溢出别名）
+  的 `debug_assert_ne!` 保留并区分两种成因的注释；上界推导已在类型级
+  rustdoc 与 streaming.md 标注（`[1 Ki, 1 Mi]` clamp 说明）。
 
 ### 10. （非性能，顺带记录）`ordered()` + `expand()` panic（2026-10 设计分析）
 
