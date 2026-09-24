@@ -23,7 +23,7 @@ def cv(values: list[float]) -> float:
 
 
 def main() -> None:
-    out = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/counter-bench-drift")
+    out = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/youpipe-bench-drift")
     runs = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 
     # data[(event, id)] = list of per-run means, list of per-run within CVs

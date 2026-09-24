@@ -1,0 +1,64 @@
+# Lab bench crate: every opt-in benchmark tool that needs heavyweight deps
+# (perfcnt/nom4, zstd, aes-gcm) or a non-criterion shape lives here, in ONE
+# package, instead of one crate per bench. Out of `default-members`, so the
+# plain `cargo build/test/clippy` at the workspace root never compiles any of
+# it; every target is selected explicitly:
+#
+#   cargo bench  -p youpipe-bench --bench perf_events   # perf-event counters
+#   cargo run    -p youpipe-bench --bin file-encrypt    # real-disk mixed CPU/IO
+#   cargo run    -p youpipe-bench --bin hotpath-profile --features hotpath
+#
+# (Why not benches/ in the main crate: `dev-dependencies` cannot be optional,
+# so a root bench target would drag perfcnt + zstd + aes-gcm into every
+# `cargo bench` of the main suite, even when unused.)
+#
+# Methodology and recorded results: docs/src/dev/benchmarks.md.
+[package]
+name         = "youpipe-bench"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+description  = "Opt-in lab benches: perf-event counters, real-disk file-encrypt, hotpath profiling"
+publish      = false
+
+[features]
+# Turns youpipe's permanent `#[hotpath::measure]` probes into real recorders
+# for the `hotpath-profile` binary. Feature-gated so the other targets in
+# this crate never run instrumented: the perf-event and file-encrypt benches
+# would otherwise count the probe bookkeeping as framework cost.
+hotpath = ["youpipe/hotpath", "dep:hotpath"]
+
+[dependencies]
+aes-gcm   = "0.10"
+# Version-pinned to youpipe's own `hotpath` dep: the probes and the
+# `HotpathGuard` in the profile binary must share one global state.
+hotpath   = { version = "0.24", optional = true }
+getrandom = "0.2"
+rayon     = "1"
+tokio     = { version = "1", features = ["fs", "rt-multi-thread"] }
+youpipe   = { path = "../youpipe", default-features = true }
+zstd      = "0.13"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+criterion               = "0.8"
+criterion-perf-counters = { package = "youpipe-criterion-perf-counters", path = "../youpipe-criterion-perf-counters" }
+perfcnt                 = "0.8"
+
+# ── perf-event counter bench (criterion driven by hardware counters) ──
+[[bench]]
+harness = false
+name    = "perf_events"
+
+# ── one-shot application benches (not criterion; run with `cargo run`) ──
+[[bin]]
+name = "file-encrypt"
+
+[[bin]]
+name              = "hotpath-profile"
+required-features = ["hotpath"]
+
+# Lab bench (publish = false): intentionally not inheriting the workspace lint set.
+[lints]

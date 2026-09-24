@@ -30,14 +30,14 @@
 //! # Run
 //!
 //! ```text
-//! cargo run --release -p file-encrypt-bench
+//! cargo run --release -p youpipe-bench --bin file-encrypt
 //! ```
 //!
 //! Optional env overrides (for sizing the workload / task up/down):
 //!
 //! ```text
 //! FC_TASK=compress FC_ZSTD_LEVEL=19 FC_COUNT=800 FC_MIN_KIB=4 FC_MAX_MIB=64 \
-//!   cargo run --release -p file-encrypt-bench
+//!   cargo run --release -p youpipe-bench --bin file-encrypt
 //! ```
 //!
 //! # Where the data lives
@@ -50,7 +50,7 @@
 //! at real storage, e.g.:
 //!
 //! ```text
-//! FC_DATA_DIR=/var/tmp/feb cargo run --release -p file-encrypt-bench
+//! FC_DATA_DIR=/var/tmp/feb cargo run --release -p youpipe-bench --bin file-encrypt
 //! ```
 
 use std::{

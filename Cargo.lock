@@ -2221,44 +2221,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "youpipe-bench-counter"
-version = "0.1.0"
-dependencies = [
- "criterion 0.8.2",
- "perfcnt",
- "rayon",
- "youpipe",
- "youpipe-criterion-perf-counters",
-]
-
-[[package]]
-name = "youpipe-bench-file-encrypt"
+name = "youpipe-bench"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "criterion 0.8.2",
  "getrandom 0.2.17",
- "libc 0.2.189",
- "rayon",
- "tokio",
- "youpipe",
- "zstd",
-]
-
-[[package]]
-name = "youpipe-bench-hotpath-profile"
-version = "0.1.0"
-dependencies = [
  "hotpath",
- "youpipe",
-]
-
-[[package]]
-name = "youpipe-bench-pipeline"
-version = "0.1.0"
-dependencies = [
+ "libc 0.2.189",
+ "perfcnt",
  "rayon",
  "tokio",
  "youpipe",
+ "youpipe-criterion-perf-counters",
+ "zstd",
 ]
 
 [[package]]

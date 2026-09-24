@@ -377,7 +377,7 @@ Readings:
 
 ### hotpath instrumentation round (2026-09)
 
-With `crates/youpipe-bench-hotpath-profile` (p50 percentiles over `HOTPATH_OUTPUT_FORMAT=json`
+With the `hotpath-profile` binary of `crates/youpipe-bench` (p50 percentiles over `HOTPATH_OUTPUT_FORMAT=json`
 reports — p50 is the noise-robust statistic; raw call counts from hotpath are
 approximate under load because its per-thread batch queue drops events):
 
@@ -614,23 +614,23 @@ bar's absolute value is ratio × that number.
   at the larger batches (fewer tasks, pooled scheduling, mixed-mode
   channels) and beat rayon by ~10× once IO blocks its workers.
 
-## Perf-event counter measurement (`crates/youpipe-bench-counter`)
+## Perf-event counter measurement (`crates/youpipe-bench`)
 
-`crates/youpipe-bench-counter` runs the same bench code under Linux perf hardware
-counters (instructions / cycles / ref-cycles / cache-misses / …) instead of
-wall time, via the workspace's `youpipe-criterion-perf-counters` crate — a maintained
-fork of criterion-perf-events re-targeted at criterion 0.8 and extended with
-process-wide per-thread counters (upstream counts the main thread only,
-which for a pool library measures the coordinator and misses the workers).
+`crates/youpipe-bench` (the opt-in lab-bench crate) runs the same bench code under
+Linux perf hardware counters (instructions / cycles / ref-cycles / cache-misses /
+…) instead of wall time, via the workspace's `youpipe-criterion-perf-counters` crate
+— a maintained fork of criterion-perf-events re-targeted at criterion 0.8 and
+extended with process-wide per-thread counters (upstream counts the main thread
+only, which for a pool library measures the coordinator and misses the workers).
 Threads that spawn and exit inside one measurement window are invisible, so
 channel benches can't use it; plain `b.iter` only (`BatchSize::PerIteration`
 windows multiply the per-window `4 × n_threads` counter syscalls by the
 iteration count and inflate fast benches).
 
 ```sh
-cargo bench -p youpipe-bench-counter --bench perf_events
-PERF_EVENT=ref-cycles cargo bench -p youpipe-bench-counter
-crates/youpipe-bench-counter/run-drift-exp.sh   # N runs per event + drift summary table
+cargo bench -p youpipe-bench --bench perf_events
+PERF_EVENT=ref-cycles cargo bench -p youpipe-bench --bench perf_events
+crates/youpipe-bench/run-drift-exp.sh          # N runs per event + drift summary table
 ```
 
 Drift experiment (2026-09, 3 runs × 20 samples per kind, taskset 1-31) —
@@ -660,3 +660,16 @@ Verdict:
   only because the governor pins frequency); cache-misses is meaningless
   when the absolute count is tiny; no counter is uniformly most stable
   (ref-cycles was worst for youpipe lightweight).
+
+## Lab bench crate layout (`crates/youpipe-bench`)
+
+The four former standalone bench crates were consolidated (2026-10) into one
+opt-in lab crate, `crates/youpipe-bench`: `--bench perf_events` (the
+perf-counter criterion bench above), `--bin file-encrypt` (real-disk mixed
+CPU/IO, recorded results in `results-file-encrypt.txt`), `--bin
+hotpath-profile --features hotpath` (the hotpath driver). The fourth
+(`pipeline-bench`, simulated-IO 5-strategy document pipeline) was deleted
+rather than merged: its scenario already lived on as the `real_doc` row of
+`benches/horizontal` (interleaved rounds, stricter methodology), and its
+"youpipe all-sync 3 stages" row is moot since pure-sync `stream` chains now
+fuse onto the fused core.

@@ -2,10 +2,7 @@
 resolver        = "2"
 members         = [
   "crates/youpipe",
-  "crates/youpipe-bench-counter",
-  "crates/youpipe-bench-file-encrypt",
-  "crates/youpipe-bench-hotpath-profile",
-  "crates/youpipe-bench-pipeline",
+  "crates/youpipe-bench",
   "crates/youpipe-concurrent-queue",
   "crates/youpipe-crossfire",
   "crates/youpipe-criterion-perf-counters",
@@ -13,8 +10,8 @@ members         = [
   "crates/youpipe-sys",
 ]
 # Plain `cargo build/test/clippy` at the root covers only the library crates;
-# the vendored forks and the perf benches are opt-in via `-p` / `--workspace`
-# (the perf benches pull heavyweight deps: aes-gcm, zstd, perfcnt, ...).
+# the vendored forks and the bench crates are opt-in via `-p` / `--workspace`
+# (they pull heavyweight deps: aes-gcm, zstd, perfcnt, valgrind runner, ...).
 default-members = ["crates/youpipe", "crates/youpipe-sys"]
 
 # Shared metadata for the youpipe-* crates developed in-tree (everything

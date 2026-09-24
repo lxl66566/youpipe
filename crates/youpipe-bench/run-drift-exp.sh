@@ -17,7 +17,7 @@ RUNS=${RUNS:-3}
 SAMPLES=${SAMPLES:-20}
 CPUS=${CPUS:-1-31}
 EVENTS=${EVENTS:-"walltime instructions cycles ref-cycles cache-misses"}
-OUT=${OUT:-/tmp/counter-bench-drift}
+OUT=${OUT:-/tmp/youpipe-bench-drift}
 
 for event in $EVENTS; do
     for run in $(seq 1 "$RUNS"); do

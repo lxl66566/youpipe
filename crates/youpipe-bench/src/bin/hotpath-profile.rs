@@ -1,23 +1,23 @@
-//! One-shot profiling driver for the work-stealing pool. Standalone package
-//! under `perf/`; depends on youpipe's `hotpath` feature, which turns every
-//! `#[hotpath::measure]` probe planted in `src/pool/` and `src/builder/` into a
-//! real per-function recorder under a `HotpathGuard`.
+//! One-shot profiling driver for the work-stealing pool (an opt-in target of
+//! the `youpipe-bench` lab crate). Depends on youpipe's `hotpath` feature,
+//! which turns every `#[hotpath::measure]` probe planted in `src/pool/` and
+//! `src/builder/` into a real per-function recorder under a `HotpathGuard`.
 //!
 //! ```text
 //! # default: sweep small→large cpu_heavy batches
-//! cargo run --release -p hotpath-profile
+//! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath
 //!
 //! # focused scenario (for isolating one bottleneck):
 //! #   hotpath-profile [size] [heavy|light] [iters]
-//! cargo run --release -p hotpath-profile -- 10000 heavy 200
-//! cargo run --release -p hotpath-profile -- 1000000 light 20
+//! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- 10000 heavy 200
+//! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- 1000000 light 20
 //! ```
 //!
 //! For machine-readable output (A/B comparisons), override without touching the
 //! code via env vars:
 //! ```text
 //! HOTPATH_OUTPUT_FORMAT=json-pretty HOTPATH_OUTPUT_PATH=target/hotpath-report.json \
-//!   cargo run --release -p hotpath-profile -- 1000000 light 20
+//!   cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- 1000000 light 20
 //! ```
 //!
 //! The probes are permanent (feature-gated to no-ops in normal builds), so you

@@ -153,7 +153,7 @@ fn skewed_cpu(size: usize) -> Vec<(u64, u32)> {
 }
 
 /// Log-normal document sizes (Box-Muller over a fixed-seed LCG), clamped to
-/// [256 B, 2 MB]. Same shape as perf/pipeline-bench: heavy-tailed, P99 ≈
+/// [256 B, 2 MB]. Same shape as the retired pipeline-bench app: heavy-tailed, P99 ≈
 /// 259 KiB.
 fn gen_doc_sizes(n: usize) -> Vec<usize> {
     let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
@@ -192,7 +192,7 @@ fn web_parse(body: &[u8]) -> u64 {
 }
 
 /// Realistic-scenario simulated IO: fetch ≈ 30 ns/B (cap 5 ms), save ≈
-/// 15 ns/B (cap 3 ms) — same shape as perf/pipeline-bench. All sleeps, no
+/// 15 ns/B (cap 3 ms) — same shape as the retired pipeline-bench app. All sleeps, no
 /// disk touched.
 fn fetch_dur(sz: usize) -> Duration {
     Duration::from_nanos((sz as u64 * 30).min(5_000_000))
@@ -939,7 +939,8 @@ fn mixed_cpu_io() -> Scenario {
 
 /// S6: realistic document pipeline (three stages, sync + async mixed):
 /// fetch (async IO) → parse (CPU) → save (async IO), log-normal heavy-tailed
-/// document sizes. Adapted from perf/pipeline-bench; all IO is sleeps.
+/// document sizes. Adapted from the pipeline-bench app (since deleted in
+/// favour of this row); all IO is sleeps.
 fn real_doc() -> Scenario {
     let batches = [1_000usize, 4_000]
         .into_iter()

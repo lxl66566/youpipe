@@ -32,7 +32,7 @@ temperature: 0
 
 详情请参考 mdbook（docs/src/SUMMARY.md，`mdbook build docs` 构建）。
 
-- Workspace 布局：根目录是 virtual workspace（只有清单与共享配置），`youpipe` 主 crate 在 `crates/youpipe`（含 src/benches/tests/examples），其余子 crate 也都在 `crates/` 下——`youpipe-sys`（miri/loom 透明原语层，util 的 sys shims + CachePadded）、两个 fork（`youpipe-st3`、`youpipe-concurrent-queue`，原 vendor 目录）、`youpipe-criterion-perf-counters` 和 4 个 bench crate（均 `youpipe-` 命名，bench 均 `publish = false`）。`perf/` 只放非 crate 的方法论文档与脚本。workspace 内部依赖用 path+version 双声明：本地走 path，发布后走 crates.io 版本（见 docs/publishing.md）。主 crate 的 README 用 symlink 指向仓库根 README（cargo package 会解引用）。
+- Workspace 布局：根目录是 virtual workspace（只有清单与共享配置），`youpipe` 主 crate 在 `crates/youpipe`（含 src/benches/tests/examples），其余子 crate 也都在 `crates/` 下——`youpipe-sys`（miri/loom 透明原语层，util 的 sys shims + CachePadded）、两个 fork（`youpipe-st3`、`youpipe-concurrent-queue`，原 vendor 目录）、`youpipe-criterion-perf-counters` 和 lab bench crate `youpipe-bench`（perf-event 计数器 + file-encrypt + hotpath-profile 多 target 一包，`publish = false`，用 `-p` 显式选择）。`perf/` 只放非 crate 的方法论文档与脚本。workspace 内部依赖用 path+version 双声明：本地走 path，发布后走 crates.io 版本（见 docs/publishing.md）。主 crate 的 README 用 symlink 指向仓库根 README（cargo package 会解引用）。
   - `cargo build/test/clippy` 默认只覆盖 youpipe + youpipe-sys（default-members）；fork 与 bench 用 `-p`/`--workspace` 显式选择。
   - fork crate 的源码必须与 fork 仓库保持可 diff：不要手改（各目录的 rustfmt.toml 已 ignore）；clippy 警告用其自身清单的 `[lints]` 压制。
 - CPU 负载任务：rayon 架构在各种 balanced/unbalanced 负载下的综合表现都很好，这里直接采用 rayon 的调度器核心，详见 `crates/youpipe/src/pool/`。
@@ -47,10 +47,10 @@ temperature: 0
 - 推荐使用 hotpath 库进行可观测的插桩性能测试，一次编写永久受益。关键路径植入 `#[cfg_attr(feature = "hotpath", hotpath::measure)]`（同步/异步函数均可用）。用法：
   ```sh
   # 人类可读表格
-  cargo run --release -p youpipe-bench-hotpath-profile
+  cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath
   # 结构化 JSON 落盘（便于 A/B 对比）
   HOTPATH_OUTPUT_FORMAT=json-pretty HOTPATH_OUTPUT_PATH=target/hotpath-report.json \
-  cargo run --release -p youpipe-bench-hotpath-profile
+  cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath
   ```
 - miri 测试：`MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks" cargo miri test`
 - 写测试/bench 的时候都需要注意耗时，不要搞出要跑太久的测试；如果在某个测试上卡了太久，请立刻尝试定位并使用 debugger 分析，不要一直等。

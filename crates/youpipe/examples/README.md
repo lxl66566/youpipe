@@ -165,13 +165,15 @@ and run once. For rigorous, repeatable measurements see:
 
   Run any of them with `cargo bench --bench <name>`.
 
-- `../../perf/` — standalone application-level benchmark packages and the
-  `hotpath` profiling driver (not didactic; for maintainer/perf work).
+- `../../crates/youpipe-bench` — the opt-in lab bench crate (perf-event
+  counters, real-disk file-encrypt, hotpath profiling driver; maintainer/
+  perf work, not didactic).
 
-  | Package | What it does |
+  | Target | What it does |
   |---|---|
-  | `hotpath-profile` | Drives every `#[hotpath::measure]` probe under a `HotpathGuard`; per-function timing/percentiles without `perf` |
-  | `pipeline-bench` | 5-strategy comparison on a heavy-tailed document pipeline (youpipe mixed/sync vs rayon vs tokio vs sequential) |
-  | `file-encrypt-bench` | Real-disk mixed CPU/IO: read skewed-size files, zstd+AES-256-GCM, write back — youpipe vs rayon vs tokio |
+  | `--bench perf_events` | criterion driven by Linux hardware perf counters (instr/cycles/cache-misses instead of wall time) |
+  | `--bin file-encrypt` | Real-disk mixed CPU/IO: read skewed-size files, zstd+AES-256-GCM, write back — youpipe vs rayon vs tokio |
+  | `--bin hotpath-profile --features hotpath` | Drives every `#[hotpath::measure]` probe under a `HotpathGuard`; per-function timing/percentiles without `perf` |
 
-  Run from the repo root with `cargo run --release -p <name>`.
+  Run from the repo root with `cargo bench -p youpipe-bench --bench <name>` /
+  `cargo run --release -p youpipe-bench --bin <name>`.

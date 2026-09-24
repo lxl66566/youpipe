@@ -12,13 +12,13 @@
 //! Usage:
 //!
 //! ```sh
-//! cargo bench --manifest-path perf/counter-bench/Cargo.toml --bench perf_events
-//! PERF_EVENT=cycles    cargo bench --manifest-path perf/counter-bench/Cargo.toml
-//! PERF_EVENT=ref-cycles cargo bench --manifest-path perf/counter-bench/Cargo.toml
-//! PERF_EVENT=walltime  cargo bench --manifest-path perf/counter-bench/Cargo.toml
+//! cargo bench -p youpipe-bench --bench perf_events
+//! PERF_EVENT=cycles    cargo bench -p youpipe-bench --bench perf_events
+//! PERF_EVENT=ref-cycles cargo bench -p youpipe-bench --bench perf_events
+//! PERF_EVENT=walltime  cargo bench -p youpipe-bench --bench perf_events
 //! # full statistical treatment on a single event:
 //! BENCH_SAMPLE_SIZE=100 BENCH_WARMUP_MS=3000 BENCH_MEASUREMENT_MS=5000 \
-//!     cargo bench --manifest-path perf/counter-bench/Cargo.toml
+//!     cargo bench -p youpipe-bench --bench perf_events
 //! ```
 //!
 //! Design notes — why these benches look different from the main suite:

@@ -8,16 +8,15 @@ on relative paths while published builds resolve registry versions.
 
 | Crate | Directory | Published |
 | ----- | --------- | --------- |
+| Crate | Directory | Published |
+| ----- | --------- | --------- |
 | `youpipe` | `crates/youpipe` | yes |
 | `youpipe-sys` | `crates/youpipe-sys` | yes |
 | `youpipe-st3` | `crates/youpipe-st3` | yes (fork of upstream st3) |
 | `youpipe-concurrent-queue` | `crates/youpipe-concurrent-queue` | yes (fork of upstream concurrent-queue) |
 | `youpipe-crossfire` | `crates/youpipe-crossfire` | yes (fork of upstream crossfire, per-thread blocking waker) |
 | `youpipe-criterion-perf-counters` | `crates/youpipe-criterion-perf-counters` | no (bench-only tool dep) |
-| `youpipe-bench-counter` | `crates/youpipe-bench-counter` | no (`publish = false`) |
-| `youpipe-bench-file-encrypt` | `crates/youpipe-bench-file-encrypt` | no |
-| `youpipe-bench-hotpath-profile` | `crates/youpipe-bench-hotpath-profile` | no |
-| `youpipe-bench-pipeline` | `crates/youpipe-bench-pipeline` | no |
+| `youpipe-bench` | `crates/youpipe-bench` | no (`publish = false`; opt-in lab benches) |
 
 ## Path + version dual dependencies
 
