@@ -186,3 +186,21 @@ latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
 - **池缩到物理核数**：zstd SMT 收益 ~1.9×，直接 +78…89% 墙钟。
 - **小批量自动串行**：API 诚实性问题（`prefers_serial` 注释），仅保留
   n≤1 / 单线程池的平凡短路。
+- **chunk 边界 cache line 对齐**（`YOUPIPE_ALIGN_CHUNKS`，2026-09）：顶层
+  chunk 边界与 `par_*_rec` 每层 mid 全部 snap 到 input/output 双 buffer
+  的 64B 边界格点（同余联合，output 优先；纯 index 重排，off 路径
+  bit-for-bit 不变）。同 binary 5 对 off/on 进程交替（horizontal
+  cpu_balanced，rounds=5，taskset 1-31）：youpipe 2M +0.35%、4M +0.28%、
+  1M −0.02%、100K −0.31%，全部在 rayon 对照 ±0.8% 噪声底内；1K +1.9%、
+  10K +0.7% 反付每 batch 的格点计算 + bounds Vec 分配固定开销。机制归因：
+  每 chunk（4M/32 ≈ 131K 元素）仅首尾 2/16K 条 line 跨界（~0.01% 量级），
+  且 SIMD store 对齐前提已由 malloc 16B 对齐保证——64B 全 line 对齐在 Zen
+  上无边际收益，差距不在边界对齐。
+- **`Slots::uninit` 输出分配 `MADV_HUGEPAGE`**（2026-09，机制性证伪未跑
+  A/B）：sysfs THP `enabled=[madvise]`（非 never），但此机内存状态使
+  madvise 无效——buddyinfo Normal zone order-9 空闲块 0、MemFree ~2 GB
+  碎片化，fault-time 2 MiB 分配恒失败（纯 mmap 2M 对齐 + madvise + 写
+  touch 实测 6/6 `AnonHugePages: 0 kB`）；khugepaged 异步 collapse 30 s
+  后仍为 0（`pages_to_scan=4096`/轮 × 10 s 周期，bench 秒级迭代等不到）。
+  bench 场景依赖 fault-time 路径，除非机器重启后早期或空闲大块充足，
+  否则该方向不可测。first-touch 单 NUMA 无意义（已排除）。
