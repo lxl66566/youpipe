@@ -75,7 +75,10 @@ fn parse_args() -> Config {
                 cfg.libs = val("--libs").split(',').map(str::to_owned).collect();
             },
             "--batches" => {
-                cfg.batches = val("--batches").split(',').map(|s| s.parse().expect("n")).collect();
+                cfg.batches = val("--batches")
+                    .split(',')
+                    .map(|s| s.parse().expect("n"))
+                    .collect();
             },
             other => panic!("unknown arg: {other}"),
         }
@@ -478,8 +481,8 @@ fn write_json(cfg: &Config, recs: &[ResultRec]) -> std::io::Result<()> {
             .join(", ");
         let _ = writeln!(
             out,
-            "{{\"scenario\": \"{}\", \"lib\": \"{}\", \"n\": {}, \"rounds_ns\": [{}], \
-             \"iters\": [{}], \"median_ns\": {m:.1}}} {}",
+            "{{\"scenario\": \"{}\", \"lib\": \"{}\", \"n\": {}, \"rounds_ns\": [{}], \"iters\": \
+             [{}], \"median_ns\": {m:.1}}} {}",
             r.scenario,
             r.lib,
             r.n,
@@ -565,6 +568,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 fn build_scenarios() -> Vec<Scenario> {
     vec![
         cpu_balanced(),
+        cpu_balanced_readback(),
         cpu_unbalanced(),
         io_async(),
         io_blocking(),
@@ -627,6 +631,58 @@ fn cpu_balanced() -> Scenario {
         .collect();
     Scenario {
         name: "cpu_balanced",
+        batches,
+    }
+}
+
+/// S1b: `cpu_balanced` with an immediate consumer read-back of the collected
+/// output (a fold over the `Vec` inside the timed region). This is the shape
+/// the NT-store knob trades against: streaming stores bypass the cache
+/// hierarchy, so a consumer that reads the output right after collect pays a
+/// DRAM round-trip per line instead of an L3 hit. Timed region = collect +
+/// fold; deallocation stays outside (same convention as `finish`). The rayon
+/// column doubles as the drift control for the NT off/on two-process A/B —
+/// rayon's collect path is unaffected by the knob.
+fn cpu_balanced_readback() -> Scenario {
+    let batches = [100_000usize, 1_000_000, 2_000_000, 4_000_000]
+        .into_iter()
+        .map(|n| {
+            let data: Vec<u64> = (0..n as u64).collect();
+            Batch {
+                n,
+                libs: vec![
+                    (
+                        "youpipe".to_owned(),
+                        Box::new({
+                            let data = data.clone();
+                            move || {
+                                let t = Instant::now();
+                                let r: Vec<u64> =
+                                    pipe_ref(&data).map(|&x| bb(cpu_work(x, 100))).collect();
+                                let sum = r.iter().fold(0u64, |a, &v| a.wrapping_add(v));
+                                finish(sum, t)
+                            }
+                        }) as Job,
+                    ),
+                    (
+                        "rayon".to_owned(),
+                        Box::new({
+                            let data = data.clone();
+                            move || {
+                                let t = Instant::now();
+                                let r: Vec<u64> =
+                                    data.par_iter().map(|&x| bb(cpu_work(x, 100))).collect();
+                                let sum = r.iter().fold(0u64, |a, &v| a.wrapping_add(v));
+                                finish(sum, t)
+                            }
+                        }) as Job,
+                    ),
+                ],
+            }
+        })
+        .collect();
+    Scenario {
+        name: "cpu_balanced_readback",
         batches,
     }
 }
