@@ -57,16 +57,26 @@ narrowing them measured as global regressions there (history in `sleep.rs`)
 — so treat them as experiment knobs for heterogeneous machines, not
 tuning levers with known upside.
 
-The fused `.collect()` output-store policy is runtime-overridable too:
-`YOUPIPE_NT_STORE=1` writes eligible 8-byte outputs with non-temporal
-(streaming) stores that bypass the cache hierarchy. For write-once
-outputs that are only dropped after collect (≥ ~1 M items / 8 MB+) this
-removes read-for-ownership traffic and L3 pollution — measured +15–18 %
-wall time on 1–4 M-item balanced-map batches, reversing the former
-rayon deficit there (data in the developer guide's benchmarks notes) —
-while outputs read right after collect trade a cache hit for a DRAM
-round-trip, hence the default-off. Below ~100 K items the output fits
-cache and the knob is a no-op (±2 %).
+The fused `.collect()` output-store policy defaults to **auto**:
+eligible 8-byte outputs of at least 8 MiB (1 M items) per whole batch are
+written with non-temporal (streaming) stores that bypass the cache
+hierarchy — at those sizes removing read-for-ownership traffic and L3
+pollution dominates everything else. Runtime-overridable tri-state via
+`YOUPIPE_NT_STORE`: unset = auto, `"0"` = force off, `"1"` = force on
+(any other value panics — an early A/B passed `=off` and silently
+enabled NT on both sides).
+
+Why auto is safe for consumers that read the output right after collect
+(the feared DRAM round-trip): measured on the reference machine
+(same-binary two-process A/B, rayon drift control) the knob wins *both*
+shapes — write-once outputs +12–18 % wall at 1–4 M items, and a fold
+over the output immediately after collect +12–15 % at 1–4 M
+(`cpu_balanced_readback`) — the parallel phase's RFO elimination
+outweighs the consumer's prefetched sequential re-read. Below the
+threshold gains shrink toward ±2 % (output fits cache), which is why
+auto starts at 8 MiB; known write-once workloads below it can force the
+knob on (100 K items measured +9–11 %). Data in the developer guide's
+benchmarks notes ("NT-store attribution").
 ## Worker budget across stages (streaming)
 
 `compute_workers` is a **budget**, not a thread count. The runner first

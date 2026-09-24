@@ -689,6 +689,40 @@ sides and measured +0 % everywhere; (2) two pairs of a prior run were
 polluted by background build load (rayon control drifted +4–14 %),
 which only per-pair pairing + the control column exposed — pooled
 medians alone would have read it as a win/loss.
+
+**Read-back follow-up (same day, same caliber): the feared consumer
+penalty did not materialize.** New horizontal shape
+`cpu_balanced_readback` — same `cpu_work(x, 100)` load, but after
+`collect()` the consumer folds the whole output `Vec` inside the timed
+region (write-then-immediately-read, the exact shape the default-off
+was guarding against). Same-binary two-process A/B, 5 alternating
+pairs × `--rounds 2`, `taskset 1-31`, per-pair pairing, rayon column as
+drift control; write-once `cpu_balanced` re-run in the same session
+(gain holds):
+
+| n | write-once off→on (ms) | delta | read-back off→on (ms) | delta | rayon control (w / r) |
+| --- | --- | --- | --- | --- | --- |
+| 100 K | 0.052 → 0.047 | +9.3 % | 0.081 → 0.072 | +11.5 % | +0.7 % / +0.5 % |
+| 1 M | 0.486 → 0.419 | +12.3 % | 0.656 → 0.580 | +11.6 % | ±0 % / −0.3 % |
+| 2 M | 0.962 → 0.830 | +13.6 % | 1.281 → 1.109 | +13.3 % | −0.3 % / −0.5 % |
+| 4 M | 1.947 → 1.612 | +17.8 % | 2.569 → 2.192 | +14.8 % | −0.1 % / +0.2 % |
+
+Raw JSON under `target/horizontal/nt_readback_ab/` (not committed).
+Mechanism: the consumer's re-read is a *sequential, prefetch-friendly*
+sweep, while the RFO elimination pays off during the 31-thread parallel
+phase — the asymmetry holds at every measured size ≥ 100 K.
+
+**Default-tier decision (todo P2 #8, closed)**: NT wins both consumer
+shapes, so the knob graduated from opt-in to an **auto tier**:
+`nt_store_enabled` resolves per *whole-batch* output size (a leaf only
+sees its chunk), ≥ 8 MiB → NT, threaded down as a leaf `bool`. Env
+became a tri-state — unset = auto, `"0"` = force off, `"1"` = force on,
+any other value panics (the `=off` trap above is now a loud failure).
+8 MiB rather than 800 KB: the sub-threshold gains (+9–11 % at 100 K)
+shrink toward the ±2 % noise floor where the balance gets
+machine-dependent; known write-once shapes below the threshold can
+force it on. The remaining occupancy deficit (~1–4 pt) stays tracked as
+todo P1 #4.
 ## Attributing the 2M/4M fused-collect gap (2026-09-25)
 
 Single-shape single-library runs of the horizontal binary itself

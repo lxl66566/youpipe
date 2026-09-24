@@ -73,15 +73,16 @@ collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s�
   切换 99 vs 13–19/迭代、迁移 7.6 vs 0.5/迭代：空闲工人泊车 + futex 唤醒 +
   落冷核；rayon 靠全程自旋保温（多烧 +11–16% cycles）。同 binary 旋钮因果
   验证：`YOUPIPE_SPIN_ROUNDS=YOUPIPE_YIELD_ROUNDS=2048` 各 shape 一致改善，
-  但只救回 1–4 pt（NT store 另行救回 ~13 pt 并反超，见 P2 #8）。
+  但只救回 1–4 pt（NT store 另行救回 ~13 pt 并反超，已落 auto 默认档，见
+  benchmarks.md "NT-store attribution"）。
 - **方向**（结构性手段；勿拉长全局自旋窗口——`ROUNDS_SPIN` 历史 +20–36% 回退）：
   1. 背靠背批次（bench 循环、流式多批次）下「下一批将至」提示 / 短窗口热身，
      让工人跨迭代保温（时间戳触发的 hot-epoch 窗口已证伪，见文末清单——
      时间窗无法区分批内 ramp-down idle 与批间 gap idle）；
   2. 尾部 straggler 细化：末段更细粒度 oversplit（动态，非 cost-EMA 路线，
      该路线已两次证伪）；
-  3. 1M 打平而 2M 落后的边界为何不随占用亏损移动，未解释；NT 默认档落定后
-     复查。
+  3. 1M 打平而 2M 落后的边界为何不随占用亏损移动，未解释；NT 已落 auto
+     （≥8 MiB 输出自动开，1M 起生效），可在新口径下复查。
 - **验证**：`cpu_balanced` 1M/2M/4M 隔离 A/B + `horizontal-counters`
   （youpipe-bench）复查 task-clock / ctx-switch / migration。
 
@@ -125,17 +126,6 @@ latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
 
 若做批量 payload 方案，注意与 crossfire per-thread waker（设计 C，
 `dev/crossfire-waker-designs.md` §11）叠加后每组的 channel hop 数减少，是顺带收益。
-
-### 8. NT store 默认档位（原「≥2M 带宽差距」项的收尾决策）
-
-- **现状**：`YOUPIPE_NT_STORE=1`（fused collect 叶子输出非临时 store）实测
-  cpu_balanced 100K/1M/2M/4M +10/+15/+15/+18%，默认 off——输出写后立读的
-  形状会把 cache hit 换成 DRAM round-trip。归因与数据：`dev/benchmarks.md`
-  "NT-store attribution"。
-- **方向**：决定默认档位——保持纯 opt-in、按输出字节数/缓存几何自动启用，
-  或作为 collect Options 暴露；需要「写后立读」形状的回归数据支撑。
-- **验证**：horizontal `cpu_balanced` 全档 + criterion fused 家族隔离交替
-  （100K 家族塌缩陷阱）。
 
 ---
 
