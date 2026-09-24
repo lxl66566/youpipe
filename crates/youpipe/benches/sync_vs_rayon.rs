@@ -1,6 +1,6 @@
 mod common;
 
-use std::hint::black_box;
+use std::{hint::black_box, num::NonZeroUsize};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rayon::prelude::*;
@@ -380,6 +380,132 @@ criterion_group! {
         bench_try_collect,
         bench_for_each_vs_rayon,
         bench_filter_chain,
-        bench_lightweight_owned_cold
+        bench_lightweight_owned_cold,
+        bench_nested_on_pool
+}
+
+/// Nested fused terminals inside pool workers — the on-pool hybrid dispatch
+/// path (`Stealing` latch: the calling worker drives the batch and waits by
+/// stealing). Two regimes:
+///
+/// - `nested_single`: one submitted job runs a nested `.collect()`; the
+///   other P-1 workers are idle/awake, so this isolates the batch ramp-up
+///   (how fast the pool distributes the injected chunks).
+/// - `nested_saturated`: P concurrent submitted jobs each run a nested
+///   `.collect()` — every worker is a hybrid driver waiting on its own
+///   latch while stealing; the throughput regime for the stealing wait.
+///
+/// The rayon rows run the same shape on a same-sized rayon pool
+/// (`ThreadPool::spawn` + nested `par_iter`), the direct analogue of an
+/// on-pool nested terminal.
+fn bench_nested_on_pool(c: &mut Criterion) {
+    let threads = std::thread::available_parallelism().map_or(32, NonZeroUsize::get);
+    let pool = youpipe::ComputePool::new(threads);
+    let rayon_pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+
+    let mut group = c.benchmark_group("sync_nested_on_pool");
+    for size in [1_000, 100_000] {
+        let data: std::sync::Arc<Vec<u64>> = std::sync::Arc::new((0..size).collect());
+
+        group.throughput(Throughput::Elements(size));
+
+        group.bench_with_input(
+            BenchmarkId::new("youpipe_nested_single", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let data = std::sync::Arc::clone(data);
+                    let p = pool.clone();
+                    pool.submit(move || {
+                        let r: Vec<u64> = youpipe::pipe_ref(data.as_slice())
+                            .map(|&x| black_box(cpu_work(x)))
+                            .with_compute_pool(p)
+                            .collect();
+                        tx.send(r).unwrap();
+                    });
+                    black_box(rx.recv().unwrap())
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("rayon_nested_single", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let data = std::sync::Arc::clone(data);
+                    rayon_pool.spawn(move || {
+                        let r: Vec<u64> = data
+                            .par_iter()
+                            .map(|&x| black_box(cpu_work(x)))
+                            .collect();
+                        tx.send(r).unwrap();
+                    });
+                    black_box(rx.recv().unwrap())
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("youpipe_nested_saturated", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let jobs: Vec<_> = (0..threads)
+                        .map(|_| {
+                            let tx = tx.clone();
+                            let data = std::sync::Arc::clone(data);
+                            let p = pool.clone();
+                            move || {
+                                let r: Vec<u64> = youpipe::pipe_ref(data.as_slice())
+                                    .map(|&x| black_box(cpu_work(x)))
+                                    .with_compute_pool(p)
+                                    .collect();
+                                tx.send(r).unwrap();
+                            }
+                        })
+                        .collect();
+                    pool.submit_batch(jobs);
+                    drop(tx);
+                    let mut last = Vec::new();
+                    for _ in 0..threads {
+                        last = rx.recv().unwrap();
+                    }
+                    black_box(last)
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("rayon_nested_saturated", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    for _ in 0..threads {
+                        let tx = tx.clone();
+                        let data = std::sync::Arc::clone(data);
+                        rayon_pool.spawn(move || {
+                            let r: Vec<u64> = data
+                                .par_iter()
+                                .map(|&x| black_box(cpu_work(x)))
+                                .collect();
+                            tx.send(r).unwrap();
+                        });
+                    }
+                    drop(tx);
+                    let mut last = Vec::new();
+                    for _ in 0..threads {
+                        last = rx.recv().unwrap();
+                    }
+                    black_box(last)
+                });
+            },
+        );
+    }
+    group.finish();
 }
 criterion_main!(benches);
