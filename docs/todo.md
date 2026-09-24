@@ -65,7 +65,7 @@ collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s�
 
 ---
 
-### 5. fused 批次间 worker 泊车/唤醒占用亏损（NT store 收窄后的残余项）
+### 4. fused 批次间 worker 泊车/唤醒占用亏损（NT store 收窄后的残余项）
 
 - **现状**（2026-09-25 归因，详见 `dev/benchmarks.md` "Attributing the
   2M/4M fused-collect gap"）：cpu_balanced 大批量上 youpipe 每迭代 cycles/
