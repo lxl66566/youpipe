@@ -276,40 +276,27 @@ where
     let input = Slots::from_vec(items);
     let output = Slots::<R>::uninit(n);
 
-    // Hybrid dispatch when called from outside the pool (the common
-    // `.collect()` case): inject `num_threads` broad top-level chunks into the
+    // Hybrid dispatch: inject `num_threads` broad top-level chunks into the
     // global injector so every worker grabs one immediately — no fork/join
     // ramp-up. Each chunk then recurses via the tree (distributed deques +
     // stealing). See the "flat dispatch" post-mortem below for why pure flat
     // was a wash; hybrid keeps its small/medium-N win (parallel ramp-up) while
     // avoiding its large-N regression (only `num_threads` items through the
-    // injector, not `N`).
-    //
-    // Fall back to the single-tree path when already on a worker of THIS pool:
-    // the hybrid path blocks the caller on a `CountLatch`/`LockLatch`, which
-    // would deadlock a same-pool worker (it must steal while waiting, not
-    // park). A worker of a *different* pool is fine — it can park without
-    // deadlocking this pool's workers.
-    let on_pool = pool.is_on_this_pool();
-    let result = if on_pool {
-        par_index_rec(pool, &input, &output, 0, n, op, plan.depth)
-            .err()
-            .map(ErasedFailure::Panic)
-    } else {
-        let strategy = CollectStrategy {
-            output: &output,
-            op,
-        };
-        hybrid_dispatch(
-            pool,
-            &input,
-            &ErasedStrategy::from(&strategy),
-            n,
-            plan,
-            num_threads,
-        )
-        .err()
+    // injector, not `N`). Works for on-pool callers too: the dispatcher picks
+    // a work-stealing `Stealing` latch for them (see `hybrid_dispatch`).
+    let strategy = CollectStrategy {
+        output: &output,
+        op,
     };
+    let result = hybrid_dispatch(
+        pool,
+        &input,
+        &ErasedStrategy::from(&strategy),
+        n,
+        plan,
+        num_threads,
+    )
+    .err();
     if let Some(f) = result {
         // Recursion already dropped every live slot; freeing buffers is safe.
         drop(input);
@@ -815,6 +802,17 @@ impl<IN: ?Sized + Sync> Job for ChunkJob<IN> {
 /// spinning) driver at the cost of parallelism when workers ARE available.
 const ASSIST_RESERVE_CHUNKS: usize = 1;
 
+/// Whether on-pool callers may take the hybrid dispatcher (large batches
+/// only — see the regime comment in `hybrid_dispatch`). Runtime-overridable
+/// (`YOUPIPE_ONPOOL_HYBRID=0` forces the pre-hybrid single tree for every
+/// on-pool caller) so A/B benchmarks compare the same binary: recompiles
+/// swing tight benchmarks by tens of percent through pure code-layout
+/// shifts (the established methodology — see `YOUPIPE_OVERSPLIT`).
+fn onpool_hybrid() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("YOUPIPE_ONPOOL_HYBRID").is_ok_and(|v| v != "0"))
+}
+
 /// Hybrid top-level dispatcher. Splits `[0, n)` into `num_chunks` contiguous
 /// ranges (`num_threads + plan.chunk_slack`, see [`UNBALANCED_CHUNK_SLACK`]).
 /// Chunk 0 is run **inline on the driver thread** (mirrors rayon's
@@ -823,6 +821,11 @@ const ASSIST_RESERVE_CHUNKS: usize = 1;
 /// `1..num_chunks - reserve` are injected as `ChunkJob`s and the driver blocks
 /// until all complete. The `reserve` tail chunks (small batches only) are
 /// never injected — the driver executes them from its wait loop instead.
+///
+/// On-pool callers (a worker of this pool) take the hybrid path only for
+/// large batches (`chunk_splits > 0`), waiting through a work-stealing
+/// `Stealing` latch; small batches shortcut to the single tree inside (see
+/// the body for the measured regime split).
 ///
 /// Returns `Err(first_failure)` if any chunk (driver or pool) failed (after
 /// the strategy has cleaned up the successful chunks' per-chunk resources so
@@ -845,6 +848,17 @@ fn hybrid_dispatch<IN>(
 where
     IN: ?Sized + Sync,
 {
+    // Caller context decides how the driver waits: a worker of THIS pool gets
+    // a `Stealing` `CountLatch` (waits via the work-stealing `wait_until`
+    // loop, parking through the sleep module's latch protocol — never a
+    // condvar it would have to service itself); an off-pool thread (or a
+    // worker of a different pool) gets the spin-then-condvar `Blocking`
+    // latch. This is what lets on-pool callers — `pool.submit` tasks, stream
+    // stage closures, nested `.run()` collectors — take the hybrid path
+    // instead of paying a log2(num_threads) fork/join ramp-up per nested
+    // terminal.
+    let owner = pool.on_this_pool_owner();
+
     // One chunk per worker → instant parallel ramp-up; `chunk_slack` adds
     // extra chunks that persist in the injector for late-arriving workers
     // (see `UNBALANCED_CHUNK_SLACK`). Round the split depth reduction so the
@@ -869,9 +883,10 @@ where
     let chunk = n / num_chunks;
     let rem = n % num_chunks;
 
-    // Driver participation (small batches, `chunk_splits == 0`): the off-pool
-    // calling thread runs chunk 0 inline while the pool handles the rest —
-    // mirroring rayon's off-pool path. Beyond chunk 0, `ASSIST_RESERVE_CHUNKS`
+    // Driver participation (small batches, `chunk_splits == 0`): the calling
+    // thread (off-pool external thread or on-pool worker alike) runs chunk 0
+    // inline while the pool handles the rest — mirroring rayon's off-pool
+    // path. Beyond chunk 0 (off-pool only), `ASSIST_RESERVE_CHUNKS`
     // tail chunks are withheld from the injector and executed by the driver
     // from its wait loop (`wait_spin_assist`): a parked worker takes ~µs-scale
     // to wake and the slowest-to-wake worker gates the batch tail, so letting
@@ -898,6 +913,36 @@ where
     // ~3 %.
     let driver_participates = chunk_splits == 0;
     let first_pool_chunk = usize::from(driver_participates);
+    // Small batches (`chunk_splits == 0`) on-pool keep the single tree.
+    // Measured 2026-07 on `sync_nested_on_pool` (32 cores):
+    //   * `nested_saturated/1K` +430 % under hybrid (recompile A/B): P
+    //     concurrent nested batches flood the global injector with ~P×P
+    //     tiny chunks, and every driver's stealing wait then pops through
+    //     that one contended MPMC — the same single-injector collapse that
+    //     sank flat dispatch at large N. The tree distributes via local
+    //     deques + peer stealing instead.
+    //   * `nested_single/1K` +3 % under hybrid (recompile A/B): with P−1
+    //     workers parked, the tree's incremental local-deque pushes (one
+    //     wake per join) edge out the inject_batch wake cascade.
+    // Large batches keep the hybrid path: same-binary knob A/B
+    // (`YOUPIPE_ONPOOL_HYBRID`, 5 interleaved rounds) shows
+    // `nested_single/100K` −3.5 % (25/25 dominant) — ramp-up dominates and
+    // the injector round trips amortize; `nested_saturated/100K` is a
+    // +2 %-lean wash (every worker nesting large batches is exotic, and
+    // even there hybrid is within spread of the tree).
+    //
+    // SAFETY: single-tree execution of `[0, n)` with the full split budget
+    // — the same call the pre-hybrid on-pool path made directly. Panics
+    // unwind out of `run_chunk` (leaf guards clean partial state) exactly
+    // as they did through the `par_*_rec` calls; op failures return through
+    // the erased boundary, which the call sites already downcast (the
+    // `Op(Box<TryFailure<E>>)` shape is the try strategies' own).
+    if owner.is_some() && (driver_participates || !onpool_hybrid()) {
+        return unsafe { (strategy.run_chunk)(strategy.ctx, pool, input, 0, n, plan.depth) };
+    }
+    // From here on every on-pool caller is in the large-batch regime with the
+    // knob enabled (`!driver_participates`), so `reserve` is 0 for them via
+    // the else branch — and the `Stealing` wait never needs the assist hook.
     let reserve = if driver_participates {
         ASSIST_RESERVE_CHUNKS.min(num_chunks - first_pool_chunk - 1)
     } else {
@@ -906,9 +951,10 @@ where
     let pool_chunks = num_chunks - first_pool_chunk;
     debug_assert!(pool_chunks >= 1, "prefers_serial guarantees num_chunks ≥ 2");
     let fail_slot: Mutex<Option<ErasedFailure>> = Mutex::new(None);
-    // The latch waits for every non-inline chunk, including the driver's
-    // reserve: the driver's own execution decrements it like a worker's would.
-    let latch = CountLatch::with_count(pool_chunks, None);
+    // The latch waits for every non-inline chunk, including the off-pool
+    // driver's reserve chunks (their execution decrements it like a worker's
+    // would).
+    let latch = CountLatch::with_count(pool_chunks, owner);
 
     // Build pool chunk jobs (chunks `first_pool_chunk..num_chunks`). All
     // ChunkJobs share ONE heap allocation (`Box<[ChunkJob]>`, frozen via
@@ -977,13 +1023,8 @@ where
         }
     }
 
-    // Block the external thread until every pool chunk has signalled.
-    // `CountLatch` with no owner uses a `LockLatch` (parking-lot condvar) —
-    // correct for an off-pool caller (a pool worker must NOT take this path;
-    // see the guard in `par_index_collect` / `par_for_each` /
-    // `par_index_try_collect`).
-    //
-    // `wait_spin` instead of `wait`: spin-then-park. The condvar park/notify
+    // Wait until every pool chunk has signalled. Off-pool (`Blocking`
+    // latch): `wait_spin` — spin-then-park, because the condvar park/notify
     // handshake is ~10–20 µs of fixed overhead per batch (two syscalls + a
     // wake cascade); for small/medium batches whose own parallel work is only
     // tens of µs that handshake dominated the wall time. Spinning on the
@@ -992,14 +1033,20 @@ where
     // fall through to the condvar. See `CountLatch::wait_spin` for the
     // synchronization argument.
     //
-    // Work-assist (driver-participates regime only): while waiting, the
-    // driver runs the batch's withheld reserve chunks (see the reserve block
-    // above for why they never touch the injector). `counter == 0` still
-    // implies every *injected* `JobRef` was fully consumed (the completion
-    // `set` lives inside `execute`), which is load-bearing for the teardown
-    // below: once `wait` returns and this frame (owning the `Box<[ChunkJob]>`)
-    // goes away, no worker can touch a freed chunk.
-    if driver_participates {
+    // Work-assist (off-pool, driver-participates regime, `reserve > 0`):
+    // while waiting, the driver runs the batch's withheld reserve chunks
+    // (see the reserve block above for why they never touch the injector).
+    // `counter == 0` still implies every *injected* `JobRef` was fully
+    // consumed (the completion `set` lives inside `execute`), which is
+    // load-bearing for the teardown below: once `wait` returns and this
+    // frame (owning the `Box<[ChunkJob]>`) goes away, no worker can touch a
+    // freed chunk.
+    //
+    // On-pool (`Stealing` latch): `wait_spin` routes to the work-stealing
+    // `wait_until` loop — the driver keeps executing (its own injected
+    // chunks, foreign jobs, steals) instead of burning a core, and parks
+    // only through the sleep module's latch protocol.
+    if reserve > 0 {
         let mut reserve_next = injected_len;
         let assist = || {
             if reserve_next >= jobs.len() {
@@ -1190,36 +1237,24 @@ where
     let num_threads = pool.num_workers();
     let input = Slots::from_vec(items);
 
-    // Hybrid dispatch from outside the pool (the common `.for_each()` case):
-    // inject `num_threads` broad top-level chunks so every worker is busy at
-    // t≈0 with no fork/join ramp-up — the same structural win `par_index_collect`
-    // gets via `CollectStrategy`. See the "flat dispatch" post-mortem below for
-    // why pure flat was a wash; hybrid keeps the small/medium-N ramp-up win
-    // while each chunk recurses via the tree (distributed deques + stealing),
-    // avoiding the single-injector MPMC contention that sank pure flat at large
-    // N.
-    //
-    // Fall back to the single-tree path when already on a worker of THIS pool:
-    // the hybrid path blocks the caller on a `CountLatch`/`LockLatch`, which
-    // would deadlock a same-pool worker (it must steal while waiting, not
-    // park). A worker of a *different* pool is fine.
-    let on_pool = pool.is_on_this_pool();
-    let result = if on_pool {
-        par_for_each_rec(pool, &input, 0, n, op, plan.depth)
-            .err()
-            .map(ErasedFailure::Panic)
-    } else {
-        let strategy = SinkStrategy { op };
-        hybrid_dispatch(
-            pool,
-            &input,
-            &ErasedStrategy::from(&strategy),
-            n,
-            plan,
-            num_threads,
-        )
-        .err()
-    };
+    // Hybrid dispatch: inject `num_threads` broad top-level chunks so every
+    // worker is busy at t≈0 with no fork/join ramp-up — the same structural
+    // win `par_index_collect` gets via `CollectStrategy`. See the "flat
+    // dispatch" post-mortem below for why pure flat was a wash; hybrid keeps
+    // the small/medium-N ramp-up win while each chunk recurses via the tree
+    // (distributed deques + stealing), avoiding the single-injector MPMC
+    // contention that sank pure flat at large N. On-pool callers get the
+    // work-stealing `Stealing` latch (see `hybrid_dispatch`).
+    let strategy = SinkStrategy { op };
+    let result = hybrid_dispatch(
+        pool,
+        &input,
+        &ErasedStrategy::from(&strategy),
+        n,
+        plan,
+        num_threads,
+    )
+    .err();
     match result {
         Some(f) => {
             // Recursion already dropped every live (unread) input slot.
@@ -1393,11 +1428,10 @@ where
 /// slots; on panic, the panic propagates (and the output buffer's init slots
 /// may leak, same as `par_index_collect`).
 ///
-/// Off-pool callers take the hybrid flat/tree dispatch path (shared with
-/// `collect` / `for_each` via [`TryStrategy`]): `num_threads` broad chunks
-/// injected in one `inject_batch`, every worker busy at t≈0 — no fork/join
-/// ramp-up. A same-pool caller falls back to the single tree (the hybrid
-/// `CountLatch` park would deadlock a worker of this pool).
+/// Hybrid flat/tree dispatch (shared with `collect` / `for_each` via
+/// [`TryStrategy`]): `num_threads` broad chunks injected in one
+/// `inject_batch`, every worker busy at t≈0 — no fork/join ramp-up. On-pool
+/// callers get the work-stealing `Stealing` latch (see `hybrid_dispatch`).
 fn par_index_try_collect<T, R, E, OP>(
     items: Vec<T>,
     op: &OP,
@@ -1416,35 +1450,28 @@ where
     let input = Slots::from_vec(items);
     let output = Slots::<R>::uninit(n);
 
-    let on_pool = pool.is_on_this_pool();
-    let result = if on_pool {
-        par_index_try_rec(pool, &input, &output, 0, n, op, plan.depth)
-            .map_err(|e| TryFailure::Error(e))
-            .err()
-    } else {
-        let strategy = TryStrategy {
-            output: &output,
-            op,
-            _marker: PhantomData,
-        };
-        // Downcast the erased op failure back to `TryFailure<E>`.
-        hybrid_dispatch(
-            pool,
-            &input,
-            &ErasedStrategy::from(&strategy),
-            n,
-            plan,
-            num_threads,
-        )
-        .err()
-        .map(|f| match f {
-            ErasedFailure::Op(b) => match b.downcast::<TryFailure<E>>() {
-                Ok(tf) => *tf,
-                Err(_) => unreachable!("try strategy only records TryFailure<E>"),
-            },
-            ErasedFailure::Panic(p) => TryFailure::Panic(p),
-        })
+    let strategy = TryStrategy {
+        output: &output,
+        op,
+        _marker: PhantomData,
     };
+    // Downcast the erased op failure back to `TryFailure<E>`.
+    let result = hybrid_dispatch(
+        pool,
+        &input,
+        &ErasedStrategy::from(&strategy),
+        n,
+        plan,
+        num_threads,
+    )
+    .err()
+    .map(|f| match f {
+        ErasedFailure::Op(b) => match b.downcast::<TryFailure<E>>() {
+            Ok(tf) => *tf,
+            Err(_) => unreachable!("try strategy only records TryFailure<E>"),
+        },
+        ErasedFailure::Panic(p) => TryFailure::Panic(p),
+    });
     match result {
         None => {
             drop(input);
@@ -2847,30 +2874,22 @@ where
     let num_threads = pool.num_workers();
     let output = Slots::<R>::uninit(n);
 
-    // Same hybrid dispatch as the owned path — see `par_index_collect`. A
-    // same-pool worker still falls back to the single tree (the hybrid
-    // `CountLatch` park would deadlock it).
-    let on_pool = pool.is_on_this_pool();
-    let result = if on_pool {
-        par_index_rec_by_ref(pool, input, &output, 0, n, op, plan.depth)
-            .err()
-            .map(ErasedFailure::Panic)
-    } else {
-        let strategy = CollectByRefStrategy {
-            output: &output,
-            op,
-        };
-        // The dispatcher's input handle is the slice reference itself.
-        hybrid_dispatch(
-            pool,
-            &input,
-            &ErasedStrategy::from(&strategy),
-            n,
-            plan,
-            num_threads,
-        )
-        .err()
+    // Same hybrid dispatch as the owned path — see `par_index_collect`
+    // (on-pool callers included, via the `Stealing` latch).
+    let strategy = CollectByRefStrategy {
+        output: &output,
+        op,
     };
+    // The dispatcher's input handle is the slice reference itself.
+    let result = hybrid_dispatch(
+        pool,
+        &input,
+        &ErasedStrategy::from(&strategy),
+        n,
+        plan,
+        num_threads,
+    )
+    .err();
     if let Some(f) = result {
         // Recursion already dropped every live output slot; freeing the
         // buffer is safe. The borrowed input needs nothing.
@@ -2986,23 +3005,18 @@ where
     debug_assert!(n > 0);
     let num_threads = pool.num_workers();
 
-    let on_pool = pool.is_on_this_pool();
-    let result = if on_pool {
-        par_for_each_rec_by_ref(pool, input, 0, n, op, plan.depth)
-            .err()
-            .map(ErasedFailure::Panic)
-    } else {
-        let strategy = SinkByRefStrategy { op };
-        hybrid_dispatch(
-            pool,
-            &input,
-            &ErasedStrategy::from(&strategy),
-            n,
-            plan,
-            num_threads,
-        )
-        .err()
-    };
+    // Same hybrid dispatch as the owned path — see `par_for_each` (on-pool
+    // callers included, via the `Stealing` latch).
+    let strategy = SinkByRefStrategy { op };
+    let result = hybrid_dispatch(
+        pool,
+        &input,
+        &ErasedStrategy::from(&strategy),
+        n,
+        plan,
+        num_threads,
+    )
+    .err();
     if let Some(f) = result {
         resume_panic(f);
     }
@@ -3203,34 +3217,29 @@ where
     let num_threads = pool.num_workers();
     let output = Slots::<R>::uninit(n);
 
-    let on_pool = pool.is_on_this_pool();
-    let result = if on_pool {
-        par_index_try_rec_by_ref(pool, input, &output, 0, n, op, plan.depth)
-            .map_err(TryFailure::Error)
-            .err()
-    } else {
-        let strategy = TryByRefStrategy {
-            output: &output,
-            op,
-            _marker: PhantomData,
-        };
-        hybrid_dispatch(
-            pool,
-            &input,
-            &ErasedStrategy::from(&strategy),
-            n,
-            plan,
-            num_threads,
-        )
-        .err()
-        .map(|f| match f {
-            ErasedFailure::Op(b) => match b.downcast::<TryFailure<F>>() {
-                Ok(tf) => *tf,
-                Err(_) => unreachable!("try strategy only records TryFailure<F>"),
-            },
-            ErasedFailure::Panic(p) => TryFailure::Panic(p),
-        })
+    // Same hybrid dispatch as the owned path — see `par_index_try_collect`
+    // (on-pool callers included, via the `Stealing` latch).
+    let strategy = TryByRefStrategy {
+        output: &output,
+        op,
+        _marker: PhantomData,
     };
+    let result = hybrid_dispatch(
+        pool,
+        &input,
+        &ErasedStrategy::from(&strategy),
+        n,
+        plan,
+        num_threads,
+    )
+    .err()
+    .map(|f| match f {
+        ErasedFailure::Op(b) => match b.downcast::<TryFailure<F>>() {
+            Ok(tf) => *tf,
+            Err(_) => unreachable!("try strategy only records TryFailure<F>"),
+        },
+        ErasedFailure::Panic(p) => TryFailure::Panic(p),
+    });
     match result {
         None => Ok(output.into_vec()),
         Some(TryFailure::Error(e)) => {

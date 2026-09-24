@@ -81,6 +81,32 @@ profile config except where noted in their `Cargo.toml` headers.
 2. `Sleep::new_injected_jobs` bumps the packed atomic counters and wakes parked workers via `wake_any_threads`
 3. Worker wakes → `find_work()` searches by priority
 
+### On-pool callers of the fused terminals (`Stealing` latch)
+
+A fused terminal (`.collect()` / `.for_each()` / `.try_collect()`) reached
+from a worker of the driving pool — a `pool.submit` task, a stream stage
+closure, a nested `scope`/`.run()` — dispatches through the same hybrid
+dispatcher as an off-pool caller. The only difference is how the driver
+waits: `ComputePool::on_this_pool_owner()` yields the current worker's
+`(registry, index)` to `CountLatch::with_count`, selecting the `Stealing`
+variant, whose wait is `WorkerThread::wait_until` — the same work-stealing
+loop (and sleep-module latch park, woken by `CoreLatch::set` →
+`notify_worker_latch_is_set`) that `join`'s `SpinLatch` uses. An off-pool
+caller instead gets the `Blocking` variant (spin-then-condvar).
+
+Historically on-pool callers fell back to the single `par_index_rec` tree
+because the `LockLatch` condvar would deadlock a same-pool worker; the
+cost was a log2(num_threads) fork/join ramp-up per nested terminal. The
+`Stealing` routing removes that for large batches (`chunk_splits > 0`):
+same-binary knob A/B (`YOUPIPE_ONPOOL_HYBRID`, 5 interleaved rounds) shows
+`nested_single/100K` −3.5 % (25/25 dominant). Small batches keep the
+tree — see the regime comment in `hybrid_dispatch` for the measured split
+(P concurrent nested small batches under hybrid collapse the single
+injector, +430 %). Two behavioural notes: the off-pool driver's assist
+reserve is 0 on-pool (`wait_spin_assist`'s `Stealing` arm cannot run the
+reserve-chunk hook, so a withheld chunk would have no executor), and
+`YOUPIPE_ONPOOL_HYBRID=0` restores the always-tree behaviour for
+same-binary A/B.
 ### Work Search Strategy
 
 `find_work()` tries sources in priority order:

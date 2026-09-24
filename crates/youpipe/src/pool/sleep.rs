@@ -582,7 +582,7 @@ mod tests {
 
 #[cfg(all(test, loom))]
 mod loom_tests {
-    use std::sync::Arc;
+    use std::{ptr, sync::Arc};
 
     use youpipe_sys::AtomicUsize;
 
@@ -663,6 +663,50 @@ mod loom_tests {
             let counters = sleep.counters.load(Ordering::SeqCst);
             assert_eq!(counters.sleeping_threads(), 0, "sleeping count leaked");
             assert!(!latch.probe());
+        });
+    }
+
+    /// The `Stealing` `CountLatch` wake path (activated by the on-pool hybrid
+    /// dispatcher): the last setter runs `CoreLatch::set(latch)` and, when
+    /// that reports the waiter was SLEEPING, `notify_worker_latch_is_set`
+    /// (`wake_specific_thread`). Modelled at protocol level — the `Registry`
+    /// itself spawns real threads and cannot exist under loom.
+    ///
+    /// Invariants checked by model exhaustion:
+    ///   * liveness — the parked waiter always returns (no lost wake: the
+    ///     sleeping bit is pre-published under the `is_blocked` mutex, and
+    ///     `CoreLatch::set`'s state swap to SET happens before the
+    ///     condvar notify decision);
+    ///   * the latch reads SET and the sleeping state is fully reclaimed on
+    ///     every interleaving.
+    #[test]
+    fn sleeper_is_woken_by_latch_set() {
+        loom::model(|| {
+            let sleep = Arc::new(Sleep::new(2));
+            let latch = Arc::new(CoreLatch::new());
+
+            let s2 = Arc::clone(&sleep);
+            let l2 = Arc::clone(&latch);
+            let waiter = loom::thread::spawn(move || {
+                // Mirror `wait_until_cold`'s park shape.
+                let mut idle = s2.start_looking(0);
+                idle.rounds = idle.tuning.sleepy_round() + 1;
+                idle.jobs_counter = s2.announce_sleepy();
+                s2.sleep(&mut idle, &l2, || false);
+                s2.work_found();
+            });
+
+            // Mirror `CountLatch::set`'s `Stealing` arm: set, then wake the
+            // owning worker iff it had reached SLEEPING.
+            let was_sleeping = unsafe { CoreLatch::set(ptr::from_ref(&*latch)) };
+            if was_sleeping {
+                sleep.notify_worker_latch_is_set(0);
+            }
+
+            waiter.join().unwrap();
+            assert!(latch.probe(), "latch must end SET");
+            let counters = sleep.counters.load(Ordering::SeqCst);
+            assert_eq!(counters.sleeping_threads(), 0, "sleeping count leaked");
         });
     }
 

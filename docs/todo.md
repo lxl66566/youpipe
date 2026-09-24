@@ -60,19 +60,34 @@
 
 ## P1
 
-### 3. on-pool 调用者的 hybrid dispatch（消除嵌套 fused 的 ramp-up）
+### 3. on-pool 调用者的 hybrid dispatch（✅ 已落地，2026-07，带 regime 门控）
 
-- **现状**：`par_index_collect` 等在 `is_on_this_pool()` 为真时退回单树
-  （`fused.rs` 各 on_pool 分支），理由是 hybrid 的 `CountLatch` park 会死锁
-  同池 worker——但 `CountLatch::with_count` 本就有 **Stealing** 变体
-  （等待期间偷任务，`Registry::wait_until_worker`），`hybrid_dispatch` 目前
-  只构造 Blocking（传 `None`）。
-- **场景**：池 worker 闭包内嵌套 fused 终端（`pool.submit` 任务、stream
-  stage 闭包内调 `pipe().collect()`）——单树要付 log2(P) 级 fork/join ramp-up。
-- **注意**：Stealing 分支的 `wait_spin_assist` 会忽略 assist hook（reserve
-  chunk 兜底失效）——可接受（on-pool 本就不缺算力）或另行改造；需补 loom
-  覆盖与 same-pool 回归测试。
-- **验证**：新增嵌套 bench（worker 内 collect）+ 全量 fused 家族确认无回归。
+- **结果**：`hybrid_dispatch` 用 `ComputePool::on_this_pool_owner()` 取当前
+  worker 的 `(registry, index)` 传入 `CountLatch::with_count` 构造 **Stealing**
+  变体——driver 等待走 `wait_until` 工作窃取循环（park 经 sleep 模块的
+  latch 协议：`CoreLatch::set` → `notify_worker_latch_is_set`，与
+  `join`/`SpinLatch` 同协议），取代原先「on-pool 一律退单树」的路径；6 个
+  终端入口（owned/by_ref × collect/for_each/try_collect）统一进 dispatcher，
+  单树回退收敛为 dispatcher 内部一处。
+- **regime 门控（实测推翻了无条件切换）**：仅大批量（`chunk_splits > 0`）
+  走 hybrid；小批量保留单树。同 binary 旋钮 A/B（`YOUPIPE_ONPOOL_HYBRID`，
+  5 轮交错，32 核）：`nested_single/100K` **−3.5 %（25/25 dominant）**、
+  `nested_saturated/100K` +2.0 %（spread 内）。无门控时小批量崩盘：
+  `nested_saturated/1K` **+430 %**（P 个并发嵌套批次把 ~P² 个小 chunk 灌进
+  全局 injector，每个 driver 的窃取等待都在同一个 MPMC 上弹跳出队——正是
+  大 N flat 派发的单注入器崩盘复刻）、`nested_single/1K` +3 %。
+- **方法论教训（已记 benchmarks.md）**：本改动的首轮 recompile A/B 第二个
+  session 在**未改动的 rayon 锚点上 +31 %**、目标 id 反转 +18 %——纯代码
+  布局噪声。调度器类改动的结论必须走 `-E` 同 binary 环境变量 A/B
+  （bench_ab.sh 新增该选项）。另修了 bench_ab per-id 默认 filter 的引号
+  bug（`'.*'` 字面量匹配不到任何 id，整场 A/B 静默空跑）。
+- **验证**：新增 `tests/on_pool_nested.rs`（6 测试：嵌套 collect/for_each/
+  try_collect 错误路径/panic 传播/全池并发嵌套/stream stage 闭包内 pipe，
+  双旋钮取值均过）+ loom 模型 `sleeper_is_woken_by_latch_set`（Stealing set
+  臂 vs park 的丢失唤醒协议）+ miri（on_pool_nested/compute_pool）+ 全量
+  fused 家族 per-id A/B 无回归（sequential 锚点 ±6–13 % 对向漂移=布局彩票）。
+  bench：`sync_nested_on_pool` 家族（nested_single/nested_saturated ×
+  youpipe/rayon × 1K/100K）。
 
 ### 4. zstd_shape 残余差距与 slack 档位边界
 

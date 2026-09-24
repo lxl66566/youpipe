@@ -118,19 +118,32 @@ impl ComputePool {
 
     /// Returns `true` if the current thread is a worker on *this* pool.
     ///
-    /// Used by the fused path to decide between the hybrid dispatcher (safe
-    /// only off-pool — its `CountLatch` park would deadlock a same-pool
-    /// worker) and the single-tree recursion. When a user supplies a custom
-    /// `ComputePool` via `with_compute_pool`, a worker of the *global* pool is
-    /// "off-pool" relative to the custom one and may safely take the hybrid
-    /// path; only a worker of the *same* pool must fall back.
+    /// When a user supplies a custom `ComputePool` via `with_compute_pool`, a
+    /// worker of the *global* pool is "off-pool" relative to the custom one
+    /// and may safely take the blocking wait; only a worker of the *same*
+    /// pool must wait by stealing (see [`Self::on_this_pool_owner`]).
     pub(crate) fn is_on_this_pool(&self) -> bool {
+        self.on_this_pool_owner().is_some()
+    }
+
+    /// The current thread's `(registry, index)` if it is a worker of *this*
+    /// pool — the owner context for a work-stealing (`Stealing`) `CountLatch`.
+    ///
+    /// The fused hybrid dispatcher hands this to `CountLatch::with_count` so an
+    /// on-pool caller waits through the work-stealing `wait_until` loop
+    /// (parking, if at all, via the sleep module's latch protocol:
+    /// `CoreLatch::set` → `notify_worker_latch_is_set`) instead of a condvar
+    /// the caller's own pool would have to service. This is the same protocol
+    /// `join`/`SpinLatch` uses, so an on-pool nested terminal can never
+    /// deadlock its pool.
+    pub(crate) fn on_this_pool_owner(&self) -> Option<(&Arc<Registry>, usize)> {
         let wt = pool::registry::WorkerThread::current();
         if wt.is_null() {
-            return false;
+            return None;
         }
         // SAFETY: `wt` is non-null — set by a pool worker's `main_loop`.
-        unsafe { (*wt).registry_id() == self.registry.id() }
+        let wt = unsafe { &*wt };
+        (wt.registry_id() == self.registry.id()).then(|| (wt.registry(), wt.index()))
     }
 }
 

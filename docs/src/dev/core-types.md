@@ -206,10 +206,19 @@ impl<S, I, O> Pipe<S, I, O> {
   `RangeOp` (`FusedOp(stages)`) through `apply_pure` — branch-free and
   vectorizable. Workload selects the oversplit factor per
 [`Workload`](#workload--per-item-cost-distribution-hint). The hybrid
-  path is skipped when `.collect()` is reached from inside a worker of the
-  *same* pool (e.g. nested `scope`), where the `CountLatch` park would
-  deadlock — the single-tree `par_index_rec` runs instead. A worker of a
-  *different* pool can safely take the hybrid path.
+[`Workload`](#workload--per-item-cost-distribution-hint). On-pool callers
+  (a worker of the *same* pool — `pool.submit` tasks, stream stage closures,
+  nested `scope`/`run()`) take the same hybrid path for large batches
+  (`chunk_splits > 0`): the dispatcher hands
+  `ComputePool::on_this_pool_owner` to `CountLatch::with_count`, whose
+  `Stealing` variant waits through the work-stealing `wait_until` loop
+  (parking, if at all, via the sleep module's latch protocol) instead of a
+  condvar the caller's own pool would have to service. Small batches keep
+  the single-tree shortcut inside the dispatcher — P concurrent nested
+  small batches would otherwise flood the global injector (+430 % measured;
+  see the regime comment in `hybrid_dispatch`), while a single nested large
+  batch wins −3.5 % (same-binary knob A/B). `YOUPIPE_ONPOOL_HYBRID=0`
+  restores the always-tree behaviour.
   The dispatcher is generic only over the item type: the per-terminal
   strategy (`CollectStrategy` / `SinkStrategy` / `TryStrategy`) crosses a
   type-erased `ErasedStrategy` boundary (three fn pointers + a context
@@ -266,9 +275,8 @@ buffer + `n` writes for data nobody reads.
 `HybridStrategy` trait — chunk-layout / inject / `CountLatch::wait_spin` /
 panic-funnel code is written once and shared with `try_collect`'s
 `TryStrategy` too (no vtable cost — see the `ErasedStrategy` note under
-`collect`). When reached from a worker of the *same* pool (nested `scope`),
-the hybrid `CountLatch` park would deadlock, so it falls back to the
-single-tree `par_for_each_rec`.
+`collect`). On-pool callers take the same path via the `Stealing` latch (see
+`collect` above).
 
 Panic safety is the input-tail mirror of `LeafGuard`: each leaf's
 `ForEachGuard` drops `input[pos+1..]` on unwind (item `pos` was consumed by

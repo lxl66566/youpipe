@@ -529,10 +529,12 @@ impl CountLatch {
     pub(crate) fn wait_spin_assist(&self, mut try_work: impl FnMut() -> bool) {
         match &self.kind {
             CountLatchKind::Stealing { .. } => {
-                // On-pool callers never reach the hybrid dispatcher's assist
-                // path (the dispatch entry points route on-pool callers to
-                // `join` instead); keep the work-stealing wait as a safe
-                // fallback.
+                // Unreachable from the hybrid dispatcher (on-pool small
+                // batches take the single-tree shortcut before the latch
+                // is even built; large batches reserve 0): the
+                // work-stealing wait cannot run the assist hook (the
+                // reserve chunks would have no executor). Kept as a safe
+                // fallback for other callers.
                 self.wait_spin();
             },
             CountLatchKind::Blocking { latch } => {

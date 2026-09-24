@@ -55,6 +55,10 @@
 #   perf/bench-suite/bench_ab.sh -a base -b wt -r 5 --per-id \
 #       'stream_pipeline/single_stage_ordered' 'with_fence'
 #
+#
+#   # same-binary runtime-knob A/B (per-side env, -E LABEL=VAR=VAL):
+#   perf/bench-suite/bench_ab.sh -a off=wt -b on=wt \
+#       -E off=YOUPIPE_ONPOOL_HYBRID=0 -E on=YOUPIPE_ONPOOL_HYBRID=1 \
 #   # add two more rounds to an existing run (same outdir continues)
 #   perf/bench-suite/bench_ab.sh -o target/bench-ab/run-XXX -a ... -b ... -r 2
 set -euo pipefail
@@ -65,7 +69,7 @@ cd "$REPO_ROOT"
 ROUNDS=3
 TASKSET_CPUS=""
 OUTDIR=""
-declare -a BENCH_TARGETS=() FILTERS=() SIDE_REVS=()
+declare -a BENCH_TARGETS=() FILTERS=() SIDE_REVS=() SIDE_ENVS=()
 PER_ID=0
 SAMPLES=20
 WARMUP_MS=1000
@@ -81,6 +85,7 @@ while [[ $# -gt 0 ]]; do
         -t|--taskset) TASKSET_CPUS="$2"; shift 2 ;;
         -o|--outdir) OUTDIR="$2"; shift 2 ;;
         -B|--bench) BENCH_TARGETS+=("$2"); shift 2 ;;
+        -E|--env) SIDE_ENVS+=("$2"); shift 2 ;;
         -1|--per-id) PER_ID=1; shift ;;
         -s|--samples) SAMPLES="$2"; shift 2 ;;
         -w|--warmup-ms) WARMUP_MS="$2"; shift 2 ;;
@@ -237,8 +242,20 @@ run_one() { # label bin round filter
     measure=$(awk "BEGIN{printf \"%.4g\", $MEASURE_MS/1000}")
     local log="$OUTDIR/logs/r$round-$label-$(basename "$bin" | sed 's/-[0-9a-f]*$//').log"
     echo "    [$label] r$round $filter"
+    # Per-side env overrides (-E LABEL=VAR=VAL, repeatable): the canonical
+    # way to A/B a runtime knob in the SAME binary — recompiles swing tight
+    # benchmarks by tens of percent through pure code-layout shifts. Pair
+    # with two labels over the same rev, e.g.
+    #   -a off=wt -b on=wt -E off=YOUPIPE_X=0 -E on=YOUPIPE_X=1
+    local -a envs=()
+    local spec
+    for spec in "${SIDE_ENVS[@]}"; do
+        if [[ "${spec%%=*}" == "$label" ]]; then
+            envs+=("${spec#*=}")
+        fi
+    done
     CRITERION_HOME="$home" \
-        taskset -c "$TASKSET_CPUS" \
+        env "${envs[@]}" taskset -c "$TASKSET_CPUS" \
         "$bin" --bench \
                --sample-size "$SAMPLES" \
                --warm-up-time "$warmup" \

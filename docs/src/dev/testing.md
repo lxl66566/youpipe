@@ -82,7 +82,10 @@ What the models cover:
   (mask pre-publish under the `is_blocked` mutex, counters CAS, final
   queue check, condvar park) vs `new_injected_jobs` (fence, JEC increment,
   wake scan). The models verify exhaustively that no interleaving loses a
-  wake, and that `sleeping_threads` returns to 0 on every path.
+  wake, and that `sleeping_threads` returns to 0 on every path. A fourth
+  model races the same park against the `Stealing` `CountLatch`'s set arm
+  (`CoreLatch::set` → conditional `notify_worker_latch_is_set`) — the wake
+  path the on-pool hybrid dispatcher depends on.
 
 Developing these tests surfaced one latent landmine, now guarded: the
 wake heuristic's `awake_but_idle_threads()` computes

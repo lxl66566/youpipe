@@ -64,6 +64,11 @@ perf/bench-suite/bench_ab.sh -a base=9b31fb0 -b new=HEAD
 perf/bench-suite/bench_ab.sh -a base -b wt -r 5 --per-id \
     'stream_pipeline/single_stage_ordered' 'with_fence'
 
+
+# same-binary runtime-knob A/B (scheduler-class changes: recompiles swing
+# tight benchmarks ±30 % through pure code layout)
+perf/bench-suite/bench_ab.sh -a off=wt -b on=wt \
+    -E off=YOUPIPE_ONPOOL_HYBRID=0 -E on=YOUPIPE_ONPOOL_HYBRID=1 \
 # three-way: rounds interleave A,B,C (label=rev syntax)
 perf/bench-suite/bench_ab.sh -a old=HEAD~2 -b mid=HEAD~1 -c wt
 
@@ -249,6 +254,36 @@ participating" gap was, in hindsight, mostly the uncached
 `join`-unfold pattern) **regressed** — the work-stealing ramp-up cost exceeded
 the per-chunk savings, so the hybrid chunk strategy was kept.
 
+
+### On-pool nested terminals (`sync_nested_on_pool`, cpu_heavy per item)
+
+Fused terminals reached from *inside* a worker of the driving pool —
+`pool.submit` tasks or stream stage closures calling `.collect()` —
+benchmarked as one submitted job (`nested_single`: isolates batch ramp-up
+with P−1 workers free) and as P concurrent submitted jobs
+(`nested_saturated`: every worker is a driver waiting on its own latch
+while stealing), against same-shaped `ThreadPool::spawn` + nested
+`par_iter` on a same-sized rayon pool.
+
+The on-pool hybrid dispatch (`Stealing` latch) is gated by batch regime —
+same-binary knob A/B (`YOUPIPE_ONPOOL_HYBRID`, 5 interleaved rounds, 32
+cores):
+
+- `nested_single/100K` **−3.5 %** (25/25 dominant) — the ramp-up win the
+  change targets;
+- `nested_saturated/100K` +2.0 % lean (within spread, 0/25) — every worker
+  nesting large batches is exotic;
+- 1K sizes are pure noise *with the gate*; ungated hybrid there measured
+  **+430 %** (`nested_saturated/1K`, P×P tiny chunks collapsing the single
+  injector) and +3 % (`nested_single/1K`) — the recompile-based A/B that
+  motivated the gate.
+
+Methodology note: the first recompile A/B of this change produced a
+contradictory second session (+18 % on `nested_single/100K` **and +31 % on
+the untouched rayon anchor**) — pure code-layout noise on a recompiled
+binary, exactly the trap that motivates the knob methodology. Scheduler-
+class changes get verified with `-E` same-binary env A/Bs (`bench_ab.sh -a
+off=wt -b on=wt -E off=YOUPIPE_X=0 -E on=YOUPIPE_X=1`), not recompiles.
 ### Mixed Load — `stream()` vs `tokio::spawn_blocking` (`mixed_load`)
 
 | Size | youpipe stream | spawn_blocking | rayon (CPU-only) |
