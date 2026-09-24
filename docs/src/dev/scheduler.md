@@ -97,16 +97,44 @@ caller instead gets the `Blocking` variant (spin-then-condvar).
 Historically on-pool callers fell back to the single `par_index_rec` tree
 because the `LockLatch` condvar would deadlock a same-pool worker; the
 cost was a log2(num_threads) fork/join ramp-up per nested terminal. The
-`Stealing` routing removes that for large batches (`chunk_splits > 0`):
-same-binary knob A/B (`YOUPIPE_ONPOOL_HYBRID`, 5 interleaved rounds) shows
-`nested_single/100K` −3.5 % (25/25 dominant). Small batches keep the
-tree — see the regime comment in `hybrid_dispatch` for the measured split
-(P concurrent nested small batches under hybrid collapse the single
-injector, +430 %). Two behavioural notes: the off-pool driver's assist
-reserve is 0 on-pool (`wait_spin_assist`'s `Stealing` arm cannot run the
-reserve-chunk hook, so a withheld chunk would have no executor), and
-`YOUPIPE_ONPOOL_HYBRID=0` restores the always-tree behaviour for
-same-binary A/B.
+`Stealing` routing removes that for large batches (`chunk_splits > 0`).
+Small batches keep the tree — see the regime comment in `hybrid_dispatch`
+for the measured split (P concurrent nested small batches under hybrid
+collapse the single injector, +430 %). One behavioural note: the
+off-pool driver's assist reserve is 0 on-pool (`wait_spin_assist`'s
+`Stealing` arm cannot run the reserve-chunk hook, so a withheld chunk
+would have no executor).
+
+`YOUPIPE_ONPOOL_HYBRID` is a three-level same-binary A/B knob (0 = tree,
+default; 1 = injector hybrid; 2 = local-deque hybrid, 2026-09-25). Level 2
+pushes the driver's whole chunk batch onto its OWN local LIFO deque
+(`WorkerThread::push_batch`: one JEC increment + one wake cascade for the
+batch, overflow spills to the injector — measured 0 spills, 32 chunks vs
+a 256-slot deque); peers steal from the FIFO end, so P concurrent nested
+batches distribute across P deques instead of converging on the one
+global MPMC, and the driver's own `Stealing` wait consumes the LIFO end
+exactly like `join`'s B branch (`counter == 0` ⇒ every JobRef consumed
+holds on every consumption surface). Measured (5 interleaved rounds,
+taskset 1–31, 32 cores):
+
+* level 2 vs level 1 (the mechanism check): `nested_single/100K` −2.9 %
+  (24/25 dominant), `nested_saturated/100K` −1.7 % (25/25) — the
+  +2 %-lean injector convergence penalty under saturation is gone; level 1
+  is dominated in every measured row.
+* level 2 vs tree: the margin is small and session-unstable (one session
+  +3.3 % for the tree on `nested_single/100K`, another −6.4 % for level 2;
+  `nested_saturated/100K` lean-better for level 2 in both, −0.4 %/−1.0 %).
+  No stable cross-session win either way ⇒ the default stays 0; level 2 is
+  the opt-in for saturation-heavy shapes and the A/B instrument.
+* fused 1M family (`sync_lightweight*`): ±1.5 % noise on all sides — the
+  off-pool dispatch path is shared and untouched.
+* ungating the small-batch `chunk_splits > 0` gate under level 2
+  (`YOUPIPE_ONPOOL_HYBRID_SMALL`, experiment only, reverted):
+  `nested_single/1K` +80 % (0/25 — the parked-peers single-driver regime
+  still collapses; the tree's incremental one-push-per-join ramp stays
+  the right shape), `nested_saturated/1K` −8 % (25/25). Per-regime mixed
+  verdict ⇒ gate stays; an adaptive gate is the cost-EMA class already
+  twice falsified above.
 ### Work Search Strategy
 
 `find_work()` tries sources in priority order:

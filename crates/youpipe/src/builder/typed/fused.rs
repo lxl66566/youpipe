@@ -1080,7 +1080,16 @@ where
     // `nested_single/100K` −3.5 % (25/25 dominant) — ramp-up dominates and
     // the injector round trips amortize; `nested_saturated/100K` is a
     // +2 %-lean wash (every worker nesting large batches is exotic, and
-    // even there hybrid is within spread of the tree).
+    // even there hybrid is within spread of the tree). Level 2
+    // (`LocalDeque`, 2026-09-25, 5 interleaved rounds) removes that
+    // saturation lean: vs level 1 `nested_single/100K` −2.9 % (24/25),
+    // `nested_saturated/100K` −1.7 % (25/25); vs the tree the margin is
+    // session-unstable (±3–6 %, sign flips across sessions), so the
+    // default stays 0. Ungating this small-batch shortcut under level 2
+    // (`YOUPIPE_ONPOOL_HYBRID_SMALL`, experiment, reverted) still collapses
+    // the parked-peers regime: `nested_single/1K` +80 % (0/25) — only
+    // `nested_saturated/1K` improves (−8 %, 25/25); the gate stays (see
+    // docs/src/dev/scheduler.md "on-pool callers").
     //
     // SAFETY: single-tree execution of `[0, n)` with the full split budget
     // — the same call the pre-hybrid on-pool path made directly. Panics

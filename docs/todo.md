@@ -43,26 +43,7 @@ collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s�
   send 无自旋窗口、park 策略不同，低深度背压场景可能反而回退。
 - **验证**：`stream_pipeline` 全家族 + `mixed_load` 隔离交替 A/B。
 
-### 3. on-pool hybrid 的 chunk 分发走 driver 本地 deque（实验）
-
-- **现状**（2026-07 `YOUPIPE_ONPOOL_HYBRID` 旋钮 A/B，5 轮交错）：on-pool
-  大批量 hybrid `nested_single/100K` −3.5 %，但 `nested_saturated/100K`
-  +2.0 % lean（spread 内、0/25）——P 个并发嵌套批次的 chunk 全部经由全局
-  injector 分发，注入器仍是汇聚点；小批量更是 +430 % 崩盘（见已证伪清单），
-  现以 `chunk_splits > 0` 门控退回单树。
-- **方向**：on-pool driver 把自己的 chunk 推到**本地 LIFO deque**（对等
-  worker 从 FIFO 端偷）而非 injector——分布式的分发面正是单树小批量不崩的
-  机制。若成立，可解除小批量门控，让 on-pool 全尺寸走 hybrid。注意：
-  1. `counter==0 ⇒ JobRef 全部消费` 不变量必须保持（wait_until 窃取循环
-     会从本地 deque 弹出自己的 chunk，语义同 join 的 B 分支）；
-  2. 本地 deque 容量溢出会 spill 回 injector（`WorkerThread::push` 已有该
-     路径），需确认溢出量级；
-  3. 结论必须同 binary 旋钮 A/B（沿用 `YOUPIPE_ONPOOL_HYBRID` 加档位）。
-- **验证**：`sync_nested_on_pool` 全家族 + 全量 fused 家族 per-id 无回归。
-
----
-
-### 4. （正确性存疑）`pipeline_integration` 间歇性挂死：未定位的丢唤醒窗口
+### 3. （正确性存疑）`pipeline_integration` 间歇性挂死：未定位的丢唤醒窗口
 
 - **现状**（2026-09 复现记录，详见 `dev/crossfire-waker-designs.md` §12.4）：
   `cargo test --release --test pipeline_integration` 单测试二进制循环
@@ -171,6 +152,14 @@ latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
   `nested_saturated/1K` **+430 %**、`nested_single/1K` +3 %。单树的本地
   deque + 偷取才是小批量的正确形态；on-pool hybrid 仅大批量（`chunk_splits
   > 0`）启用。详见 `hybrid_dispatch` 的 regime 注释。
+- **local-deque hybrid 解除小批量门控**（2026-09-25，`YOUPIPE_ONPOOL_HYBRID
+  =2` + `YOUPIPE_ONPOOL_HYBRID_SMALL`，5 轮交错）：分布到 driver 本地 deque
+  只救回饱和侧——`nested_saturated/1K` −8 %（25/25），但 `nested_single/1K`
+  仍 **+80 %**（0/25）：P−1 worker 停机、单 driver 的形状里，hybrid 的固定
+  开销（chunk 划分 + 一次 wake cascade + latch 等待）压不过单树逐层 push
+  的增量 ramp。按 regime 混合结论 ⇒ 门控保留；自适应门控即 cost-EMA 类，
+  已两次证伪。大批量侧的 level 2 本体成立（vs level 1 稳定 −1.7…−2.9 %，
+  见 scheduler.md），默认仍 0。
 - **cost-EMA 自适应 chunk 数 / execute-time split-back**：门条件在稳态几乎
   不同时成立（实测 1 次/进程），机制零命中即删。
 - **加宽自旋或 yield 窗口**（32/64 之外）、**限制 steal 扫描范围**（有界探测）：
