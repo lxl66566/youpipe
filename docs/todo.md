@@ -76,7 +76,8 @@ collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s�
   但只救回 1–4 pt（NT store 另行救回 ~13 pt 并反超，见 P2 #8）。
 - **方向**（结构性手段；勿拉长全局自旋窗口——`ROUNDS_SPIN` 历史 +20–36% 回退）：
   1. 背靠背批次（bench 循环、流式多批次）下「下一批将至」提示 / 短窗口热身，
-     让工人跨迭代保温；
+     让工人跨迭代保温（时间戳触发的 hot-epoch 窗口已证伪，见文末清单——
+     时间窗无法区分批内 ramp-down idle 与批间 gap idle）；
   2. 尾部 straggler 细化：末段更细粒度 oversplit（动态，非 cost-EMA 路线，
      该路线已两次证伪）；
   3. 1M 打平而 2M 落后的边界为何不随占用亏损移动，未解释；NT 默认档落定后
@@ -184,6 +185,25 @@ latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
   每 chunk（4M/32 ≈ 131K 元素）仅首尾 2/16K 条 line 跨界（~0.01% 量级），
   且 SIMD store 对齐前提已由 malloc 16B 对齐保证——64B 全 line 对齐在 Zen
   上无边际收益，差距不在边界对齐。
+- **hot-epoch 条件性保温窗口**（`YOUPIPE_HOT_EPOCH_MS`，2026-09-25）：机制——
+  进程级 activity 时间戳（锚点仅 2 个：fused dispatch 完成 + fused 批注入，
+  每批各一次，driver 侧执行）+ idle sleepy 决策点判定：热窗内（now −
+  last_activity < epoch）把该 idle episode 退避临时扩为 2048/2048（同因果
+  验证值），deadline 封顶、过期即回默认泊车；off 路径行为不变。A/B
+  （horizontal cpu_balanced 100K/1M/2M/4M，同 binary 两进程交替 ×5 对 +
+  rayon 对照进程，taskset 1-31，1 对 off 进程被外部负载污染剔除）：per-pair
+  中位 100K ~0%、1M −2.0%、2M −0.3%、4M −1.4%，全部低于 +3% 门槛（2M 对
+  rayon gap 仅 12.5→11.5 pt）。空闲 burn（3×2M 批后 10s 空转，getrusage
+  全进程 utime+stime）：off 0.1–0.2 ms、epoch=1ms 2–6 ms、epoch=2ms
+  0.4–15 ms（末批尾部分布的运气主导，鲁棒性差）、epoch=5ms 47–70 ms ≈
+  全局 2048/2048（~60 ms）——封顶语义生效，但窗口≈批时长（5ms vs ~1ms/批）
+  时机制退化为全局加宽。失败根因：时间窗无法区分两种 idle——批内
+  ramp-down（工人做完 chunk，widening 烧核干扰在职工人，正是 ROUNDS_SPIN
+  回退机制）与批间 gap（widening 的收益来源）；2M 批执行 ~1ms >> gap
+  30–100µs，净收益抵消至 ~1 pt，与全局 2048 的 1–4 pt 因果上界一致。
+  旁证（不作结论）：外部 bench 挤占 20+ 核的争载下同 A/B 一致 −8~−13%，
+  提示泊车频率被放大时窗口才有净收益。「下一批将至」的显式提示（caller
+  侧声明、非时间推断）与尾部 straggler 细化仍开放。
 - **`Slots::uninit` 输出分配 `MADV_HUGEPAGE`**（2026-09，机制性证伪未跑
   A/B）：sysfs THP `enabled=[madvise]`（非 never），但此机内存状态使
   madvise 无效——buddyinfo Normal zone order-9 空闲块 0、MemFree ~2 GB
