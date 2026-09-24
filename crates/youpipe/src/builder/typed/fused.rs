@@ -1829,8 +1829,10 @@ const UNBALANCED_CHUNK_SLACK: usize = 8;
 /// 200→167 items/chunk): worst seed +6.9 %→+1.3 % vs rayon, mean
 /// +1.1 %→−1.1 %, spread 14.6 pt→4.2 pt; n=4000 all three shapes improve
 /// (heavy-tail mean −2.5 pt, uniform −2 pt). n=2000 (≈42 items/chunk)
-/// regresses +2…+4 pt — per-chunk overhead dominates once chunks get
-/// small, hence the two tiers.
+/// first measured +2…+4 pt against the wide tier; a 6-seed re-scan found
+/// it neutral instead (see [`UNBALANCED_SLACK_WIDE_MIN_PER_CHUNK`]) —
+/// that regression was seed luck. Per-chunk overhead does bite further
+/// down (flat 32/64 below), hence the two tiers.
 ///
 /// Rejected alongside: dropping the default to the 16 physical cores
 /// (SMT gives zstd ~1.9×; 16 threads lose +78…+89 % wall time — see the
@@ -1839,9 +1841,16 @@ const UNBALANCED_CHUNK_SLACK_WIDE: usize = 16;
 
 /// Items per wide-tier chunk (`n / (num_threads + WIDE)`) required to
 /// upgrade from [`UNBALANCED_CHUNK_SLACK`] to [`UNBALANCED_CHUNK_SLACK_WIDE`].
-/// Boundary data: 42 items/chunk (n=2000) prefers the narrow tier, 83
-/// (n=4000) the wide tier; 64 sits between the measured points.
-const UNBALANCED_SLACK_WIDE_MIN_PER_CHUNK: usize = 64;
+/// Boundary scan (2026-09, criterion zstd_shape grid n=2000/3000/4000 =
+/// 42/63/85 items per chunk, 6 seeds × 3 interleaved same-binary rounds of
+/// flat `YOUPIPE_CHUNK_SLACK` 8/16, drift-cancelled by pairing youpipe with
+/// the same pass's rayon id): 42/chunk is neutral (median −1.2…+0.5 %,
+/// 3–5 of 6 seeds — below the adoption bar, stays narrow), 63/chunk favors
+/// wide on every shape (heavy-tail −3.0 %, capped −1.4 %, uniform −0.3 %).
+/// 48 sits between the neutral and the wide-favored point; every cheap-side
+/// family (cpu_unbalanced n=200/5000, fused 200/1000) keeps its previous
+/// tier bit-for-bit.
+const UNBALANCED_SLACK_WIDE_MIN_PER_CHUNK: usize = 48;
 
 /// Adaptive [`UNBALANCED_CHUNK_SLACK`]: the wide tier once wide-tier chunks
 /// still hold ≥ [`UNBALANCED_SLACK_WIDE_MIN_PER_CHUNK`] items. `n` comes from
