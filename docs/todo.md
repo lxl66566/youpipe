@@ -31,19 +31,7 @@
   `ZSTD_SEEDS`/`ZSTD_SHAPE_NS` id 网格透传）；cheap 侧档位经算术核对
   不随边界变化（cpu_unbalanced n=200/5000 均未跨 48）。
 
-### 2. 终端 collector 通道 in-pipeline A/B：`std sync_channel` vs crossfire mpsc
-
-2026-10）显示无竞争 1P1C 形状下 `std::sync::mpsc::sync_channel(256)` 比当前
-collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s）。
-当初切 MPSC 的依据是 in-pipeline profiling（N 生产者竞争下 recv 侧 CAS 主导，
-见 handoff/channel.rs），微基准无法复现该竞争，两者口径不同、并不矛盾。
-
-- **方向**：在真实 pipeline 里 A/B 把 collector 通道换成 `sync_channel`
-  （`SyncSender: Clone` 满足多生产者，`RecvItem` 抽象已就位）。注意 std 阻塞
-  send 无自旋窗口、park 策略不同，低深度背压场景可能反而回退。
-- **验证**：`stream_pipeline` 全家族 + `mixed_load` 隔离交替 A/B。
-
-### 3. （正确性存疑）`pipeline_integration` 间歇性挂死：未定位的丢唤醒窗口
+### 2. （正确性存疑）`pipeline_integration` 间歇性挂死：未定位的丢唤醒窗口
 
 - **现状**（2026-09 复现记录，详见 `dev/crossfire-waker-designs.md` §12.4）：
   `cargo test --release --test pipeline_integration` 单测试二进制循环
@@ -65,7 +53,7 @@ collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s�
 
 ---
 
-### 4. fused 批次间 worker 泊车/唤醒占用亏损（NT store 收窄后的残余项）
+### 3. fused 批次间 worker 泊车/唤醒占用亏损（NT store 收窄后的残余项）
 
 - **现状**（2026-09-25 归因，详见 `dev/benchmarks.md` "Attributing the
   2M/4M fused-collect gap"）：cpu_balanced 大批量上 youpipe 每迭代 cycles/
@@ -90,21 +78,21 @@ collector 用的 crossfire mpsc flavor 快 ~17–31 %（41/58 vs 35/44 Melem/s�
 
 ## P2
 
-### 5. 池 worker 核绑定（affinity）实验
+### 4. 池 worker 核绑定（affinity）实验
 
 latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
 100 µs–1.7 ms 是残余 straggler 的根源，属内核调度行为。可选：per-worker
 `pthread_setaffinity` 配置项（默认关闭），在 zstd_shape/unbalanced 上 A/B。
 风险：与用户 `taskset` 冲突、跨 NUMA 迁移损失、库越权管理拓扑。
 
-### 6. transient pool 复用缓存
+### 5. transient pool 复用缓存
 
 `with_compute_workers(n≠ncpus)` / `with_oversubscribe` 每次终端调用建池
 拆池（~ms 级，`ExecPool::Owned`）。可做进程内按尺寸的小 LRU 缓存。
 风险：线程数失控（用户以为池已销毁）；至少在 rustdoc 与 tuning.md 把
 「紧循环请预建池」的警示提级。
 
-### 7. （非性能，顺带记录）`ordered()` + `expand()` panic（2026-10 设计分析）
+### 6. （非性能，顺带记录）`ordered()` + `expand()` panic（2026-10 设计分析）
 
 可用 `(seq, sub_seq)` 子序号支持展开保序，解除当前组合禁用。属 API 能力项。
 2026-10 深入设计后确认三条硬约束，后续实现前必须先解决：
@@ -202,3 +190,22 @@ latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
   后仍为 0（`pages_to_scan=4096`/轮 × 10 s 周期，bench 秒级迭代等不到）。
   bench 场景依赖 fault-time 路径，除非机器重启后早期或空闲大块充足，
   否则该方向不可测。first-touch 单 NUMA 无意义（已排除）。
+- **终端 collector 通道换 `std::sync::mpsc::sync_channel`**（2026-09，实验
+  e1684fc → revert aa842a6）：微基准（无竞争 1P1C）曾显示 sync_channel(256)
+  比当前 crossfire mpsc flavor 快 17–31 %（41/58 vs 35/44 Melem/s），但
+  in-pipeline A/B（`bench_ab.sh -a base=main -b wt`，5 轮 per-id 交错；控制列
+  `mixed_load/rayon_par_iter` ±0.5 %、`pipeline_fusion/fused_3_stages` ±0.1 %
+  排除环境漂移与布局噪声）全面回退：`stream_pipeline` 1K 档三 id
+  +11.1…+12.0 %（两侧轮次中位区间几乎不重叠）、`with_fence/100K` +13.6 %、
+  100K 多生产者档 +1.2…+1.9 %；`mixed_load/youpipe_stream_cpu` 1K/100K
+  +0.1/−3.6 %（±22–25 % 噪声底内）。机制：微基准赢在无竞争稳态吞吐
+  （recv 侧无 CAS、无 waker 注册表），但真实 collector 是 burst-drain 节奏
+  ——burst 之间通道清空，std 的空 recv / 满 send 立即 park（无自旋窗口），
+  每个 burst 边界都付一次 futex 往返；1K 小批量另付每 run 的通道构造差异
+  （std block 链表初始化 vs crossfire ring 一次分配）；`with_fence` 的
+  单生产者→单消费者 ping-pong（Chunked(500) 突发释放）是 std 最差形状，
+  每次唤醒延迟直接串行化进 chunk 间隔。语义对齐本身无问题（disconnect
+  排空后 Err、try_recv 区分 Empty/Closed、多生产者 Clone，std 亦无
+  crossfire #70 假 Disconnected 窗口）。结论：crossfire mpsc 保留；微基准
+  （无竞争稳态）与 in-pipeline（burst 节奏 + park 往返）两种口径的矛盾
+  以此收束——当初切 crossfire 的 in-pipeline profiling 依据仍成立。
