@@ -74,6 +74,8 @@ concurrent-queue = { package = "youpipe-concurrent-queue", path = "../youpipe-co
 # See docs/src/dev/crossfire-waker-designs.md (design C) and
 # docs/src/dev/crossfire-waker-cache.md (archaeology; superseded design A).
 crossfire        = { package = "youpipe-crossfire", path = "../youpipe-crossfire", version = "0.5" }
+# Only pulled in by the `crossfire-trace` forensics feature (see [features]).
+log              = { version = "0.4", optional = true }
 hotpath          = { version = "0.24", optional = true }
 st3              = { package = "youpipe-st3", path = "../youpipe-st3", version = "0.5" }
 tokio            = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"], optional = true }
@@ -141,6 +143,12 @@ default       = ["tokio-runtime"]
 hotpath       = ["dep:hotpath", "hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
+# ── Crossfire waker-layer trace (deadlock forensics) ──
+# Forwards to the vendored crossfire's `trace_log` (log::debug! per
+# send/recv/wake episode). Off by default: the log volume is huge and the
+# feature exists purely to instrument reproduction runs of intermittent
+# lost-wakeup hangs (todo P1 #2).
+crossfire-trace = ["crossfire/trace_log", "dep:log"]
 # ── Async runtime backend for streaming `.stage_async(..)` stages ──
 # The fused CPU path (`pipe` / `scope`) is fully sync and needs no backend.
 #

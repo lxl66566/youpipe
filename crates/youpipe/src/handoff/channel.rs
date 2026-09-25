@@ -2,6 +2,17 @@ use std::future::Future;
 
 use crossfire::{mpmc, mpsc};
 
+// Channel identity for `crossfire-trace` forensics: the shared `ChannelShared`
+// address is stable for the channel's lifetime, letting per-thread trace logs
+// be grouped by channel when replaying a hang. Same feature gate as the
+// crossfire `trace_log` episodes (zero cost when off).
+#[cfg(feature = "crossfire-trace")]
+macro_rules! trace_ch {
+    ($shared:expr, $op:expr) => {
+        log::debug!("{} @{:p}", $op, $shared as *const _);
+    };
+}
+
 /// Blocking MPMC sender.
 pub struct SyncSender<T: Send + 'static> {
     tx: crossfire::MTx<mpmc::Array<T>>,
@@ -26,6 +37,8 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (SyncSender<T>, SyncReceiv
 
 impl<T: Send + 'static> SyncSender<T> {
     pub fn send(&self, item: T) -> Result<(), ChannelError> {
+        #[cfg(feature = "crossfire-trace")]
+        trace_ch!(&**self.tx, "tx send");
         self.tx.send(item).map_err(|_| ChannelError::Closed)
     }
 
@@ -47,6 +60,8 @@ impl<T: Send + 'static> Clone for SyncSender<T> {
 
 impl<T: Send + 'static> SyncReceiver<T> {
     pub fn recv(&self) -> Result<T, ChannelError> {
+        #[cfg(feature = "crossfire-trace")]
+        trace_ch!(&**self.rx, "rx recv");
         self.rx.recv().map_err(|_| ChannelError::Closed)
     }
 
@@ -179,6 +194,8 @@ pub fn mpsc_channel<T: Send + 'static>(capacity: usize) -> (MpscSender<T>, MpscR
 
 impl<T: Send + 'static> MpscSender<T> {
     pub fn send(&self, item: T) -> Result<(), ChannelError> {
+        #[cfg(feature = "crossfire-trace")]
+        trace_ch!(&**self.tx, "tx send");
         self.tx.send(item).map_err(|_| ChannelError::Closed)
     }
 }
@@ -200,6 +217,8 @@ impl<T: Send + 'static> Clone for MpscSender<T> {
 
 impl<T: Send + 'static> MpscReceiver<T> {
     pub fn recv(&self) -> Result<T, ChannelError> {
+        #[cfg(feature = "crossfire-trace")]
+        trace_ch!(&*self.rx, "rx recv");
         self.rx.recv().map_err(|_| ChannelError::Closed)
     }
 

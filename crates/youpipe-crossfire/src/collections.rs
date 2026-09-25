@@ -4,6 +4,8 @@ use std::sync::{
     Arc, Weak,
 };
 
+use crate::trace_log;
+
 pub struct ArcCell<T> {
     ptr: AtomicPtr<T>,
 }
@@ -101,7 +103,11 @@ impl<T> WeakCell<T> {
         loop {
             match self.ptr.compare_exchange(v, ptr::null_mut(), Ordering::SeqCst, Ordering::Acquire)
             {
-                Ok(_) => return unsafe { Weak::from_raw(v) }.upgrade(),
+                Ok(_) => {
+                    let r = unsafe { Weak::from_raw(v) }.upgrade();
+                    trace_log!("cell pop {:p} -> {}", v, r.is_some());
+                    return r;
+                }
                 Err(_v) => {
                     if _v.is_null() {
                         return None;
@@ -134,7 +140,9 @@ impl<T> WeakCell<T> {
 
     #[inline(always)]
     pub fn replace(&self, item: Weak<T>) {
-        let old_ptr = self.ptr.swap(item.into_raw() as *mut T, Ordering::SeqCst);
+        let new = item.into_raw() as *mut T;
+        let old_ptr = self.ptr.swap(new, Ordering::SeqCst);
+        trace_log!("cell replace {:p}->{:p}", old_ptr, new);
         if !old_ptr.is_null() {
             let _ = unsafe { Weak::from_raw(old_ptr) };
         }
