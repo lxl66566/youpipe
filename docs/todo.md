@@ -31,25 +31,28 @@
   `ZSTD_SEEDS`/`ZSTD_SHAPE_NS` id 网格透传）；cheap 侧档位经算术核对
   不随边界变化（cpu_unbalanced n=200/5000 均未跨 48）。
 
-### 2. （正确性存疑）`pipeline_integration` 间歇性挂死：未定位的丢唤醒窗口
+### 2. `pipeline_integration` 间歇性挂死：容量成分已修复，残余低概率窗口未定位
 
-- **现状**（2026-09 复现记录，详见 `dev/crossfire-waker-designs.md` §12.4）：
-  `cargo test --release --test pipeline_integration` 单测试二进制循环
-  （无外部负载、90 s 超时判定）下间歇挂死：waker 设计 C（vendored HEAD）
-  20 轮第 16 轮挂、设计 B（`waker-intrusive` vendor 快照）20 轮第 7 轮挂，
-  另有 10 轮全套循环内 1 次（多测试并发）——**与 crossfire waker 实现无关**
-  （两种实现均复现，共享的是通道语义层），属预存在问题。每轮 ~5–15% 概率。
-- **形态**（gdb 全线程回溯，两次挂起一致）：池 worker 停在 crossfire mpmc
-  `Tx::send` 满 park、消费端停 `MpscReceiver::recv` park、
-  `test_hybrid_dispatch_spin_wait_stress` 停 `LockLatch::wait`；挂起时全部
-  线程 futex wait（无 CPU 消耗），通道对端不消费也不被唤醒的死锁形态。
-- **排除项**：crossfire waker 的 C 与 B 两个实现；两实现的 miri
-  （tree-borrows）+ loom 协议验证均无反例（designs §11.6 / §12.1）。
-- **方向**：① `timeout`+gdb 循环复现，重点查 `hybrid_dispatch`/LockLatch
-  唤醒与 stage 通道 close/drop 的时序、以及多通道 episode 的唤醒配对；
-  ② youpipe 侧补"多通道 select + 池 sleep"交错的 loom 模型；③ 不排除测试
-  自身（spin_wait_stress 与其余测试并发抢核导致的长饥饿尾巴）。
-- **验证**：归因后复现轮转绿；`perf/verify` 脚本长循环稳定性。
+- **已修复成分**（2026-09-25，详见 `dev/streaming.md` "Pool-wide parking
+  lease"）：stream run 的 liveness 预算按单 run 独占池计算，多 run 并发共享
+  池时联合超订——全部 worker park 在通道 send/recv 上、排队的 stage-worker
+  job 与其后 injector FIFO 里的 fused chunk 永远无法弹出。放大复现（4 个
+  barrier 对齐 2-stage run）5/5 挂死；修复为池级 parking lease（run 整体
+  CAS 预留 parking jobs 上界，放不下则转 dedicated threads），复现 8/8
+  通过、40 轮单二进制循环零挂；`mixed_load` A/B 无回归；回归测试
+  `test_concurrent_full_budget_runs_share_pool_no_deadlock` /
+  `test_concurrent_pinned_runs_mixed_admission_no_deadlock`（pre-fix 双挂）。
+- **残余**（同日多二进制并发压测，~1/8 组概率复现）：挂住 run 的 n=100
+  远小于 256 容量（send 不可能因 Full park）；budget 测试线程已退出而其
+  stage workers 仍 park 在 send（closed 唤醒未达）；存在「同一通道 collector
+  recv park（空）与上游 send park（满）并存」矛盾。指向 crossfire blocking
+  send/recv 的 fire 信号经济（`RegistryMulti::fire` 单事件只保证一个等待者
+  重试，wake 到 stale waker 信号即被浪费）或另一未定位调度缺陷。记录见
+  `dev/crossfire-waker-designs.md` §12.4。
+- **方向**：debuginfo 构建的全并发复现器（release 内联混淆使 job 归属无法
+  保真重建）+ trace_log 按线程粒度插桩；重点审 `fire` 的 pop_again seq
+  早停、`_clear_wakers` 竞争、以及 close 路径对 park 中 sender 的唤醒配对。
+- **验证**：复现器稳定转绿后，多二进制并发压测长循环（≥50 组）零挂。
 
 ---
 

@@ -1625,6 +1625,90 @@ fn test_compute_workers_pin_survives_compute_pool() {
 
 // ── Streaming liveness: worker budget vs pool size ──
 
+/// Regression (the intermittent `pipeline_integration` hang, todo P1 #2):
+/// the streaming run's liveness budget was computed per run against the
+/// **full** pool, so concurrent full-budget runs on a shared pool jointly
+/// oversubscribed it — every worker parked on a full/empty inter-stage
+/// channel while the still-queued stage-worker jobs (and anything behind
+/// them in the injector FIFO, e.g. fused chunks) could never be popped.
+/// Barrier-aligned full-budget runs reproduced the hang deterministically;
+/// the pool-wide parking lease now admits a run only if its whole upper
+/// bound of channel-parking jobs fits the remaining pool capacity, else it
+/// falls back to dedicated threads. This shape deadlocked 5/5 pre-fix.
+#[test]
+#[cfg_attr(miri, ignore)] // thread-count stress the interpreter cannot pace
+fn test_concurrent_full_budget_runs_share_pool_no_deadlock() {
+    let r: Vec<usize> = run_with_deadlock_watchdog(|| {
+        const RUNS: usize = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(RUNS));
+        let pool = youpipe::ComputePool::new(8);
+        let lens: Vec<usize> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..RUNS)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let pool = pool.clone();
+                    s.spawn(move || {
+                        // Align the runs so their [feeder, stage-1 workers,
+                        // stage-2 workers] job batches interleave in the
+                        // injector — the shape that parked every worker on a
+                        // stage-1 channel with stage-2 jobs still queued.
+                        barrier.wait();
+                        let r: Vec<u64> = stream(0..2000u64)
+                            .with_compute_pool(pool)
+                            .stage(|x| x.wrapping_mul(3).wrapping_add(1))
+                            .fence(FenceMode::Chunked(NonZeroUsize::new(64).unwrap()))
+                            .stage(|x| x ^ 0x5a5a)
+                            .run();
+                        r.len()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        lens
+    });
+    assert_eq!(r, vec![2000; 8]);
+}
+
+/// Mixed admission under the parking lease: runs small enough to co-lease
+/// the pool share it (pool mode), the overflow falls back to dedicated
+/// threads, and the lease accounting must fully drain afterwards — pinned
+/// stages lease their exact pin, unpinned ones the divided default.
+#[test]
+#[cfg_attr(miri, ignore)] // thread-count stress the interpreter cannot pace
+fn test_concurrent_pinned_runs_mixed_admission_no_deadlock() {
+    use youpipe::StageOptions;
+
+    let r: Vec<usize> = run_with_deadlock_watchdog(|| {
+        const RUNS: usize = 12;
+        let barrier = Arc::new(std::sync::Barrier::new(RUNS));
+        // 8-thread pool; each run needs 1 feeder + 2 pinned stages × 2
+        // workers = 5 slots, so ~1 run co-leases at a time and the rest take
+        // dedicated threads — both admission paths run concurrently.
+        let pool = youpipe::ComputePool::new(8);
+        let lens: Vec<usize> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..RUNS)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let pool = pool.clone();
+                    s.spawn(move || {
+                        barrier.wait();
+                        let r: Vec<u64> = stream(0..1000u64)
+                            .with_compute_pool(pool)
+                            .stage_with(StageOptions::new().workers(2), |x| x + 1)
+                            .stage_with(StageOptions::new().workers(2), |x| x * 2)
+                            .run();
+                        r.len()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        lens
+    });
+    assert_eq!(r, vec![1000; 12]);
+}
+
 /// Helper: run `f` on a helper thread and require completion within 30 s, so
 /// a liveness regression fails the test instead of hanging the harness.
 /// Mirrors the dedicated-pool rationale of

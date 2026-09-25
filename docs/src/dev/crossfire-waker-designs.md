@@ -546,3 +546,19 @@ vendor 侧（本仓库）验证：`--lib` 20/20、loom 5/5（49.7s）、`cargo t
 ### 12.4 顺带发现：§11.5 的间歇挂起与 waker 设计无关（预存在问题）
 
 B 侧压测（`pipeline_integration` 单二进制、无外部负载、90 s 超时判定）20 轮内第 7 轮挂起；随后 C 侧（stash 对照）同法 20 轮第 16 轮挂起——**两种 waker 实现均复现**，gdb 形态同 §11.5（池 worker 停 crossfire `Tx::send` 满 park、消费端停 `recv` park、hybrid_dispatch 停 LockLatch）。§11.5/§11.6 的"高负载饥饿"归因由此修正为**未定位的预存在问题**（youpipe 自身或两个 waker 实现共享的通道语义层）；每轮 ~5–15% 概率，已立 todo 跟踪。B 侧另有一次 10 轮全套循环内的挂起（多测试并发，形态同上）。
+
+**2026-09-25 归因进展**：挂死的一个确定性成分已定位并修复——stream run 的 liveness 预算按
+"单 run 独占池"计算，多个满预算 run 并发共享池时联合超订，全部 worker park 在通道
+send/recv 上、排队的 stage-worker job（及其后在 injector FIFO 里的 fused chunk）永远无法
+弹出。放大复现（4 个 barrier 对齐的 2-stage run，n=5000 > buffer）5/5 挂死，修复
+（池级 parking lease，见 streaming.md "Pool-wide parking lease"）后 8/8 通过、
+40 轮单二进制循环零挂。**但该修复未收束全部窗口**：多测试二进制并发压测
+（pipeline_integration + scope_integration + 全套 `cargo test` 同跑）仍以低概率（约
+1/8 组）复现挂死，且新样本与容量无关——挂住 run 的 n=100 远小于 256 容量（send 不可能
+因 Full park），其中 budget 测试线程已退出而其 stage workers 仍 park 在 send 上
+（closed 通道的唤醒未达），并存在「同一通道 collector recv park（空）与上游 send park
+（满）并存」的矛盾。指向 crossfire blocking send/recv 的 fire 信号经济
+（`RegistryMulti::fire` 一次只保证一个等待者的重试，wake 到 stale waker 时信号被浪费）
+或另一未定位调度缺陷；release 符号内联混淆（多个 `spawn_stage` 单态化折叠）使回溯无法
+保真重建 job 归属。下一步：debuginfo 构建的全并发复现器 + 按线程/waker 粒度的
+trace_log 插桩，重点审 `fire` 的 pop_again seq 早停与 `_clear_wakers` 的竞争。

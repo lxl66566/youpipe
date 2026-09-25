@@ -135,6 +135,50 @@ throughput of 2 workers (best case unreachable; convoy bistability). The
 terminal collectors have used the same shape since their burst-drain
 introduction.
 
+## Pool-wide parking lease (deadlock freedom across concurrent runs)
+
+A channel-parking job — a non-inline feeder, a sync/expand stage worker —
+holds its pool worker until the run's channels drain: it never returns to
+`find_work` while parked inside a crossfire send/recv. The per-run liveness
+budget (`feeder + Σ stage workers ≤ pool_threads`, computed in `try_exec`)
+is therefore only sound while a **single** run uses the pool. Concurrent
+full-budget runs on a shared pool (the global pool under the parallel test
+harness, or multi-threaded user code) each individually fit yet jointly
+oversubscribe it: every worker parks on a full/empty inter-stage channel
+while the still-queued jobs — either run's stage workers, or fused chunks
+behind them in the injector FIFO — can never be popped. This was reproduced
+deterministically (4 barrier-aligned 2-stage runs, 5/5 hangs; gdb: every
+worker parked on `Tx::send`, collectors on `MpscReceiver::recv`, the fused
+victim on `LockLatch::wait`) and is one confirmed component of the
+intermittent `pipeline_integration` hang (todo P1 #2).
+
+The fix is a **pool-wide lease** (`Registry::parking_slots` +
+`ParkingLease` in `stream.rs`): before submitting its first job, a run
+computes its upper bound of parking jobs (`feeder_slot + explicit_workers +
+unpinned_stages × min(per_stage, n)`, where the feeder slot is predicted
+against the smallest possible buffer so it never misses the pool-job case)
+and atomically CAS-leases that many slots from the registry
+(`try_reserve_parking`, total ≤ `num_threads`). A run that does not fit the
+remaining capacity — or executes on a worker of the same pool (nested
+`run()`) — falls back to dedicated threads, exactly the pre-existing
+fallback shape. Release is per job: each wrapped job returns its slot on
+completion via a drop guard (unwind-safe), and the lease's own drop returns
+the never-spawned remainder (`reserved − spawned`), so a run that granted
+fewer workers than reserved (small `n` clamping) still drains fully.
+
+Invariant restored: whenever a parking job is still queued, at least one
+worker is free of parking jobs and eventually pops it (regular jobs are
+finite by the pool's basic contract). Bench impact is one CAS per run plus
+one `fetch_sub` per parking job — `mixed_load` A/B (3 interleaved rounds)
+is all noise. Regression tests:
+`test_concurrent_full_budget_runs_share_pool_no_deadlock` (deadlocked
+pre-fix),
+`test_concurrent_pinned_runs_mixed_admission_no_deadlock`.
+
+Note the lease deliberately does **not** cover: fence forwarders and
+async-bridge threads (dedicated OS threads already), async consumers
+(runtime tasks), and fused chunks (finite, never park on channels).
+
 ---
 
 ## Ordered Output (`state/reorder.rs`)

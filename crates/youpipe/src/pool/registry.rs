@@ -63,6 +63,16 @@ pub(crate) struct Registry {
     // global pool has a ref that never gets released; a user-created pool
     // holds one ref via the ComputePool.
     terminate_count: AtomicUsize,
+    /// Capacity leased by streaming runs for jobs that may **park on an
+    /// inter-stage channel** (feeders, sync/expand stage workers). Such a job
+    /// never returns to `find_work` until its run's channels drain, so a
+    /// queued job of the same kind can be starved forever once every worker
+    /// hosts a parked one. Invariant: `parking_slots ≤ num_threads` — if any
+    /// parking job is still queued, at least one worker is free of parking
+    /// jobs and will eventually pop it (regular jobs are finite). Leased
+    /// atomically per run (`try_reserve_parking`) before the run's first job
+    /// is submitted; released per job on completion (see `stream.rs`).
+    parking_slots: AtomicUsize,
 }
 
 struct ThreadInfo {
@@ -105,6 +115,7 @@ impl Registry {
             sleep: Sleep::new(num_threads),
             injected_jobs: concurrent_queue::ConcurrentQueue::unbounded(),
             terminate_count: AtomicUsize::new(1),
+            parking_slots: AtomicUsize::new(0),
         });
 
         for (index, worker) in workers.into_iter().enumerate() {
@@ -275,6 +286,44 @@ impl Registry {
     }
 
     // ── Termination ──
+
+    /// Atomically lease `n` parking slots (see `parking_slots`). Fails —
+    /// without side effects — when the remaining capacity cannot host the
+    /// whole request; a partial lease would leave a run half-admitted, which
+    /// is exactly the deadlock this reservation prevents.
+    pub(crate) fn try_reserve_parking(&self, n: usize) -> bool {
+        let cap = self.num_threads();
+        let mut used = self.parking_slots.load(Ordering::Acquire);
+        loop {
+            if used + n > cap {
+                return false;
+            }
+            match self.parking_slots.compare_exchange_weak(
+                used,
+                used + n,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => used = current,
+            }
+        }
+    }
+
+    /// Current parking-slot usage (leased minus released). A snapshot only —
+    /// admission decisions must go through [`Self::try_reserve_parking`],
+    /// which revalidates against the live counter.
+    pub(crate) fn parking_used(&self) -> usize {
+        self.parking_slots.load(Ordering::Acquire)
+    }
+
+    /// Return `n` leased parking slots. Called per job on completion and for
+    /// the never-spawned remainder of a lease when the run finishes.
+    pub(crate) fn release_parking(&self, n: usize) {
+        if n > 0 {
+            self.parking_slots.fetch_sub(n, Ordering::AcqRel);
+        }
+    }
 
     pub(crate) fn increment_terminate_count(&self) {
         let prev = self.terminate_count.fetch_add(1, Ordering::AcqRel);
@@ -710,6 +759,7 @@ mod tests {
                 sleep: Sleep::new(num_threads),
                 injected_jobs: concurrent_queue::ConcurrentQueue::unbounded(),
                 terminate_count: AtomicUsize::new(1),
+                parking_slots: AtomicUsize::new(0),
             });
             for info in &registry.thread_infos[..spawned] {
                 // SAFETY: `info` outlives the drop below.

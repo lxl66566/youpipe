@@ -18,6 +18,7 @@ use crate::{
         MpscReceiver, Receiver, RecvItem, SendItem, SyncSender, TryRecvError, channel::channel,
         mpsc_channel,
     },
+    pool::Registry,
     runtime::{AsyncRuntime, DefaultRuntime},
     state::{FenceBarrier, FenceMode, run_ordered_collect},
     sync::CancellationToken,
@@ -81,6 +82,67 @@ fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
 /// semantics of the old feeder thread's `join`).
 type FeederPanicSlot = Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
 
+/// Pool-capacity lease covering one streaming run's channel-parking jobs
+/// (non-inline feeder + sync/expand stage workers).
+///
+/// A job that parks inside a crossfire send/recv holds its worker until the
+/// run's channels drain, so per-run budgeting alone ("my jobs ≤ my pool") is
+/// only sound while a single run uses the pool: two concurrent full-budget
+/// runs oversubscribe it, every worker parks on a full/empty channel, and
+/// the still-queued jobs — stage workers of either run, fused chunks behind
+/// them in the injector FIFO — can never be popped (reproduced with 4
+/// concurrent 2-stage runs on the global pool; every worker parked on
+/// `send`, all stage-2 jobs queued). The lease closes that hole at *pool*
+/// scope: a run either atomically reserves capacity for its whole upper
+/// bound of parking jobs (≤ remaining worker count) or falls back to
+/// dedicated threads, restoring the invariant "some worker is free of
+/// parking jobs whenever a parking job is still queued".
+///
+/// Release is per job (each wrapped job returns its slot on completion, via
+/// drop so unwinds are covered) plus the never-spawned remainder here.
+pub(crate) struct ParkingLease {
+    registry: Arc<Registry>,
+    /// Reserved upper bound: `feeder_slot + explicit_workers +
+    /// unpinned_stages * min(per_stage, n)`.
+    reserved: usize,
+    /// Jobs wrapped so far; never exceeds `reserved`.
+    spawned: Cell<usize>,
+}
+
+impl ParkingLease {
+    /// Wrap `job` so its completion — return or unwind — returns one leased
+    /// slot. The release must not precede the job's last channel access,
+    /// hence drop-guard (a plain tail call would be skipped on unwind).
+    fn wrap_job<F>(&self, job: F) -> impl FnOnce() + Send + 'static
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.spawned.set(self.spawned.get() + 1);
+        let registry = Arc::clone(&self.registry);
+        move || {
+            struct ReleaseSlot(Arc<Registry>);
+            impl Drop for ReleaseSlot {
+                fn drop(&mut self) {
+                    self.0.release_parking(1);
+                }
+            }
+            let _release = ReleaseSlot(registry);
+            job();
+        }
+    }
+}
+
+impl Drop for ParkingLease {
+    fn drop(&mut self) {
+        // Return only the never-spawned remainder: spawned jobs return their
+        // own slot, possibly still in flight while this drop runs (the
+        // collector's return only orders the channel close, not each
+        // worker's exit from the job).
+        self.registry
+            .release_parking(self.reserved - self.spawned.get());
+    }
+}
+
 /// Handle returned by [`feed_items`]: either an inline push (already done,
 /// nothing to reap) or a detached feeder (pool job or dedicated thread)
 /// whose panic payload is re-raised by [`Feeder::finish`].
@@ -125,10 +187,10 @@ impl Feeder {
 /// on the *output* channel, the calling thread finishes pushing, drops the
 /// sender, and proceeds to collect — draining the output and unblocking
 /// workers. The pool path is only taken when [`StreamPipe::try_exec`] has
-/// reserved a slot for it in the pool's liveness budget (one pool thread on
-/// top of every sync stage's workers), so the feeder job is always
-/// schedulable. The dedicated-thread path is trivially safe: the OS
-/// schedules the thread independently of the pool.
+/// leased a slot for it through the pool-wide [`ParkingLease`] (on top of
+/// every sync stage's workers), so the feeder job is always schedulable even
+/// with other runs resident on the same pool. The dedicated-thread path is
+/// trivially safe: the OS schedules the thread independently of the pool.
 ///
 /// The pool-path job is **injected** (`submit_injected`), never `submit`ed:
 /// it must sit in the injector FIFO *before* the stage-worker jobs that
@@ -155,6 +217,7 @@ fn feed_items<I: Send + 'static>(
     cancel: Option<CancellationToken>,
     buffer: usize,
     dedicated: bool,
+    lease: Option<&ParkingLease>,
 ) -> Feeder {
     if items.len() <= buffer {
         for (seq, item) in items.into_iter().enumerate() {
@@ -190,7 +253,10 @@ fn feed_items<I: Send + 'static>(
         std::thread::spawn(push_loop);
         Feeder::Thread(slot)
     } else {
-        pool.submit_injected(push_loop);
+        match lease {
+            Some(l) => pool.submit_injected(l.wrap_job(push_loop)),
+            None => pool.submit_injected(push_loop),
+        }
         Feeder::Pool(slot)
     }
 }
@@ -1019,15 +1085,20 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     pub per_stage_parallelism: usize,
     /// When `true`, sync/expand stage workers (and a non-inline feeder) run
     /// as dedicated OS threads instead of pool jobs. Chosen by
-    /// [`StreamPipe::try_exec`] when the pool's liveness budget cannot give
-    /// every sync stage a resident worker (more sync stages than available
-    /// pool slots), or when `run()` itself executes on a worker of the same
-    /// pool (nested pipelines park that worker in the collector for the
-    /// whole run, so pool admission can never be guaranteed). The pool's
-    /// fixed thread count makes parked-in-channel jobs unschedulable by
-    /// definition; dedicated threads keep such chains deadlock-free at the
-    /// cost of one `thread::spawn` per worker.
+    /// [`StreamPipe::try_exec`] when the pool-wide parking lease cannot host
+    /// the run's whole upper bound of channel-parking jobs (pool busy with
+    /// other runs' leases, or more sync stages than available pool slots),
+    /// or when `run()` itself executes on a worker of the same pool (nested
+    /// pipelines park that worker in the collector for the whole run, so
+    /// pool admission can never be guaranteed). The pool's fixed thread
+    /// count makes parked-in-channel jobs unschedulable by definition;
+    /// dedicated threads keep such chains deadlock-free at the cost of one
+    /// `thread::spawn` per worker.
     pub dedicated_threads: bool,
+    /// The pool-capacity lease backing pool mode (`dedicated_threads ==
+    /// false`); `None` in dedicated mode. Every channel-parking job
+    /// submitted for this run is wrapped through [`ParkingLease::wrap_job`].
+    pub(crate) lease: Option<ParkingLease>,
     /// Pool-mode liveness budget: worker slots still grantable to
     /// not-yet-spawned sync stages. Initialised to `pool_threads - reserved`
     /// (the feeder job reserves one slot when it is not inline) and decremented
@@ -1106,6 +1177,9 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     /// mode. Threads are detached — workers always terminate on channel
     /// disconnect (see [`spawn_stage`]), and the collector only returns once
     /// every sender is dropped, so no thread outlives the run's usefulness.
+    ///
+    /// Pool mode wraps each job through the run's [`ParkingLease`] so its
+    /// leased slot is returned exactly when the worker leaves the job.
     pub(crate) fn spawn_stage_jobs<F>(&self, jobs: Vec<F>)
     where
         F: FnOnce() + Send + 'static,
@@ -1122,7 +1196,13 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
                 });
             }
         } else {
-            self.compute_pool().submit_batch(jobs);
+            match &self.lease {
+                Some(lease) => {
+                    let wrapped = jobs.into_iter().map(|job| lease.wrap_job(job));
+                    self.compute_pool().submit_batch(wrapped);
+                },
+                None => self.compute_pool().submit_batch(jobs),
+            }
         }
     }
 
@@ -2687,31 +2767,26 @@ where
         // n > k × buffer hung forever — the feeder job was uncounted and the
         // per-stage floor of 1 pushed the total past the pool).
         //
-        // The feeder therefore reserves a slot *before* dividing the budget:
-        // it is a pool job whenever `n > buffer`, inline on the calling
-        // thread otherwise. Explicit `StageOptions::workers` pins are granted
-        // first (clamped to what remains — see `StreamCtx::stage_workers`),
-        // then the rest is divided equally across unpinned stages.
+        // That budget must hold at *pool* scope, not per run: concurrent
+        // full-budget runs on a shared pool (global pool + parallel callers)
+        // each individually fit yet jointly oversubscribe it, parking every
+        // worker with stage-2 jobs still queued (see [`ParkingLease`]). The
+        // run therefore leases its whole upper bound of parking jobs from
+        // the pool atomically, or falls back to dedicated threads.
         //
-        // When even 1 worker per sync stage does not fit (k + feeder >
-        // pool_threads), or when `run()` itself executes on a worker of the
-        // same pool (nested pipelines: the collector parks that worker for
-        // the whole run, so pool admission of *any* further blocking job —
-        // feeder included — depends on other tenants' courtesy), stage
-        // workers and the feeder fall back to dedicated OS threads, which the
-        // OS schedules independently of pool occupancy.
+        // When the remaining lease capacity cannot host the run (busy pool,
+        // or more sync stages than slots), or when `run()` itself executes
+        // on a worker of the same pool (nested pipelines: the collector
+        // parks that worker for the whole run, so pool admission of *any*
+        // further blocking job — feeder included — depends on other
+        // tenants' courtesy), stage workers and the feeder fall back to
+        // dedicated OS threads, which the OS schedules independently of
+        // pool occupancy.
         let budget = stages.stage_budget();
         let pool = compute_pool
             .as_ref()
             .map_or_else(|| ComputePool::global().clone(), Clone::clone);
         let pool_threads = pool.num_workers();
-        // Buffer/parallelism are mutually dependent (the buffer floor is
-        // `parallelism * 4`), so the feeder-path prediction uses a
-        // provisional division over the full pool. Pool mode only ever
-        // divides *fewer* slots, shrinking the buffer floor — never flipping
-        // a predicted-inline feeder into a blocking one. Dedicated mode may
-        // divide more, but there the feeder is a thread anyway.
-        //
         // Budget resolution: an explicitly pinned `with_compute_workers` wins
         // (clamped to the pool below); unpinned follows the pool's thread
         // count so a big blocking-IO pool actually gets its workers.
@@ -2720,20 +2795,49 @@ where
         } else {
             config.compute_workers.max(pool_threads)
         };
-        let provisional = budget.default_workers(workers_budget.min(pool_threads));
-        let feeder_buffer = config.buffer_size.max(provisional * 4);
-        let live_slots = pool_threads.saturating_sub(usize::from(n > feeder_buffer));
-        let dedicated_threads = pool.is_on_this_pool() || live_slots < budget.stages;
-        let per_stage_parallelism = if dedicated_threads {
-            // Threads are not pool-bounded; divide the configured budget.
-            budget.default_workers(workers_budget)
-        } else {
-            budget.default_workers(workers_budget.min(live_slots))
-        };
+        // Feeder-slot prediction must cover (never miss) the pool-job case.
+        // The feeder is a job iff `n > buffer_actual = max(buffer_size,
+        // per_stage_actual * 4)`; `per_stage_actual ≥ 1`, so predicting with
+        // the *smallest* possible buffer (`max(buffer_size, 4)`) reserves a
+        // slot in every case the feeder could be a job — the converse
+        // (reserved but inline) merely over-reserves by one slot, returned
+        // by the lease's drop.
+        let feeder_slot = usize::from(n > config.buffer_size.max(4));
+        let (lease, dedicated_threads, per_stage_parallelism, run_live_slots) =
+            if pool.is_on_this_pool() {
+                (None, true, budget.default_workers(workers_budget), 0)
+            } else {
+                // Snapshot the pool's lease load, size this run against it, and
+                // CAS the whole grant in one piece — `try_reserve_parking`
+                // revalidates against the live counter, so a stale snapshot can
+                // only under-promise (per_stage too small), never over-admit.
+                let used = pool.registry().parking_used();
+                let live_slots = pool_threads.saturating_sub(used + feeder_slot);
+                let per_stage = budget.default_workers(workers_budget.min(live_slots));
+                // Upper bound of granted workers: pins are additionally clamped
+                // to `n` by `stage_workers`, so this never under-reserves.
+                let unpinned = budget.stages.saturating_sub(budget.explicit_stages);
+                let need = feeder_slot + budget.explicit_workers + unpinned * per_stage.min(n);
+                if need <= pool_threads && pool.registry().try_reserve_parking(need) {
+                    let lease = ParkingLease {
+                        registry: Arc::clone(pool.registry()),
+                        reserved: need,
+                        spawned: Cell::new(0),
+                    };
+                    (Some(lease), false, per_stage, live_slots)
+                } else {
+                    (None, true, budget.default_workers(workers_budget), 0)
+                }
+            };
+        // Per-run worker budget in pool mode: the leased capacity minus the
+        // feeder slot. `unpinned * per_stage ≤ live_slots - explicit` by the
+        // `default_workers` division, so `stage_workers`' clamping grants
+        // every stage its full request — the lease bound stays an upper
+        // bound and the unspent remainder returns via the lease's drop.
         let (worker_slots_left, stages_left) = if dedicated_threads {
             (0, 0)
         } else {
-            (live_slots, budget.stages)
+            (run_live_slots, budget.stages)
         };
 
         let ctx: StreamCtx<'_, R> = StreamCtx {
@@ -2742,6 +2846,7 @@ where
             n,
             per_stage_parallelism,
             dedicated_threads,
+            lease,
             worker_slots_left: Cell::new(worker_slots_left),
             stages_left: Cell::new(stages_left),
             compute_pool: Some(pool),
@@ -2804,6 +2909,7 @@ where
                 feeder_cancel,
                 buffer,
                 dedicated_threads,
+                ctx.lease.as_ref(),
             );
             // `spawn_async_feeder_single` keeps the terminal MPSC property
             // (same rationale as the sync branch's `spawn_single`): without
@@ -2822,6 +2928,7 @@ where
                 feeder_cancel,
                 buffer,
                 dedicated_threads,
+                ctx.lease.as_ref(),
             );
             // Use `spawn_single` so the terminal stage's output channel is MPSC
             // (store-based dequeue, lock-free waker registry) — the collector is
@@ -2838,6 +2945,7 @@ where
                 feeder_cancel,
                 buffer,
                 dedicated_threads,
+                ctx.lease.as_ref(),
             );
             (stages.spawn_single::<R>(feeder_rx, &ctx), feeder)
         };
