@@ -31,9 +31,9 @@
   `ZSTD_SEEDS`/`ZSTD_SHAPE_NS` id 网格透传）；cheap 侧档位经算术核对
   不随边界变化（cpu_unbalanced n=200/5000 均未跨 48）。
 
-### 2. `pipeline_integration` 间歇性挂死：容量成分已修复，残余低概率窗口未定位
+### 2. `pipeline_integration` 间歇性挂死：已修复（双重根因，2026-09-25 收束）
 
-- **已修复成分**（2026-09-25，详见 `dev/streaming.md` "Pool-wide parking
+- **成分一**（详见 `dev/streaming.md` "Pool-wide parking
   lease"）：stream run 的 liveness 预算按单 run 独占池计算，多 run 并发共享
   池时联合超订——全部 worker park 在通道 send/recv 上、排队的 stage-worker
   job 与其后 injector FIFO 里的 fused chunk 永远无法弹出。放大复现（4 个
@@ -42,17 +42,20 @@
   通过、40 轮单二进制循环零挂；`mixed_load` A/B 无回归；回归测试
   `test_concurrent_full_budget_runs_share_pool_no_deadlock` /
   `test_concurrent_pinned_runs_mixed_admission_no_deadlock`（pre-fix 双挂）。
-- **残余**（同日多二进制并发压测，~1/8 组概率复现）：挂住 run 的 n=100
-  远小于 256 容量（send 不可能因 Full park）；budget 测试线程已退出而其
-  stage workers 仍 park 在 send（closed 唤醒未达）；存在「同一通道 collector
-  recv park（空）与上游 send park（满）并存」矛盾。指向 crossfire blocking
-  send/recv 的 fire 信号经济（`RegistryMulti::fire` 单事件只保证一个等待者
-  重试，wake 到 stale waker 信号即被浪费）或另一未定位调度缺陷。记录见
-  `dev/crossfire-waker-designs.md` §12.4。
-- **方向**：debuginfo 构建的全并发复现器（release 内联混淆使 job 归属无法
-  保真重建）+ trace_log 按线程粒度插桩；重点审 `fire` 的 pop_again seq
-  早停、`_clear_wakers` 竞争、以及 close 路径对 park 中 sender 的唤醒配对。
-- **验证**：复现器稳定转绿后，多二进制并发压测长循环（≥50 组）零挂。
+- **成分二**（详见 `dev/crossfire-waker-designs.md` §12.4 末节）：crossfire
+  `RegistrySingle` 状态真值源分裂——`get_waker_state` 读 WeakCell 槽位占用而
+  wake 写节点状态；`fire()` 的 pop 与 wake 两步之间被调度延迟任意放大后，
+  等待者 cancel+re-arm 重新填充槽位，迟到的 wake 置节点 Woken 但线程读槽位
+  得 Init 误判虚假唤醒再 park，此后所有 fire 对 Woken 节点 Skip 不 unpark，
+  事件流枯竭即永久死锁（解释了 n=100≪容量却 send park、closed 唤醒未达、
+  同通道 send 满/recv 空并存全部残余指纹）。修复：`get_waker_state` 改读节点
+  状态 + `_fire` Skip 重试补发；wepipe 新增 `crossfire-trace` forensics
+  feature（trace_log 转发 + 通道地址标识插桩）支撑本次定位。
+- **验证**：插桩复现器（3 进程 × 30 轮/组）修复前 ~1/6 组挂、修复后 75 组
+  零挂；crossfire 25 测试（含两个 pre-fix 失败的回归测试）+ youpipe 全量
+  release 测试 + 双 crate miri + clippy 全绿。已知理论残余：
+  `RegistryMulti` 跨 registry stale entry 偷单次 fire（Relaxed seq 无 hb，
+  loom 契约"一个事件内恢复"），未观察到闭环实例，留观察。
 
 ---
 

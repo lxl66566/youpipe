@@ -562,3 +562,38 @@ send/recv 上、排队的 stage-worker job（及其后在 injector FIFO 里的 f
 或另一未定位调度缺陷；release 符号内联混淆（多个 `spawn_stage` 单态化折叠）使回溯无法
 保真重建 job 归属。下一步：debuginfo 构建的全并发复现器 + 按线程/waker 粒度的
 trace_log 插桩，重点审 `fire` 的 pop_again seq 早停与 `_clear_wakers` 的竞争。
+
+**2026-09-25 根因实锤并修复（RegistrySingle 状态真值源分裂）**：插桩复现器
+（wepipe `crossfire-trace` feature 转发 crossfire `trace_log`，per-thread 文件 logger +
+通道地址标识）在 3 进程并发 × 多轮循环下稳定复现（约 1/6 组），trace 完整重放了死链：
+
+- 线程 F 的 `fire()`（`on_send` 触发）执行 `cell.pop()`（槽位置 null）后被抢占
+  **826 ms**，`waker.wake()` 迟到；
+- 期间 receiver 完成"消费 token → cancel（槽位残留）→ 下一个 episode 重新
+  `reg`（`tl_blocking_waker` 复位节点为 Init 并把节点 weak 重新填入槽位）→ park"；
+- 迟到的 wake 把**新代**节点置 Woken 并 unpark；receiver 醒来后 `get_waker_state`
+  读的是**槽位占用**（被 re-arm 重新填充 → Init）而非节点状态 → 误判虚假唤醒 →
+  再次 park；
+- 此后节点 state 恒为 Woken，后续所有 `fire` pop 到它都走 `Skip`（state ≥ Woken，
+  不 unpark）→ 事件流停止后**永久死锁**。这同时解释了此前全部残余指纹：n=100 ≪
+  容量却 send park（senders 等的是这个永不醒的 collector 消费）、budget 线程退出
+  而 workers 未收到 closed（close 的 fire 同样 Skip）、「同一通道 send 满 + recv 空
+  并存」（双方认知过时）。
+
+修复（waker_registry.rs）：
+
+1. `RegistrySingle::get_waker_state` 改读 waker 节点状态（单一真值源，与
+   `RegistryMulti` 一致）——延迟落地的 wake 无论迟到多久都会被 park 返回后的
+   线程观测到；
+2. `RegistrySingle::_fire` 增加 Skip 重试——pop 出的句柄节点已 Woken（re-arm 前
+   的过期句柄）时重新 pop 一次，把信号交给 re-arm 后的新注册，消除
+   "wake 与 cancel+re-arm 竞争落在 Skip 上"的残余窗口。
+
+回归测试 `test_single_delayed_wake_after_rearm_is_observed` /
+`test_single_fire_after_rearm_wakes_new_episode` 在旧实现上失败（读槽位返回
+Init）、修复后通过。验证：插桩复现器 75 组 × 3 进程零挂（修复前约 1/6 组挂）；
+crossfire 25 测试 + youpipe 全量 release 测试 + 双 crate miri + clippy 全绿。
+`RegistryMulti` 的 `fire` pop/wake 同为两步，但 `get_waker_state` 本就读节点状态，
+同构死锁不存在；跨 registry stale entry 偷一次 fire（Relaxed seq 无 hb，
+loom 契约"一个事件内恢复"）仍是已知理论残余，事件流枯竭的闭环场景由本次
+Single 修复消除了主通道（collector 通道），Multi 侧未观察到实例。

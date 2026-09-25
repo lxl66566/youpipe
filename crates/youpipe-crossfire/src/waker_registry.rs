@@ -182,9 +182,18 @@ pub struct RegistrySingle {
 impl RegistrySingle {
     #[inline(always)]
     fn _fire(&self) {
-        if let Some(waker) = self.cell.pop() {
-            waker.wake();
-            trace_log!("{} wake", self._tag);
+        // Retry-on-Skip: a popped handle whose node is already Woken is a
+        // stale registration from before the waiter re-armed (the re-arm
+        // resets the node to Init and refills the slot). Looping re-pops the
+        // fresh registration and delivers the wake it is owed — without it,
+        // a wake racing a cancel + re-arm can land as Skip and leave the new
+        // episode parked forever once the event stream goes quiet.
+        while let Some(waker) = self.cell.pop() {
+            let r = waker.wake();
+            trace_log!("{} wake {:?} {:?}", self._tag, waker, r);
+            if r != WakeResult::Skip {
+                break;
+            }
         }
     }
 
@@ -213,11 +222,21 @@ impl Registry for RegistrySingle {
     type Waker = SingleWaker;
 
     #[inline(always)]
-    fn get_waker_state(&self, _o_waker: &Option<SingleWaker>, _order: Ordering) -> u8 {
-        if self.cell.is_empty() {
-            WakerState::Woken as u8
+    fn get_waker_state(&self, o_waker: &Option<SingleWaker>, order: Ordering) -> u8 {
+        // The single source of truth is the waker node's state, NOT the cell
+        // slot. fire() consumes the slot and wakes the node as two separate
+        // steps; an arbitrarily long preemption between them lets the waiter
+        // cancel + re-arm (refilling the slot) before the delayed wake lands.
+        // Reading slot occupancy then reports Init while the node says Woken:
+        // the woken thread re-parks, the node stays Woken forever, and every
+        // later fire pops it and Skips (state >= Woken, no unpark) — a
+        // permanent deadlock (reproduced under CPU oversubscription). The
+        // node's state machine has no such gap: a delayed wake still flips it
+        // to Woken, which the parked thread observes on its return.
+        if let Some(waker) = o_waker {
+            waker._get_state(order)
         } else {
-            WakerState::Init as u8
+            WakerState::Woken as u8
         }
     }
 
@@ -974,6 +993,71 @@ mod tests {
         }
         assert_eq!(waker2.get_state(), WakerState::Woken as u8);
         assert_eq!(reg.len(), 0);
+    }
+
+    // Regression (youpipe intermittent-hang forensics, 2026-09): fire() pops
+    // the cell and wakes the node as two separate steps. An arbitrarily long
+    // preemption between them lets the waiter cancel + re-arm (refilling the
+    // slot, resetting the node to Init) before the delayed wake lands. The
+    // parked thread must observe Woken after that wake, or it re-parks with
+    // the node stuck at Woken and every later fire Skips — a permanent
+    // deadlock once the event stream goes quiet.
+    #[test]
+    fn test_single_delayed_wake_after_rearm_is_observed() {
+        let reg = <RegistrySingle as RegistryRecv>::new();
+        let mut o_waker: Option<SingleWaker> = None;
+        <RegistrySingle as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+
+        // fire()'s first half, as preempted mid-way: slot consumed, wake not
+        // yet delivered.
+        let stale = reg.cell.pop().expect("registered");
+
+        // The waiter wakes on an earlier token, cancels its stale episode and
+        // re-arms for a new one (same per-thread node, state reset to Init).
+        <RegistrySingle as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+        assert_eq!(
+            <RegistrySingle as Registry>::get_waker_state(&reg, &o_waker, Ordering::SeqCst),
+            WakerState::Init as u8
+        );
+
+        // fire()'s delayed second half: the stale handle's wake finally runs.
+        // It flips the re-armed node to Woken and unparks.
+        assert_eq!(stale.wake(), WakeResult::Next);
+        let state = <RegistrySingle as Registry>::get_waker_state(&reg, &o_waker, Ordering::SeqCst);
+        assert_eq!(
+            state,
+            WakerState::Woken as u8,
+            "delayed wake after re-arm must be observable via the node state"
+        );
+    }
+
+    // Same forensics, skip-recovery half: when a fire lands on an already
+    // Woken node (pre-re-arm handle), the re-armed registration in the slot
+    // must still receive a wake — the retry-on-Skip loop in `_fire`.
+    #[test]
+    fn test_single_fire_after_rearm_wakes_new_episode() {
+        let reg = <RegistrySingle as RegistryRecv>::new();
+        let mut o_waker: Option<SingleWaker> = None;
+        <RegistrySingle as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+
+        // Preempted fire half: pop the stale handle, then the waiter re-arms
+        // (node back to Init, slot refilled with the same node).
+        let stale = reg.cell.pop().expect("registered");
+        <RegistrySingle as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+
+        // A second, complete fire: its first pop may observe the stale
+        // Woken… but here the stale wake has not run yet, so the node is
+        // Init and the fire delivers normally. Force the stale-first shape:
+        stale.wake(); // node -> Woken (as if an older fire just landed)
+        // The complete fire must still wake the (re-armed) waiter instead of
+        // silently Skipping on the Woken node.
+        reg.fire();
+        let state = <RegistrySingle as Registry>::get_waker_state(&reg, &o_waker, Ordering::SeqCst);
+        assert_eq!(
+            state,
+            WakerState::Woken as u8,
+            "re-armed episode must end Woken after fire"
+        );
     }
 
     #[test]
