@@ -413,6 +413,62 @@ fused 200/1000 → 4/21 — none crosses 48), and on the reference
 boundary is machine-independent by design — a smaller pool holds
 proportionally more items per chunk and may cross into the wide tier.
 
+#### Worker affinity: opt-in 1:1 core pinning (accepted, opt-in)
+
+The fused 2M/4M occupancy attribution (benchmarks.md) showed the residual
+per-batch cost is parked workers' futex wake + cold-core placement
+(7.6 migrations/iter vs rayon's 0.5, 99 vs 13–19 ctx switches). The
+sanctioned structural lever from that round — keep workers hot across
+back-to-back batches — is not reachable by spin-window policy: a causal
+probe (`YOUPIPE_SPIN_ROUNDS=YOUPIPE_YIELD_ROUNDS=2048`, same-binary,
+2026-09) recovers capped −3.8…−5.3 % / uniform −1.5…−3.9 % but regresses
+heavy-tail +1.1…+4.1 % (spinning during the ms-scale straggler burns its
+SMT sibling), and a quiescence-gated extension (extend the spin phase only
+while `inactive == num_threads`) measured no win — in these shapes the
+early parkers park *before* quiescence (the straggler is still running),
+so the gate always fires too late (reverted; see the falsified list in
+`todo.md`).
+
+`ComputePool::new_pinned(n)` attacks the same residual without burning
+anything: worker `i` is pinned to the i-th CPU of the process's allowed
+set, so a worker that parks between batches always wakes on its own —
+idle, cache-warm — core. Same-binary A/B (`YOUPIPE_PIN_WORKERS=1`,
+16C/32T, taskset 1-31, 5 interleaved rounds, rayon columns all noise):
+
+| family (youpipe ids) | off → pinned |
+| --- | --- |
+| zstd capped n=2000 (2 seeds) | **−6.9 / −6.1 %** (25/25) |
+| zstd uniform n=2000 (2 seeds) | **−4.0 / −4.6 %** (25/25) |
+| zstd heavy-tail n=2000 (2 seeds) | −1.6 / **−3.8 %** (21-25/25) |
+| horizontal cpu_balanced 1M/2M/4M | −7.2 / −5.1 / −6.5 % (5/5 rounds each) |
+
+Pinning is **not** a default because it trades away CFS's wake steering,
+which other regimes need (a woken pinned thread cannot move to an idle
+CPU if its own is busy). Same-session regression sweep (3 rounds, ids
+where the verdict was stable):
+
+| family (youpipe ids) | off → pinned |
+| --- | --- |
+| cpu_unbalanced_stream unordered/ordered 5000 | **+47.7 / +42.8 %** |
+| sync_nested_on_pool nested_saturated/1K | **+37.1 %** |
+| sync_for_each cpu_heavy/1K | +22.1 % |
+| cpu_unbalanced_stream 200 | +17.2…+18.2 % |
+| sync_lightweight par_map_borrowed/10K | +17.1 % |
+| sync_filter filter_map(_owned) 1K/10K | +5.2…+12.9 % |
+| mixed_load stream_cpu/100K | +6.1 % |
+| (improvements) nested_saturated/100K, io_unbalanced unordered/1K | −2.2 / −2.4 % |
+
+The dividing line is batch saturation: when a batch occupies (nearly)
+all workers for its whole duration, every wake lands on an idle core and
+pinning is pure win; when few workers are active (small/medium batches
+with a participating driver) or work is item-granular and wake-heavy
+(streaming stage workers parked on inter-stage channels), forcing
+placement loses to the scheduler. Hence: opt-in constructor, single
+≤-CPU-sized pool serving fused batch terminals only, never shared with
+`stream` pipelines; `YOUPIPE_PIN_WORKERS=1` remains as the same-binary
+A/B knob (it pins *every* pool in the process — that is exactly how the
+regression column above was measured).
+
 ### Graceful Shutdown
 
 `ComputePool::Drop` calls `Registry::terminate()`, which decrements a ref-count

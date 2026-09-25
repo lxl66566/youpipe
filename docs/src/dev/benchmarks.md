@@ -792,7 +792,11 @@ but also that it is only worth 1.2–4.4 pt of the ~13 pt gap in that
 session. Widening the window indiscriminately burns idle CPU (the
 `ROUNDS_SPIN` history), so the open lever is structural: keep workers
 across a batch's back-to-back iterations (or shave the tail chunk) instead
-of stretching the idle window.
+of stretching the idle window. Status (2026-09-26): the keep-warm side is
+resolved by opt-in core pinning (`ComputePool::new_pinned` — −5.1…−7.2 %
+on this exact caliber, no burn; see scheduler.md "Worker affinity"), and
+re-measuring the gap under the NT-store auto default found it collapsed:
+1M +0.6 %, 2M +1.5 %, 4M −6.8 % (7 interleaved rounds, taskset 1-31).
 
 Harness note: attribution initially used a standalone runner
 (`youpipe-bench`'s `horizontal-counters`, same workload); its wall times

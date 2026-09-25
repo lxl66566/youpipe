@@ -12,6 +12,7 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `.ordered()` | reorder pass restoring input order | streaming | output must match input order |
 | `.fence(mode)` | isolation at one stage boundary | streaming | downstream must not see partial upstream |
 | `StageOptions` | per-stage workers / io_concurrency / buffer | streaming | stages have unequal costs |
+| `ComputePool::new_pinned(n)` | workers pinned 1:1 to allowed CPUs | pools | tight loops of large saturated fused batches (**not** streaming — see [pools](pools.md)) |
 
 `Workload` and `buffer_size`/`async_workers`/`io_concurrency` are disjoint: a
 fused `pipe()` ignores the streaming knobs (it has no channels and no async

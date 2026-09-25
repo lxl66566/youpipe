@@ -24,6 +24,13 @@
   "Wide-tier boundary scan"：42 items/chunk 中性、63/chunk wide 全形状
   占优，heavy-tail n=3000 vs-rayon 差距 +8.6%→+2.5%）。残余：capped
   +1…+2%、uniform +4…+6%、heavy-tail n=2000（narrow）~+1% 仍落后 rayon。
+- **归因收束（2026-09-26）**：capped/uniform 残差主体是批间 park/wake
+  占用（keep-hot 旋钮因果验证：capped −3.8…−5.3%、uniform −1.5…−3.9%，
+  但 heavy-tail +1.1…+4.1%——全局加宽的 Pareto 代价）。**已落地 opt-in
+  解法**：`ComputePool::new_pinned` 核绑定（capped −6.1…−6.9%、uniform
+  −4.0…−4.6%、heavy-tail 也 −1.6…−3.8%，无烧核副作用；小批量/流式
+  regime 代价见 scheduler.md "Worker affinity"）。默认路径的残余改按
+  pinning 闸下口径重估。
 - **方向**：capped 形状的残余是重尾 spread（4.2 pt）而非均值——考虑 chunk 内条目
   乱序化或第三档，但注意 cost-EMA 类自适应已两次证伪（见 scheduler.md），
   不要再走运行时成本估计路线。
@@ -70,13 +77,16 @@
   但只救回 1–4 pt（NT store 另行救回 ~13 pt 并反超，已落 auto 默认档，见
   benchmarks.md "NT-store attribution"）。
 - **方向**（结构性手段；勿拉长全局自旋窗口——`ROUNDS_SPIN` 历史 +20–36% 回退）：
-  1. 背靠背批次（bench 循环、流式多批次）下「下一批将至」提示 / 短窗口热身，
-     让工人跨迭代保温（时间戳触发的 hot-epoch 窗口已证伪，见文末清单——
-     时间窗无法区分批内 ramp-down idle 与批间 gap idle）；
+  1. ~~背靠背批次下「下一批将至」提示 / 短窗口热身~~——已由 opt-in
+     `ComputePool::new_pinned` 核绑定覆盖（2026-09-26 落地，cpu_balanced
+     1M/2M/4M −5.1…−7.2%，见 scheduler.md "Worker affinity"；时间戳
+     hot-epoch 窗口与 quiescence 门控均证伪，见文末清单）；
   2. 尾部 straggler 细化：末段更细粒度 oversplit（动态，非 cost-EMA 路线，
-     该路线已两次证伪）；
-  3. 1M 打平而 2M 落后的边界为何不随占用亏损移动，未解释；NT 已落 auto
-     （≥8 MiB 输出自动开，1M 起生效），可在新口径下复查。
+     该路线已两次证伪）——残余价值有限（新口径下 2M 仅 +1.5%）；
+  3. ~~新口径复查~~（2026-09-26，7 轮交错，taskset 1-31）：fused 差距已收束
+     ——cpu_balanced 1M +0.6%、2M +1.5%、4M **−6.8%**（youpipe 反超）；
+     readback 口径 youpipe 领先 24–29%。占用亏损主体已由 NT-store auto +
+     pinning 闸下可选收回，默认路径残余 ≈1.5 pt @2M。
 - **验证**：`cpu_balanced` 1M/2M/4M 隔离 A/B + `horizontal-counters`
   （youpipe-bench）复查 task-clock / ctx-switch / migration。
 
@@ -84,12 +94,15 @@
 
 ## P2
 
-### 4. 池 worker 核绑定（affinity）实验
+### 4. 池 worker 核绑定（affinity）：已落地（2026-09-26，opt-in `ComputePool::new_pinned`）
 
 latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
-100 µs–1.7 ms 是残余 straggler 的根源，属内核调度行为。可选：per-worker
-`pthread_setaffinity` 配置项（默认关闭），在 zstd_shape/unbalanced 上 A/B。
-风险：与用户 `taskset` 冲突、跨 NUMA 迁移损失、库越权管理拓扑。
+100 µs–1.7 ms 是残余 straggler 的根源，属内核调度行为。已实现 per-worker
+`sched_setaffinity`（worker i → 允许集第 i 个 CPU，round-robin），默认关闭。
+zstd 全形状 −1.6…−6.9%、fused 1M/2M/4M −5.1…−7.2%，且无 keep-hot 自旋的
+heavy-tail 副作用；但小批量/流式 regime 回退 +5…+48%（woken 线程无法迁往
+空闲 CPU），故仅作显式构造器 + `YOUPIPE_PIN_WORKERS` A/B 旋钮，regime 表与
+警示见 scheduler.md "Worker affinity" 与 advanced/pools.md。
 
 ### 5. transient pool 复用缓存
 
@@ -188,6 +201,16 @@ latecomer 分析（`dev/scheduler.md`）表明 SMT 过下载下 CFS 唤醒延迟
   旁证（不作结论）：外部 bench 挤占 20+ 核的争载下同 A/B 一致 −8~−13%，
   提示泊车频率被放大时窗口才有净收益。「下一批将至」的显式提示（caller
   侧声明、非时间推断）与尾部 straggler 细化仍开放。
+- **quiescence 门控保温自旋**（2026-09-26，实现后 A/B 前回退）：机制——
+  worker 在 spin→yield 相位边界检查 `counters.inactive == num_threads`
+  （全池静默 = 没有在执行的工人 = 批间 gap 而非 ramp-down），静默期间以
+  有界预算（env 旋钮）延长 busy-spin 跨过批间 gap。判据本身正确地区分了
+  两种 idle，但**生效太晚**：capped/uniform 形状里早停工人在批尾（尚有
+  straggler 在跑、非静默）就耗尽 32+32 窗口泊车，静默成立时救援窗口已过；
+  冒烟（uniform，q=2048 vs 0）+1.5…+2.8% 无收益，而对照组全局
+  spin=2048 同形状 −4%（收益全部来自「非静默期间也保温」，即被证伪的
+  全局加宽）。结论：批间 park/wake 残差不存在只作用于 gap idle 的
+  池内信号；opt-in 核绑定（P2#4）从唤醒落核侧收回了同一残差。
 - **`Slots::uninit` 输出分配 `MADV_HUGEPAGE`**（2026-09，机制性证伪未跑
   A/B）：sysfs THP `enabled=[madvise]`（非 never），但此机内存状态使
   madvise 无效——buddyinfo Normal zone order-9 空闲块 0、MemFree ~2 GB

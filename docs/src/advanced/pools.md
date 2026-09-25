@@ -44,6 +44,38 @@ Factor guidance: CPU + fast IO → 1 (no benefit), CPU + slow disk IO → 2–3,
 network/lock contention → 3–4, mostly IO → 4–8. Never oversubscribe pure-CPU
 work — measured 10–30 % regression.
 
+## Core pinning for tight batch loops (opt-in)
+
+`ComputePool::new_pinned(n)` pins worker `i` to the i-th CPU the process is
+allowed to run on. A worker that parks between back-to-back batches then
+always wakes on its own — idle, cache-warm — core instead of wherever CFS
+places it (measured 7.6 cold-core migrations per iteration unpinned).
+
+```rust
+use youpipe::{ComputePool, prelude::*};
+
+// Hot loop of large saturated batches: −4…−7 % vs the unpinned pool.
+let pool = ComputePool::new_pinned(num_cpus);
+loop {
+    let r: Vec<_> = pipe_ref(&batch).map(transform).with_compute_pool(&pool).collect();
+}
+```
+
+The regime matters — pinning trades away the scheduler's ability to steer a
+woken thread to an idle CPU:
+
+| Workload shape | Measured effect of pinning |
+| --- | --- |
+| back-to-back saturated batches (≥ ~1 ms of even work) | **−4…−7 %** |
+| small/medium batches (driver participates, most workers parked) | +5…+22 % |
+| streaming pipelines (stage workers park on channels) | **+17…+48 % — do not pin** |
+| oversubscribed pools (> #CPUs threads) | meaningless (16+ threads per CPU) |
+
+Use exactly one pinned, ≤-CPU-sized pool for fused batch terminals; never
+share it with `stream` pipelines or run several pinned pools on overlapping
+CPUs. `YOUPIPE_PIN_WORKERS=1` is the same-binary benchmarking knob (it pins
+every pool in the process); the supported API is the constructor.
+
 ## Blocking IO: the numbers
 
 Blocking work in a sync `.stage()` must oversubscribe, or waits serialize.
