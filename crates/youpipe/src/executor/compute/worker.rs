@@ -47,7 +47,34 @@ impl ComputePool {
     /// query the cap programmatically.
     #[must_use]
     pub fn new(num_workers: usize) -> Self {
-        let registry = Registry::new(num_workers);
+        let registry = Registry::new(num_workers, false);
+        registry.wait_until_primed();
+        Self { registry }
+    }
+
+    /// Create a pool whose workers are pinned to the CPUs the process is
+    /// allowed to run on: worker `i` → the i-th allowed CPU (round-robin
+    /// when `num_workers` exceeds the CPU count).
+    ///
+    /// Regime (same-binary A/B, 16C/32T SMT, taskset to 31 CPUs, 5
+    /// interleaved rounds): back-to-back **saturated batch loops** win,
+    /// because a worker that parks between batches always wakes on its own
+    /// — idle, cache-warm — core instead of being placed on a busy or cold
+    /// one by CFS: zstd-shaped unbalanced −4…−7 %, fused collect 1–4 M
+    /// −5…−7 %. The same pinning **regresses** shapes that rely on the
+    /// scheduler steering woken threads to idle CPUs: small/medium batches
+    /// with a participating driver (+5…+22 %), streaming stage workers
+    /// parked on inter-stage channels (+17…+48 %), nested saturated 1 K
+    /// (+37 %). Pin only a single, ≤-CPU-sized pool that serves fused
+    /// batch terminals; never share it with `stream` pipelines, oversize
+    /// it, or run several pinned pools on overlapping CPUs. Details:
+    /// dev/scheduler.md "worker affinity".
+    ///
+    /// On platforms without affinity support (non-Linux, miri) this
+    /// degrades to an unpinned pool.
+    #[must_use]
+    pub fn new_pinned(num_workers: usize) -> Self {
+        let registry = Registry::new(num_workers, true);
         registry.wait_until_primed();
         Self { registry }
     }
@@ -259,5 +286,65 @@ mod tests {
         let (a, b) = pool.join(|| 10 + 20, || 30 + 40);
         assert_eq!(a, 30);
         assert_eq!(b, 70);
+    }
+
+    /// `new_pinned` must leave its workers affine to exactly one distinct
+    /// CPU of the process's allowed set (read back from /proc, no mocks).
+    /// Other tests in this binary create unpinned pools whose threads share
+    /// the `yp-pool-*` name, so the invariant is "≥ n distinct single-CPU
+    /// workers inside the allowed set".
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn test_new_pinned_workers_have_distinct_single_cpu_affinity() {
+        let allowed = youpipe_sys::allowed_cpus();
+        if allowed.len() < 2 {
+            // Restrictive sandbox; nothing meaningful to pin.
+            return;
+        }
+        let n = Ord::min(4, allowed.len());
+        let pool = ComputePool::new_pinned(n);
+        // Force the workers to exist before scanning /proc.
+        pool.registry().wait_until_primed();
+
+        let mut seen = Vec::new();
+        for status in std::fs::read_dir("/proc/self/task").unwrap() {
+            let status = status.unwrap();
+            let path = status.path().join("status");
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Worker threads are named `yp-pool-<i>` (≤ 15 chars in /proc).
+            if !text.lines().any(|l| l.starts_with("Name:") && l.contains("yp-pool-")) {
+                continue;
+            }
+            let Some(list) = text
+                .lines()
+                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            else {
+                continue;
+            };
+            let cpus: Vec<u32> = list
+                .split(',')
+                .flat_map(|part| {
+                    let (a, b) = part.split_once('-').unwrap_or((part, part));
+                    let a: u32 = a.trim().parse().unwrap();
+                    let b: u32 = b.trim().parse().unwrap();
+                    a..=b
+                })
+                .collect();
+            if cpus.len() == 1 && allowed.contains(&cpus[0]) {
+                seen.push(cpus[0]);
+            }
+        }
+        assert!(
+            seen.len() >= n,
+            "expected ≥{n} single-CPU workers, saw {seen:?}"
+        );
+        seen.sort_unstable();
+        seen.dedup();
+        assert!(
+            seen.len() >= n,
+            "workers must sit on distinct CPUs, got {seen:?}"
+        );
     }
 }

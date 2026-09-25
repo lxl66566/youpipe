@@ -18,8 +18,10 @@
 //! The API surface follows youpipe's needs and carries no stability
 //! guarantees outside youpipe releases; do not depend on it directly.
 
+mod affinity;
 mod cache_padded;
 mod sync;
 
+pub use affinity::{allowed_cpus, pin_current_thread_to};
 pub use cache_padded::CachePadded;
 pub use sync::{AtomicU64, AtomicUsize, Condvar, Mutex, MutexGuard, Ordering, fence, thread_yield};

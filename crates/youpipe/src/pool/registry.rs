@@ -98,7 +98,7 @@ impl ThreadInfo {
 }
 
 impl Registry {
-    pub(crate) fn new(num_threads: usize) -> Arc<Self> {
+    pub(crate) fn new(num_threads: usize, pin_workers: bool) -> Arc<Self> {
         let num_threads = Ord::min(num_threads.max(1), super::sleep::THREADS_MAX);
 
         let (workers, stealers): (Vec<_>, Vec<_>) = (0..num_threads)
@@ -118,11 +118,28 @@ impl Registry {
             parking_slots: AtomicUsize::new(0),
         });
 
+        // Worker→core pinning (`ComputePool::new_pinned`, or the
+        // `YOUPIPE_PIN_WORKERS` A/B knob for every pool): worker `i` is
+        // pinned to the i-th CPU of the process's allowed set (round-robin
+        // when the pool is larger than the set). Rationale, regime limits,
+        // and A/B numbers: dev/scheduler.md "worker affinity".
+        let pin_targets = Arc::new(if pin_workers || workers_pinned_by_env() {
+            youpipe_sys::allowed_cpus()
+        } else {
+            Vec::new()
+        });
+
         for (index, worker) in workers.into_iter().enumerate() {
             let thread_registry = Arc::clone(&registry);
+            let pin_targets = Arc::clone(&pin_targets);
             match thread::Builder::new()
                 .name(format!("yp-pool-{index}"))
                 .spawn(move || {
+                    if let Some(&cpu) = pin_targets.get(index) {
+                        // Best-effort: on failure the worker simply stays
+                        // unpinned (see `pin_current_thread_to`).
+                        let _ = youpipe_sys::pin_current_thread_to(cpu);
+                    }
                     unsafe { main_loop(worker, thread_registry, index) };
                 }) {
                 Ok(_) => {
@@ -368,6 +385,19 @@ impl Drop for Registry {
     }
 }
 
+/// Same-binary A/B escape hatch for worker pinning (default off): pins every
+/// pool in the process, including the global one. The supported opt-in is
+/// [`crate::ComputePool::new_pinned`]; this knob exists so scheduler-side
+/// experiments and the documented A/B numbers stay re-runnable without
+/// recompiles (the established methodology — see `YOUPIPE_OVERSPLIT`).
+fn workers_pinned_by_env() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("YOUPIPE_PIN_WORKERS")
+            .is_ok_and(|v| v == "1" || v == "true")
+    })
+}
+
 // ── Global registry ──
 
 static GLOBAL_REGISTRY: OnceLock<Arc<Registry>> = OnceLock::new();
@@ -375,7 +405,9 @@ static GLOBAL_REGISTRY: OnceLock<Arc<Registry>> = OnceLock::new();
 pub(crate) fn global_registry() -> &'static Arc<Registry> {
     GLOBAL_REGISTRY.get_or_init(|| {
         let cpus = crate::num_cpus();
-        let registry = Registry::new(cpus);
+        // Unpinned by default; `YOUPIPE_PIN_WORKERS` still covers the global
+        // pool as the same-binary A/B escape hatch.
+        let registry = Registry::new(cpus, false);
         registry.wait_until_primed();
         registry
     })

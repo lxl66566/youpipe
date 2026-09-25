@@ -12,6 +12,9 @@ categories             = ["concurrency"]
 [dependencies]
 parking_lot = "0.12"
 
+[target."cfg(all(target_os = \"linux\", not(miri)))".dependencies]
+libc = "0.2"
+
 [target."cfg(loom)".dependencies]
 loom = "0.7"
 

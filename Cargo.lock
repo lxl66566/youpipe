@@ -2462,6 +2462,7 @@ dependencies = [
 name = "youpipe-sys"
 version = "0.5.0"
 dependencies = [
+ "libc 0.2.189",
  "loom",
  "parking_lot",
 ]
