@@ -160,19 +160,36 @@ impl<T> ReorderBuffer<T> {
         }
     }
 
+    /// Flush every buffered item, sorted by seq. Cold path (once per run,
+    /// at close). Single allocation: occupied slots are compacted to the
+    /// front and sorted in place (by tag), then read into the returned
+    /// `Vec` — the earlier collect-`Vec<(u64, T)>`-then-`collect()` shape
+    /// paid a second heap allocation purely to carry the seq through the
+    /// sort.
     pub fn flush_remaining(&mut self) -> Vec<T> {
-        let mut items: Vec<(u64, T)> = Vec::with_capacity(self.len);
-        for slot in &mut self.slots {
-            if slot.tag != UNOCCUPIED {
-                let item = unsafe { slot.item.assume_init_read() };
-                let seq = slot.tag - 1;
-                slot.tag = UNOCCUPIED;
-                items.push((seq, item));
+        // Compact occupied slots to the front. Swap-based so every slot
+        // stays a valid value — moving out of a `Vec` element would leave
+        // an uninitialized hole behind.
+        let mut write = 0;
+        for read in 0..self.slots.len() {
+            if self.slots[read].tag != UNOCCUPIED {
+                self.slots.swap(write, read);
+                write += 1;
             }
         }
-        items.sort_by_key(|(seq, _)| *seq);
+        debug_assert_eq!(write, self.len);
+        // Sort by tag (== seq + 1). `Slot` moves are byte copies of the
+        // `MaybeUninit` payload — nothing is dropped here.
+        self.slots[..write].sort_unstable_by_key(|s| s.tag);
+        let mut out = Vec::with_capacity(write);
+        for slot in &mut self.slots[..write] {
+            // SAFETY: occupied and init — `tag != UNOCCUPIED` until the
+            // read below clears it.
+            out.push(unsafe { slot.item.assume_init_read() });
+            slot.tag = UNOCCUPIED;
+        }
         self.len = 0;
-        items.into_iter().map(|(_, item)| item).collect()
+        out
     }
 
     #[must_use]
@@ -280,8 +297,14 @@ mod tests {
         buf.insert(3, 40);
         buf.insert(1, 20);
         buf.insert(5, 50);
+        // A wrapped-window item: seq 17 aliases slot 1 (17 & 15), which was
+        // already flushed — its slot index (1) is lower than the in-window
+        // items' (3, 5), so sorting must order by seq, not slot index.
+        buf.insert(17, 170);
         let remaining = buf.flush_remaining();
-        assert_eq!(remaining, vec![40, 50]);
+        assert_eq!(remaining, vec![40, 50, 170]);
+        assert!(buf.is_empty());
+        assert_eq!(buf.next_expected(), 2);
     }
 
     #[test]
