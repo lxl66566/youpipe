@@ -34,6 +34,9 @@ let r: Vec<i32> = (0..1000).pipe()
     .map(|x| x * 10)
     .collect();
 
+// aggregation terminals: same fusion, no output Vec at all
+let s: i64 = (0..1000).pipe().map(|x| x + 1).sum();
+
 // sync CPU stage + async IO stage, overlapped on separate pools
 let r: Vec<u64> = (0..1000).stream()
     .stage(|x: u64| x + 1)

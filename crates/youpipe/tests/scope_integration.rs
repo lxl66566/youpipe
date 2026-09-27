@@ -427,3 +427,41 @@ fn test_scoped_try_with_workload_custom() {
     });
     assert_eq!(r.unwrap(), (0..2_000).map(|x| x + 7).collect::<Vec<_>>());
 }
+
+/// Scoped reduce/fold: borrow a stack-local table inside the fold closures —
+/// the `scope` headline applied to the aggregation terminals.
+#[test]
+fn test_scope_reduce_and_fold_borrow() {
+    use youpipe::scope;
+    let table: Vec<u64> = (0..1000u64).map(|i| i.wrapping_mul(7)).collect();
+    let sum = scope(|s| {
+        s.pipe(0..table.len())
+            .map(|i: usize| table[i])
+            .reduce(u64::wrapping_add)
+    });
+    assert_eq!(
+        sum,
+        Some(table.iter().copied().fold(0u64, u64::wrapping_add))
+    );
+
+    let digit_sum = scope(|s| {
+        s.pipe(0..table.len())
+            .map(|i: usize| table[i] % 10)
+            .fold(0u64, |a, x| a + x, |a, b| a + b)
+    });
+    assert_eq!(digit_sum, table.iter().map(|x| x % 10).sum::<u64>());
+
+    // Scoped fallible variants.
+    let r = scope(|s| {
+        s.pipe(0..100u64)
+            .try_map(|x| -> Result<u64, &str> { Ok(x + 1) })
+            .try_reduce(|a, b| a + b)
+    });
+    assert_eq!(r, Ok(Some((1..=100u64).sum())));
+    let r = scope(|s| {
+        s.pipe(0..100u64)
+            .try_map(|x| -> Result<u64, &str> { Ok(x + 1) })
+            .try_fold(0u64, |a, x| a + x % 10, |a, b| a + b)
+    });
+    assert_eq!(r, Ok((1..=100u64).map(|x| x % 10).sum::<u64>()));
+}

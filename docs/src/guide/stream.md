@@ -39,6 +39,11 @@ let mut total = 0u64;
 stream(0..10_000).stage(|x: u64| x * 2).for_each(|x| total += x);
 ```
 
+The aggregation terminals — `.reduce(op)` / `.fold(init, f, combine)` /
+`.sum()` / `.count()` / `.min()` / `.max()` — combine outputs without an
+output `Vec`, always in input order regardless of completion order (the
+same contract as the [fused counterparts](pipe.md#aggregation-terminals-reduce--fold--sum--)).
+
 **Fused pass-through.** When the chain is only `.stage()`s (no `expand` /
 `fence` / `stage_async`, no `with_cancel`, no `with_compute_workers` or
 per-stage `workers`/`buffer` pin), `.run()` detects it at the type level and

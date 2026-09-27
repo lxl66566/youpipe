@@ -135,6 +135,60 @@ taskset 1–31, 32 cores):
   the right shape), `nested_saturated/1K` −8 % (25/25). Per-regime mixed
   verdict ⇒ gate stays; an adaptive gate is the cost-EMA class already
   twice falsified above.
+### Generic chunk tree `par_tree_rec` and the reduce core (2026-10)
+
+The eight per-terminal tree recursions (`par_index_rec[(_by_ref)]`,
+`par_index_try_rec[(_by_ref)]`, `par_for_each_rec[(_by_ref)]`,
+`par_range_gen_rec`, `par_range_gen_sink_rec` — each a verbatim copy of the
+`(Ok,Ok)/(Err,Ok)/(Ok,Err)/(Err,Err)` sibling-drop match) converged into one
+generic `par_tree_rec` (crates/youpipe/src/builder/typed/fused.rs): a `leaf`
+closure plus a `drop_success_range` hook — the internal-node granularity of
+`HybridStrategy::cleanup_success_chunk`. The hooks are closure references
+monomorphized per strategy, so every leaf loop stays independently inlined;
+the auto-vectorization argument on `par_index_leaf` only holds for concrete,
+fully inlined leaves, which is why the leaves themselves were never unified.
+The eight per-leaf RAII guards (`LeafGuard` / `TryLeafGuard` / `RefLeafGuard`
+/ `TryRefLeafGuard` / `ForEachGuard` / `FilterGuard` / `PlaceLeafGuard` /
+`GenLeafGuard`) collapsed the same way into one `LeafCleanup<T, R, OUT, IN>`
+whose const halves select output-prefix / input-tail drops (dead halves
+compile away; the dead-half pointers are never dereferenced). Pure refactor,
+net −361 lines: full test suite + miri (tree-borrows, drop-accounting)
+green; interleaved A/B over the `sync_vs_rayon` families (per-id isolated,
+3 rounds) — every id graded noise — worst youpipe delta +0.8 % (the one leaning id, sync_lightweight 10 K borrowed, confirmed noise by 2 extra rounds: dom 13/25, spreads 11–14 %), tightest family (sync_lightweight 1 M borrowed) −0.1 % at ±0.4 % spread, rayon anchors within ±1 %.
+
+The reduction terminals (todo perf #3) landed on a sibling core, *not*
+`par_tree_rec`: `par_reduce_rec` is a value-carrying recursion (`join`
+returns both child partials, the node combines them), so there is no
+shared-buffer sibling-drop path at all — panic safety is structural (every
+partial is a local dropped by unwind / `join`; the leaf guard owns only the
+input tail). `ReduceStrategy` plugs into `hybrid_dispatch` unchanged: each
+chunk's tree publishes its partial into a one-shot `ChunkSlots` cell — a
+plain store to the chunk's own cell, sequenced before the latch `set` —
+and the driver folds the cells in chunk ordinal order (the boundary
+formula's inverse; no sort, no lock). The first design published into a
+`Mutex<Vec<(start, Acc)>>` instead: correct, but the ~num_threads pushes
+pile onto one lock at the batch tail, and at small n the per-chunk work is
+too short to hide it — measured +80…+112 % vs collect-then-sum at 1K and
++40…+73 % at 10K (the 100K/1M wins of −40 %/−80 % stayed, publication
+overlapping real compute there). Per-chunk cells remove the shared
+writable line entirely; unpublished (`Empty`) cells are skipped, which also
+covers the on-pool single-tree shortcut (one chunk). On failure paths
+`cleanup_success_chunk` (`ChunkSlots::drop_published`) eagerly drops each
+successful chunk's published partial — the slot box's own drop is the
+backstop — a failed batch having no user-visible accumulator. After the
+slot fix the reduce core sits within noise of collect-then-sum at 1K
+(+9.5 % median-of-5 with 18 % bimodal round spread) and wins from 10K up
+(−16 % @ 10K, −74 % @ 100K, −87 % @ 1M; see dev/benchmarks.md).
+
+API note: the streaming reduce pass-through threads the reducer through
+`StageSpawn::fuse_exec_reduce` with the composed chain's output type as an
+explicit parameter bound by equality (`OP: RangeOp<Self::Out, Out = B>`,
+`R: Reducer<B>`) — a projection of one method-generic inside another
+method-generic's bound (`R: Reducer<OP::Out>`) defeats rustc's
+implied-bounds elaboration and the impls fail with a bogus
+"`OP: RangeOp<..>` is not satisfied" (minimal repro verified; nightly
+1.100).
+
 ### Work Search Strategy
 
 `find_work()` tries sources in priority order:

@@ -3,8 +3,10 @@ use std::{cell::Cell, marker::PhantomData, num::NonZeroUsize, sync::Arc};
 use std::{future::Future, sync::OnceLock};
 
 use super::{
-    fused::fused_pass_collect,
-    traits::{FusedOp, Identity, RangeOp},
+    fused::{fused_pass_collect, fused_pass_reduce},
+    traits::{
+        CountReducer, FoldReducer, FusedOp, Identity, OptionReducer, RangeOp, Reducer, SumReducer,
+    },
 };
 #[cfg(feature = "tokio-runtime")]
 use crate::handoff::{
@@ -889,6 +891,36 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
         Err(items)
     }
 
+    /// Reduce-flavoured [`fuse_exec`](Self::fuse_exec): compose the chain
+    /// into one [`RangeOp`] and fold it with `reducer` on the fused reduce
+    /// core — no output `Vec`. Same eligibility (only `StreamStart` and
+    /// unpinned `SyncStage` override; same `Err(items)` fallback contract);
+    /// driven by the reduce terminals (`StreamPipe::reduce` / `fold` /
+    /// `sum` / `count`).
+    ///
+    /// The composed chain's output type `B` is an explicit parameter bound
+    /// by equality (`OP: RangeOp<Self::Out, Out = B>`) instead of using
+    /// `R: Reducer<OP::Out>` — a projection of one method-generic inside
+    /// another's bound defeats rustc's implied-bounds elaboration, and the
+    /// impls then fail with a bogus `OP: RangeOp<..> is not satisfied`
+    /// (verified on a minimal repro).
+    fn fuse_exec_reduce<B, OP, R>(
+        &self,
+        downstream: OP,
+        reducer: &R,
+        items: Vec<In>,
+        workload: Workload,
+        pool: &ComputePool,
+    ) -> Result<R::Acc, Vec<In>>
+    where
+        OP: RangeOp<Self::Out, Out = B>,
+        R: Reducer<B>,
+    {
+        // Not eligible: give the items back for the streaming feeder.
+        let _ = (downstream, reducer, workload, pool);
+        Err(items)
+    }
+
     /// Spawn with an async feeder receiver. Called by [`StreamPipe::run`]
     /// when [`Self::first_consumer_is_async`] returns `Some(true)`.
     ///
@@ -1315,6 +1347,22 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
         Ok(fused_pass_collect(items, &downstream, workload, pool))
     }
 
+    fn fuse_exec_reduce<B, OP, R>(
+        &self,
+        downstream: OP,
+        reducer: &R,
+        items: Vec<I>,
+        workload: Workload,
+        pool: &ComputePool,
+    ) -> Result<R::Acc, Vec<I>>
+    where
+        OP: RangeOp<I, Out = B>,
+        R: Reducer<B>,
+    {
+        // The recursion bottomed out: `downstream` IS the composed chain.
+        Ok(fused_pass_reduce(items, &downstream, reducer, workload, pool))
+    }
+
     #[cfg(feature = "tokio-runtime")]
     fn spawn_async_feeder<R: AsyncRuntime>(
         self,
@@ -1476,6 +1524,34 @@ where
                 f: &self.f,
                 next: downstream,
             },
+            items,
+            workload,
+            pool,
+        )
+    }
+
+    fn fuse_exec_reduce<B, OP, R>(
+        &self,
+        downstream: OP,
+        reducer: &R,
+        items: Vec<In>,
+        workload: Workload,
+        pool: &ComputePool,
+    ) -> Result<R::Acc, Vec<In>>
+    where
+        OP: RangeOp<M, Out = B>,
+        R: Reducer<B>,
+    {
+        // Same pin policy as `fuse_exec` — see the comment there.
+        if self.opts.workers.is_some() || self.opts.buffer.is_some() {
+            return Err(items);
+        }
+        self.prev.fuse_exec_reduce(
+            FuseCompose {
+                f: &self.f,
+                next: downstream,
+            },
+            reducer,
             items,
             workload,
             pool,
@@ -2662,6 +2738,188 @@ where
     {
         self.try_exec(ForEachCollector { f })
             .expect("StreamPipe::for_each: failed to build async runtime (see run/try_run)");
+    }
+
+    /// Execute the streaming pipeline and reduce the outputs into a single
+    /// value — **no output `Vec` is materialised**.
+    ///
+    /// Pure sync chains (no async stage, no cancellation, no pins — the
+    /// [`run`](Self::run) pass-through eligibility) take the fused reduce
+    /// core, sharing [`Pipe::reduce`](crate::Pipe::reduce)'s tree-combine
+    /// machinery; every other chain runs the streaming topology and folds
+    /// the drained items.
+    ///
+    /// `op` should be associative (see [`Pipe::reduce`](crate::Pipe::reduce)).
+    /// Returns `None` for an empty input.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`run`](Self::run).
+    pub fn reduce<F>(mut self, op: F) -> Option<O>
+    where
+        F: Fn(O, O) -> O + Send + Sync + 'static,
+    {
+        if self.cancel.is_none() && !self.config.compute_workers_pinned {
+            let pool = self
+                .compute_pool
+                .as_ref()
+                .unwrap_or_else(|| ComputePool::global());
+            let items = std::mem::take(&mut self.items);
+            // `&op` keeps the streaming fallback below able to use `op`.
+            match self.stages.fuse_exec_reduce(
+                FusedOp(Identity),
+                &OptionReducer(&op),
+                items,
+                self.config.workload,
+                pool,
+            ) {
+                Ok(acc) => return acc,
+                // Chain not pass-through-eligible: restore the items and
+                // take the streaming path below.
+                Err(items) => self.items = items,
+            }
+        }
+        self.try_exec(VecCollector)
+            .expect("StreamPipe::reduce: failed to build async runtime (see run/try_run)")
+            .into_iter()
+            .reduce(op)
+    }
+
+    /// Execute the streaming pipeline, folding outputs into an accumulator
+    /// of a **different type** — no output `Vec` on the fused pass-through
+    /// path (see [`reduce`](Self::reduce) and
+    /// [`Pipe::fold`](crate::Pipe::fold), the latter for the associativity
+    /// contract).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`run`](Self::run).
+    pub fn fold<A, F, C>(mut self, init: A, f: F, combine: C) -> A
+    where
+        A: Clone + Send + Sync + 'static,
+        F: Fn(A, O) -> A + Send + Sync + 'static,
+        C: Fn(A, A) -> A + Send + Sync + 'static,
+    {
+        if self.cancel.is_none() && !self.config.compute_workers_pinned {
+            let pool = self
+                .compute_pool
+                .as_ref()
+                .unwrap_or_else(|| ComputePool::global());
+            let items = std::mem::take(&mut self.items);
+            // `&f` / `&combine` keep the streaming fallback able to use them.
+            let reducer = FoldReducer {
+                init: init.clone(),
+                f: &f,
+                combine: &combine,
+            };
+            match self.stages.fuse_exec_reduce(
+                FusedOp(Identity),
+                &reducer,
+                items,
+                self.config.workload,
+                pool,
+            ) {
+                Ok(acc) => return acc,
+                Err(items) => self.items = items,
+            }
+        }
+        let drained = self
+            .try_exec(VecCollector)
+            .expect("StreamPipe::fold: failed to build async runtime (see run/try_run)");
+        let mut acc = init;
+        for o in drained {
+            acc = f(acc, o);
+        }
+        acc
+    }
+
+    /// Execute the streaming pipeline and sum the outputs — the zero-copy
+    /// `.stage(f).sum()` shape (see [`reduce`](Self::reduce)). Empty input
+    /// folds to the additive identity.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`run`](Self::run).
+    pub fn sum(mut self) -> O
+    where
+        O: std::iter::Sum,
+    {
+        if self.cancel.is_none() && !self.config.compute_workers_pinned {
+            let pool = self
+                .compute_pool
+                .as_ref()
+                .unwrap_or_else(|| ComputePool::global());
+            let items = std::mem::take(&mut self.items);
+            match self.stages.fuse_exec_reduce(
+                FusedOp(Identity),
+                &SumReducer::<O>(PhantomData),
+                items,
+                self.config.workload,
+                pool,
+            ) {
+                Ok(acc) => return acc,
+                Err(items) => self.items = items,
+            }
+        }
+        self.try_exec(VecCollector)
+            .expect("StreamPipe::sum: failed to build async runtime (see run/try_run)")
+            .into_iter()
+            .sum()
+    }
+
+    /// Execute the streaming pipeline and count the outputs — no output
+    /// buffer on the fused pass-through path (see [`reduce`](Self::reduce)).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`run`](Self::run).
+    pub fn count(mut self) -> usize {
+        if self.cancel.is_none() && !self.config.compute_workers_pinned {
+            let pool = self
+                .compute_pool
+                .as_ref()
+                .unwrap_or_else(|| ComputePool::global());
+            let items = std::mem::take(&mut self.items);
+            match self.stages.fuse_exec_reduce(
+                FusedOp(Identity),
+                &CountReducer,
+                items,
+                self.config.workload,
+                pool,
+            ) {
+                Ok(acc) => return acc,
+                Err(items) => self.items = items,
+            }
+        }
+        self.try_exec(VecCollector)
+            .expect("StreamPipe::count: failed to build async runtime (see run/try_run)")
+            .len()
+    }
+
+    /// Execute the streaming pipeline and return the minimum output —
+    /// `reduce(Ord::min)` (see [`reduce`](Self::reduce)).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`run`](Self::run).
+    pub fn min(self) -> Option<O>
+    where
+        O: Ord,
+    {
+        self.reduce(Ord::min)
+    }
+
+    /// Execute the streaming pipeline and return the maximum output —
+    /// `reduce(Ord::max)` (see [`min`](Self::min)).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`run`](Self::run).
+    pub fn max(self) -> Option<O>
+    where
+        O: Ord,
+    {
+        self.reduce(Ord::max)
     }
 
     /// Fallible counterpart to [`run`](Self::run): returns the runtime

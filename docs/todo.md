@@ -47,19 +47,6 @@
 - 验证：`cpu_balanced` 1M/2M/4M 隔离 A/B + `horizontal-counters`（youpipe-bench）
   复查 task-clock / ctx-switch / migration。
 
-### 3. [P1] reduction 终端（reduce/fold/sum/count）
-
-- 现状：六个 builder（Pipe/TryPipe/PipeRef/TryPipeRef/ScopedPipe/
-  ScopedTryPipe）只有 collect / try_collect / for_each 三类终端；聚合需求
-  必须物化整棵 `Vec<O>`（n 槽 Slots 分配 + n 次写 + 串行 fold）——对
-  `.map(f).sum()` 形状是纯浪费，正是 `for_each` 规避的结构问题（见
-  fused.rs for_each 的结构性优势注释）。
-- 方向：`ReduceStrategy: HybridStrategy`（`cleanup_success_chunk` = no-op）
-  + `par_reduce_rec`（无输出 buffer，叶内部分聚合 + 树形 combine）；
-  HybridStrategy 抽象使派发半边免费，只需叶/combine 逻辑。API：
-  `reduce`/`fold` + 便捷 `sum`/`count`/`min`/`max`；stream 纯 sync 链的
-  fuse 路径同享。与 #13 的 par_tree_rec 抽象配套做可省一遍树形样板。
-
 ### 4. [P2] streaming 相邻 sync stage 融合
 
 整链 fuse 仅在纯 sync、无 pin、无 cancel 时触发（`fuse_exec` 谱系）；
@@ -161,16 +148,6 @@ MAY_FILTER 分派）→ `SplitPlan::new` → MAY_FILTER 两路核心选择——
 scoped 三件、by_ref 三件、`fused_pass_collect`）。split 策略或串行语义一动
 就要改十处。抽 `terminal_plan(n, config, pool) -> Plan { Serial, Parallel(
 SplitPlan) }` + 共享串行回退 helper；prologue 每 run 一次，零热路径风险。
-
-### 13. [P1] par_*_rec 内部节点失败清理四份 + 六个 guard 变体
-
-`(Ok,Ok)/(Err,Ok)/(Ok,Err)/(Err,Err)` 兄弟区间丢弃 match 在 `par_index_rec`
-/ `par_index_try_rec` / `par_index_rec_by_ref` / `par_index_try_rec_by_ref`
-四处逐字复制；`LeafGuard`/`TryLeafGuard`/`RefLeafGuard`/`TryRefLeafGuard`/
-`ForEachGuard`/`FilterGuard` 六个同型 raw-pointer/tail-drop guard。抽泛型
-`par_tree_rec` + `drop_success_range` 钩子（即既有 `HybridStrategy::
-cleanup_success_chunk` 语义）；**叶函数保持独立单态化**（向量化论证只对叶
-成立）。落地后新终端（#3 reduce）只需叶 + 钩子。
 
 ### 14. [P1] StageSpawn 五路 spawn 体 × 四 stage 类型
 
