@@ -8,7 +8,7 @@
 
 use std::{marker::PhantomData, ops::Deref, sync::Arc};
 
-use youpipe_sys::{AtomicUsize, Condvar, Mutex, Ordering};
+use youpipe_sys::{AtomicUsize, Condvar, Mutex, MutexGuard, Ordering};
 
 use super::registry::Registry;
 
@@ -176,18 +176,24 @@ impl LockLatch {
 
     /// Block until latch is set, then reset so it can be reused.
     pub(crate) fn wait_and_reset(&self) {
-        let mut guard = self.m.lock();
-        while !*guard {
-            self.v.wait(&mut guard);
-        }
+        let mut guard = self.wait_set();
         *guard = false;
     }
 
     pub(crate) fn wait(&self) {
+        let _guard = self.wait_set();
+    }
+
+    /// Park until the flag is set. Returns still holding the mutex with
+    /// `*guard == true`, so a caller-side reset (see `wait_and_reset`)
+    /// cannot race a concurrent `set`'s notify — the clear happens under
+    /// the same lock the setter uses.
+    fn wait_set(&self) -> MutexGuard<'_, bool> {
         let mut guard = self.m.lock();
         while !*guard {
             self.v.wait(&mut guard);
         }
+        guard
     }
 }
 
