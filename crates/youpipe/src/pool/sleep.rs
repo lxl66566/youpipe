@@ -504,13 +504,21 @@ impl Sleep {
         }
     }
 
-    #[cold]
+    /// Cold-policy: deliberately NOT `#[cold]`. This is the entry of the
+    /// wake cascade every dispatch with parked peers runs through — the
+    /// latency-sensitive path whose p99 tails (100–270 µs) motivated the
+    /// `SleepMask` scan and the lock-drop-before-notify below. `#[cold]`
+    /// would evict it from the main code layout despite firing on the
+    /// poster's hot path; only the parking side (`sleep`,
+    /// `announce_sleepy`) is genuinely cold (once per idle episode).
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn wake_any_threads(&self, num_to_wake: u32) {
         self.sleeping_mask
             .wake_scan(num_to_wake, |i| self.wake_specific_thread(i));
     }
 
+    /// Same cold-policy as [`Self::wake_any_threads`]: a futex-notify
+    /// latency path, kept in the hot layout.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn wake_specific_thread(&self, index: usize) -> bool {
         let sleep_state = &self.worker_sleep_states[index];
