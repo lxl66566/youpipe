@@ -88,13 +88,6 @@ worker 同形，计入 parking lease），dedicated 模式保留线程；顺带�
 
 ## 用户 API
 
-### 7. [P1] transient pool 复用缓存
-
-`with_compute_workers(n≠ncpus)` / `with_oversubscribe` 每次终端调用建池
-拆池（~ms 级，`ExecPool::Owned`）。可做进程内按 (workers, factor) 的小 LRU
-缓存。风险：线程数失控（用户以为池已销毁）；至少在 rustdoc 与 tuning.md 把
-「紧循环请预建池」的警示提级。
-
 ### 8. [P1] `ordered()` + `expand()`：批量 payload 方案
 
 2026-10 设计分析确认三条硬约束，实现前必须先解决（详见 dev/core-types.md

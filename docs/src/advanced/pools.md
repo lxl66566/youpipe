@@ -18,8 +18,8 @@ bitmask is 9 bits). Larger values are **silently clamped**, never rejected.
 ## ComputePool: create once, reuse
 
 `ComputePool` is cheap to clone (`Arc` + one atomic). Pre-create it and share
-it across runs — per-call construction (~ms of thread spawn + priming)
-dominates tight loops:
+it across runs — construction costs ~15 µs per worker (thread spawn +
+priming), which dominates tight loops:
 
 ```rust
 use youpipe::{ComputePool, stream};
@@ -35,11 +35,29 @@ let r = (0..1000).stream()
 ```
 
 The fused path has the same knobs: `with_compute_pool`, plus two conveniences
-— `.with_compute_workers(n)`, which runs the terminal on a transient pool of
-exactly `n` threads whenever `n` differs from the machine default, and
-`.with_oversubscribe(factor)`, which builds a transient
-`factor × compute_workers` pool at terminal time and tears it down after.
-Both are fine for one-shot pipelines; in loops prefer the pre-created pool.
+— `.with_compute_workers(n)`, which runs the terminal on a pool of exactly
+`n` threads whenever `n` differs from the machine default, and
+`.with_oversubscribe(factor)`, which uses a `factor × compute_workers` pool
+at terminal time. Both resolve through `ComputePool::new`, which **recycles**:
+a dropped pool is parked (threads stay alive, idle) and the next call with
+the same worker count reuses it, so one-shot pipelines sitting in loops no
+longer pay per-run spawn/join costs.
+
+Recycling rules:
+
+* At most 4 recent worker counts stay parked; anything evicted joins its
+  threads for real.
+* `ComputePool::clear_cached_pools()` drops all parked pools, joining their
+  threads — call it when the process must give the threads back (strict
+  thread-count budgeting, teardown, tests). It returns the number of pools
+  dropped.
+* `new_pinned` pools are never cached: pinned workers hold scarce CPU
+  placement and always join when the last handle drops. The global pool
+  bypasses the cache too (process-lifetime already).
+* In steady-state loops an explicit pre-created pool is still the best form:
+  it keeps the pool alive under your control and documents intent; the cache
+  is a safety net for one-shot call sites.
+
 Factor guidance: CPU + fast IO → 1 (no benefit), CPU + slow disk IO → 2–3,
 network/lock contention → 3–4, mostly IO → 4–8. Never oversubscribe pure-CPU
 work — measured 10–30 % regression.

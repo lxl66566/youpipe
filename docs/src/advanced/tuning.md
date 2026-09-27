@@ -41,7 +41,11 @@ let r: Vec<u64> = (0..5_000).pipe()
 ```
 
 `Workload` never changes the thread count — that is a pool decision
-([pools](pools.md)).
+([pools](pools.md)). Fused terminals with a non-default worker budget
+(`with_compute_workers(n)`, `with_oversubscribe(f)`) in loops recycle their
+pools automatically (run 2 onward is spawn-free), but a pre-created
+`ComputePool` + `with_compute_pool` remains the cheapest and most explicit
+form — see [pools](pools.md).
 
 For same-binary A/B benchmarking the two `Unbalanced` knobs are
 runtime-overridable: `YOUPIPE_OVERSPLIT` (leaf-count factor, default 32)

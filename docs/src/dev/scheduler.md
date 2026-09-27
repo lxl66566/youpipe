@@ -514,3 +514,45 @@ no-regression evidence.
 `terminate` OnceLatch and tickles it awake. Each worker's `wait_until_out_of_work`
 then drains its remaining local-deque work, sets its `stopped` latch, and exits;
 `Registry::Drop` blocks on every spawned worker's `stopped` before returning.
+
+### Transient pool recycling (accepted, 2026-09)
+
+`ComputePool::new` parks dropped pools in a process-wide LRU keyed by the
+clamped worker count (`executor/compute/pool_cache.rs`, capacity 4) instead
+of joining them; the next `new` of the same size reuses the parked pool for
+an `Arc` clone + `terminate_count` increment.
+
+Motivation (`pool_reuse` bench, 32C/32T, criterion at 3089274): per-terminal
+pool build+join costs ~15 µs per worker — 8 workers ≈ 125 µs,
+`with_oversubscribe(2)`'s 64 workers ≈ 1.2 ms — against 2.7 / 7.8 / 44 µs
+for the actual fused run on 1K / 10K / 100K cheap-map items: the pool
+lifecycle was 98 % / 94 % / 80 % of the terminal call. With recycling the
+`transient_workers8` variants collapse onto `prebuilt_pool8` (2–4 µs
+overhead per run).
+
+Design decisions:
+
+- The cache holds its own handle per slot; handing a pool out clones it, so
+  external drops park the pool instead of joining — a deliberate,
+  documented semantic change (threads stay alive, idle).
+- Idle-timeout reaping rejected: a timer per pool makes thread counts
+  nondeterministic and the "the pool is gone" belief *less* predictable.
+  Instead: bounded capacity + `ComputePool::clear_cached_pools()` explicit
+  join entry. Auditable invariant: at most 4 parked pools exist; everything
+  evicted, cleared, or built through `new_pinned` joins for real.
+- `new_pinned` bypasses the cache (pinned workers hold scarce CPU placement);
+  so does the global pool (process-lifetime already).
+- Locking: the hit path is a mutex + linear scan of ≤4 entries; pool
+  *construction* happens outside the lock; and every pool drop (eviction,
+  lost build race, clear) happens outside the lock too — dropping the last
+  handle joins worker threads, and a worker can itself be blocked on the
+  cache mutex (a detached job `pool.submit(|| ..nested terminal..)` followed
+  by `drop(pool)`), which would deadlock joiner↔job under the lock.
+- Teardown stays asynchronous (see Graceful Shutdown: each worker holds its
+  own registry `Arc`, the last one to exit runs `Registry::Drop`), so
+  `clear_cached_pools()` may return just before the OS threads are gone —
+  tests poll briefly instead of asserting an exact instant.
+- A recycled pool keeps the name/affinity it was created with
+  (`yp-pool-<i>`, unpinned for `new`); under the `YOUPIPE_PIN_WORKERS=1`
+  benchmark knob recycling therefore preserves affinity — benign, the knob
+  pins every pool in the process anyway.
