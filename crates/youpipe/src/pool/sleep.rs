@@ -51,9 +51,16 @@ fn select_jec(word: usize) -> usize {
 }
 
 /// Atomic counters packing sleeping-threads, inactive-threads, and JEC.
+///
+/// `CachePadded`: this word is the pool's most contended line (every idle
+/// round loads it, every dispatch CASes the JEC). Today it dodges false
+/// sharing only by field-layout luck — inside `Sleep` it sits between the
+/// `worker_sleep_states` Vec header and the already-padded `sleeping_mask`.
+/// Padding makes that immunity structural against future layout churn,
+/// mirroring `sleeping_mask` (measured +3-5 % when it lacked padding).
 #[allow(dead_code)]
 pub(crate) struct AtomicCounters {
-    value: AtomicUsize,
+    value: CachePadded<AtomicUsize>,
 }
 
 #[derive(Copy, Clone)]
@@ -83,7 +90,7 @@ impl AtomicCounters {
     #[inline]
     pub(crate) fn new() -> AtomicCounters {
         AtomicCounters {
-            value: AtomicUsize::new(0),
+            value: CachePadded(AtomicUsize::new(0)),
         }
     }
 
@@ -504,13 +511,21 @@ impl Sleep {
         }
     }
 
-    #[cold]
+    /// Cold-policy: deliberately NOT `#[cold]`. This is the entry of the
+    /// wake cascade every dispatch with parked peers runs through — the
+    /// latency-sensitive path whose p99 tails (100–270 µs) motivated the
+    /// `SleepMask` scan and the lock-drop-before-notify below. `#[cold]`
+    /// would evict it from the main code layout despite firing on the
+    /// poster's hot path; only the parking side (`sleep`,
+    /// `announce_sleepy`) is genuinely cold (once per idle episode).
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn wake_any_threads(&self, num_to_wake: u32) {
         self.sleeping_mask
             .wake_scan(num_to_wake, |i| self.wake_specific_thread(i));
     }
 
+    /// Same cold-policy as [`Self::wake_any_threads`]: a futex-notify
+    /// latency path, kept in the hot layout.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn wake_specific_thread(&self, index: usize) -> bool {
         let sleep_state = &self.worker_sleep_states[index];

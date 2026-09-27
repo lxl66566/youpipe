@@ -469,6 +469,44 @@ placement loses to the scheduler. Hence: opt-in constructor, single
 A/B knob (it pins *every* pool in the process — that is exactly how the
 regression column above was measured).
 
+#### Wake-path layout hygiene: cold attributes and counter padding (2026-09)
+
+Two layout-level cleanups (todo micro-optimization round), verified as
+no-regression rather than win-seeking. Both change struct/code layout by
+necessity, so recompile-pair A/B on the tight families is layout-noise
+bound (the compile-time trap in dev/benchmarks.md; +32 % pure layout
+swings on `sync_cpu_heavy` n=100k are on record) and only directional
+evidence is claimable:
+
+- `wake_any_threads` lost its `#[cold]`: it is the entry of every
+  dispatch's wake cascade — the path whose p99 tails (100–270 µs)
+  motivated the `SleepMask` scan and the lock-drop-before-notify — so
+  evicting it from the main code layout was backwards. The policy, now
+  documented at both functions: the wake side
+  (`wake_any_threads`/`wake_specific_thread`) stays hot, the park side
+  (`sleep`/`announce_sleepy`) stays cold (each runs once per idle
+  episode).
+- `AtomicCounters`' packed word is now `CachePadded`, mirroring
+  `sleeping_mask`: the counters line is the pool's most contended (every
+  idle round loads it, every dispatch CASes the JEC) and previously
+  dodged false sharing only by field-layout luck inside `Sleep`. Loom
+  drops the padding (`youpipe_sys::CachePadded`); miri semantics are
+  unchanged.
+
+Criterion A/B (`bench_ab.sh`, per-id interleaved, 3 rounds × 2 sessions,
+`cc0dfbc` → this round): `sync_lightweight` 10K/1M ±1.7 % (noise);
+`stream_pipeline/single_stage_ordered` 1K **−10.6 %** (9/9 dominant),
+100K −6.1 %. The one tight family that moved — `sync_cpu_heavy` 100K
+youpipe +29/+42 % — moved its *untouched* rayon and sequential anchors
+the same way in the same passes (+13.6 % / +6.3 %, spread ≤1.8 %), the
+documented code-layout signature; drift-cancelled youpipe-vs-rayon
+ratios still shifted +13/+25 %, inside the recorded layout swing band
+but not provably clean. Layout cannot be knob-gated for a struct-layout
+change, so the cpu_heavy verdict stays "unattributable under recompile
+noise" — exactly the trap that motivates the runtime-knob rule — and
+the directional read (stream faster, lightweight flat) stands as the
+no-regression evidence.
+
 ### Graceful Shutdown
 
 `ComputePool::Drop` calls `Registry::terminate()`, which decrements a ref-count
