@@ -105,17 +105,30 @@ impl ComputePool {
         self.registry.inject(job_ref);
     }
 
-    /// Submit multiple jobs at once (reduces per-job notification overhead).
+    /// Submit multiple jobs at once (reduces per-job notification overhead:
+    /// one sleep notification for the whole batch instead of one per job).
+    ///
+    /// The batch always goes to the **global injector** in FIFO order —
+    /// unlike [`Self::submit`], which routes through the on-pool local-deque
+    /// fast path (`inject_or_push`) when called from a worker of this pool.
+    /// If the injector's cross-batch FIFO order is part of your protocol (a
+    /// job injected before its dependents is popped first, like
+    /// [`Self::submit_injected`]), rely on `submit_batch`, not `submit`.
+    ///
+    /// `I::IntoIter` must be [`ExactSizeIterator`] so the `JobRef`s stream
+    /// straight into the injector's segment-reserving `push_n` — no
+    /// intermediate `Vec<JobRef>` allocation (the same trick the fused
+    /// hybrid dispatcher's injection side uses).
     pub fn submit_batch<F, I>(&self, jobs: I)
     where
         F: FnOnce() + Send + 'static,
         I: IntoIterator<Item = F>,
+        I::IntoIter: ExactSizeIterator,
     {
-        let job_refs: Vec<_> = jobs
-            .into_iter()
-            .map(|f| pool::job::HeapJob::new(f).into_static_job_ref())
-            .collect();
-        self.registry.inject_batch(job_refs.into_iter());
+        self.registry.inject_batch(
+            jobs.into_iter()
+                .map(|f| pool::job::HeapJob::new(f).into_static_job_ref()),
+        );
     }
 
     /// Number of worker threads in this pool.

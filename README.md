@@ -41,6 +41,11 @@ let r: Vec<u64> = (0..1000).stream()
     .run();
 ```
 
+For index-shaped work (`0..n`), `pipe_range(0..n)` skips input materialization
+entirely — items are generated in the parallel leaves instead of serially
+collected on the calling thread (the dominant cost of `pipe(0..n)` at 1M+
+items).
+
 Pick the engine and tuning knobs by workload — see
 [Choosing the right engine](https://lxl66566.github.io/youpipe/advanced/choosing-engine.html).
 

@@ -213,6 +213,53 @@ cheap (~0.12 ns/item) that the measurement had been pure fixed dispatch
 cost, ~50 µs of which was the two cgroup-reading `available_parallelism`
 syscalls).
 
+### Input materialization: `pipe(0..n)` vs `pipe_range` (`sync_lightweight_input_materialize`)
+
+`pipe(items)` materializes any non-`Vec` input on the calling thread before
+the parallel phase — `(0..n).collect::<Vec<_>>()` is a serial O(n) iota fill
+(a `Vec` input rides std's `vec::IntoIter` collect specialization for free,
+so this caliber only bites range/iterator inputs). Quantification group
+(2026-09-27, quick config, criterion medians; `borrowed_floor` = `pipe_ref`,
+engine only):
+
+| Shape | 1M | 4M |
+| --- | --- | --- |
+| `range_input` (`pipe(0..n)`) | ~584–624 µs | ~16.8–17.2 ms |
+| `vec_input` (`pipe(v.clone())`) | ~536–549 µs | ~19.4–21.7 ms |
+| `borrowed_floor` (`pipe_ref`) | ~176–177 µs | ~1.20–1.24 ms |
+| `range_gen` (`pipe_range(0..n)`) | ~175 µs | ~0.97 ms |
+
+The owned rows are one-shot-cost calibers (fresh buffer + free inside the
+timed region): criterion's back-to-back sampling pays the mmap/fault churn
+of a fresh 8–32 MB buffer per iteration, so the medians sit far above a
+steady-state best-of. Attribution probe (standalone binary, best-of-100,
+`taskset 1-31`): iota fill alone 167 µs @ 1M / 1.1 ms @ 4M; whole range call
+332 µs / 4.2 ms vs engine floor 110 µs / 1.9 ms — **the input's fill +
+lifecycle is 56–70 % of an owned range-input call** at those sizes.
+`pipe_range(0..n).map(+1).collect()` lands ON the borrowed floor at 1 M
+(−72 % vs `pipe(0..n)`) and **beats it by ~21 % at 4 M** (−94 % vs
+`pipe(0..n)`): beyond L3 the materialized paths pay the input's DRAM read,
+which the generation core never performs.
+
+Regression check (3 interleaved per-id rounds vs the branch point,
+`bench_ab.sh -B sync_vs_rayon`): every youpipe family within ±3 % noise;
+the only flagged row was the `rayon_nested_saturated/1000` *anchor* (+5.4 %,
+0/9 dominant — layout/drift wobble on untouched rayon code). Horizontal
+`cpu_balanced`/`cpu_balanced_readback` two-binary alternating A/B (5 pairs ×
+2 rounds, `taskset 1-31`): pooled +0.1…+1.0 % at 1 M/4 M with mixed
+per-pair signs — no regression. Miri (Tree Borrows) covers the generation
+cores' guards via the `pipe_range` integration tests.
+
+`pipe_range(range)` therefore removes the input buffer entirely: the item at
+index `i` IS the index, generated inside the leaves (`RangeGenStrategy` /
+`par_range_gen_*` over the same `hybrid_dispatch`, input handle `IN = ()`) —
+no input allocation, no serial fill, no input cache traffic. Allocation
+proof: `tests/pipe_range_alloc.rs` counts N-sized allocations — exactly 1
+(the output buffer) vs 2 on the materialized path. Filter chains and the
+fallible terminal materialize once at the terminal (documented fallback —
+same fill `pipe(range)` always paid). If you already own a `Vec`, `pipe(v)`
+stays zero-copy; a `pipe_vec` constructor would add nothing.
+
 ### Fallible `try_map().try_collect()` vs rayon (`try_collect`, borrowed input)
 
 When the chain has `MAY_FILTER == false`, `try_collect` uses the same
@@ -773,7 +820,7 @@ Mechanism: the consumer's re-read is a *sequential, prefetch-friendly*
 sweep, while the RFO elimination pays off during the 31-thread parallel
 phase — the asymmetry holds at every measured size ≥ 100 K.
 
-**Default-tier decision (todo P2 #8, closed)**: NT wins both consumer
+**Default-tier decision (todo, closed 2026-09)**: NT wins both consumer
 shapes, so the knob graduated from opt-in to an **auto tier**:
 `nt_store_enabled` resolves per *whole-batch* output size (a leaf only
 sees its chunk), ≥ 8 MiB → NT, threaded down as a leaf `bool`. Env

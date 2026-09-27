@@ -145,6 +145,36 @@ done (same soundness invariant as `ScopedPipe`). `TryPipeRef` is the fallible
 counterpart (`E: 'static`, same erased-failure-slot caveat as
 `ScopedTryPipe`).
 
+### `RangePipe<S, O>` — Generated-Index Fused Pipeline
+
+`pipe_range(0..n)` is the zero-materialization entry: the item at index `i`
+IS the index, generated inside the leaves, so no input buffer ever exists
+(`pipe(0..n)` pays a serial O(n) iota fill + buffer lifecycle on the calling
+thread — 56–70 % of the whole owned call at 1 M/4 M; see
+[benchmarks.md](benchmarks.md) "Input materialization"). Input type is fixed
+to `usize`, which is also what lets the terminals dispatch to the generation
+core statically (`S: FusedStage<usize, Output = O>`).
+
+| vs `pipe(items)`            | `pipe(items)`             | `pipe_range(range)`          |
+| --------------------------- | ------------------------- | ---------------------------- |
+| input                       | any `IntoIterator`        | `Range<usize>`               |
+| input buffer                | materialized `Vec`        | none (items generated)      |
+| `filter` chains / `try_map` | native paths              | materialize at the terminal |
+| `collect`/`for_each` (no filter) | `par_index_collect`  | `par_range_gen_collect`      |
+
+Dispatch rides the same `hybrid_dispatch` with a third input handle — the
+zero-sized `IN = ()` (the dispatcher only hands the input to strategy
+leaves; the generation strategies ignore it). `RangeGenStrategy` /
+`RangeGenSinkStrategy` are the `CollectStrategy` / `SinkStrategy` twins with
+the input half elided: `par_range_gen_leaf`'s `GenLeafGuard` drops only the
+partial output range on unwind (a generated item is never stored), and the
+sink core has no guard at all. NT-store tiering is shared
+(`nt_store_enabled::<R>` per whole-batch output size).
+
+`RangePipe` duplicates `Pipe`'s builder surface by delegation-free field
+moves (the #16 setter-macro consolidation subsumes it when that lands);
+`try_map` transitions into a `TryPipe` over the materialized indices.
+
 ### `FusedStage` / `FusedTryStage` Traits — Zero-Dispatch Execution
 
 ```rust

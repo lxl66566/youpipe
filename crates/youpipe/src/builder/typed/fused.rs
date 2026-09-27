@@ -6,6 +6,7 @@ use std::{
     any::Any,
     marker::PhantomData,
     num::NonZeroUsize,
+    ops::Range,
     panic, ptr,
     sync::{
         Mutex, OnceLock,
@@ -841,6 +842,354 @@ where
         // No-op: `for_each` allocates no output buffer; the failed chunk's
         // `ForEachGuard` already dropped its own unread input tail inside
         // `par_for_each_rec`, and successful chunks fully consumed theirs.
+    }
+}
+
+// ── Zero-materialization generation core (`pipe_range`) ──
+//
+// `pipe(items)` materializes any non-`Vec` input on the calling thread
+// before the parallel phase: `(0..n).collect::<Vec<u64>>()` is a serial O(n)
+// fill (measured 167 µs @ 1 M / 1.1 ms @ 4 M, plus the buffer's
+// alloc/read/free lifecycle), which is 56–70 % of the whole owned call at
+// those sizes (input-materialize caliber, docs/src/dev/benchmarks.md). The
+// generation core removes the input buffer entirely: the item at index `i`
+// IS the index, so each leaf computes `op.apply(base + i)` straight into the
+// output slot — no input allocation, no fill, no input cache traffic.
+//
+// Reuses `hybrid_dispatch` behind the same erased-strategy boundary with the
+// zero-sized input handle `IN = ()` (the dispatcher never dereferences the
+// input; only strategy leaves do, and these ignore it).
+
+/// Hybrid strategy for `RangePipe::collect()`: the generated-input
+/// counterpart of [`CollectStrategy`] — same output contract (shared
+/// `Slots<R>`, drop successful chunks' ranges on failure), minus the input
+/// buffer.
+struct RangeGenStrategy<'a, R, OP> {
+    /// Absolute value of the first generated item (the range's start).
+    base: usize,
+    output: &'a Slots<R>,
+    op: &'a OP,
+    /// Whole-batch NT decision (see [`nt_store_enabled`]).
+    nt: bool,
+}
+
+impl<R, OP> HybridStrategy<()> for RangeGenStrategy<'_, R, OP>
+where
+    R: Send,
+    OP: RangeOp<usize, Out = R>,
+{
+    type Failure = PanicPayload;
+
+    #[inline]
+    fn run_chunk(
+        &self,
+        pool: &ComputePool,
+        _input: &(),
+        start: usize,
+        end: usize,
+        splits: usize,
+    ) -> Result<(), PanicPayload> {
+        par_range_gen_rec(
+            pool,
+            self.output,
+            self.base,
+            start,
+            end,
+            self.op,
+            splits,
+            self.nt,
+        )
+    }
+
+    #[inline]
+    fn run_sequential(&self, _input: &(), start: usize, end: usize) -> Result<(), PanicPayload> {
+        // SAFETY: disjoint range — the caller (driver or leaf) owns
+        // `[start, end)` exclusively; output slots are uninit.
+        let out_slice = unsafe { self.output.as_mut_slice(start, end) };
+        par_range_gen_leaf(self.base + start, out_slice, self.op, self.nt);
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn cleanup_success_chunk(&self, start: usize, end: usize) {
+        // SAFETY: caller guarantees `run_chunk` returned `Ok(())` for
+        // `[start, end)`, so those output slots are fully init and safe to
+        // drop; after this the range is uninit and the buffer frees cleanly.
+        unsafe { self.output.drop_range(start, end) };
+    }
+}
+
+/// Recursive index-based parallel generation. Each leaf claims a disjoint
+/// index range `[start, end)` and writes `op.apply(base + i)` into
+/// `output[start..end)` — the generation twin of [`par_index_rec`] (same
+/// sibling-cleanup shape; no input buffer to consume).
+fn par_range_gen_rec<R, OP>(
+    pool: &ComputePool,
+    output: &Slots<R>,
+    base: usize,
+    start: usize,
+    end: usize,
+    op: &OP,
+    splits_left: usize,
+    nt: bool,
+) -> Result<(), PanicPayload>
+where
+    R: Send,
+    OP: RangeOp<usize, Out = R>,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: this leaf owns the disjoint range `[start, end)`
+        // exclusively; output[start..end) is fully uninit.
+        let out_slice = unsafe { output.as_mut_slice(start, end) };
+        par_range_gen_leaf(base + start, out_slice, op, nt);
+        return Ok(());
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = pool.join(
+        || par_range_gen_rec(pool, output, base, start, mid, op, splits_left - 1, nt),
+        || par_range_gen_rec(pool, output, base, mid, end, op, splits_left - 1, nt),
+    );
+    match (l, r) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(p), Ok(())) => {
+            // SAFETY: right sibling completed without filter (RangeOp never
+            // filters), so [mid, end) is fully init and safe to drop.
+            unsafe { output.drop_range(mid, end) };
+            Err(p)
+        },
+        (Ok(()), Err(p)) => {
+            unsafe { output.drop_range(start, mid) };
+            Err(p)
+        },
+        (Err(p), Err(_)) => {
+            unsafe {
+                output.drop_range(start, mid);
+                output.drop_range(mid, end);
+            }
+            Err(p)
+        },
+    }
+}
+
+/// Generate `[base, base + output.len())` sequentially into `output`.
+///
+/// The [`par_index_leaf`] counterpart with the input half elided: the guard
+/// drops only the partial OUTPUT range on unwind (a generated item is never
+/// stored, so there is no input tail to drop). Same NT-store branch shape —
+/// the plain loop's codegen (register-allocated `written`,
+/// auto-vectorizable `op`) must stay untouched when NT is off.
+fn par_range_gen_leaf<R, OP>(base: usize, output: &mut [R], op: &OP, nt: bool)
+where
+    R: Send,
+    OP: RangeOp<usize, Out = R>,
+{
+    /// RAII guard that drops the partial output slots on unwind — the
+    /// `LeafGuard` counterpart with the input half elided.
+    ///
+    /// `written` tracks the count of fully completed iterations (item
+    /// generated + applied + written). At the panic point in
+    /// `op.apply(item)` for iter `i = written`, the item was never stored
+    /// (gone with the panic), `output[..i]` is init (must be dropped), and
+    /// `output[i..]` is uninit.
+    struct GenLeafGuard<R> {
+        out_ptr: *mut R,
+        written: usize,
+    }
+
+    impl<R> Drop for GenLeafGuard<R> {
+        fn drop(&mut self) {
+            // SAFETY: `written` reflects the actual completed-iteration
+            // count at the unwind point. `RangeOp` never filters, so
+            // output[..written) has no holes — every slot is init.
+            unsafe {
+                for j in 0..self.written {
+                    ptr::drop_in_place(self.out_ptr.add(j));
+                }
+            }
+        }
+    }
+
+    let n = output.len();
+    let out_ptr = output.as_mut_ptr();
+    let mut g = GenLeafGuard {
+        out_ptr,
+        written: 0,
+    };
+
+    // The NT branch stays a separate loop copy (see `par_index_leaf`).
+    if nt {
+        let _fence = NtFenceOnDrop;
+        while g.written < n {
+            let i = g.written;
+            let out = op.apply(base + i);
+            // SAFETY: disjoint index; slot i is uninit. `nt_store`'s
+            // alignment/size requirements come from `nt_store_enabled`'s
+            // eligibility check.
+            unsafe { nt_store(out_ptr.add(i), out) };
+            g.written = i + 1;
+        }
+    } else {
+        while g.written < n {
+            let i = g.written;
+            let out = op.apply(base + i);
+            // SAFETY: disjoint index; slot i is uninit.
+            unsafe { ptr::write(out_ptr.add(i), out) };
+            g.written = i + 1;
+        }
+    }
+
+    // Success: disarm the cleanup Drop.
+    std::mem::forget(g);
+}
+
+/// Drive [`par_range_gen_rec`] over a whole range and convert the output
+/// buffer into a `Vec<R>` — the generation twin of [`par_index_collect`].
+///
+/// # Panics
+///
+/// Propagates any panic raised by `op`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_range_gen_collect<R, OP>(
+    range: Range<usize>,
+    op: &OP,
+    plan: SplitPlan,
+    pool: &ComputePool,
+) -> Vec<R>
+where
+    R: Send,
+    OP: RangeOp<usize, Out = R>,
+{
+    let n = range.len();
+    debug_assert!(n > 0);
+    let num_threads = pool.num_workers();
+    let output = Slots::<R>::uninit(n);
+    let strategy = RangeGenStrategy {
+        base: range.start,
+        output: &output,
+        op,
+        nt: nt_store_enabled::<R>(n),
+    };
+    let result = hybrid_dispatch(
+        pool,
+        &(),
+        &ErasedStrategy::from(&strategy),
+        n,
+        plan,
+        num_threads,
+    )
+    .err();
+    if let Some(f) = result {
+        // Successful chunks' output ranges were dropped by the strategy;
+        // freeing the box just frees memory.
+        drop(output);
+        resume_panic(f);
+    }
+    // Output fully init: transmute into the result Vec.
+    output.into_vec()
+}
+
+/// Hybrid strategy for `RangePipe::for_each()`: sink-only, no output buffer,
+/// no input buffer — nothing to clean on any path.
+struct RangeGenSinkStrategy<'a, OP> {
+    base: usize,
+    op: &'a OP,
+}
+
+impl<OP> HybridStrategy<()> for RangeGenSinkStrategy<'_, OP>
+where
+    OP: SinkOp<usize>,
+{
+    type Failure = PanicPayload;
+
+    #[inline]
+    fn run_chunk(
+        &self,
+        pool: &ComputePool,
+        _input: &(),
+        start: usize,
+        end: usize,
+        splits: usize,
+    ) -> Result<(), PanicPayload> {
+        par_range_gen_sink_rec(pool, self.base, start, end, self.op, splits)
+    }
+
+    #[inline]
+    fn run_sequential(&self, _input: &(), start: usize, end: usize) -> Result<(), PanicPayload> {
+        for item in (self.base + start)..(self.base + end) {
+            self.op.consume(item);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    /// # Safety
+    ///
+    /// Nothing to drop for a sink-only, buffer-free strategy.
+    unsafe fn cleanup_success_chunk(&self, _start: usize, _end: usize) {
+        // No-op: no output buffer, and generated items are never stored.
+    }
+}
+
+/// Recursive generation for `for_each` — the [`par_for_each_rec`] twin with
+/// the input guard elided (no unread tail can exist: items are generated
+/// one ahead of consumption and never stored).
+fn par_range_gen_sink_rec<OP>(
+    pool: &ComputePool,
+    base: usize,
+    start: usize,
+    end: usize,
+    op: &OP,
+    splits_left: usize,
+) -> Result<(), PanicPayload>
+where
+    OP: SinkOp<usize>,
+{
+    if splits_left == 0 || end - start <= 1 {
+        for item in (base + start)..(base + end) {
+            op.consume(item);
+        }
+        return Ok(());
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = pool.join(
+        || par_range_gen_sink_rec(pool, base, start, mid, op, splits_left - 1),
+        || par_range_gen_sink_rec(pool, base, mid, end, op, splits_left - 1),
+    );
+    match (l, r) {
+        (Ok(()), Ok(())) => Ok(()),
+        // Neither half owns buffers — first panic wins, nothing to drop.
+        (Err(p), _) | (_, Err(p)) => Err(p),
+    }
+}
+
+/// Drive [`par_range_gen_sink_rec`] over a whole range.
+///
+/// # Panics
+///
+/// Propagates any panic raised by `op`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_range_gen_for_each<OP>(range: Range<usize>, op: &OP, plan: SplitPlan, pool: &ComputePool)
+where
+    OP: SinkOp<usize>,
+{
+    let n = range.len();
+    debug_assert!(n > 0);
+    let num_threads = pool.num_workers();
+    let strategy = RangeGenSinkStrategy {
+        base: range.start,
+        op,
+    };
+    let result = hybrid_dispatch(
+        pool,
+        &(),
+        &ErasedStrategy::from(&strategy),
+        n,
+        plan,
+        num_threads,
+    )
+    .err();
+    if let Some(f) = result {
+        resume_panic(f);
     }
 }
 
@@ -2912,6 +3261,262 @@ where
             // merge path.
             let op = FusedTryOp(stages);
             par_index_try_collect(items, &op, plan, pool)
+        }
+    }
+}
+
+// ── RangePipe (zero-materialization pipeline over a generated index range) ──
+
+/// Data-first entry point over an index range — the zero-materialization
+/// counterpart of `pipe(range)`. Items are *generated* inside the parallel
+/// leaves (the item at index `i` is `i`), so no input `Vec` is ever
+/// allocated or serially filled on the calling thread: `pipe(0..n)` pays a
+/// serial O(n) iota fill before the parallel phase starts, which measures
+/// 56–70 % of the whole owned call at 1 M/4 M items (see
+/// docs/src/dev/benchmarks.md "Input materialization").
+///
+/// ```rust
+/// # use youpipe::pipe_range;
+/// let result: Vec<usize> = pipe_range(0..1000).map(|i: usize| i * 2).collect();
+/// assert_eq!(result.len(), 1000);
+/// assert_eq!(result[7], 14);
+/// ```
+#[must_use]
+pub fn pipe_range(range: Range<usize>) -> RangePipe<Identity, usize> {
+    RangePipe {
+        range,
+        stages: Identity,
+        config: PipelineConfig::default(),
+        compute_pool: None,
+        oversubscribe: None,
+        _marker: PhantomData,
+    }
+}
+
+/// [`pipe_range`]'s builder. Mirrors [`Pipe`]'s builder surface (`.map` /
+/// `.filter` / `.try_map` / tuning setters — identical semantics, input type
+/// fixed to `usize`), but the filter-free `.collect()` / `.for_each()`
+/// terminals run the generation core: items are produced inside the leaves
+/// and no input buffer exists. Chains that *can* filter, and the fallible
+/// `.try_collect()` terminal, materialize the indices once at the terminal —
+/// the same serial fill `pipe(range)` always paid.
+pub struct RangePipe<S = Identity, O = usize> {
+    range: Range<usize>,
+    stages: S,
+    config: PipelineConfig,
+    /// Custom compute pool — see [`Pipe::with_compute_pool`].
+    compute_pool: Option<ComputePool>,
+    /// Oversubscribe factor — see [`Pipe::with_oversubscribe`].
+    oversubscribe: Option<NonZeroUsize>,
+    _marker: PhantomData<O>,
+}
+
+impl<S, O> RangePipe<S, O> {
+    /// Override the default [`PipelineConfig`] — see [`Pipe::with_config`].
+    #[must_use]
+    pub fn with_config(mut self, config: PipelineConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Tune the workload split factor — see [`Pipe::with_workload`].
+    #[must_use]
+    pub fn with_workload(mut self, workload: Workload) -> Self {
+        self.config.workload = workload;
+        self
+    }
+
+    /// Set the compute-pool worker budget — see [`Pipe::with_compute_workers`].
+    #[must_use]
+    pub fn with_compute_workers(mut self, n: usize) -> Self {
+        self.config.set_compute_workers(n);
+        self
+    }
+
+    /// Attach a custom [`ComputePool`] — see [`Pipe::with_compute_pool`].
+    #[must_use]
+    pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
+        self.compute_pool = Some(pool);
+        self
+    }
+
+    /// Oversubscribe the compute pool — see [`Pipe::with_oversubscribe`].
+    #[must_use]
+    pub fn with_oversubscribe(mut self, factor: usize) -> Self {
+        self.oversubscribe = NonZeroUsize::new(factor.max(1));
+        self
+    }
+}
+
+impl<S, O> RangePipe<S, O>
+where
+    S: StageMarker<usize, Output = O>,
+    O: Send + 'static,
+{
+    /// Append a synchronous map stage: `Fn(O) -> N`. The output type
+    /// changes to `N`; the input stays the generated index.
+    pub fn map<N>(
+        self,
+        f: impl Fn(O) -> N + Send + Sync + 'static,
+    ) -> RangePipe<SyncMap<S, impl Fn(O) -> N + Send + Sync + 'static>, N>
+    where
+        N: Send + 'static,
+    {
+        RangePipe {
+            range: self.range,
+            stages: SyncMap {
+                prev: self.stages,
+                f,
+            },
+            config: self.config,
+            compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Append a filter stage — see [`Pipe::filter`]. Keeps items where `f`
+    /// returns `true`. Filter chains materialize the indices at the
+    /// terminal (see the [`RangePipe`] type doc).
+    pub fn filter(
+        self,
+        f: impl Fn(&O) -> bool + Send + Sync + 'static,
+    ) -> RangePipe<Filter<S, impl Fn(&O) -> bool + Send + Sync + 'static>, O> {
+        RangePipe {
+            range: self.range,
+            stages: Filter {
+                prev: self.stages,
+                f,
+            },
+            config: self.config,
+            compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Append a fallible map stage — see [`Pipe::try_map`]. Transitions into
+    /// a [`TryPipe`] whose items are the materialized indices (the fallible
+    /// terminal has no generation core yet — the fallback equals
+    /// `pipe(range).try_map(..)`).
+    #[allow(clippy::type_complexity)] // mirrors `Pipe::try_map`'s typestate chain
+    pub fn try_map<N, E>(
+        self,
+        f: impl Fn(O) -> Result<N, E> + Send + Sync + 'static,
+    ) -> TryPipe<
+        TryMap<InfallibleChain<S, E>, impl Fn(O) -> Result<N, E> + Send + Sync + 'static>,
+        usize,
+        N,
+        E,
+    >
+    where
+        E: Send + 'static,
+        N: Send + 'static,
+    {
+        TryPipe {
+            items: self.range.collect(),
+            stages: TryMap {
+                prev: InfallibleChain(self.stages, PhantomData),
+                f,
+            },
+            config: self.config,
+            compute_pool: self.compute_pool,
+            oversubscribe: self.oversubscribe,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<S, O> RangePipe<S, O>
+where
+    S: FusedStage<usize, Output = O> + Send + Sync + 'static,
+    O: Send + 'static,
+{
+    /// Execute the fused pipeline over the generated indices and collect the
+    /// results — the generation core (no input buffer) when the chain cannot
+    /// filter, the materialized [`Pipe::collect`] path otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain (after the leaves'
+    /// cleanup guards dropped all partial state).
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn collect(self) -> Vec<O> {
+        let n = self.range.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        let num_threads = pool.num_workers();
+        if prefers_serial(n, num_threads) {
+            // Trivial case — mirrors `Pipe::collect`'s serial arm, items
+            // generated inline by the range iterator itself.
+            if S::MAY_FILTER {
+                return self.range.filter_map(|i| self.stages.apply(i)).collect();
+            }
+            return self.range.map(|i| self.stages.apply_pure(i)).collect();
+        }
+        let plan = SplitPlan::new(n, num_threads, self.config.workload);
+        if S::MAY_FILTER {
+            // Filters change output cardinality (the range-tree path needs
+            // materialized items): fill once, then the shared filter core.
+            fused_filter_collect(self.range.collect(), &self.stages, plan.depth, pool)
+        } else {
+            let op = FusedOp(self.stages);
+            par_range_gen_collect(self.range, &op, plan, pool)
+        }
+    }
+
+    /// Execute the fused pipeline over the generated indices, applying `f` to
+    /// each output for its side effect — no output `Vec`, no input buffer.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain or `f`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn for_each<F>(self, f: F)
+    where
+        F: Fn(O) + Send + Sync + 'static,
+    {
+        let n = self.range.len();
+        if n == 0 {
+            return;
+        }
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        let num_threads = pool.num_workers();
+        if prefers_serial(n, num_threads) {
+            if S::MAY_FILTER {
+                for i in self.range {
+                    if let Some(o) = self.stages.apply(i) {
+                        f(o);
+                    }
+                }
+            } else {
+                for i in self.range {
+                    let o = self.stages.apply_pure(i);
+                    f(o);
+                }
+            }
+            return;
+        }
+        let plan = SplitPlan::new(n, num_threads, self.config.workload);
+        let op = FusedSink(self.stages, f);
+        if S::MAY_FILTER {
+            // `FusedSink::consume` honours filters, but the sink generation
+            // core has no input buffer to read items from — materialize.
+            par_for_each(self.range.collect(), &op, plan, pool);
+        } else {
+            par_range_gen_for_each(self.range, &op, plan, pool);
         }
     }
 }

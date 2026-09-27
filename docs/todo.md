@@ -58,20 +58,9 @@
   + `par_reduce_rec`（无输出 buffer，叶内部分聚合 + 树形 combine）；
   HybridStrategy 抽象使派发半边免费，只需叶/combine 逻辑。API：
   `reduce`/`fold` + 便捷 `sum`/`count`/`min`/`max`；stream 纯 sync 链的
-  fuse 路径同享。与 #15 的 par_tree_rec 抽象配套做可省一遍树形样板。
+  fuse 路径同享。与 #13 的 par_tree_rec 抽象配套做可省一遍树形样板。
 
-### 4. [P2] `submit_batch` 中间 Vec 分配
-
-`ComputePool::submit_batch` 先 `collect::<Vec<JobRef>>()` 再喂 `inject_batch`
-（executor/compute/worker.rs）；concurrent-queue 的 `push_n` 接受任何
-`ExactSizeIterator`，`map` 保持该界——把 public bound 收紧为
-`I::IntoIter: ExactSizeIterator` 即可直通免分配（fused.rs 的注入侧已用同
-技巧，见其「no intermediate Vec<JobRef>」注释）。顺带统一 `submit` /
-`submit_batch` 的 on-pool 语义：前者走 `inject_or_push`（本地 deque 快路），
-后者无条件进全局 injector——若 injector FIFO 是调用方的隐式依赖，在
-`submit_batch` 文档写明（`submit_injected` 已写）。
-
-### 5. [P2] streaming 相邻 sync stage 融合
+### 4. [P2] streaming 相邻 sync stage 融合
 
 整链 fuse 仅在纯 sync、无 pin、无 cancel 时触发（`fuse_exec` 谱系）；
 `stream(..).stage(a).stage(b)` 是两个 worker 种群 + 每 item 一次 channel
@@ -79,7 +68,7 @@ hop，而等价 fused 链单遍完成（`FuseCompose` 已具备闭包复合能�
 spawn 链游走时对相邻 unpinned `SyncStage` 合并成单 worker 池，任一侧 pin
 `workers`/`buffer` 即放弃。投机项：先 bench 后落地。
 
-### 6. [P2] fence 的每 run 专线程
+### 5. [P2] fence 的每 run 专线程
 
 每个 `FenceLink` 变体 `std::thread::spawn`（stream.rs 五处，~30–80 µs/
 fence/run，feeder 侧同款成本曾被专门移除），且 fence 是唯一没有
@@ -88,35 +77,25 @@ pool 模式下可作为 leased pool job（parks 在 mid channel 上，与 stage
 worker 同形，计入 parking lease），dedicated 模式保留线程；顺带提供
 `fence_with(StageOptions, mode)`。
 
-### 7. [P2] 微优化包
+### 6. [P2] filter 高选择率：write-then-compact 单遍 stage 变体
 
-- `wake_any_threads` 标 `#[cold]`（pool/sleep.rs）但它是唤醒热路径入口
-  （该文件注释以 wake p99 100–270 µs 为回归动机）——去掉或注明理由；
-  `wake_specific_thread` 未标，不一致；
-- `AtomicCounters` 未 CachePadded（pool/sleep.rs），目前靠字段布局运气躲
-  false sharing（SleepMask 已专门 padding 保护它）——防御性补齐；
-- `LockLatch::wait` / `wait_and_reset` 近重复（pool/latch.rs）；
-- `ReorderBuffer::flush_remaining` 双重分配（state/reorder.rs，冷路径，
-  每 run 一次）。
-
-### 8. [P2] `pipe()` 对非 Vec 输入的串行物化
-
-`pipe(items)` 先 `into_iter().collect::<Vec<_>>()`（fused.rs `pub fn pipe`）：
-`Vec` 输入免费（std 特化复用），range 等输入在并行启动前于驱动线程付 O(n)
-串行 fill。可选：owned-buffer 零拷贝构造器（`pipe_vec`），或 range/fn 输入
-用 hybrid 派发器并行 fill（`RangeOp` 忽略输入写 `i` 即可）。先量化 1M/4M
-轻量形状的串行占比再决定。
+- count-then-place（已落地 opt-in `YOUPIPE_FILTER_CTP`）高选择率 −31…−50 %
+  @100K，但 stage 跑两遍、10K 与低选择率回退（见 benchmarks.md filter 小节）。
+- write-then-compact：叶子把存活项按输入下标直写 n 槽输出 buffer 并记录
+  per-leaf 存活数；compaction 遍按 scan 偏移整块拷贝各叶连续存活段——
+  stage 只跑一遍、每存活项恰好一次拷贝（偏移相等时可跳过），代价是 n 尺寸
+  （而非 total 尺寸）输出 buffer。有望全形状占优或接近，需 A/B 定夺。
 
 ## 用户 API
 
-### 9. [P1] transient pool 复用缓存
+### 7. [P1] transient pool 复用缓存
 
 `with_compute_workers(n≠ncpus)` / `with_oversubscribe` 每次终端调用建池
 拆池（~ms 级，`ExecPool::Owned`）。可做进程内按 (workers, factor) 的小 LRU
 缓存。风险：线程数失控（用户以为池已销毁）；至少在 rustdoc 与 tuning.md 把
 「紧循环请预建池」的警示提级。
 
-### 10. [P1] `ordered()` + `expand()`：批量 payload 方案
+### 8. [P1] `ordered()` + `expand()`：批量 payload 方案
 
 2026-10 设计分析确认三条硬约束，实现前必须先解决（详见 dev/core-types.md
 对应记录）：
@@ -137,7 +116,7 @@ worker 同形，计入 parking lease），dedicated 模式保留线程；顺带�
 顺带收益：与 crossfire per-thread waker（设计 C，dev/crossfire-waker-designs.md
 §11）叠加后每组的 channel hop 数减少。
 
-### 11. [P1] StageOptions 类型分裂与零值语义统一
+### 9. [P1] StageOptions 类型分裂与零值语义统一
 
 - **无效旋钮静默忽略**：`workers` 对 async stage 无意义（async 扇出只读
   `io_concurrency`/`buffer`）、`io_concurrency` 对 sync stage 无意义——
@@ -151,14 +130,14 @@ worker 同形，计入 parking lease），dedicated 模式保留线程；顺带�
   （六处 `.max(1)`），与 `Workload::Custom(NonZeroUsize)` 的纪律不一致。
   统一为 assert! 或 NonZero 入参，一次 breaking 收敛。
 
-### 12. [P1] 取消的部分输出语义
+### 10. [P1] 取消的部分输出语义
 
 取消时 feeder/worker break，collector 排干通道即返回——中途取消产出静默
 截断的 `Vec`，与正常短 run 不可区分；`run()` / `for_each` / `with_cancel`
 均未文档化。至少补文档；更优：`RunOutcome` 或 `try_run_checked` 报告
 `Cancelled { emitted }`（collector 排干后查 token 即可）。
 
-### 13. [P2] API 小项包
+### 11. [P2] API 小项包
 
 - **文档失实（快修）**：`Workload::Unbalanced` 文档说 "Always 8× oversplit"
   （builder/config.rs 两处），实际 `unbalanced_oversplit()` 默认 32
@@ -181,7 +160,7 @@ worker 同形，计入 parking lease），dedicated 模式保留线程；顺带�
 
 ## 代码健康（重构/坏味道）
 
-### 14. [P1] 终端 prologue 十处复制
+### 12. [P1] 终端 prologue 十处复制
 
 `n==0` 短路 → `resolve_exec_pool` → `prefers_serial` 串行回退（含
 MAY_FILTER 分派）→ `SplitPlan::new` → MAY_FILTER 两路核心选择——同一序列
@@ -190,7 +169,7 @@ scoped 三件、by_ref 三件、`fused_pass_collect`）。split 策略或串行�
 就要改十处。抽 `terminal_plan(n, config, pool) -> Plan { Serial, Parallel(
 SplitPlan) }` + 共享串行回退 helper；prologue 每 run 一次，零热路径风险。
 
-### 15. [P1] par_*_rec 内部节点失败清理四份 + 六个 guard 变体
+### 13. [P1] par_*_rec 内部节点失败清理四份 + 六个 guard 变体
 
 `(Ok,Ok)/(Err,Ok)/(Ok,Err)/(Err,Err)` 兄弟区间丢弃 match 在 `par_index_rec`
 / `par_index_try_rec` / `par_index_rec_by_ref` / `par_index_try_rec_by_ref`
@@ -200,7 +179,7 @@ SplitPlan) }` + 共享串行回退 helper；prologue 每 run 一次，零热路�
 cleanup_success_chunk` 语义）；**叶函数保持独立单态化**（向量化论证只对叶
 成立）。落地后新终端（#3 reduce）只需叶 + 钩子。
 
-### 16. [P1] StageSpawn 五路 spawn 体 × 四 stage 类型
+### 14. [P1] StageSpawn 五路 spawn 体 × 四 stage 类型
 
 每 stage 类型手写 `spawn`/`spawn_single`/`spawn_for_async`/
 `spawn_async_feeder`/`spawn_async_feeder_single`，~15 个近同体（stream.rs
@@ -214,7 +193,7 @@ Mpsc/MixedAsync），每 stage 一个泛型 `spawn_into`，五方法变单行委
 收编 `_single` 孪生。回归防护（try_exec 的终端 Single-variant debug_assert）
 重构期作安全网。
 
-### 17. [P1] 六 builder × 五 setter 复制
+### 15. [P1] 六 builder × 五 setter 复制
 
 Pipe/TryPipe/PipeRef/TryPipeRef/ScopedPipe/ScopedTryPipe 各手抄
 `with_config`/`with_workload`/`with_compute_workers`/`with_compute_pool`/
@@ -223,7 +202,7 @@ Pipe/TryPipe/PipeRef/TryPipeRef/ScopedPipe/ScopedTryPipe 各手抄
 有记录）。抽内部 `ExecOptions { config, compute_pool, oversubscribe }` 被
 move 进各 builder + setter 宏，加字段只改一处。
 
-### 18. [P2] 死代码清理
+### 16. [P2] 死代码清理
 
 pool/mod.rs 模块级 `#![allow(dead_code)]`（"Scope/spawn infrastructure not
 yet wired"）已掩盖真死代码（repo 内零调用者，2026-09 核实）：`spawn_static`
@@ -233,7 +212,7 @@ yet wired"）已掩盖真死代码（repo 内零调用者，2026-09 核实）：
 `CancellationToken::reset`（sync/cancel.rs，仅自测调用；复活 token 对在飞
 worker 是脚枪）。删项后摘掉模块级 allow，让编译器重新把关。
 
-### 19. [P2] 正确性相邻与杂项
+### 17. [P2] 正确性相邻与杂项
 
 - **ReorderBuffer 窗口溢出静默丢数据**：`insert` 慢路径里 slot 被占且
   tag 不同（两 seq 别名同槽 = 容量前置被超）时，debug/release 均无信号、
@@ -268,12 +247,3 @@ worker 是脚枪）。删项后摘掉模块级 allow，让编译器重新把关�
   （应为 `StageSpawn::has_expand`）；`stage_buffer` floor 措辞
   "downstream_workers * 4" 与调用点传本 stage 自身 worker 数不符
   （stream.rs 两处）。
-
-### 20. [P2] filter 高选择率：write-then-compact 单遍 stage 变体
-
-- count-then-place（已落地 opt-in `YOUPIPE_FILTER_CTP`）高选择率 −31…−50 %
-  @100K，但 stage 跑两遍、10K 与低选择率回退（见 benchmarks.md filter 小节）。
-- write-then-compact：叶子把存活项按输入下标直写 n 槽输出 buffer 并记录
-  per-leaf 存活数；compaction 遍按 scan 偏移整块拷贝各叶连续存活段——
-  stage 只跑一遍、每存活项恰好一次拷贝（偏移相等时可跳过），代价是 n 尺寸
-  （而非 total 尺寸）输出 buffer。有望全形状占优或接近，需 A/B 定夺。
