@@ -162,11 +162,23 @@ returns both child partials, the node combines them), so there is no
 shared-buffer sibling-drop path at all — panic safety is structural (every
 partial is a local dropped by unwind / `join`; the leaf guard owns only the
 input tail). `ReduceStrategy` plugs into `hybrid_dispatch` unchanged: each
-chunk's tree publishes one partial `(start, acc)` into a mutexed slot list
-(one push per chunk, far off the per-item hot path), and the driver sorts
-by `start` and combines left-to-right — deterministic input order.
-`cleanup_success_chunk` is a no-op: on any failure the published partials
-drop with the strategy, a failed batch having no user-visible accumulator.
+chunk's tree publishes its partial into a one-shot `ChunkSlots` cell — a
+plain store to the chunk's own cell, sequenced before the latch `set` —
+and the driver folds the cells in chunk ordinal order (the boundary
+formula's inverse; no sort, no lock). The first design published into a
+`Mutex<Vec<(start, Acc)>>` instead: correct, but the ~num_threads pushes
+pile onto one lock at the batch tail, and at small n the per-chunk work is
+too short to hide it — measured +80…+112 % vs collect-then-sum at 1K and
++40…+73 % at 10K (the 100K/1M wins of −40 %/−80 % stayed, publication
+overlapping real compute there). Per-chunk cells remove the shared
+writable line entirely; unpublished (`Empty`) cells are skipped, which also
+covers the on-pool single-tree shortcut (one chunk). On failure paths
+`cleanup_success_chunk` (`ChunkSlots::drop_published`) eagerly drops each
+successful chunk's published partial — the slot box's own drop is the
+backstop — a failed batch having no user-visible accumulator. After the
+slot fix the reduce core sits within noise of collect-then-sum at 1K
+(+9.5 % median-of-5 with 18 % bimodal round spread) and wins from 10K up
+(−16 % @ 10K, −74 % @ 100K, −87 % @ 1M; see dev/benchmarks.md).
 
 API note: the streaming reduce pass-through threads the reducer through
 `StageSpawn::fuse_exec_reduce` with the composed chain's output type as an

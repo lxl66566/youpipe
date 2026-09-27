@@ -362,6 +362,34 @@ participating" gap was, in hindsight, mostly the uncached
 the per-chunk savings, so the hybrid chunk strategy was kept.
 
 
+### Reduce terminals vs collect-then-sum (`sync_reduce`, `x+1` map, 2026-09-28)
+
+The aggregation terminals (`reduce`/`fold`/`sum`/`count`/`min`/`max` and
+the fallible twins) never allocate the output `Vec`: each leaf folds its
+range into a partial and the tree combines partials through `join`
+returns; the chunk driver publishes one partial per chunk into a one-shot
+cell (design history in dev/scheduler.md). Caliber: borrowed `x+1` map over
+a warm slice (owned side pays a fresh clone, identical on every A/B side).
+5 interleaved per-id rounds — the family is new, so there is no base side;
+the old path (`youpipe_collect_sum_borrowed`) and `rayon_sum` run in the
+same rounds as drift anchors.
+
+| Size | youpipe `sum` (borrowed) | collect+sum (old path) | rayon `.sum()` | sequential |
+| ---- | ------------------------ | ---------------------- | -------------- | ---------- |
+| 1K   | ~10.3 µs | ~9.4 µs  | ~39.2 µs | ~0.3 µs  |
+| 10K  | ~10.6 µs | ~12.7 µs | ~53.7 µs | ~3.0 µs  |
+| 100K | ~12.2 µs | ~46.6 µs | ~69.5 µs | ~29.4 µs |
+| 1M   | ~29.9 µs | ~235.7 µs| ~121.2 µs| ~293.0 µs|
+
+vs the materialize-then-fold path: **−16 % @ 10K, −74 % @ 100K, −87 % @
+1M**; at 1K the reduce core medians +9.5 % but with 18 % bimodal round
+spread (8.8/10.3 µs alternating; 2/5 rounds beat the old path) — borderline
+noise, below the size-gating threshold, no gating done. vs rayon:
+**−74…−82 % at every size** (the cpu-heavy collect caliber narrows that —
+this is the lightweight end where the removed output buffer dominates).
+Owned input pays the fresh clone (~17.3 µs @ 10K, ~74.5 µs @ 100K) —
+identical lifecycle on every side of any owned A/B.
+
 ### On-pool nested terminals (`sync_nested_on_pool`, cpu_heavy per item)
 
 Fused terminals reached from *inside* a worker of the driving pool —

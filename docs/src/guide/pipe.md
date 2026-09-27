@@ -39,6 +39,33 @@ pipe(0..1000u64).for_each(move |x| t.fetch_add(x, Ordering::Relaxed));
 To borrow stack-local data in the closure instead, use
 [`pipe_ref`](#borrowed-input-pipe_ref) or [scope](scope.md).
 
+## Aggregation terminals: `reduce` / `fold` / `sum` / …
+
+Aggregation skips the output `Vec` the same way `for_each` does: each
+parallel leaf folds its range into one partial accumulator and the tree
+combines partials in parallel — rayon's `.par_iter().sum()` shape without
+materializing anything:
+
+```rust
+use youpipe::pipe;
+
+let max = pipe(0..1000).map(|x: i64| x * 3).reduce(i64::max);
+let sum: i64 = pipe(0..1000).map(|x: i64| x * 3).sum();
+let n = pipe(0..1000).filter(|x: &i64| x % 2 == 0).count();
+```
+
+`reduce(op)` returns `Option<O>` — `None` for an empty or fully filtered
+input. `fold(init, f, combine)` folds into an accumulator of a different
+type (each leaf seeds from `init.clone()`); `count()` counts post-filter
+outputs; `min()`/`max()` are `reduce(Ord::min/max)` conveniences.
+
+The fold/combine pair must be **associative** for the result to be
+independent of the split layout — outputs combine as a deterministic tree
+over input order, but the exact association depends on batch size and
+worker count, so e.g. float `+` may differ in the last ulp run-to-run.
+Fallible chains get `try_reduce`/`try_fold` (the first `Err`
+short-circuits); `pipe_ref` carries the same conveniences.
+
 ## Borrowed input: `pipe_ref`
 
 `pipe_ref(&slice)` is the counterpart of rayon's `slice.par_iter()`. Items
@@ -54,7 +81,8 @@ let doubled: Vec<u64> = pipe_ref(&data).map(|&x| x * 2).collect();
 assert_eq!(data.len(), 1000); // `data` was only read, not consumed
 ```
 
-`pipe_ref` also has `filter`, `try_map`, `for_each`, and `collect`. Because
+`pipe_ref` also has `filter`, `try_map`, `for_each`, `collect`, and the
+[aggregation terminals](#aggregation-terminals-reduce--fold--sum--). Because
 its closures are bounded by the input borrow instead of `'static`, they may
 capture other stack-local data for free — see [borrowing data](scope.md).
 

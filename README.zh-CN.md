@@ -31,6 +31,9 @@ let r: Vec<i32> = (0..1000).pipe()
     .map(|x| x * 10)
     .collect();
 
+// 聚合终端：同样的融合，完全不分配输出 Vec
+let s: i64 = (0..1000).pipe().map(|x| x + 1).sum();
+
 // 同步 CPU 阶段 + 异步 IO 阶段（在各自线程池上重叠运行）
 let r: Vec<u64> = (0..1000).stream()
     .stage(|x: u64| x + 1)

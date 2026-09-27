@@ -47,19 +47,6 @@
 - 验证：`cpu_balanced` 1M/2M/4M 隔离 A/B + `horizontal-counters`（youpipe-bench）
   复查 task-clock / ctx-switch / migration。
 
-### 3. [P1] reduction 终端（reduce/fold/sum/count）
-
-- 现状：六个 builder（Pipe/TryPipe/PipeRef/TryPipeRef/ScopedPipe/
-  ScopedTryPipe）只有 collect / try_collect / for_each 三类终端；聚合需求
-  必须物化整棵 `Vec<O>`（n 槽 Slots 分配 + n 次写 + 串行 fold）——对
-  `.map(f).sum()` 形状是纯浪费，正是 `for_each` 规避的结构问题（见
-  fused.rs for_each 的结构性优势注释）。
-- 方向：`ReduceStrategy: HybridStrategy`（`cleanup_success_chunk` = no-op）
-  + `par_reduce_rec`（无输出 buffer，叶内部分聚合 + 树形 combine）；
-  HybridStrategy 抽象使派发半边免费，只需叶/combine 逻辑。API：
-  `reduce`/`fold` + 便捷 `sum`/`count`/`min`/`max`；stream 纯 sync 链的
-  fuse 路径同享。与 #13 的 par_tree_rec 抽象配套做可省一遍树形样板。
-
 ### 4. [P2] streaming 相邻 sync stage 融合
 
 整链 fuse 仅在纯 sync、无 pin、无 cancel 时触发（`fuse_exec` 谱系）；

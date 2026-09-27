@@ -42,6 +42,7 @@ Pick whichever reads better at the call site.
 | Read-only transform over an existing slice | `pipe_ref(&slice)` |
 | Closures borrowing stack-local data | `scope(\|s\| s.pipe(items)...)` |
 | Side effects only, no output `Vec` | `pipe(items).for_each(..)` |
+| Aggregate without an output `Vec` | `pipe(items).map(..).sum()` |
 | Fallible stages | `pipe(items).try_map(..).try_collect()` |
 | Skewed item costs (a few slow items) | `pipe(items).with_workload(Workload::Unbalanced)` |
 | Async IO, mixed sync CPU + async IO | `stream(items).stage_async(..)` |
