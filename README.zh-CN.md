@@ -38,6 +38,9 @@ let r: Vec<u64> = (0..1000).stream()
     .run();
 ```
 
+索引形状的负载（`0..n`）可用 `pipe_range(0..n)` 完全跳过输入物化——条目直接在并行叶子内生成，
+省去在调用线程上串行 collect 的开销（这是 `pipe(0..n)` 在 1M+ 条目下的主要成本）。
+
 可按负载类型进行调优——见[选择合适的引擎](https://lxl66566.github.io/youpipe/advanced/choosing-engine.html)。
 
 ## 文档

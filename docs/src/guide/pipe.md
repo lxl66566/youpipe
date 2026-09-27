@@ -58,6 +58,30 @@ assert_eq!(data.len(), 1000); // `data` was only read, not consumed
 its closures are bounded by the input borrow instead of `'static`, they may
 capture other stack-local data for free — see [borrowing data](scope.md).
 
+## Index input: `pipe_range`
+
+`pipe(0..n)` materializes any non-`Vec` input on the calling thread before
+the parallel phase starts — for a range that is a serial O(n) fill, which
+dominates lightweight maps at 1M+ items (measured 56–70 % of the whole call
+at 1M/4M, see the dev benchmarks). `pipe_range(0..n)` removes the input
+buffer entirely: items are *generated* inside the parallel leaves — the item
+at index `i` is `i` — so there is nothing to fill, allocate, or read:
+
+```rust
+use youpipe::pipe_range;
+
+let r: Vec<u64> = pipe_range(0..1_000_000)
+    .map(|i: usize| (i as u64).wrapping_mul(31).wrapping_add(7))
+    .collect();
+```
+
+`pipe_range` has the same builder surface as `pipe` (`map`, `filter`,
+`try_map`, the tuning setters). Chains that can `filter` — and the fallible
+`try_collect()` terminal — materialize the indices once at the terminal
+(the same serial fill `pipe(range)` always paid); the filter-free `collect()`
+and `for_each()` run the generation core. If you already own a `Vec`, keep
+using `pipe(v)` — it reuses your buffer with zero copies.
+
 ## No global stage waits
 
 A fused chain has no stage boundaries at all — each worker applies the whole
