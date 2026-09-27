@@ -1,6 +1,7 @@
 //! Expand-heavy microbenchmarks: fan-out × per-item cost × API shape.
 //!
-//! Purpose (docs/todo #4, closed): quantify the per-item `Vec` allocation
+//! Purpose (expand alloc-cost question, closed; record in
+//! tests/expand_alloc.rs): quantify the per-item `Vec` allocation
 //! cost of the owned-buffer `expand` API against the push-style
 //! `expand_emit` (per-worker reused scratch buffer). rayon's `flat_map`
 //! (owned `Vec`) and `flat_map_iter` (lazy iterator) rows give the external

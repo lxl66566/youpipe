@@ -25,5 +25,6 @@
 - [Verification: miri and loom](dev/testing.md)
 - [Vendored crossfire: blocking-waker designs](dev/crossfire-waker-designs.md)
 - [Vendored crossfire: waker-cache archaeology](dev/crossfire-waker-cache.md)
+- [Falsified directions](dev/dead-ends.md)
 - [Benchmarks and methodology](dev/benchmarks.md)
 - [Publishing](dev/publishing.md)

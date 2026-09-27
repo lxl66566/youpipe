@@ -17,7 +17,7 @@
 # largest allocation class in youpipe's streaming data plane under
 # saturation (94–96% of all allocations in the expand fanout-9 profile) —
 # and supersedes design A (branch `waker-cache`, per-handle WakerCache).
-# Design/acceptance record: docs/todo.md #6.
+# Design/acceptance record: docs/src/dev/crossfire-waker-designs.md.
 #
 # The package is renamed so it can never be confused with the crates.io
 # release; call sites keep importing `crossfire` via the dependency alias

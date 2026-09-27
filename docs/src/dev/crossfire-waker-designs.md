@@ -1,6 +1,6 @@
 # crossfire 阻塞 waker 设计空间
 
-> [todo #6](../../todo.md) 的续篇。前置考古见 [crossfire-waker-cache.md](crossfire-waker-cache.md)（下称"考古"）——它论证了 40B `ArcWaker` 分配的根因、`WakerCache` 的死因，并给出复活方案（§4，本文称**设计 A**）。本文回答下一个问题：**除了复活 A，还有没有更好的设计**。
+> 承接 [crossfire-waker-cache.md](crossfire-waker-cache.md) 的考古（下称"考古"）——它论证了 40B `ArcWaker` 分配的根因、`WakerCache` 的死因，并给出复活方案（§4，本文称**设计 A**）。本文回答下一个问题：**除了复活 A，还有没有更好的设计**。
 >
 > 考古对象：`/root/programs/fork/crossfire-rs`。**代码基线为 HEAD `6f761e0`**（= 3.1.20 + issue #70 修复）。注意：本文写作时 fork 工作树已存在一份**未提交的**设计 A 复活实现（改 `Tx/Rx/waker.rs/waker_registry.rs` 四文件），正被并行编辑；因此本文所有行号引用以 HEAD 为准，仅作粗定位，以函数名为锚。
 
@@ -343,7 +343,7 @@ parking-lot 是这个模式最著名的实现，结构：
 1. **UB 面升级**：A/C 的失败模式是"缓存 miss / 多一次 skip"（良性）；B 的失败模式是漏一个摘链出口 = use-after-free。出口清单分散在 blocking_tx/blocking_rx/select/shared 四处宏里，枚举完备性的审查成本高。
 2. **select 的单节点进 N 个链表**（F9）：侵入式双链节点只能属于一个链表，select 需要 per-registry 节点拷贝（SmallVec 栈数组）或为 select 单独保留堆节点——协议分叉。
 3. **async 分轨**（F6）：async waker 必须留在 Weak/堆世界，队列要变成 `enum { Heap(Weak<..>), Stack(*mut ..) }` 或双队列，fire 循环双轨化。
-4. **违背 fork 可 diff 原则**：AGENTS.md 要求 fork crate 与 upstream 可 diff、不手改；registry 结构重写只能走"先 upstream 化、再同步"的长路径，与 todo #6 的小步目标冲突。
+4. **违背 fork 可 diff 原则**：AGENTS.md 要求 fork crate 与 upstream 可 diff、不手改；registry 结构重写只能走"先 upstream 化、再同步"的长路径，与本项的小步目标冲突。
 5. miri/loom 重验成本最高（新 UB 面 + 双轨队列）。
 
 **定位**：作为给 upstream 的长期提案（“registry 简化 + 零分配等待”），实施前先精读 parking_lot_core 的 `park_internal`/`unpark_one_inner` 作参照。
@@ -381,7 +381,7 @@ notify_one:      if waiters > 0 { epoch += 1; futex_wake(&epoch, 1) }
 - **F. registry 持 strong、owner 不持**：episode 结束节点仍在队列里，晚到的 fire 会 unpark 一个已回到用户代码的线程——unpark token 串进**用户的** park（仍合法，F11），但队列里堆满已死 episode 的 strong 引用，且 owner 读自己状态需要 weak。不解决任何问题，纯劣化。
 - **G. per-thread 的 WakerCache**：即"TL 槽里放一个单槽缓存"——缓存协议照旧、门照旧，只是把槽从 handle 挪到线程。相比 C 多此一举（C 的节点不死，根本不需要缓存协议），是 A→C 的过渡形态，无独立价值。
 - **youpipe 侧注入 API**（`send_with_waker(&mut Option<ArcWaker>)`）：把节点生命周期交给 youpipe（per-worker 常驻）。能消灭分配，但 crossfire 要暴露 `WakerCache`-ish 公共类型、youpipe 每个 send 调用点要穿透一层——为回避 C 的 10 行 TLS 引入公共 API 面，不划算。
-- **不修 upstream 的替代路径**（考古 §6）：todo #10 批量 payload（摊薄 park 次数，40B 流量同比例下降）、collector 换 `std sync_channel`、fork 到 `crates/youpipe-crossfire`。与本文方案正交，可叠加。
+- **不修 upstream 的替代路径**（考古 §6）：批量 payload（摊薄 park 次数，40B 流量同比例下降，见 [todo.md](../../todo.md)）、collector 换 `std sync_channel`（已证伪）、fork 到 `crates/youpipe-crossfire`。与本文方案正交，可叠加。
 
 ---
 

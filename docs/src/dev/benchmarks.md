@@ -403,8 +403,9 @@ Readings:
   channel was adopted from **in-pipeline** profiling under N-producer
   contention (recv-side CAS dominates there, see `handoff/channel.rs`); this
   microbench has no recv-side contention, so it measures the pure
-  cache-line-transfer/wake path instead. Follow-up in `docs/todo.md`: A/B
-  `std sync_channel` as the collector channel inside the real pipeline.
+  cache-line-transfer/wake path instead. The in-pipeline follow-up was run
+  and falsified (e1684fc → revert aa842a6): burst-boundary park round-trips
+  regress every real-collector shape — see [dead-ends.md](dead-ends.md).
 - The inter-stage MPMC channel (crossfire, 85 Melem/s at 100K) beats every
   bounded alternative here — the "nothing left to squeeze" conclusion for
   the middle channels stands (see scheduler.md).

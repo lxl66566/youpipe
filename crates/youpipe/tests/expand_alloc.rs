@@ -16,7 +16,7 @@
 //!
 //! Unfiltered counts are therefore nondeterministic under backpressure —
 //! a 2-stage pipeline measured 17/387/2 wakers across three consecutive
-//! runs — see the crossfire waker entry in `docs/todo.md` for the full
+//! runs — see `docs/src/dev/crossfire-waker-designs.md` for the full
 //! attribution.
 
 use std::{

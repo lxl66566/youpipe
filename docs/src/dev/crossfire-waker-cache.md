@@ -1,6 +1,6 @@
 # crossfire 阻塞 waker 缓存考古
 
-> 支撑 [todo #6](../../todo.md)：streaming 数据面在背压下每次 park 分配 40 B `ArcWaker` 的根因、upstream（crossfire 3.1.20）的设计意图与演化史、重新启用缓存需要的改动与并发安全论证、以及对 youpipe 的预期影响。考古对象：`/root/programs/fork/crossfire-rs`（本地 fork，与 crates.io 3.1.20 同源）。
+> streaming 数据面在背压下每次 park 分配 40 B `ArcWaker` 的根因、upstream（crossfire 3.1.20）的设计意图与演化史、重新启用缓存需要的改动与并发安全论证、以及对 youpipe 的预期影响。考古对象：`/root/programs/fork/crossfire-rs`（本地 fork，与 crates.io 3.1.20 同源）。
 
 ## TL;DR
 
@@ -37,7 +37,7 @@
 
 ### 1.4 结论的边界（诚实声明）
 
-以上证明了"**背压下第一分配流量来自 crossfire 的 park 路径**"，这是可复现、可归因的事实。但它**尚未**证明是墙钟瓶颈：单次 malloc+free（glibc tcache 命中约 20–50 ns）相对于 park 的 futex 系统调用（µs 级）是小头。墙钟/尾延迟影响是 todo #6 的待办项（同 binary 交错 A/B）。本考古解决的是"这个分配该不该存在"——它本来就不该存在，upstream 自己写好了缓存又注释掉了。
+以上证明了"**背压下第一分配流量来自 crossfire 的 park 路径**"，这是可复现、可归因的事实。但它**尚未**证明是墙钟瓶颈：单次 malloc+free（glibc tcache 命中约 20–50 ns）相对于 park 的 futex 系统调用（µs 级）是小头。墙钟/尾延迟影响是后续待办项（同 binary 交错 A/B）。本考古解决的是"这个分配该不该存在"——它本来就不该存在，upstream 自己写好了缓存又注释掉了。
 
 ## 2. 现状生命周期（3.1.20，复用已死版）
 
@@ -235,15 +235,15 @@ impl WakerCache {
 
 **待验证（可能才是主收益）**：
 
-- 尾延迟与方差：40B 计数的双峰抖动（17/387/2）与调度抖动同现。去掉分配流量本身不改变 park 次数（那是 todo #10 批量 payload 的活），但消除了"分配器工作嵌在 park 关键路径上"这一扰动源，streaming bench 的 p99 稳定性是否改善需要 A/B；
+- 尾延迟与方差：40B 计数的双峰抖动（17/387/2）与调度抖动同现。去掉分配流量本身不改变 park 次数（那是批量 payload 待办的活，见 [todo.md](../../todo.md)），但消除了"分配器工作嵌在 park 关键路径上"这一扰动源，streaming bench 的 p99 稳定性是否改善需要 A/B；
 - 分配器全局压力：tcache/arena 的额外流量减少，对同进程里用户态分配（scratch 倍增、用户 stage 内分配）的干扰降低。
 
 **不会变的**：fast path（本就零分配零 waker）、park 次数、futex 系统调用成本、调度行为。若 A/B 显示墙钟无显著变化，该 patch 的价值仍然是"卫生 + 可测性 + 消除一个可疑的尾部扰动源"，且代价极小（30 行、每 episode 一次 CAS）。
 
 ## 6. 备选路径
 
-- **不修 upstream**：与 todo #10 的批量 payload（channel 携带 `(seq, Vec<N>)`）合流，每 hop 的 park 次数按批大小摊薄，40B 流量同比例下降；
-- **collector 侧换 `std sync_channel`**（todo #5 联动）：暴露面缩小到 stage 间 MPMC；
+- **不修 upstream**：与批量 payload 待办（channel 携带 `(seq, Vec<N>)`，见 [todo.md](../../todo.md)）合流，每 hop 的 park 次数按批大小摊薄，40B 流量同比例下降；
+- **collector 侧换 `std sync_channel`**：已证伪（burst 边界 park 往返回退，见 [dead-ends.md](dead-ends.md)）；
 - upstream 拒收 patch 则 fork 到 `crates/youpipe-crossfire`（与 `youpipe-concurrent-queue` 同策略，保持可 diff 维护）。
 
 ## 7. 落地验证（2026-10，已合入）

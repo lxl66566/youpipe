@@ -1,4 +1,5 @@
-//! Attribution runner for the horizontal `cpu_balanced` gap (todo.md P0 #1):
+//! Attribution runner for the horizontal `cpu_balanced` gap (docs/todo.md
+//! 性能#1, zstd_shape/fused residuals):
 //! one process, both sides of the comparison interleaved rep-by-rep, the
 //! exact `cpu_balanced` workload (borrowed `u64` input, 100-iteration
 //! foldable `cpu_work`), per-iteration wall times on stdout as CSV for

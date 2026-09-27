@@ -427,7 +427,7 @@ SMT sibling), and a quiescence-gated extension (extend the spin phase only
 while `inactive == num_threads`) measured no win — in these shapes the
 early parkers park *before* quiescence (the straggler is still running),
 so the gate always fires too late (reverted; see the falsified list in
-`todo.md`).
+[dead-ends.md](dead-ends.md)).
 
 `ComputePool::new_pinned(n)` attacks the same residual without burning
 anything: worker `i` is pinned to the i-th CPU of the process's allowed
