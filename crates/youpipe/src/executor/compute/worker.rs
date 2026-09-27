@@ -39,17 +39,56 @@ impl ComputePool {
         })
     }
 
-    /// Create a new pool with `num_workers` threads.
+    /// Create a pool with `num_workers` threads.
     ///
     /// `num_workers` is clamped to `[1, MAX_COMPUTE_WORKERS]` (511): the
     /// scheduler's sleep bitmask addresses at most 511 workers. The clamp is
     /// silent — use [`MAX_COMPUTE_WORKERS`](crate::MAX_COMPUTE_WORKERS) to
     /// query the cap programmatically.
+    ///
+    /// # Pool recycling
+    ///
+    /// Pools are recycled through a small process-wide cache keyed by worker
+    /// count: dropping the last external handle **parks** the pool (its
+    /// threads stay alive, idle) instead of joining it, and the next `new`
+    /// with the same size reuses it for the cost of an `Arc` clone.
+    /// Construction is ~15 µs per worker (spawn + prime + later join), which
+    /// dominates fused terminals in tight loops — `.with_compute_workers(n)`
+    /// and `.with_oversubscribe(f)` both resolve through this constructor.
+    /// At most a few recent sizes stay parked; evicted ones join for real.
+    ///
+    /// Consequences:
+    ///
+    /// * after dropping a pool its threads may still be alive (parked). If they must be gone —
+    ///   thread-count budgeting, teardown, tests — call [`ComputePool::clear_cached_pools`];
+    /// * [`Self::new_pinned`] is never cached: pinned workers hold scarce CPU placement and always
+    ///   join on drop;
+    /// * [`Self::global`] bypasses the cache (process-lifetime already);
+    /// * two calls with sizes that clamp to the same value share one pool.
     #[must_use]
     pub fn new(num_workers: usize) -> Self {
+        super::pool_cache::acquire(num_workers)
+    }
+
+    /// Build a pool eagerly — spawn, prime, no cache. Internal construction
+    /// path for `pool_cache::acquire` (miss path).
+    pub(super) fn build(num_workers: usize) -> Self {
         let registry = Registry::new(num_workers, false);
         registry.wait_until_primed();
         Self { registry }
+    }
+
+    /// Drop every pool parked in the process-wide recycling cache (see
+    /// [`Self::new`]), joining their worker threads. Returns the number of
+    /// pools dropped.
+    ///
+    /// Pools still referenced by a live handle are unaffected; this only
+    /// releases the cache's own references.
+    // The side effect is the contract; the count is diagnostic, so callers
+    // discarding it are not bugs.
+    #[allow(clippy::must_use_candidate)]
+    pub fn clear_cached_pools() -> usize {
+        super::pool_cache::clear()
     }
 
     /// Create a pool whose workers are pinned to the CPUs the process is
@@ -72,6 +111,10 @@ impl ComputePool {
     ///
     /// On platforms without affinity support (non-Linux, miri) this
     /// degrades to an unpinned pool.
+    ///
+    /// Never recycled through the pool cache (see [`Self::new`]): pinned
+    /// workers hold scarce CPU placement, so they join for real when the
+    /// last handle drops.
     #[must_use]
     pub fn new_pinned(num_workers: usize) -> Self {
         let registry = Registry::new(num_workers, true);
@@ -306,6 +349,18 @@ mod tests {
     /// Other tests in this binary create unpinned pools whose threads share
     /// the `yp-pool-*` name, so the invariant is "≥ n distinct single-CPU
     /// workers inside the allowed set".
+    /// `new_pinned` must bypass the recycling cache: two constructions are
+    /// two distinct registries (the "clears nothing" half of the contract
+    /// lives in tests/pool_cache.rs — the lib test binary parks unrelated
+    /// pools into the global cache from parallel tests, so counting here
+    /// would be racy).
+    #[test]
+    fn test_new_pinned_not_cached() {
+        let a = ComputePool::new_pinned(2);
+        let b = ComputePool::new_pinned(2);
+        assert_ne!(a.registry().id(), b.registry().id());
+    }
+
     #[cfg(all(target_os = "linux", not(miri)))]
     #[test]
     fn test_new_pinned_workers_have_distinct_single_cpu_affinity() {
@@ -327,7 +382,10 @@ mod tests {
                 continue;
             };
             // Worker threads are named `yp-pool-<i>` (≤ 15 chars in /proc).
-            if !text.lines().any(|l| l.starts_with("Name:") && l.contains("yp-pool-")) {
+            if !text
+                .lines()
+                .any(|l| l.starts_with("Name:") && l.contains("yp-pool-"))
+            {
                 continue;
             }
             let Some(list) = text

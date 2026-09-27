@@ -62,11 +62,14 @@ pub enum Workload {
 pub struct PipelineConfig {
     /// Number of threads dedicated to CPU-bound (sync) work.
     ///
-    /// Fused path: the pool size — the terminal runs on a transient pool of
-    /// this many threads whenever it differs from the machine default (the
-    /// global pool, one thread per core), and
+    /// Fused path: the pool size — the terminal runs on a pool of this many
+    /// threads whenever it differs from the machine default (the global
+    /// pool, one thread per core), and
     /// [`with_oversubscribe`](crate::Pipe::with_oversubscribe) multiplies it.
-    /// An explicit `with_compute_pool` always takes precedence. Streaming
+    /// Those pools are recycled through the process-wide cache (see
+    /// [`ComputePool::new`](crate::ComputePool::new)) — in a loop the second
+    /// run onward is spawn-free. An explicit `with_compute_pool` always
+    /// takes precedence. Streaming
     /// path: the worker budget divided across sync stages (see
     /// `StageOptions::workers` for per-stage overrides).
     ///
@@ -138,6 +141,12 @@ impl PipelineConfig {
     }
 
     /// Sets the number of CPU-bound worker threads.
+    ///
+    /// On the fused path a non-default value resolves to a pool from the
+    /// recycling cache ([`ComputePool::new`](crate::ComputePool::new)) —
+    /// dropped pools park instead of joining; call
+    /// [`ComputePool::clear_cached_pools`](crate::ComputePool::clear_cached_pools)
+    /// to reclaim their threads.
     ///
     /// Silently clamped to `[1, MAX_COMPUTE_WORKERS]` (511 on 64-bit): the
     /// scheduler's sleep bitmask packs thread indices into 9 bits, so a pool

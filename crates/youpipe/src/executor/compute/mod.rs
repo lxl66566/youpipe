@@ -1,3 +1,4 @@
+mod pool_cache;
 mod worker;
 
 pub use worker::ComputePool;
