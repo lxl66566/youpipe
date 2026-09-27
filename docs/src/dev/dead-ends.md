@@ -24,12 +24,19 @@
   见 scheduler.md），默认仍 0。
 - **cost-EMA 自适应 chunk 数 / execute-time split-back**：门条件在稳态几乎
   不同时成立（实测 1 次/进程），机制零命中即删。
-- **count-then-place 用于低选择率 filter**（2026-09-27，`YOUPIPE_FILTER_CTP`
-  实验，5 轮同 binary knob A/B）：前提反了——merge 树开销随存活数缩放，
+- **count-then-place 用于低选择率 filter**（2026-09-27，5 轮同 binary
+  knob A/B，时为 `YOUPIPE_FILTER_CTP`、现为 `YOUPIPE_FILTER_COLLECT=ctp`）：前提反了——merge 树开销随存活数缩放，
   count-then-place 随输入数持平（stage 跑两遍），交叉点 ~25 % @100K：
   keep10 **+41 %**、全部 10K 形状 +28…+75 %（均 0/25）。高选择率侧成立
   （keep90 −50.5 %、keep50 −37.1 %、33 % −31.1 %，均 25/25），故 knob 以
   opt-in 保留、默认关。数据见 benchmarks.md filter 小节。
+- **write-then-compact 用于 10K 中高选择率**（2026-09-27，
+  `YOUPIPE_FILTER_COLLECT=wtc` 三侧终测，5 轮同 binary）：存活 payload
+  （keep90 @10K = 72 KB）低于 256 KB 并行压缩门槛，driver 顺序压缩为 worker
+  刚写完的 cache line 付跨核传输——keep90 **+25 %**（0/25）、keep33 +8 %。
+  调低门槛不可救（fork/join ramp ~10 µs > 顺序传输 ~5 µs）。其余形状占优
+  （100K keep33/50/90 −24…−38 % 均 25/25、1K −12.8 %），knob 以 opt-in 保留、
+  默认 merge；数据与机制见 benchmarks.md filter 小节。
 - **加宽自旋或 yield 窗口**（32/64 之外）、**限制 steal 扫描范围**（有界探测）：
   均为全局回退。
 - **去掉 async→async bridge funnel**（consumer 直接 clone 上游 receiver）：
