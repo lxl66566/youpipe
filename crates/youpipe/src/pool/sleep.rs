@@ -51,9 +51,16 @@ fn select_jec(word: usize) -> usize {
 }
 
 /// Atomic counters packing sleeping-threads, inactive-threads, and JEC.
+///
+/// `CachePadded`: this word is the pool's most contended line (every idle
+/// round loads it, every dispatch CASes the JEC). Today it dodges false
+/// sharing only by field-layout luck — inside `Sleep` it sits between the
+/// `worker_sleep_states` Vec header and the already-padded `sleeping_mask`.
+/// Padding makes that immunity structural against future layout churn,
+/// mirroring `sleeping_mask` (measured +3-5 % when it lacked padding).
 #[allow(dead_code)]
 pub(crate) struct AtomicCounters {
-    value: AtomicUsize,
+    value: CachePadded<AtomicUsize>,
 }
 
 #[derive(Copy, Clone)]
@@ -83,7 +90,7 @@ impl AtomicCounters {
     #[inline]
     pub(crate) fn new() -> AtomicCounters {
         AtomicCounters {
-            value: AtomicUsize::new(0),
+            value: CachePadded(AtomicUsize::new(0)),
         }
     }
 
