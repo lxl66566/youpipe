@@ -5059,41 +5059,56 @@ where
     }
 }
 
-// ── Count-then-place by-ref filter collect (YOUPIPE_FILTER_CTP) ──
+// ── By-ref filter collect variants: merge tree / count-then-place /
+//    write-then-compact (YOUPIPE_FILTER_COLLECT) ──
 //
-// Two-pass alternative to the merge tree for `pipe_ref(..).filter(..)`
-// collects: pass 1 counts survivors per leaf, a sequential scan turns the
-// counts into output offsets, pass 2 re-runs the chain and writes survivors
-// straight into ONE exactly-sized output buffer — every survivor moves
-// exactly once, no per-leaf `Vec` allocations, no tree merges. Trade-offs:
-//   * stage closures run TWICE over the input — a loss for expensive stages
-//     and an observable difference for side-effecting (interior-mutable)
-//     closures;
+// Count-then-place (ctp): two-pass alternative to the merge tree for
+// `pipe_ref(..).filter(..)` collects. Pass 1 counts survivors per leaf, a
+// sequential scan turns the counts into output offsets, pass 2 re-runs the
+// chain and writes survivors straight into ONE exactly-sized output buffer
+// — every survivor moves exactly once, no per-leaf `Vec` allocations, no
+// tree merges. Trade-offs:
+//   * stage closures run TWICE over the input — a loss for expensive stages and an observable
+//     difference for side-effecting (interior-mutable) closures;
 //   * two fork/join waves instead of one;
-//   * flat in selectivity: the merge tree's cost scales with survivors
-//     (O(depth) `extend` moves each), this path's with the input.
-// Opt-in (`YOUPIPE_FILTER_CTP=1`, default off — the merge tree wins at low
-// selectivity and small batches). Same-binary knob A/B (5 interleaved
-// rounds, 32-core, 100K borrowed): keep90 −50.5 %, keep50 −37.1 %, keep33
-// −31.1 % (all 25/25 stable); keep10 +41.3 %, every 10K shape +28…+75 %
-// (all 0/25) — crossover ≈ 25 % selectivity at 100K. Owned/try filter paths
-// keep the merge tree: their stages consume items by value, so a count pass
-// cannot re-run them. See docs/src/dev/benchmarks.md (filter-chain collect).
+//   * flat in selectivity: the merge tree's cost scales with survivors (O(depth) `extend` moves
+//     each), this path's with the input.
+// Same-binary knob A/B (5 interleaved rounds, 32-core, 100K borrowed):
+// keep90 −50.5 %, keep50 −37.1 %, keep33 −31.1 % (all 25/25 stable); keep10
+// +41.3 %, every 10K shape +28…+75 % (all 0/25) — crossover ≈ 25 %
+// selectivity at 100K. Owned/try filter paths keep the merge tree: their
+// stages consume items by value, so a count pass cannot re-run them. See
+// docs/src/dev/benchmarks.md (filter-chain collect).
 
-/// Whether by-ref filter collects use count-then-place. Parsed once from
-/// `YOUPIPE_FILTER_CTP`: unset/`"0"` → off (merge tree), `"1"` → on. Invalid
-/// values panic at first use — see `nt_store_policy` for why failing loudly
-/// beats silently misreading a knob.
-fn filter_ctp_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("YOUPIPE_FILTER_CTP") {
-        Err(_) => false,
+/// Which implementation by-ref filter collects use. Parsed once from
+/// `YOUPIPE_FILTER_COLLECT`: unset/`"merge"` → merge tree (default), `"ctp"`
+/// → count-then-place, `"wtc"` → write-then-compact. Invalid values panic at
+/// first use — see `nt_store_policy` for why failing loudly beats silently
+/// misreading a knob.
+///
+/// Shape guidance (three-sided A/B, docs/src/dev/benchmarks.md filter-chain
+/// collect): merge wins small/mid batches at mid/high selectivity; wtc wins
+/// ≥100K batches at any selectivity and small batches; ctp wins ≥100K
+/// batches keeping ≳30 % — the merge default is only wrong for ≥100K, which
+/// is exactly where the knobs are for.
+#[derive(Clone, Copy)]
+enum FilterCollectVariant {
+    Merge,
+    Ctp,
+    Wtc,
+}
+
+fn filter_collect_variant() -> FilterCollectVariant {
+    static VARIANT: OnceLock<FilterCollectVariant> = OnceLock::new();
+    *VARIANT.get_or_init(|| match std::env::var("YOUPIPE_FILTER_COLLECT") {
+        Err(_) => FilterCollectVariant::Merge,
         Ok(v) => match v.as_str() {
-            "0" => false,
-            "1" => true,
+            "merge" => FilterCollectVariant::Merge,
+            "ctp" => FilterCollectVariant::Ctp,
+            "wtc" => FilterCollectVariant::Wtc,
             other => panic!(
-                "YOUPIPE_FILTER_CTP: invalid value {other:?} (leave unset or \"0\" for the \
-                 merge tree, \"1\" for count-then-place)"
+                "YOUPIPE_FILTER_COLLECT: invalid value {other:?} (leave unset or \"merge\" for \
+                 the merge tree, \"ctp\" for count-then-place, \"wtc\" for write-then-compact)"
             ),
         },
     })
@@ -5270,6 +5285,352 @@ where
     place_filter_rec(pool, &ctx, 0, n, depth, 0);
     // Every output slot is init (each leaf filled exactly its count).
     output.into_vec()
+}
+
+// ── Write-then-compact by-ref filter collect (YOUPIPE_FILTER_COLLECT=wtc) ──
+//
+// Single-pass alternative to both the merge tree and count-then-place: every
+// leaf runs the chain exactly ONCE over its input range `[start, end)` and
+// writes its survivors contiguously into the LOW end of its slice of ONE
+// n-slot output buffer (`[start, start + kept)`), recording `(start, kept)`
+// per leaf. A compaction pass then prefix-sums the kept counts into output
+// offsets and block-copies each leaf's contiguous segment down to its final
+// position (`ptr::copy`, memmove semantics — one segment's dst/src ranges
+// can overlap); a segment whose offset already equals its start (nothing
+// before it was filtered out) skips the copy entirely, so an all-survive
+// chain compacts to zero copies. The copies run sequentially on the driver
+// for small payloads and through a parallel join-tree wave for large ones
+// ([`WTC_PARALLEL_COMPACT_MIN_BYTES`]): the sequential sweep is bound by
+// cross-core cache-line transfers (the segments were just written by every
+// worker, so the driver pulls each line from a remote cache — measured
+// ~4-5 µs per 72 KB, ~55 µs per 720 KB), and distributing the segment
+// copies over the pool amortizes that below one extra wave. The parallel
+// wave copies into a SEPARATE exactly-sized destination buffer — an
+// in-place downward parallel sweep is NOT interleaving-safe: a later
+// segment's destination can land inside an earlier segment's still-unread
+// source whenever that earlier leaf kept fewer items than the gaps before
+// it (sequential in-order sweeps are safe because sources are consumed
+// before later writes; found by test, not by review).
+//
+//   * vs the merge tree: ONE allocation instead of one per leaf plus extend reallocs; each survivor
+//     is written once and moved at most once (the tree moves it O(depth) times through
+//     `l.extend(r)`).
+//   * vs count-then-place: the chain runs ONCE — no observable double side effects, no second
+//     fork/join wave (ctp's 10K and low-selectivity regressions) — at the price of an n-sized (not
+//     survivor-sized) output buffer and one survivor-payload memmove on the driver thread. Output
+//     stores are plain (never NT): the compaction re-reads them immediately.
+//
+// Final three-sided same-binary knob A/B (5 interleaved rounds, 32-core,
+// rayon drift controls within ±4 %): vs the merge tree wtc wins at 100K
+// every selectivity (keep33 −24 %, keep50 −31 %, keep90 −38 %, all 25/25;
+// keep10 −0.1 % noise) and at 1K (−12.8 %), ties at 10K low selectivity,
+// and regresses at 10K mid/high selectivity (keep90 +25 %, 0/25 — the
+// survivor payload sits under the parallel-compaction threshold, so the
+// driver-sequential sweep pays cross-core transfers for lines the workers
+// just wrote; a size gate would buy only that window). ctp keeps the ≥100K
+// mid/high-selectivity crown (−10…−23 % vs wtc) and loses everywhere else.
+// Verdict: merge stays the DEFAULT; all three live behind the
+// `YOUPIPE_FILTER_COLLECT` knob (merge for small/mid batches at mid/high
+// selectivity, wtc for ≥100K at any selectivity and for small batches,
+// ctp for ≥100K batches keeping ≳30 %). See docs/src/dev/benchmarks.md
+// (filter-chain collect).
+//
+// Survivors land leaf-contiguous, NOT at their exact input indices. An
+// exact-index scheme would scatter writes (at low selectivity nearly every
+// survivor would touch a fresh cache line) and its compaction could not
+// recover segment boundaries from per-leaf counts alone — it would need
+// per-run metadata. Leaf-contiguous writes keep every leaf's stores
+// sequential (cache-line dense at any selectivity) and make the compaction
+// blockwise: the only memory-bandwidth cost of low selectivity is the
+// n-sized buffer allocation itself, never touched beyond `kept` slots.
+//
+// Owned/try filter paths keep the merge tree. Owned is mechanically
+// possible (a wtc leaf would `ptr::read` each input slot once and panic
+// cleanup mirrors `FilterGuard`) but is deferred: this round pins down the
+// borrowed caliber, where the merge tree's output-side cost was measured.
+// The try path additionally entangles `Err` short-circuit with the meta
+// cleanup walk — the merge tree already short-circuits cheaply there.
+
+/// Per-leaf record for the compaction sweep: where the leaf's input range
+/// starts and how many survivors it wrote at the low end of that range.
+/// Each slot is written by exactly one leaf — the `split_at_mut` threading
+/// makes the disjoint ownership a compile-time property — and read by the
+/// driver only after the join tree completed, so plain non-atomic fields
+/// are race-free (the join latch provides the happens-before edge).
+#[derive(Clone, Copy)]
+struct WtcLeafMeta {
+    start: usize,
+    kept: usize,
+}
+
+/// Leaf guard: drops this leaf's written survivor prefix on unwind. The
+/// panicking leaf never reaches its meta store (stored only after the loop),
+/// so the driver's panic-path meta walk skips it — no double drop. Raw
+/// pointer for the same Tree Borrows reason as `PlaceLeafGuard`.
+struct WtcLeafGuard<R> {
+    out_ptr: *mut R,
+    written: usize,
+}
+
+impl<R> Drop for WtcLeafGuard<R> {
+    fn drop(&mut self) {
+        // SAFETY: `written` reflects completed iterations at the unwind
+        // point; the borrowed input needs nothing.
+        unsafe {
+            for j in 0..self.written {
+                ptr::drop_in_place(self.out_ptr.add(j));
+            }
+        }
+    }
+}
+
+/// The single stage pass: run the chain over `input[start..end)` and write
+/// survivors contiguously into `output[start..start + kept)`, recording
+/// `(start, kept)` in `meta`. `meta` covers exactly this subtree's leaves in
+/// input order; the root pass owns the whole array and each internal node
+/// splits it in half alongside the input range.
+fn write_filter_rec<'i, S, E>(
+    pool: &ComputePool,
+    input: &'i [E],
+    stages: &S,
+    start: usize,
+    end: usize,
+    splits_left: usize,
+    output: &Slots<S::Output>,
+    meta: &mut [WtcLeafMeta],
+) where
+    S: FusedStage<&'i E> + Sync,
+    E: Sync,
+    S::Output: Send,
+{
+    if splits_left == 0 || end - start <= 1 {
+        let in_slice = &input[start..end];
+        // SAFETY: this leaf owns the disjoint output range `[start, end)`
+        // exclusively; the slots are uninit.
+        let out_slice = unsafe { output.as_mut_slice(start, end) };
+        let out_ptr = out_slice.as_mut_ptr();
+        let mut g = WtcLeafGuard {
+            out_ptr,
+            written: 0,
+        };
+        for item in in_slice {
+            if let Some(o) = stages.apply(item) {
+                // SAFETY: `written` counts survivors among the items scanned
+                // so far, so the store stays inside this leaf's slice with
+                // no bounds check — even a keep-everything predicate cannot
+                // overflow it (written <= items scanned <= slice len).
+                // Slot `written` is uninit; disjoint index.
+                unsafe { ptr::write(g.out_ptr.add(g.written), o) };
+                g.written += 1;
+            }
+        }
+        meta[0] = WtcLeafMeta {
+            start,
+            kept: g.written,
+        };
+        // Success: disarm the cleanup Drop.
+        std::mem::forget(g);
+        return;
+    }
+    let mid = start + (end - start) / 2;
+    let left_leaves = split_leaf_count(mid - start, splits_left - 1);
+    let (lmeta, rmeta) = meta.split_at_mut(left_leaves);
+    pool.join(
+        || {
+            write_filter_rec(
+                pool,
+                input,
+                stages,
+                start,
+                mid,
+                splits_left - 1,
+                output,
+                lmeta,
+            );
+        },
+        || {
+            write_filter_rec(
+                pool,
+                input,
+                stages,
+                mid,
+                end,
+                splits_left - 1,
+                output,
+                rmeta,
+            );
+        },
+    );
+}
+
+/// [`WTC_PARALLEL_COMPACT_MIN_BYTES`]'s survivor-payload threshold, from
+/// which the compaction copies go through a parallel join-tree wave instead
+/// of the driver-sequential sweep. Fixed, not probed: the sequential sweep's
+/// cost is cross-core cache-line transfers (~15-20 GB/s effective), the
+/// parallel wave's is one fork/join ramp (~10 µs measured on this class of
+/// tree) — break-even sits near a few hundred KB.
+const WTC_PARALLEL_COMPACT_MIN_BYTES: usize = 256 << 10;
+
+/// One leaf's compaction assignment: move `len` survivors from the leaf's
+/// write position `src` down to its final position `dst` (`dst <= src`
+/// always — offsets trail input positions by the filtered-out count).
+#[derive(Clone, Copy)]
+struct WtcSeg {
+    src: usize,
+    dst: usize,
+    len: usize,
+}
+
+/// Parallel block-copy wave of the compaction (large payloads): each leaf
+/// copies its batch of [`WtcSeg`]s from the stage pass's n-slot `src_buffer`
+/// into the separate exactly-sized `dst_buffer`. Distinct allocations make
+/// the segment copies unconditionally interleaving-safe (an in-place
+/// downward sweep is not — see the section comment); the copies cannot
+/// panic, so no cleanup exists.
+fn compact_filter_rec<R>(
+    pool: &ComputePool,
+    src_buffer: &Slots<R>,
+    dst_buffer: &Slots<R>,
+    segs: &[WtcSeg],
+    start: usize,
+    end: usize,
+    splits_left: usize,
+) where
+    R: Send,
+{
+    if splits_left == 0 || end - start <= 1 {
+        let src_base = src_buffer.base_ptr();
+        let dst_base = dst_buffer.base_ptr();
+        for s in &segs[start..end] {
+            if s.len > 0 {
+                // SAFETY: `[s.src, s.src + s.len)` is fully init (completed
+                // leaf's survivors); the destinations of distinct segments
+                // are disjoint, and src/dst live in distinct allocations.
+                unsafe {
+                    ptr::copy_nonoverlapping(src_base.add(s.src), dst_base.add(s.dst), s.len);
+                };
+            }
+        }
+        return;
+    }
+    let mid = start + (end - start) / 2;
+    pool.join(
+        || {
+            compact_filter_rec(
+                pool,
+                src_buffer,
+                dst_buffer,
+                segs,
+                start,
+                mid,
+                splits_left - 1,
+            );
+        },
+        || {
+            compact_filter_rec(
+                pool,
+                src_buffer,
+                dst_buffer,
+                segs,
+                mid,
+                end,
+                splits_left - 1,
+            );
+        },
+    );
+}
+
+/// Drive the single-pass write-then-compact filter collect (see the section
+/// comment). `depth` is the same split budget the merge tree would use.
+///
+/// # Panics
+///
+/// Propagates any panic raised by `stages` after dropping every live output
+/// slot (unlike ctp's place pass, where completed siblings' outputs leak —
+/// see the walk below for why wtc can afford full cleanup).
+fn fused_filter_collect_by_ref_wtc<'i, S, E>(
+    pool: &ComputePool,
+    input: &'i [E],
+    stages: &S,
+    depth: usize,
+) -> Vec<S::Output>
+where
+    S: FusedStage<&'i E> + Sync,
+    E: Sync,
+    S::Output: Send,
+{
+    let n = input.len();
+    let leaves = split_leaf_count(n, depth);
+    let output = Slots::uninit(n);
+    let mut meta = vec![WtcLeafMeta { start: 0, kept: 0 }; leaves];
+
+    // `join` re-raises the first leaf panic only after every sibling
+    // completed, so at the catch point each leaf has EITHER stored its meta
+    // (fully written survivors) OR unwound through its guard (partial prefix
+    // dropped, meta still the zero initial value — `kept == 0` makes the
+    // walk skip it without touching `start`). The walk therefore drops
+    // exactly the live survivors: nothing leaks, nothing drops twice.
+    // ctp could not do this cheaply because its place pass has no record of
+    // WHICH leaves finished before the panic; wtc's meta store IS that
+    // record.
+    let result = unwind::halt_unwinding(|| {
+        write_filter_rec(pool, input, stages, 0, n, depth, &output, &mut meta);
+    });
+    if let Err(p) = result {
+        for m in &meta {
+            // SAFETY: a stored meta means the leaf completed —
+            // `[m.start, m.start + m.kept)` is fully init.
+            unsafe { output.drop_range(m.start, m.start + m.kept) };
+        }
+        // All live slots dropped: freeing the buffer just frees memory.
+        drop(output);
+        unwind::resume_unwinding(p);
+    }
+
+    // Compaction: prefix-sum the kept counts into final offsets (`dst`
+    // trails `src` monotonically — after the first filtered-out item, every
+    // later segment shifts down by the cumulative filtered count), then move
+    // the segments. Sequential on the driver for small payloads; one
+    // parallel copy wave for large ones (see the section comment).
+    let mut total = 0;
+    let segs: Vec<WtcSeg> = meta
+        .iter()
+        .map(|m| {
+            let s = WtcSeg {
+                src: m.start,
+                dst: total,
+                len: m.kept,
+            };
+            total += m.kept;
+            s
+        })
+        .collect();
+
+    if total.saturating_mul(size_of::<S::Output>()) >= WTC_PARALLEL_COMPACT_MIN_BYTES {
+        let dest = Slots::uninit(total);
+        compact_filter_rec(pool, &output, &dest, &segs, 0, segs.len(), depth);
+        // The n-slot buffer now holds only moved-from stale bits — freeing
+        // it drops nothing. The destination is exactly survivor-sized.
+        drop(output);
+        return dest.into_vec();
+    }
+    // Sequential in-place sweep, safe because the segments are consumed in
+    // input order: each copy's write region ends at `s.dst + s.len`, at most
+    // the next segment's `src`, so nothing still to be read is clobbered.
+    let base = output.base_ptr();
+    for s in &segs {
+        if s.len > 0 && s.dst != s.src {
+            // SAFETY: `[s.src, s.src + s.len)` is fully init (completed
+            // leaf); `ptr::copy` is memmove — one segment's own dst/src
+            // ranges can overlap.
+            unsafe { ptr::copy(base.add(s.src), base.add(s.dst), s.len) };
+        }
+    }
+    // `[0, total)` holds the survivors in input order; the tail is
+    // moved-from stale bits that `into_vec_with_len` never drops. The Vec
+    // keeps the n-slot capacity (len == survivors) — shrink is left to the
+    // caller; a copy to shrink would defeat the single-move design.
+    output.into_vec_with_len(total)
 }
 
 // ── pub(crate) scoped entry point ──
@@ -5602,14 +5963,20 @@ where
     }
     let plan = SplitPlan::new(n, num_threads, workload);
     if S::MAY_FILTER {
-        if filter_ctp_enabled() {
-            return fused_filter_collect_by_ref_ctp(pool, input, &stages, plan.depth);
-        }
-        join_fused_collect_by_ref(pool, input, &stages, 0, n, plan.depth)
-    } else {
-        let op = FusedOp(stages);
-        par_index_collect_by_ref(input, &op, plan, pool)
+        return match filter_collect_variant() {
+            FilterCollectVariant::Merge => {
+                join_fused_collect_by_ref(pool, input, &stages, 0, n, plan.depth)
+            },
+            FilterCollectVariant::Ctp => {
+                fused_filter_collect_by_ref_ctp(pool, input, &stages, plan.depth)
+            },
+            FilterCollectVariant::Wtc => {
+                fused_filter_collect_by_ref_wtc(pool, input, &stages, plan.depth)
+            },
+        };
     }
+    let op = FusedOp(stages);
+    par_index_collect_by_ref(input, &op, plan, pool)
 }
 
 /// Entry point for the borrowed-input `.for_each()`.
@@ -5994,6 +6361,171 @@ mod tests {
                 assert_eq!(merged, expected, "merge tree, keep={name} depth={depth}");
                 assert_eq!(ctp, expected, "count-then-place, keep={name} depth={depth}");
             }
+        }
+    }
+
+    /// Write-then-compact by-ref filter collect: identical output to the
+    /// merge tree across selectivity shapes, split depths (including depths
+    /// that hit the `len <= 1` early exit) and the empty-output edge. Drives
+    /// the wtc driver directly — the env knob is a process-global `OnceLock`
+    /// and is covered by the same-binary knob A/B instead.
+    #[test]
+    fn test_filter_wtc_by_ref_matches_merge_tree() {
+        let pool = ComputePool::global();
+        // Small prime under miri: the 10K shape costs >20 interpreted
+        // minutes at depth 20 (10K single-item leaves); 503 keeps the same
+        // split shapes (multi-leaf trees AND the `len <= 1` early exit).
+        let n: u64 = if cfg!(miri) {
+            503
+        } else {
+            10_007
+        };
+        let data: Vec<u64> = (0..n).collect();
+
+        for (name, keep) in [("all", 1u64), ("none", 10_000), ("third", 3)] {
+            let stages = SyncMap {
+                prev: Filter {
+                    prev: SyncMap {
+                        prev: Identity,
+                        f: |x: &u64| x + 1,
+                    },
+                    f: move |&x: &u64| x % keep == 0,
+                },
+                f: |x: u64| x * 2,
+            };
+            let expected: Vec<u64> = data
+                .iter()
+                .map(|&x| x + 1)
+                .filter(|&x| x % keep == 0)
+                .map(|x| x * 2)
+                .collect();
+
+            for depth in [0, 1, 6, 20] {
+                let merged = join_fused_collect_by_ref(pool, &data, &stages, 0, data.len(), depth);
+                let wtc = fused_filter_collect_by_ref_wtc(pool, &data, &stages, depth);
+                assert_eq!(merged, expected, "merge tree, keep={name} depth={depth}");
+                assert_eq!(
+                    wtc, expected,
+                    "write-then-compact, keep={name} depth={depth}"
+                );
+                // The compacted Vec is exactly survivor-sized (capacity may
+                // keep the n-slot buffer — documented behavior).
+                assert_eq!(
+                    wtc.len(),
+                    expected.len(),
+                    "wtc len, keep={name} depth={depth}"
+                );
+            }
+        }
+    }
+
+    /// Large-payload caliber: the survivor bytes cross
+    /// `WTC_PARALLEL_COMPACT_MIN_BYTES`, so the compaction takes the parallel
+    /// copy wave (native-only — miri has no throughput caliber to offer, and
+    /// the wave's correctness argument is interleaving-independent anyway).
+    #[cfg(not(miri))]
+    #[test]
+    fn test_filter_wtc_parallel_compact_matches_merge_tree() {
+        let pool = ComputePool::global();
+        let n: u64 = (WTC_PARALLEL_COMPACT_MIN_BYTES / size_of::<u64>()) as u64 * 3 / 2;
+        let data: Vec<u64> = (0..n).collect();
+        let stages = SyncMap {
+            prev: Filter {
+                prev: SyncMap {
+                    prev: Identity,
+                    f: |x: &u64| x + 1,
+                },
+                f: |&x: &u64| x % 4 != 0, // keep 75 %
+            },
+            f: |x: u64| x * 2,
+        };
+        let expected: Vec<u64> = data
+            .iter()
+            .map(|&x| x + 1)
+            .filter(|&x| x % 4 != 0)
+            .map(|x| x * 2)
+            .collect();
+        // 384 KB of survivors on 8-byte items — above the threshold.
+        assert!(expected.len() * size_of::<u64>() >= WTC_PARALLEL_COMPACT_MIN_BYTES);
+
+        for depth in [3, 6] {
+            let merged = join_fused_collect_by_ref(pool, &data, &stages, 0, data.len(), depth);
+            let wtc = fused_filter_collect_by_ref_wtc(pool, &data, &stages, depth);
+            assert_eq!(merged, expected, "merge tree, depth={depth}");
+            assert_eq!(wtc, expected, "write-then-compact wave, depth={depth}");
+        }
+    }
+
+    /// Panic accounting for the wtc driver: after the re-raised panic every
+    /// produced output instance is dropped exactly once — the panicking
+    /// leaf's guard drops its own written prefix, the driver's meta walk
+    /// drops every completed leaf's survivors (ctp's place pass leaks those;
+    /// wtc's meta store makes the exact walk possible). Exercises both a
+    /// multi-leaf tree (panic mid-tree, siblings complete around it) and the
+    /// single-leaf depth (guard-only cleanup).
+    #[test]
+    fn test_filter_wtc_panic_drop_accounting() {
+        use std::sync::Arc;
+
+        struct DropCounter {
+            dropped: Arc<AtomicUsize>,
+        }
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let n: u64 = if cfg!(miri) {
+            500
+        } else {
+            20_000
+        };
+        // After the `x + 1` map below; even so the `x % 2 == 0` filter
+        // actually lets it through to the panicking stage.
+        let panic_marker = ((n / 3) + 2) & !1;
+        let data: Vec<u64> = (0..n).collect();
+
+        for depth in [3, 0] {
+            let created = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let (c_create, d_drop) = (created.clone(), dropped.clone());
+            let stages = SyncMap {
+                prev: Filter {
+                    prev: SyncMap {
+                        prev: Identity,
+                        f: |x: &u64| x + 1,
+                    },
+                    f: |&x: &u64| x % 2 == 0,
+                },
+                f: move |x: u64| {
+                    assert!(x != panic_marker, "boom");
+                    c_create.fetch_add(1, Ordering::Relaxed);
+                    DropCounter {
+                        dropped: d_drop.clone(),
+                    }
+                },
+            };
+            let r = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                fused_filter_collect_by_ref_wtc(ComputePool::global(), &data, &stages, depth)
+            }));
+            assert!(
+                r.is_err(),
+                "panic must propagate through the wtc tree (depth={depth})"
+            );
+            let (c, d) = (
+                created.load(Ordering::Relaxed),
+                dropped.load(Ordering::Relaxed),
+            );
+            assert_eq!(
+                c, d,
+                "every produced output must drop exactly once (depth={depth}): created={c}, \
+                 dropped={d}"
+            );
+            // The panicking item's leaf stops AT it and every other leaf
+            // completes (`join` runs both sides), so at least the items
+            // before the leaf boundary must have been produced.
+            assert!(c > 0, "some outputs must precede the panic (depth={depth})");
         }
     }
 

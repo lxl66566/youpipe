@@ -281,7 +281,7 @@ The owned + filter caliber (`youpipe_try_filter_owned`, `MAY_FILTER == true`
 rounds; the 100K base side had one outlier round that inflated its spread —
 every post-change round beat every pre-change round).
 
-### Filter-chain collect: leaf pre-allocation, honest merge cost, count-then-place (2026-09-27)
+### Filter-chain collect: leaf pre-allocation, honest merge cost, count-then-place, write-then-compact (2026-09-27)
 
 Filter chains (`MAY_FILTER == true`) cannot use the index-based core
 (output cardinality is unknown up front), so leaves build per-leaf `Vec`s
@@ -313,7 +313,7 @@ copying the *input* side, not single-move outputs.) Comments corrected.
 anchors the survival-rate axis; the rayon rows double as drift controls for
 same-binary knob A/Bs.
 
-**Count-then-place (`YOUPIPE_FILTER_CTP=1`, default off)** — opt-in
+**Count-then-place (`YOUPIPE_FILTER_COLLECT=ctp`, opt-in)** —
 two-pass by-ref filter collect: pass 1 counts survivors per leaf, a
 sequential scan turns counts into output offsets, pass 2 re-runs the chain
 and writes survivors straight into one exactly-sized buffer (each survivor
@@ -337,9 +337,52 @@ survivors, count-then-place with the input. The original hypothesis
 ("count-then-place for LOW-selectivity batches") is inverted — the knob
 pays off for filters that KEEP most items on ≥ 100K batches. Owned /
 scoped / try filter paths keep the merge tree: their stages consume items
-by value, so a counting pass cannot re-run them. A single-stage-pass
-variant (write survivors input-indexed + compact once, todo #20) may
-dominate everywhere.
+by value, so a counting pass cannot re-run them. A single-stage-pass variant landed as write-then-compact
+(below); it did NOT dominate everywhere, but it wins the large-batch side
+of the crossover.
+
+**Write-then-compact (`YOUPIPE_FILTER_COLLECT=wtc`, opt-in)** — the
+single-stage-pass variant: each leaf runs the chain exactly ONCE and
+writes its survivors contiguously into the low end of its slice of ONE
+n-slot output buffer (leaf-contiguous, not input-indexed — exact-index
+writes would scatter at low selectivity and need per-run metadata for the
+compaction); a compaction pass prefix-sums per-leaf counts into final
+offsets and block-copies each leaf's contiguous segment (a segment
+already in place skips the copy; payloads ≥ 256 KB copy through a
+parallel join-tree wave into a SEPARATE exactly-sized buffer — an
+in-place parallel sweep is not interleaving-safe, see the section comment
+in `fused.rs`). One allocation, one pass, one payload move per survivor;
+the price is an n-sized (not survivor-sized) output buffer. Final
+three-sided same-binary knob A/B (5 interleaved rounds, 32 cores, all
+rayon drift controls within ±4 % noise):
+
+| shape | merge tree | count-then-place | write-then-compact | wtc vs merge |
+| ----- | ---------- | ---------------- | ------------------ | ------------ |
+| 1K keep33 (`sync_filter`) | 13.1 µs | 21.1 µs | 11.5 µs | −12.8 % (25/25) |
+| 10K keep 10 % | 12.7 µs | 22.5 µs | 12.4 µs | −2.2 % (noise) |
+| 10K keep 50 % | 16.6 µs | 23.4 µs | 16.7 µs | +0.7 % (noise) |
+| 10K keep33 (`sync_filter`) | 14.0 µs | 21.7 µs | 15.1 µs | +7.9 % (noise, spread 14 %) |
+| 10K keep 90 % | 17.9 µs | 23.6 µs | 22.4 µs | **+25.1 % (0/25)** |
+| 100K keep 10 % | 30.8 µs | 43.7 µs | 30.8 µs | −0.1 % (noise) |
+| 100K keep33 (`sync_filter`) | 53.3 µs | 36.6 µs | 40.3 µs | **−24.4 % (25/25)** |
+| 100K keep 50 % | 80.9 µs | 49.1 µs | 55.9 µs | **−30.9 % (25/25)** |
+| 100K keep 90 % | 107.1 µs | 54.3 µs | 66.9 µs | **−37.5 % (25/25)** |
+
+Verdict: **the merge tree stays the default.** wtc wins or ties
+everywhere except mid/high-selectivity 10K — keep90 +25 % stable — where
+the survivor payload (72 KB @ keep90) sits under the 256 KB
+parallel-compaction threshold and the driver-sequential sweep pays
+cross-core transfers for cache lines the workers just wrote; at 1K the
+payload is too small for that to matter, at ≥ 100K the parallel wave
+amortizes it. A size gate would need data points between 10K and 100K to
+place and only buys that one window — not worth the complexity (same call
+as the ctp crossover). ctp keeps the ≥ 100K mid/high-selectivity crown
+(−10…−23 % vs wtc: exact-size buffer, no compaction pass) but loses
+everywhere else. Per-shape guidance: `merge` for small/mid batches at
+mid/high selectivity; `wtc` for ≥ 100K batches at any selectivity, and
+for small batches; `ctp` for ≥ 100K batches that keep ≳ 30 %. The ctp
+boolean knob was promoted to the three-way `YOUPIPE_FILTER_COLLECT`
+(unset/`merge`/`ctp`/`wtc`; invalid values panic) accordingly.
 
 ### `for_each()` vs rayon (`sync_for_each`, cpu_heavy per item, borrowed input)
 

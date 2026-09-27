@@ -110,6 +110,18 @@ impl<T> Slots<T> {
         }
     }
 
+    /// Raw base pointer of the slot array, mutable through interior
+    /// mutability — for whole-buffer moves that need `ptr::copy` (memmove)
+    /// semantics inside this one buffer, where the destination and source
+    /// ranges can overlap and slice methods (`copy_from_slice` is
+    /// `copy_nonoverlapping`) would be UB. Carries no live borrow across the
+    /// call (raw pointers have no tags to disable under Tree Borrows).
+    #[inline]
+    #[allow(clippy::mut_from_ref)] // Same governance as `as_mut_slice`
+    pub(super) fn base_ptr(&self) -> *mut T {
+        self.buf.as_ptr().cast::<T>().cast_mut()
+    }
+
     /// Reclaim the buffer as a `Vec<T>` without dropping any slot. All slots
     /// must be init and owned by the caller.
     pub(super) fn into_vec(self) -> Vec<T> {
@@ -121,5 +133,18 @@ impl<T> Slots<T> {
         let boxed: Box<[T]> =
             unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) };
         boxed.into_vec()
+    }
+
+    /// Reclaim the buffer as a `Vec<T>` of an explicit length `<=` the
+    /// buffer's — the compaction twin of [`Slots::into_vec`]: the first
+    /// `len` slots must be init, the tail's stale bits are never dropped and
+    /// never read. The Vec keeps the full buffer capacity (len < cap).
+    pub(super) fn into_vec_with_len(self, len: usize) -> Vec<T> {
+        debug_assert!(len <= self.buf.len());
+        let cap = self.buf.len();
+        let ptr = Box::into_raw(self.buf).cast::<T>();
+        // SAFETY: layout-identical to `[T]` (see `from_vec`); the first `len`
+        // slots are init by contract, the allocation holds `cap` items.
+        unsafe { Vec::from_raw_parts(ptr, len, cap) }
     }
 }
