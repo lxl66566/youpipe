@@ -169,16 +169,6 @@ scoped 三件、by_ref 三件、`fused_pass_collect`）。split 策略或串行�
 就要改十处。抽 `terminal_plan(n, config, pool) -> Plan { Serial, Parallel(
 SplitPlan) }` + 共享串行回退 helper；prologue 每 run 一次，零热路径风险。
 
-### 13. [P1] par_*_rec 内部节点失败清理四份 + 六个 guard 变体
-
-`(Ok,Ok)/(Err,Ok)/(Ok,Err)/(Err,Err)` 兄弟区间丢弃 match 在 `par_index_rec`
-/ `par_index_try_rec` / `par_index_rec_by_ref` / `par_index_try_rec_by_ref`
-四处逐字复制；`LeafGuard`/`TryLeafGuard`/`RefLeafGuard`/`TryRefLeafGuard`/
-`ForEachGuard`/`FilterGuard` 六个同型 raw-pointer/tail-drop guard。抽泛型
-`par_tree_rec` + `drop_success_range` 钩子（即既有 `HybridStrategy::
-cleanup_success_chunk` 语义）；**叶函数保持独立单态化**（向量化论证只对叶
-成立）。落地后新终端（#3 reduce）只需叶 + 钩子。
-
 ### 14. [P1] StageSpawn 五路 spawn 体 × 四 stage 类型
 
 每 stage 类型手写 `spawn`/`spawn_single`/`spawn_for_async`/

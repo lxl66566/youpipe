@@ -102,65 +102,140 @@ pub(crate) fn resolve_exec_pool(
     ExecPool::Ref(ComputePool::global())
 }
 
-/// Recursive index-based parallel fill. Each leaf claims a disjoint index range
-/// `[start, end)` and writes outputs into `output[start..end)` by index — no
-/// `split_off`, no `extend`, no per-level reallocation.
+/// Recursive index-based parallel core — the divide-and-conquer shared by
+/// every fused terminal's chunk driver (the former per-terminal
+/// `par_*_rec` copies). Each leaf claims a disjoint index range
+/// `[start, end)` and runs it through `leaf`; no `split_off`, no `extend`,
+/// no per-level reallocation.
 ///
-/// Panic safety: a panicking leaf catches the unwind, drops the partial state
-/// of its own range (outputs written so far + unread inputs), and returns
-/// `Err`. Internal nodes propagate the first `Err`, dropping the
-/// already-completed sibling's output range. On return, the whole `[start,
-/// end)` range is fully resolved: every output slot is either init (success
-/// path) or dropped, and every input slot is consumed.
+/// Hooks (passed as closure references, monomorphized per terminal — the
+/// leaf loops stay independently inlined so the auto-vectorization argument
+/// on `par_index_leaf` keeps holding):
+///
+/// * `leaf` runs `[start, end)` sequentially on the current thread. Op
+///   failures come back as `Err`; panics propagate naturally into `join`'s
+///   unwind plumbing (the leaf guard has already dropped the partial state
+///   of its own range).
+/// * `drop_success_range` drops the resources a *successfully completed*
+///   range holds in shared buffers (the completed sibling's output slots),
+///   so the caller can free those buffers without leak or double-drop — the
+///   internal-node granularity of [`HybridStrategy::cleanup_success_chunk`].
+///   Only ever invoked for ranges whose subtree returned `Ok(())`; no-op for
+///   sink-only terminals.
+///
+/// Panic safety: a panicking leaf's unwind is caught by `join`, and internal
+/// nodes propagate the first `Err`, dropping the already-completed sibling's
+/// range via `drop_success_range`. On return, the whole `[start, end)` range
+/// is fully resolved: every slot is either init (success path) or dropped,
+/// and every input slot is consumed.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn par_index_rec<T, R, OP>(
+fn par_tree_rec<IN: ?Sized + Sync, E, L, D>(
     pool: &ComputePool,
-    input: &Slots<T>,
-    output: &Slots<R>,
+    input: &IN,
     start: usize,
     end: usize,
-    op: &OP,
     splits_left: usize,
-    nt: bool,
-) -> Result<(), PanicPayload>
+    leaf: &L,
+    drop_success_range: &D,
+) -> Result<(), E>
 where
-    T: Send,
-    R: Send,
-    OP: RangeOp<T, Out = R>,
+    E: Send,
+    L: Fn(&IN, usize, usize) -> Result<(), E> + Sync,
+    D: Fn(usize, usize) + Sync,
 {
     if splits_left == 0 || end - start <= 1 {
-        // SAFETY: this leaf owns the disjoint range `[start, end)` exclusively
-        // (par_index_rec splits never overlap). input[start..end) is fully
-        // init, output[start..end) is fully uninit.
-        let in_slice = unsafe { input.as_slice(start, end) };
-        let out_slice = unsafe { output.as_mut_slice(start, end) };
-        par_index_leaf(in_slice, out_slice, op, nt);
-        return Ok(());
+        return leaf(input, start, end);
     }
     let mid = start + (end - start) / 2;
     let (l, r) = pool.join(
-        || par_index_rec(pool, input, output, start, mid, op, splits_left - 1, nt),
-        || par_index_rec(pool, input, output, mid, end, op, splits_left - 1, nt),
+        || par_tree_rec(pool, input, start, mid, splits_left - 1, leaf, drop_success_range),
+        || par_tree_rec(pool, input, mid, end, splits_left - 1, leaf, drop_success_range),
     );
     match (l, r) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(p), Ok(())) => {
-            // SAFETY: right sibling completed without filter (RangeOp never
-            // filters), so [mid, end) is fully init and safe to drop.
-            unsafe { output.drop_range(mid, end) };
+            // SAFETY (hook contract): the right sibling completed, so its
+            // range's shared resources are live and droppable (e.g. its
+            // output slots are fully init — the no-filter cores never leave
+            // holes).
+            drop_success_range(mid, end);
             Err(p)
         },
         (Ok(()), Err(p)) => {
-            unsafe { output.drop_range(start, mid) };
+            // SAFETY (hook contract): the left sibling completed.
+            drop_success_range(start, mid);
             Err(p)
         },
         (Err(p), Err(_)) => {
-            unsafe {
-                output.drop_range(start, mid);
-                output.drop_range(mid, end);
-            }
+            // SAFETY (hook contract): both siblings completed (each with its
+            // own failure).
+            drop_success_range(start, mid);
+            drop_success_range(mid, end);
             Err(p)
         },
+    }
+}
+
+/// Generic leaf cleanup guard — the one RAII shape behind the former
+/// per-leaf guards (`LeafGuard` / `TryLeafGuard` / `RefLeafGuard` /
+/// `TryRefLeafGuard` / `ForEachGuard` / `FilterGuard` / `PlaceLeafGuard` /
+/// `GenLeafGuard`). On unwind it drops the init **output prefix**
+/// `[0, written)` (when `OUT`) and the still-init **input tail**
+/// `(written, n)` (when `IN`); dead halves compile away.
+///
+/// `written` counts fully completed iterations (read + applied + written).
+/// At the panic point in the op for iter `i = written`: `output[..i]` is init
+/// (drop when `OUT`), item `i` was moved into the op and is gone with the
+/// panic (never dropped by the guard), `input[i+1..]` is still init (drop
+/// when `IN`).
+///
+/// Stores raw pointers (not slices) so `mem::forget(g)` on the success path
+/// cannot conflict with the raw-pointer writes under Tree Borrows: a
+/// `&mut [R]` field would be disabled by the foreign write through
+/// `out_ptr`, making the `forget` access UB. Raw pointers carry no borrow
+/// tags, so there is nothing to disable. Dead-half pointers are never
+/// dereferenced (the matching const half gates every drop loop).
+struct LeafCleanup<T, R, const OUT: bool, const IN: bool> {
+    in_ptr: *const T,
+    out_ptr: *mut R,
+    n: usize,
+    written: usize,
+}
+
+impl<T, R, const OUT: bool, const IN: bool> LeafCleanup<T, R, OUT, IN> {
+    /// Run the cleanup now instead of on unwind — the fallible leaves'
+    /// `Err` short-circuit path (item `written` was consumed by the op
+    /// either way), after which the caller `mem::forget`s the guard so
+    /// `Drop` does not double-clean.
+    ///
+    /// # Safety
+    ///
+    /// `written` must be the guard's live iteration counter; every slot in
+    /// the enabled halves must hold a live value (`output[..written]` init,
+    /// `input(written..n]` init).
+    unsafe fn cleanup(&self) {
+        let i = self.written;
+        // SAFETY: contract above — the same drops the unwind path performs.
+        unsafe {
+            if OUT {
+                for j in 0..i {
+                    ptr::drop_in_place(self.out_ptr.add(j));
+                }
+            }
+            if IN {
+                for j in (i + 1)..self.n {
+                    ptr::drop_in_place(self.in_ptr.add(j).cast_mut());
+                }
+            }
+        }
+    }
+}
+
+impl<T, R, const OUT: bool, const IN: bool> Drop for LeafCleanup<T, R, OUT, IN> {
+    fn drop(&mut self) {
+        // SAFETY: `written` reflects the actual completed-iteration count at
+        // the unwind point.
+        unsafe { self.cleanup() };
     }
 }
 
@@ -306,7 +381,7 @@ fn nt_fence() {
 /// the leaf's cleanup guard: reverse-order unwind drops the fence first,
 /// then the guard's partial-output drops; the success path drops it at
 /// the `if` block's end, before the leaf returns into the latch-setting
-/// callers (`par_index_rec`'s `join` / `hybrid_dispatch`'s `CountLatch`).
+/// callers (`par_tree_rec`'s `join` / `hybrid_dispatch`'s `CountLatch`).
 struct NtFenceOnDrop;
 
 impl Drop for NtFenceOnDrop {
@@ -318,9 +393,9 @@ impl Drop for NtFenceOnDrop {
 
 /// Process `[start, end)` sequentially on the current thread.
 ///
-/// Panic safety uses a stack-local `LeafGuard` whose `Drop` runs only on
-/// unwind. Compared to wrapping the loop in `panic::catch_unwind`, this lets
-/// LLVM keep the loop index / written/consumed counters in registers when the
+/// Panic safety uses a stack-local [`LeafCleanup`] guard whose `Drop` runs
+/// only on unwind. Compared to wrapping the loop in `panic::catch_unwind`,
+/// this lets LLVM keep the loop index / written counters in registers when the
 /// per-item op provably cannot panic (e.g. `|x| x + 1`): `catch_unwind`'s
 /// `AssertUnwindSafe` forces the closure's `&mut i` capture to live in memory
 /// for the whole loop, adding a stack spill+reload per iteration.
@@ -340,57 +415,20 @@ where
     R: Send,
     OP: RangeOp<T, Out = R>,
 {
-    /// RAII guard that drops the partial slot state on unwind. `Drop` only
-    /// fires if the loop panics; the success path calls `mem::forget`.
-    ///
-    /// `written` tracks the count of fully completed iterations (read +
-    /// applied + written). At the panic point in `op.apply(item)` for iter
-    /// `i = written`, item `i` has been moved into `op` (so `input[i+1..]` is
-    /// still init and must be dropped) and `output[..i]` is init (must be
-    /// dropped); `output[i..]` is uninit and item `i` is gone with the panic.
-    /// `consumed` is therefore always `written + 1` at the panic point, so we
-    /// don't track it separately — one less store per iteration on the hot
-    /// path (helps the vectorizer keep the index in a register).
-    ///
-    /// Stores raw pointers (not `&mut [R]`) so that `mem::forget(g)` on the
-    /// success path doesn't conflict with the raw-pointer writes under
-    /// Tree Borrows: a `&mut [R]` field in the guard would be disabled by
-    /// the foreign write through `out_ptr`, making the `forget` access UB.
-    /// Raw pointers carry no borrow tags, so there is nothing to disable.
-    struct LeafGuard<T, R> {
-        in_ptr: *const T,
-        out_ptr: *mut R,
-        n: usize,
-        written: usize,
-    }
-
-    impl<T, R> Drop for LeafGuard<T, R> {
-        fn drop(&mut self) {
-            // SAFETY: `written` reflects the actual completed-iteration count
-            // at the unwind point. `RangeOp` never filters, so output[..written)
-            // has no holes — every slot there is init and must be dropped.
-            // input[written+1..] is still init (untouched), must be dropped.
-            // Item `written` itself was moved into `op` and is gone with the
-            // panic, so we don't drop input[written].
-            unsafe {
-                let i = self.written;
-                for j in 0..i {
-                    ptr::drop_in_place(self.out_ptr.add(j));
-                }
-                for j in (i + 1)..self.n {
-                    ptr::drop_in_place(self.in_ptr.add(j).cast_mut());
-                }
-            }
-        }
-    }
-
+    // Unwind cleanup via the generic `LeafCleanup` guard: `output[..written]`
+    // is init (`RangeOp` never filters, no holes), `input[written+1..]` is
+    // still init; item `written` itself is gone with the panic (moved into
+    // `op`), so nobody drops it. `consumed == written + 1`, hence the single
+    // counter — one store per iteration, letting the vectorizer keep the
+    // index in a register (see the guard's Tree Borrows note for why raw
+    // pointers, not slices).
     debug_assert_eq!(input.len(), output.len());
 
     let in_ptr = input.as_ptr();
     let out_ptr = output.as_mut_ptr();
     let n = input.len();
 
-    let mut g = LeafGuard {
+    let mut g = LeafCleanup::<T, R, true, true> {
         in_ptr,
         out_ptr,
         n,
@@ -427,7 +465,7 @@ where
     std::mem::forget(g);
 }
 
-/// Drive `par_index_rec` over `[0, n)` and convert the output buffer into a
+/// Drive the index core over `[0, n)` and convert the output buffer into a
 /// `Vec<R>`. Propagates panics after dropping all partial state.
 ///
 /// # Panics
@@ -517,7 +555,7 @@ where
 
 // ── Hybrid flat/tree top-level dispatch ──
 //
-// Hypothesis: the single-tree `par_index_rec` grows parallelism one level at a
+// Hypothesis: the single tree grows parallelism one level at a
 // time — the externally-injected top job runs on ONE worker, which runs its A
 // inline and pushes B; only after B is stolen does a second worker join, and so
 // on. That ramp-up costs ~log2(num_threads) join levels before every worker is
@@ -527,7 +565,7 @@ where
 // Hybrid injects `num_threads` disjoint top-level chunks into the injector in
 // one `inject_batch` (one JEC bump, one wake cascade). Every worker pops a
 // chunk on its first `find_work`, so all workers are busy from t≈0. Each chunk
-// then builds its own mini-tree via `par_index_rec`, so within-chunk stealing
+// then builds its own mini-tree via `par_tree_rec`, so within-chunk stealing
 // still uses the distributed local deques (no single-queue contention at large
 // N, which is what sank pure flat dispatch).
 //
@@ -546,12 +584,13 @@ where
 // `CountLatch::wait_spin`, shared failure-slot funnel) is identical for every
 // terminal. The strategies differ only in:
 //
-//   1. The recursive chunk driver — `par_index_rec` writes to a shared output `Slots<R>`
-//      (`collect`); `par_for_each_rec` is sink-only (`for_each`); `par_index_try_rec`
-//      short-circuits into a shared error slot (`try_collect`'s no-filter fast path).
+//   1. The recursive chunk driver — each strategy supplies `par_tree_rec`'s
+//      leaf + `drop_success_range` hooks: `collect` writes to a shared output
+//      `Slots<R>`, `for_each` is sink-only, `try_collect`'s no-filter fast path
+//      short-circuits into a shared error slot.
 //   2. The failure cleanup — `collect`/`try_collect` must drop successful chunks' output ranges so
 //      the caller can free the buffers; `for_each` has nothing to clean (the failed chunk's
-//      `ForEachGuard` already dropped its own unread input tail).
+//      leaf guard already dropped its own unread input tail).
 //
 // [`HybridStrategy`] abstracts exactly those differences so the dispatcher is
 // written once as [`hybrid_dispatch`]. The strategy crosses into the
@@ -756,16 +795,21 @@ where
         end: usize,
         splits: usize,
     ) -> Result<(), PanicPayload> {
-        par_index_rec(
-            pool,
-            input,
-            self.output,
-            start,
-            end,
-            self.op,
-            splits,
-            self.nt,
-        )
+        let leaf = |input: &Slots<T>, start: usize, end: usize| {
+            // SAFETY: disjoint range — the caller (driver or internal node)
+            // owns `[start, end)` exclusively. Input slots are init; output
+            // slots are uninit.
+            let in_slice = unsafe { input.as_slice(start, end) };
+            let out_slice = unsafe { self.output.as_mut_slice(start, end) };
+            par_index_leaf(in_slice, out_slice, self.op, self.nt);
+            Ok(())
+        };
+        let drop_success_range = |start: usize, end: usize| {
+            // SAFETY (hook contract): only called for completed ranges, so
+            // those output slots are fully init and safe to drop.
+            unsafe { self.output.drop_range(start, end) };
+        };
+        par_tree_rec(pool, input, start, end, splits, &leaf, &drop_success_range)
     }
 
     #[inline]
@@ -818,7 +862,17 @@ where
         end: usize,
         splits: usize,
     ) -> Result<(), PanicPayload> {
-        par_for_each_rec(pool, input, start, end, self.op, splits)
+        let leaf = |input: &Slots<T>, start: usize, end: usize| {
+            // SAFETY: disjoint range — the caller (driver or internal node)
+            // owns `[start, end)` exclusively.
+            let in_slice = unsafe { input.as_slice(start, end) };
+            par_for_each_leaf(in_slice, self.op);
+            Ok(())
+        };
+        // Sink-only: the panicking sibling's guard drops its own input tail,
+        // the completed sibling fully consumed its range — nothing to clean.
+        let noop = |_start: usize, _end: usize| {};
+        par_tree_rec(pool, input, start, end, splits, &leaf, &noop)
     }
 
     #[inline]
@@ -840,8 +894,8 @@ where
     /// Nothing to drop for a sink-only strategy.
     unsafe fn cleanup_success_chunk(&self, _start: usize, _end: usize) {
         // No-op: `for_each` allocates no output buffer; the failed chunk's
-        // `ForEachGuard` already dropped its own unread input tail inside
-        // `par_for_each_rec`, and successful chunks fully consumed theirs.
+        // leaf guard already dropped its own unread input tail inside the
+        // tree, and successful chunks fully consumed theirs.
     }
 }
 
@@ -884,21 +938,24 @@ where
     fn run_chunk(
         &self,
         pool: &ComputePool,
-        _input: &(),
+        input: &(),
         start: usize,
         end: usize,
         splits: usize,
     ) -> Result<(), PanicPayload> {
-        par_range_gen_rec(
-            pool,
-            self.output,
-            self.base,
-            start,
-            end,
-            self.op,
-            splits,
-            self.nt,
-        )
+        let leaf = |_input: &(), start: usize, end: usize| {
+            // SAFETY: disjoint range — the caller (driver or internal node)
+            // owns `[start, end)` exclusively; output slots are uninit.
+            let out_slice = unsafe { self.output.as_mut_slice(start, end) };
+            par_range_gen_leaf(self.base + start, out_slice, self.op, self.nt);
+            Ok(())
+        };
+        let drop_success_range = |start: usize, end: usize| {
+            // SAFETY (hook contract): only called for completed ranges, so
+            // those output slots are fully init and safe to drop.
+            unsafe { self.output.drop_range(start, end) };
+        };
+        par_tree_rec(pool, input, start, end, splits, &leaf, &drop_success_range)
     }
 
     #[inline]
@@ -919,58 +976,6 @@ where
     }
 }
 
-/// Recursive index-based parallel generation. Each leaf claims a disjoint
-/// index range `[start, end)` and writes `op.apply(base + i)` into
-/// `output[start..end)` — the generation twin of [`par_index_rec`] (same
-/// sibling-cleanup shape; no input buffer to consume).
-fn par_range_gen_rec<R, OP>(
-    pool: &ComputePool,
-    output: &Slots<R>,
-    base: usize,
-    start: usize,
-    end: usize,
-    op: &OP,
-    splits_left: usize,
-    nt: bool,
-) -> Result<(), PanicPayload>
-where
-    R: Send,
-    OP: RangeOp<usize, Out = R>,
-{
-    if splits_left == 0 || end - start <= 1 {
-        // SAFETY: this leaf owns the disjoint range `[start, end)`
-        // exclusively; output[start..end) is fully uninit.
-        let out_slice = unsafe { output.as_mut_slice(start, end) };
-        par_range_gen_leaf(base + start, out_slice, op, nt);
-        return Ok(());
-    }
-    let mid = start + (end - start) / 2;
-    let (l, r) = pool.join(
-        || par_range_gen_rec(pool, output, base, start, mid, op, splits_left - 1, nt),
-        || par_range_gen_rec(pool, output, base, mid, end, op, splits_left - 1, nt),
-    );
-    match (l, r) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(p), Ok(())) => {
-            // SAFETY: right sibling completed without filter (RangeOp never
-            // filters), so [mid, end) is fully init and safe to drop.
-            unsafe { output.drop_range(mid, end) };
-            Err(p)
-        },
-        (Ok(()), Err(p)) => {
-            unsafe { output.drop_range(start, mid) };
-            Err(p)
-        },
-        (Err(p), Err(_)) => {
-            unsafe {
-                output.drop_range(start, mid);
-                output.drop_range(mid, end);
-            }
-            Err(p)
-        },
-    }
-}
-
 /// Generate `[base, base + output.len())` sequentially into `output`.
 ///
 /// The [`par_index_leaf`] counterpart with the input half elided: the guard
@@ -983,36 +988,16 @@ where
     R: Send,
     OP: RangeOp<usize, Out = R>,
 {
-    /// RAII guard that drops the partial output slots on unwind — the
-    /// `LeafGuard` counterpart with the input half elided.
-    ///
-    /// `written` tracks the count of fully completed iterations (item
-    /// generated + applied + written). At the panic point in
-    /// `op.apply(item)` for iter `i = written`, the item was never stored
-    /// (gone with the panic), `output[..i]` is init (must be dropped), and
-    /// `output[i..]` is uninit.
-    struct GenLeafGuard<R> {
-        out_ptr: *mut R,
-        written: usize,
-    }
-
-    impl<R> Drop for GenLeafGuard<R> {
-        fn drop(&mut self) {
-            // SAFETY: `written` reflects the actual completed-iteration
-            // count at the unwind point. `RangeOp` never filters, so
-            // output[..written) has no holes — every slot is init.
-            unsafe {
-                for j in 0..self.written {
-                    ptr::drop_in_place(self.out_ptr.add(j));
-                }
-            }
-        }
-    }
-
+    // Unwind cleanup — `LeafCleanup` with the output half only: a generated
+    // item is never stored, so no input tail can exist (`output[..written]`
+    // has no holes — `RangeOp` never filters). The dead input pointer is
+    // never dereferenced (`IN = false`).
     let n = output.len();
     let out_ptr = output.as_mut_ptr();
-    let mut g = GenLeafGuard {
+    let mut g = LeafCleanup::<R, R, true, false> {
+        in_ptr: out_ptr.cast_const(),
         out_ptr,
+        n,
         written: 0,
     };
 
@@ -1042,7 +1027,7 @@ where
     std::mem::forget(g);
 }
 
-/// Drive [`par_range_gen_rec`] over a whole range and convert the output
+/// Drive the generation core over a whole range and convert the output
 /// buffer into a `Vec<R>` — the generation twin of [`par_index_collect`].
 ///
 /// # Panics
@@ -1105,12 +1090,21 @@ where
     fn run_chunk(
         &self,
         pool: &ComputePool,
-        _input: &(),
+        input: &(),
         start: usize,
         end: usize,
         splits: usize,
     ) -> Result<(), PanicPayload> {
-        par_range_gen_sink_rec(pool, self.base, start, end, self.op, splits)
+        let leaf = |_input: &(), start: usize, end: usize| {
+            for item in (self.base + start)..(self.base + end) {
+                self.op.consume(item);
+            }
+            Ok(())
+        };
+        // Sink-only and buffer-free: generated items are never stored, so
+        // no completed range holds anything to drop.
+        let noop = |_start: usize, _end: usize| {};
+        par_tree_rec(pool, input, start, end, splits, &leaf, &noop)
     }
 
     #[inline]
@@ -1130,39 +1124,7 @@ where
     }
 }
 
-/// Recursive generation for `for_each` — the [`par_for_each_rec`] twin with
-/// the input guard elided (no unread tail can exist: items are generated
-/// one ahead of consumption and never stored).
-fn par_range_gen_sink_rec<OP>(
-    pool: &ComputePool,
-    base: usize,
-    start: usize,
-    end: usize,
-    op: &OP,
-    splits_left: usize,
-) -> Result<(), PanicPayload>
-where
-    OP: SinkOp<usize>,
-{
-    if splits_left == 0 || end - start <= 1 {
-        for item in (base + start)..(base + end) {
-            op.consume(item);
-        }
-        return Ok(());
-    }
-    let mid = start + (end - start) / 2;
-    let (l, r) = pool.join(
-        || par_range_gen_sink_rec(pool, base, start, mid, op, splits_left - 1),
-        || par_range_gen_sink_rec(pool, base, mid, end, op, splits_left - 1),
-    );
-    match (l, r) {
-        (Ok(()), Ok(())) => Ok(()),
-        // Neither half owns buffers — first panic wins, nothing to drop.
-        (Err(p), _) | (_, Err(p)) => Err(p),
-    }
-}
-
-/// Drive [`par_range_gen_sink_rec`] over a whole range.
+/// Drive the generation sink core over a whole range.
 ///
 /// # Panics
 ///
@@ -1201,7 +1163,7 @@ where
 /// Range resolution on each failure kind:
 /// - `Ok(())` chunk — output range fully init; the driver drops it via `cleanup_success_chunk` when
 ///   some other chunk failed.
-/// - `Err(e)` chunk — `par_index_try_rec`'s leaf/internal-node cleanup has already dropped every
+/// - `Err(e)` chunk — the fallible tree's leaf/internal-node cleanup has already dropped every
 ///   live output slot and consumed every input slot in the chunk's range, so nothing remains to
 ///   clean (mirrors the panicked chunk of the infallible strategies).
 /// - Panicking chunk — unwinds through the recursion (leaf guard cleans its own partial range;
@@ -1230,7 +1192,20 @@ where
         end: usize,
         splits: usize,
     ) -> Result<(), TryFailure<E>> {
-        par_index_try_rec(pool, input, self.output, start, end, self.op, splits)
+        let leaf = |input: &Slots<T>, start: usize, end: usize| {
+            // SAFETY: disjoint range — the caller (driver or internal node)
+            // owns `[start, end)` exclusively. Input slots are init; output
+            // slots are uninit.
+            let in_slice = unsafe { input.as_slice(start, end) };
+            let out_slice = unsafe { self.output.as_mut_slice(start, end) };
+            par_index_try_leaf(in_slice, out_slice, self.op)
+        };
+        let drop_success_range = |start: usize, end: usize| {
+            // SAFETY (hook contract): only called for completed ranges, so
+            // those output slots are fully init and safe to drop.
+            unsafe { self.output.drop_range(start, end) };
+        };
+        par_tree_rec(pool, input, start, end, splits, &leaf, &drop_success_range)
             .map_err(TryFailure::Error)
     }
 
@@ -1696,109 +1671,49 @@ fn resume_panic(failure: ErasedFailure) -> ! {
 // `par_iter().for_each()` workload shape where `.map(f).collect::<Vec<()>>()`
 // would pay for a pointless n-slot output buffer + n writes.
 
-/// Recursive divide-and-conquer sink. Each leaf claims a disjoint input range
-/// `[start, end)` and consumes it via `op`; no output is written.
-///
-/// Panic safety mirrors `par_index_rec`'s input half: a panicking leaf's
-/// `ForEachGuard` drops the unread tail of its own range, internal nodes
-/// propagate the first `Err`, and the panic-free sibling's range is already
-/// fully consumed (every read slot is uninit, nothing to drop). On return,
-/// every slot in `[start, end)` is either consumed (read) or dropped.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn par_for_each_rec<T, OP>(
-    pool: &ComputePool,
-    input: &Slots<T>,
-    start: usize,
-    end: usize,
-    op: &OP,
-    splits_left: usize,
-) -> Result<(), PanicPayload>
-where
-    T: Send,
-    OP: SinkOp<T>,
-{
-    if splits_left == 0 || end - start <= 1 {
-        // SAFETY: this leaf owns the disjoint range `[start, end)` exclusively.
-        // input[start..end) is fully init; nothing else is touched.
-        let in_slice = unsafe { input.as_slice(start, end) };
-        par_for_each_leaf(in_slice, op);
-        return Ok(());
-    }
-    let mid = start + (end - start) / 2;
-    let (l, r) = pool.join(
-        || par_for_each_rec(pool, input, start, mid, op, splits_left - 1),
-        || par_for_each_rec(pool, input, mid, end, op, splits_left - 1),
-    );
-    match (l, r) {
-        (Ok(()), Ok(())) => Ok(()),
-        // The completed sibling fully consumed its own range (every slot read
-        // → uninit, nothing to drop). The panicking sibling's ForEachGuard
-        // already dropped its unread tail, so no per-range cleanup is needed
-        // here — unlike par_index_rec, there is no output buffer to drop.
-        (Err(p), _) | (_, Err(p)) => Err(p),
-    }
-}
-
 /// Consume `[start, end)` sequentially on the current thread, applying `op`
 /// for its side effect.
 ///
-/// Panic safety uses a stack-local `ForEachGuard` whose `Drop` runs only on
-/// unwind — the input-tail mirror of `LeafGuard` (without the output half,
-/// since `for_each` allocates no output buffer). At the panic point in
-/// `op.consume(item)` for iter `i = pos`, item `i` has been moved into `op`
-/// (gone with the panic), `input[i+1..]` is still init (untouched, must be
-/// dropped); `input[..i]` was already moved-out in prior iterations.
+/// Panic safety uses a stack-local [`LeafCleanup`] guard (input half only —
+/// `for_each` allocates no output buffer) whose `Drop` runs only on unwind.
+/// At the panic point in `op.consume(item)` for iter `i = written`, item `i`
+/// has been moved into `op` (gone with the panic), `input[i+1..]` is still
+/// init (untouched, must be dropped); `input[..i]` was already moved-out in
+/// prior iterations.
 fn par_for_each_leaf<T, OP>(input: &[T], op: &OP)
 where
     T: Send,
     OP: SinkOp<T>,
 {
-    /// RAII guard that drops the unread input tail on unwind. Counterpart to
-    /// `LeafGuard` with the output half elided (no output buffer exists).
-    ///
-    /// `pos` tracks the count of fully consumed iterations at the unwind
-    /// point. Item `pos` was moved into `op` and is gone with the panic, so
-    /// we drop `input[pos+1..]` only.
-    struct ForEachGuard<'a, T> {
-        input: &'a [T],
-        pos: usize,
-    }
-
-    impl<T> Drop for ForEachGuard<'_, T> {
-        fn drop(&mut self) {
-            // SAFETY: `pos` reflects the actual consumed-iteration count at
-            // the unwind point. Items `..pos` were already moved out (uninit);
-            // item `pos` was consumed by `op` and is gone; `input[pos+1..]`
-            // is still init and must be dropped.
-            unsafe {
-                let in_live = self.input.as_ptr();
-                for j in (self.pos + 1)..self.input.len() {
-                    ptr::drop_in_place(in_live.add(j).cast_mut());
-                }
-            }
-        }
-    }
-
+    // Unwind cleanup — `LeafCleanup` with the input half only (no output
+    // buffer exists): items `..written` were already moved out (uninit), item
+    // `written` is gone with the panic, `input[written+1..]` must be dropped.
+    // The dead output pointer is never dereferenced (`OUT = false`).
     let in_ptr = input.as_ptr();
     let n = input.len();
 
-    let mut g = ForEachGuard { input, pos: 0 };
+    let mut g = LeafCleanup::<T, (), false, true> {
+        in_ptr,
+        out_ptr: ptr::null_mut(),
+        n,
+        written: 0,
+    };
 
-    while g.pos < n {
-        let i = g.pos;
+    while g.written < n {
+        let i = g.written;
         // SAFETY: disjoint index; slot i is init (input). The read moves the
         // item out of the slot, leaving it uninit — never re-read.
         let item = unsafe { ptr::read(in_ptr.add(i)) };
         op.consume(item);
-        g.pos = i + 1;
+        g.written = i + 1;
     }
 
     // Success: disarm the cleanup Drop.
     std::mem::forget(g);
 }
 
-/// Drive `par_for_each_rec` over `[0, n)`. Propagates panics after the
-/// recursion's `ForEachGuard` has dropped every unread input slot.
+/// Drive the sink core over `[0, n)`. Propagates panics after the tree's
+/// leaf guards have dropped every unread input slot.
 ///
 /// # Panics
 ///
@@ -1855,72 +1770,15 @@ where
 // for infallible pipelines. The range-tree path (`fused_try_filter_collect`)
 // serves chains containing `Filter`.
 
-/// Recursive divide-and-conquer for fallible stages. Returns `Err(e)` on the
-/// first error; on error, all init output slots in the error branch are
-/// cleaned up by the leaf, and sibling ranges are dropped by this function.
-///
-/// Panics propagate naturally through `join`'s `halt_unwinding`/`resume_unwind`
-/// (re-raised past the match). The leaf's `TryLeafGuard` handles panic cleanup
-/// of the leaf's own partial range, identical to `LeafGuard` in
-/// `par_index_leaf`.
-fn par_index_try_rec<T, R, E, OP>(
-    pool: &ComputePool,
-    input: &Slots<T>,
-    output: &Slots<R>,
-    start: usize,
-    end: usize,
-    op: &OP,
-    splits_left: usize,
-) -> Result<(), E>
-where
-    T: Send,
-    R: Send,
-    E: Send,
-    OP: RangeTryOp<T, Out = R, Error = E>,
-{
-    if splits_left == 0 || end - start <= 1 {
-        // SAFETY: disjoint range — this leaf owns `[start, end)` exclusively.
-        let in_slice = unsafe { input.as_slice(start, end) };
-        let out_slice = unsafe { output.as_mut_slice(start, end) };
-        par_index_try_leaf(in_slice, out_slice, op)?;
-        return Ok(());
-    }
-    let mid = start + (end - start) / 2;
-    let (l, r) = pool.join(
-        || par_index_try_rec(pool, input, output, start, mid, op, splits_left - 1),
-        || par_index_try_rec(pool, input, output, mid, end, op, splits_left - 1),
-    );
-    match (l, r) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(e), Ok(())) => {
-            // SAFETY: right sibling completed without filter (RangeTryOp never
-            // filters), so [mid, end) is fully init and safe to drop.
-            unsafe { output.drop_range(mid, end) };
-            Err(e)
-        },
-        (Ok(()), Err(e)) => {
-            unsafe { output.drop_range(start, mid) };
-            Err(e)
-        },
-        (Err(e), Err(_)) => {
-            unsafe {
-                output.drop_range(start, mid);
-                output.drop_range(mid, end);
-            }
-            Err(e)
-        },
-    }
-}
-
 /// Process `[start, end)` sequentially, short-circuiting on the first `Err`.
 ///
 /// On error: drops `output[..written]` (init from prior iterations) and
 /// `input[written+1..]` (still init — untouched), then returns `Err`. Item
 /// `written` was consumed by `try_apply` and is gone.
 ///
-/// A `TryLeafGuard` runs the same cleanup on **panic** (unwind), disarmed by
-/// `mem::forget` on both the `Ok` and `Err` return paths — identical structure
-/// to `LeafGuard` in `par_index_leaf`.
+/// A [`LeafCleanup`] guard runs the same cleanup on **panic** (unwind),
+/// disarmed by `mem::forget` on both the `Ok` and `Err` return paths —
+/// identical structure to the guard in `par_index_leaf`.
 fn par_index_try_leaf<T, R, E, OP>(input: &[T], output: &mut [R], op: &OP) -> Result<(), E>
 where
     T: Send,
@@ -1928,40 +1786,15 @@ where
     E: Send,
     OP: RangeTryOp<T, Out = R, Error = E>,
 {
-    /// RAII guard mirroring `LeafGuard`: drops the partial slot state on
-    /// unwind. `Drop` only fires on panic; both success and error paths call
-    /// `mem::forget`. Uses raw pointers for the same Tree Borrows reason as
-    /// `LeafGuard` — see the comment there.
-    struct TryLeafGuard<T, R> {
-        in_ptr: *const T,
-        out_ptr: *mut R,
-        n: usize,
-        written: usize,
-    }
-
-    impl<T, R> Drop for TryLeafGuard<T, R> {
-        fn drop(&mut self) {
-            // SAFETY: same reasoning as `LeafGuard::drop` — `written` reflects
-            // completed iterations at the unwind point.
-            unsafe {
-                let i = self.written;
-                for j in 0..i {
-                    ptr::drop_in_place(self.out_ptr.add(j));
-                }
-                for j in (i + 1)..self.n {
-                    ptr::drop_in_place(self.in_ptr.add(j).cast_mut());
-                }
-            }
-        }
-    }
-
+    // Unwind cleanup — the shared `LeafCleanup` guard with both halves live,
+    // same contract as `par_index_leaf`'s (see the comment there).
     debug_assert_eq!(input.len(), output.len());
 
     let in_ptr = input.as_ptr();
     let out_ptr = output.as_mut_ptr();
     let n = input.len();
 
-    let mut g = TryLeafGuard {
+    let mut g = LeafCleanup::<T, R, true, true> {
         in_ptr,
         out_ptr,
         n,
@@ -1981,14 +1814,9 @@ where
                 // Error path: run the same cleanup the guard would do on
                 // panic, then disarm (forget) so Drop doesn't double-clean.
                 // Item `i` was consumed by `try_apply` and is gone.
-                unsafe {
-                    for j in 0..i {
-                        ptr::drop_in_place(out_ptr.add(j));
-                    }
-                    for j in (i + 1)..n {
-                        ptr::drop_in_place(in_ptr.add(j).cast_mut());
-                    }
-                }
+                // SAFETY: `written == i`; `output[..i)` and `input(i..n)`
+                // hold live values.
+                unsafe { g.cleanup() };
                 std::mem::forget(g);
                 return Err(e);
             },
@@ -2000,7 +1828,7 @@ where
     Ok(())
 }
 
-/// Drive `par_index_try_rec` over `[0, n)` and convert the output buffer into
+/// Drive the fallible index core over `[0, n)` and convert the output buffer into
 /// a `Vec<R>`. On error, the recursion has already dropped all init output
 /// slots; on panic, the panic propagates (and the output buffer's init slots
 /// may leak, same as `par_index_collect`).
@@ -2366,51 +2194,12 @@ impl SplitPlan {
 // merges them all on the single driver thread; that structural merge cost
 // outweighs the ramp-up win for every batch size measured.
 
-/// RAII guard that drops the unread input tail on unwind — shared by the
-/// infallible ([`filter_leaf`]) and fallible ([`filter_try_leaf`]) filter
-/// leaves. The output half is elided because each leaf's `Vec` drops itself.
-///
-/// `pos` tracks the consumed-iteration count: items `..pos` were moved out
-/// of their slots (uninit), item `pos` was moved into the stage chain and is
-/// gone with it, `input[pos+1..]` is still init and must be dropped.
-struct FilterGuard<'a, T> {
-    input: &'a [T],
-    pos: usize,
-}
-
-impl<T> FilterGuard<'_, T> {
-    /// Drop the still-init tail `input[pos+1..]`. Runs on both the unwind
-    /// path (`Drop`) and the fallible leaf's `Err` short-circuit — item `pos`
-    /// was consumed by the stage call either way.
-    ///
-    /// # Safety
-    ///
-    /// `pos` must reflect the leaf's iteration counter at the call point;
-    /// every slot in `(pos, len)` must hold a live `T`.
-    unsafe fn drop_tail(&self) {
-        let in_live = self.input.as_ptr();
-        // SAFETY: see the contract above; `pos` items were `ptr::read` out.
-        unsafe {
-            for j in (self.pos + 1)..self.input.len() {
-                ptr::drop_in_place(in_live.add(j).cast_mut());
-            }
-        }
-    }
-}
-
-impl<T> Drop for FilterGuard<'_, T> {
-    fn drop(&mut self) {
-        // SAFETY: `pos` reflects the consumed-iteration count at the unwind
-        // point.
-        unsafe { self.drop_tail() };
-    }
-}
-
 /// Consume `input` sequentially, applying `stages` and collecting surviving
 /// outputs into a fresh `Vec`.
 ///
-/// Panic safety: a [`FilterGuard`] drops the unread input tail on unwind
-/// (there is no shared output buffer; the leaf's `Vec` drops naturally).
+/// Panic safety: a [`LeafCleanup`] guard (input half only) drops the unread
+/// input tail on unwind (there is no shared output buffer; the leaf's `Vec`
+/// drops naturally).
 fn filter_leaf<T, S>(input: &[T], stages: &S) -> Vec<S::Output>
 where
     T: Send,
@@ -2423,17 +2212,23 @@ where
     // same); when most items are filtered out the over-allocation is bounded
     // by the leaf input length and avoids log-many reallocs + partial memcpys.
     let mut out = Vec::with_capacity(n);
-    let mut g = FilterGuard { input, pos: 0 };
+    // Unwind cleanup — input half only (the leaf's `Vec` drops itself).
+    let mut g = LeafCleanup::<T, (), false, true> {
+        in_ptr,
+        out_ptr: ptr::null_mut(),
+        n,
+        written: 0,
+    };
 
-    while g.pos < n {
-        let i = g.pos;
+    while g.written < n {
+        let i = g.written;
         // SAFETY: disjoint index; slot i is init. The read moves the item out
         // of the slot, leaving it uninit — never re-read.
         let item = unsafe { ptr::read(in_ptr.add(i)) };
         if let Some(o) = stages.apply(item) {
             out.push(o);
         }
-        g.pos = i + 1;
+        g.written = i + 1;
     }
 
     // Success: disarm the cleanup Drop.
@@ -2521,7 +2316,7 @@ where
 /// a fresh `Vec`. Short-circuits on the first `Err`.
 ///
 /// On `Err`, outputs produced so far drop with `out` and the unread input
-/// tail drops via [`FilterGuard::drop_tail`] (item `pos` was consumed by
+/// tail drops via the guard's cleanup (item `pos` was consumed by
 /// `try_apply`); the guard runs the same cleanup on **panic** (unwind).
 fn filter_try_leaf<T, S>(input: &[T], stages: &S) -> Result<Vec<S::Output>, S::Error>
 where
@@ -2535,10 +2330,16 @@ where
     // same); when most items are filtered out the over-allocation is bounded
     // by the leaf input length and avoids log-many reallocs + partial memcpys.
     let mut out = Vec::with_capacity(n);
-    let mut g = FilterGuard { input, pos: 0 };
+    // Unwind cleanup — input half only (the leaf's `Vec` drops itself).
+    let mut g = LeafCleanup::<T, (), false, true> {
+        in_ptr,
+        out_ptr: ptr::null_mut(),
+        n,
+        written: 0,
+    };
 
-    while g.pos < n {
-        let i = g.pos;
+    while g.written < n {
+        let i = g.written;
         // SAFETY: disjoint index; slot i is init. The read moves the item out
         // of the slot, leaving it uninit — never re-read.
         let item = unsafe { ptr::read(in_ptr.add(i)) };
@@ -2550,13 +2351,13 @@ where
                 // unwind, then disarm it so `Drop` does not double-clean.
                 // `out` drops with the return — outputs are discarded on
                 // `Err`.
-                // SAFETY: `pos == i`; slots `(i, n)` are still init.
-                unsafe { g.drop_tail() };
+                // SAFETY: `written == i`; slots `(i, n)` are still init.
+                unsafe { g.cleanup() };
                 std::mem::forget(g);
                 return Err(e);
             },
         }
-        g.pos = i + 1;
+        g.written = i + 1;
     }
 
     // Success: disarm the cleanup Drop.
@@ -3539,53 +3340,36 @@ where
 // Bound shift vs the owned core: sharing `&[E]` across workers requires
 // `E: Sync` (owned moves items across threads, which requires `E: Send`).
 //
-// Panic-safety simplification is structural: a borrowed input is always init
-// and never ours to drop, so the input half of every cleanup guard
-// (`LeafGuard` / `TryLeafGuard`) and the whole `ForEachGuard` disappear —
-// only output slots need dropping on unwind.
+// Panic-safety simplification is structural: a borrowed input is always
+// init and never ours to drop, so every leaf guard runs `LeafCleanup` with
+// its input half disabled — only output slots need dropping on unwind.
 
 /// Borrowed-input leaf: process `input` sequentially, applying `op` to each
 /// `&E` and writing outputs by index. Counterpart of [`par_index_leaf`] with
 /// the `ptr::read` move-out replaced by a shared borrow — LLVM sees the same
 /// read-8B / compute / write-8B loop shape, so the vectorized code matches.
 ///
-/// Panic safety: `RefLeafGuard` drops only the init `output[..written]` slots
-/// (a borrowed input is always init and never ours to drop).
+/// Panic safety: the [`LeafCleanup`] guard drops only the init
+/// `output[..written]` slots (a borrowed input is always init and never ours
+/// to drop).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn par_index_leaf_by_ref<'i, E, R, OP>(input: &'i [E], output: &mut [R], op: &OP, nt: bool)
 where
     OP: RangeOp<&'i E, Out = R>,
 {
-    /// RAII guard that drops the partial **output** range on unwind; the
-    /// counterpart of `LeafGuard` with the input half elided. Raw pointers for
-    /// the same Tree Borrows reason as `LeafGuard` — see the comment there.
-    struct RefLeafGuard<R> {
-        out_ptr: *mut R,
-        written: usize,
-    }
-
-    impl<R> Drop for RefLeafGuard<R> {
-        fn drop(&mut self) {
-            // SAFETY: `written` reflects the completed-iteration count at the
-            // unwind point. `RangeOp` never filters, so `output[..written)` is
-            // fully init and must be dropped; the borrowed input needs
-            // nothing.
-            unsafe {
-                for j in 0..self.written {
-                    ptr::drop_in_place(self.out_ptr.add(j));
-                }
-            }
-        }
-    }
-
+    // Unwind cleanup — `LeafCleanup` with the output half only (a borrowed
+    // input is always init and never ours to drop); `output[..written]` has
+    // no holes because `RangeOp` never filters.
     debug_assert_eq!(input.len(), output.len());
 
     let in_ptr = input.as_ptr();
     let out_ptr = output.as_mut_ptr();
     let n = input.len();
 
-    let mut g = RefLeafGuard {
+    let mut g = LeafCleanup::<E, R, true, false> {
+        in_ptr,
         out_ptr,
+        n,
         written: 0,
     };
 
@@ -3619,63 +3403,6 @@ where
     std::mem::forget(g);
 }
 
-/// Borrowed-input recursive index-based parallel fill — counterpart of
-/// [`par_index_rec`]. Each leaf claims a disjoint index range `[start, end)`;
-/// a panicking leaf's guard drops its own partial output range, internal
-/// nodes propagate the first `Err` and drop the completed sibling's output
-/// range. A borrowed input never needs cleanup.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn par_index_rec_by_ref<'i, E, R, OP>(
-    pool: &ComputePool,
-    input: &'i [E],
-    output: &Slots<R>,
-    start: usize,
-    end: usize,
-    op: &OP,
-    splits_left: usize,
-    nt: bool,
-) -> Result<(), PanicPayload>
-where
-    E: Sync,
-    R: Send,
-    OP: RangeOp<&'i E, Out = R>,
-{
-    if splits_left == 0 || end - start <= 1 {
-        // SAFETY: this leaf owns the disjoint range `[start, end)`
-        // exclusively. `input[start..end)` is shared and init;
-        // `output[start..end)` is uninit.
-        let in_slice = unsafe { input.get_unchecked(start..end) };
-        let out_slice = unsafe { output.as_mut_slice(start, end) };
-        par_index_leaf_by_ref(in_slice, out_slice, op, nt);
-        return Ok(());
-    }
-    let mid = start + (end - start) / 2;
-    let (l, r) = pool.join(
-        || par_index_rec_by_ref(pool, input, output, start, mid, op, splits_left - 1, nt),
-        || par_index_rec_by_ref(pool, input, output, mid, end, op, splits_left - 1, nt),
-    );
-    match (l, r) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(p), Ok(())) => {
-            // SAFETY: right sibling completed without filter (RangeOp never
-            // filters), so [mid, end) is fully init and safe to drop.
-            unsafe { output.drop_range(mid, end) };
-            Err(p)
-        },
-        (Ok(()), Err(p)) => {
-            unsafe { output.drop_range(start, mid) };
-            Err(p)
-        },
-        (Err(p), Err(_)) => {
-            unsafe {
-                output.drop_range(start, mid);
-                output.drop_range(mid, end);
-            }
-            Err(p)
-        },
-    }
-}
-
 /// Hybrid strategy for the borrowed-input `.collect()` — counterpart of
 /// [`CollectStrategy`] over the `&'i [E]` input handle.
 struct CollectByRefStrategy<'a, R, OP> {
@@ -3702,16 +3429,21 @@ where
         end: usize,
         splits: usize,
     ) -> Result<(), PanicPayload> {
-        par_index_rec_by_ref(
-            pool,
-            input,
-            self.output,
-            start,
-            end,
-            self.op,
-            splits,
-            self.nt,
-        )
+        let leaf = |input: &&'i [E], start: usize, end: usize| {
+            // SAFETY: disjoint range — the caller (driver or internal node)
+            // owns `[start, end)` exclusively. Input is shared + init;
+            // output is uninit.
+            let in_slice = unsafe { input.get_unchecked(start..end) };
+            let out_slice = unsafe { self.output.as_mut_slice(start, end) };
+            par_index_leaf_by_ref(in_slice, out_slice, self.op, self.nt);
+            Ok(())
+        };
+        let drop_success_range = |start: usize, end: usize| {
+            // SAFETY (hook contract): only called for completed ranges, so
+            // those output slots are fully init and safe to drop.
+            unsafe { self.output.drop_range(start, end) };
+        };
+        par_tree_rec(pool, input, start, end, splits, &leaf, &drop_success_range)
     }
 
     #[inline]
@@ -3738,7 +3470,7 @@ where
     }
 }
 
-/// Drive `par_index_rec_by_ref` over a borrowed `&'i [E]` and convert the
+/// Drive the borrowed index core over a `&'i [E]` and convert the
 /// output buffer into a `Vec<R>`. Counterpart of [`par_index_collect`] — no
 /// input `Slots` is created (nothing to free on any path), the input is only
 /// read.
@@ -3797,39 +3529,6 @@ where
     }
 }
 
-/// Borrowed-input recursive sink — counterpart of [`par_for_each_rec`]. A
-/// panicking leaf leaves no partial state, so siblings need no cleanup.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn par_for_each_rec_by_ref<'i, E, OP>(
-    pool: &ComputePool,
-    input: &'i [E],
-    start: usize,
-    end: usize,
-    op: &OP,
-    splits_left: usize,
-) -> Result<(), PanicPayload>
-where
-    E: Sync,
-    OP: SinkOp<&'i E>,
-{
-    if splits_left == 0 || end - start <= 1 {
-        // SAFETY: this leaf owns the disjoint range `[start, end)`
-        // exclusively; the input slice is shared and init.
-        let in_slice = unsafe { input.get_unchecked(start..end) };
-        par_for_each_leaf_by_ref(in_slice, op);
-        return Ok(());
-    }
-    let mid = start + (end - start) / 2;
-    let (l, r) = pool.join(
-        || par_for_each_rec_by_ref(pool, input, start, mid, op, splits_left - 1),
-        || par_for_each_rec_by_ref(pool, input, mid, end, op, splits_left - 1),
-    );
-    match (l, r) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(p), _) | (_, Err(p)) => Err(p),
-    }
-}
-
 /// Hybrid strategy for the borrowed-input `.for_each()` — counterpart of
 /// [`SinkStrategy`] over the `&'i [E]` input handle. Sink-only: no output
 /// buffer, nothing to clean on any path.
@@ -3853,7 +3552,17 @@ where
         end: usize,
         splits: usize,
     ) -> Result<(), PanicPayload> {
-        par_for_each_rec_by_ref(pool, input, start, end, self.op, splits)
+        let leaf = |input: &&'i [E], start: usize, end: usize| {
+            // SAFETY: disjoint range — the caller (driver or internal node)
+            // owns `[start, end)` exclusively; the input slice is shared and
+            // init.
+            let in_slice = unsafe { input.get_unchecked(start..end) };
+            par_for_each_leaf_by_ref(in_slice, self.op);
+            Ok(())
+        };
+        // Sink-only: no output buffer, borrowed input needs nothing.
+        let noop = |_start: usize, _end: usize| {};
+        par_tree_rec(pool, input, start, end, splits, &leaf, &noop)
     }
 
     #[inline]
@@ -3879,7 +3588,7 @@ where
     }
 }
 
-/// Drive `par_for_each_rec_by_ref` over a borrowed `&'i [E]`. Counterpart of
+/// Drive the borrowed sink core over a `&'i [E]`. Counterpart of
 /// [`par_for_each`].
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn par_for_each_by_ref<'i, E, OP>(input: &'i [E], op: &OP, plan: SplitPlan, pool: &ComputePool)
@@ -3920,34 +3629,18 @@ fn par_index_try_leaf_by_ref<'i, E, R, F, OP>(
 where
     OP: RangeTryOp<&'i E, Out = R, Error = F>,
 {
-    /// RAII guard mirroring `RefLeafGuard` for the fallible leaf — drops the
-    /// init `output[..written]` slots on unwind only. Raw pointers for the
-    /// same Tree Borrows reason as `LeafGuard`.
-    struct TryRefLeafGuard<R> {
-        out_ptr: *mut R,
-        written: usize,
-    }
-
-    impl<R> Drop for TryRefLeafGuard<R> {
-        fn drop(&mut self) {
-            // SAFETY: `written` reflects completed iterations at the unwind
-            // point; the borrowed input needs nothing.
-            unsafe {
-                for j in 0..self.written {
-                    ptr::drop_in_place(self.out_ptr.add(j));
-                }
-            }
-        }
-    }
-
+    // Unwind cleanup — same output-only `LeafCleanup` as the infallible
+    // borrowed leaf (see `par_index_leaf_by_ref`).
     debug_assert_eq!(input.len(), output.len());
 
     let in_ptr = input.as_ptr();
     let out_ptr = output.as_mut_ptr();
     let n = input.len();
 
-    let mut g = TryRefLeafGuard {
+    let mut g = LeafCleanup::<E, R, true, false> {
+        in_ptr,
         out_ptr,
+        n,
         written: 0,
     };
 
@@ -3963,11 +3656,8 @@ where
             Err(e) => {
                 // Error path: run the same output cleanup the guard would do
                 // on panic, then disarm (forget) so Drop doesn't double-clean.
-                unsafe {
-                    for j in 0..i {
-                        ptr::drop_in_place(out_ptr.add(j));
-                    }
-                }
+                // SAFETY: `written == i`; `output[..i)` holds live values.
+                unsafe { g.cleanup() };
                 std::mem::forget(g);
                 return Err(e);
             },
@@ -3977,58 +3667,6 @@ where
     // Success: disarm the cleanup Drop.
     std::mem::forget(g);
     Ok(())
-}
-
-/// Borrowed-input fallible recursion — counterpart of [`par_index_try_rec`].
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn par_index_try_rec_by_ref<'i, E, R, F, OP>(
-    pool: &ComputePool,
-    input: &'i [E],
-    output: &Slots<R>,
-    start: usize,
-    end: usize,
-    op: &OP,
-    splits_left: usize,
-) -> Result<(), F>
-where
-    E: Sync,
-    R: Send,
-    F: Send,
-    OP: RangeTryOp<&'i E, Out = R, Error = F>,
-{
-    if splits_left == 0 || end - start <= 1 {
-        // SAFETY: this leaf owns the disjoint range `[start, end)`
-        // exclusively. Input shared + init; output uninit.
-        let in_slice = unsafe { input.get_unchecked(start..end) };
-        let out_slice = unsafe { output.as_mut_slice(start, end) };
-        par_index_try_leaf_by_ref(in_slice, out_slice, op)?;
-        return Ok(());
-    }
-    let mid = start + (end - start) / 2;
-    let (l, r) = pool.join(
-        || par_index_try_rec_by_ref(pool, input, output, start, mid, op, splits_left - 1),
-        || par_index_try_rec_by_ref(pool, input, output, mid, end, op, splits_left - 1),
-    );
-    match (l, r) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(e), Ok(())) => {
-            // SAFETY: right sibling completed without filter, so [mid, end)
-            // is fully init and safe to drop.
-            unsafe { output.drop_range(mid, end) };
-            Err(e)
-        },
-        (Ok(()), Err(e)) => {
-            unsafe { output.drop_range(start, mid) };
-            Err(e)
-        },
-        (Err(e), Err(_)) => {
-            unsafe {
-                output.drop_range(start, mid);
-                output.drop_range(mid, end);
-            }
-            Err(e)
-        },
-    }
 }
 
 /// Hybrid strategy for the borrowed-input `.try_collect()` fast path —
@@ -4057,7 +3695,20 @@ where
         end: usize,
         splits: usize,
     ) -> Result<(), TryFailure<F>> {
-        par_index_try_rec_by_ref(pool, input, self.output, start, end, self.op, splits)
+        let leaf = |input: &&'i [E], start: usize, end: usize| {
+            // SAFETY: disjoint range — the caller (driver or internal node)
+            // owns `[start, end)` exclusively. Input is shared + init;
+            // output is uninit.
+            let in_slice = unsafe { input.get_unchecked(start..end) };
+            let out_slice = unsafe { self.output.as_mut_slice(start, end) };
+            par_index_try_leaf_by_ref(in_slice, out_slice, self.op)
+        };
+        let drop_success_range = |start: usize, end: usize| {
+            // SAFETY (hook contract): only called for completed ranges, so
+            // those output slots are fully init and safe to drop.
+            unsafe { self.output.drop_range(start, end) };
+        };
+        par_tree_rec(pool, input, start, end, splits, &leaf, &drop_success_range)
             .map_err(TryFailure::Error)
     }
 
@@ -4083,7 +3734,7 @@ where
     }
 }
 
-/// Drive `par_index_try_rec_by_ref` over a borrowed `&'i [E]`. Counterpart of
+/// Drive the borrowed fallible index core over a `&'i [E]`. Counterpart of
 /// [`par_index_try_collect`].
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn par_index_try_collect_by_ref<'i, E, R, F, OP>(
@@ -4322,25 +3973,6 @@ where
     l + r
 }
 
-/// Pass 2 leaf guard: drops this leaf's written output prefix on unwind.
-/// Raw pointer for the same Tree Borrows reason as `TryRefLeafGuard`.
-struct PlaceLeafGuard<R> {
-    out_ptr: *mut R,
-    written: usize,
-}
-
-impl<R> Drop for PlaceLeafGuard<R> {
-    fn drop(&mut self) {
-        // SAFETY: `written` reflects completed iterations at the unwind
-        // point; the borrowed input needs nothing.
-        unsafe {
-            for j in 0..self.written {
-                ptr::drop_in_place(self.out_ptr.add(j));
-            }
-        }
-    }
-}
-
 /// Pass 2: write leaf `leaf_base`'s survivors into the leaf's slice of the
 /// shared output buffer (`offsets`/`counts` from the scan). On unwind the
 /// leaf guard drops the written prefix; fully completed siblings' outputs
@@ -4379,7 +4011,14 @@ fn place_filter_rec<'i, S, E>(
         let out_slice = unsafe { output.as_mut_slice(off, off + cnt) };
         let in_ptr = input[start..end].as_ptr();
         let out_ptr = out_slice.as_mut_ptr();
-        let mut g = PlaceLeafGuard { out_ptr, written: 0 };
+        // Unwind cleanup — output half only, same shape as the borrowed
+        // collect leaf (`LeafCleanup`, see `par_index_leaf_by_ref`).
+        let mut g = LeafCleanup::<E, S::Output, true, false> {
+            in_ptr,
+            out_ptr,
+            n: end - start,
+            written: 0,
+        };
         for i in 0..(end - start) {
             // SAFETY: shared read of input slot i (borrowed input, no moves).
             let item = unsafe { &*in_ptr.add(i) };

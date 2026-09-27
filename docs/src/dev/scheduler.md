@@ -135,6 +135,48 @@ taskset 1–31, 32 cores):
   the right shape), `nested_saturated/1K` −8 % (25/25). Per-regime mixed
   verdict ⇒ gate stays; an adaptive gate is the cost-EMA class already
   twice falsified above.
+### Generic chunk tree `par_tree_rec` and the reduce core (2026-10)
+
+The eight per-terminal tree recursions (`par_index_rec[(_by_ref)]`,
+`par_index_try_rec[(_by_ref)]`, `par_for_each_rec[(_by_ref)]`,
+`par_range_gen_rec`, `par_range_gen_sink_rec` — each a verbatim copy of the
+`(Ok,Ok)/(Err,Ok)/(Ok,Err)/(Err,Err)` sibling-drop match) converged into one
+generic `par_tree_rec` (crates/youpipe/src/builder/typed/fused.rs): a `leaf`
+closure plus a `drop_success_range` hook — the internal-node granularity of
+`HybridStrategy::cleanup_success_chunk`. The hooks are closure references
+monomorphized per strategy, so every leaf loop stays independently inlined;
+the auto-vectorization argument on `par_index_leaf` only holds for concrete,
+fully inlined leaves, which is why the leaves themselves were never unified.
+The eight per-leaf RAII guards (`LeafGuard` / `TryLeafGuard` / `RefLeafGuard`
+/ `TryRefLeafGuard` / `ForEachGuard` / `FilterGuard` / `PlaceLeafGuard` /
+`GenLeafGuard`) collapsed the same way into one `LeafCleanup<T, R, OUT, IN>`
+whose const halves select output-prefix / input-tail drops (dead halves
+compile away; the dead-half pointers are never dereferenced). Pure refactor,
+net −361 lines: full test suite + miri (tree-borrows, drop-accounting)
+green; interleaved A/B over the `sync_vs_rayon` families (per-id isolated,
+3 rounds) — every id graded noise — worst youpipe delta +0.8 % (the one leaning id, sync_lightweight 10 K borrowed, confirmed noise by 2 extra rounds: dom 13/25, spreads 11–14 %), tightest family (sync_lightweight 1 M borrowed) −0.1 % at ±0.4 % spread, rayon anchors within ±1 %.
+
+The reduction terminals (todo perf #3) landed on a sibling core, *not*
+`par_tree_rec`: `par_reduce_rec` is a value-carrying recursion (`join`
+returns both child partials, the node combines them), so there is no
+shared-buffer sibling-drop path at all — panic safety is structural (every
+partial is a local dropped by unwind / `join`; the leaf guard owns only the
+input tail). `ReduceStrategy` plugs into `hybrid_dispatch` unchanged: each
+chunk's tree publishes one partial `(start, acc)` into a mutexed slot list
+(one push per chunk, far off the per-item hot path), and the driver sorts
+by `start` and combines left-to-right — deterministic input order.
+`cleanup_success_chunk` is a no-op: on any failure the published partials
+drop with the strategy, a failed batch having no user-visible accumulator.
+
+API note: the streaming reduce pass-through threads the reducer through
+`StageSpawn::fuse_exec_reduce` with the composed chain's output type as an
+explicit parameter bound by equality (`OP: RangeOp<Self::Out, Out = B>`,
+`R: Reducer<B>`) — a projection of one method-generic inside another
+method-generic's bound (`R: Reducer<OP::Out>`) defeats rustc's
+implied-bounds elaboration and the impls fail with a bogus
+"`OP: RangeOp<..>` is not satisfied" (minimal repro verified; nightly
+1.100).
+
 ### Work Search Strategy
 
 `find_work()` tries sources in priority order:
