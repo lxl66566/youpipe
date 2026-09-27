@@ -22,7 +22,7 @@ pub use crate::{
     Identity, Pipe, PipelineConfig, StageOptions, StreamPipe, StreamStart, Workload,
     executor::{ComputePool, compute::MAX_COMPUTE_WORKERS},
     handoff::{Receiver, Sender, async_channel, channel},
-    pipe, pipe_ref,
+    pipe, pipe_range, pipe_ref,
     runtime::{AsyncRuntime, DefaultRuntime},
     scope::{PipelineScope, ScopedPipe, ScopedTryPipe, scope},
     state::{FenceBarrier, FenceMode, ReorderBuffer},

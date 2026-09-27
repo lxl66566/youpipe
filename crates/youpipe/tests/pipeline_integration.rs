@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use youpipe::{FenceMode, Workload, pipe, stream};
+use youpipe::{FenceMode, Workload, pipe, pipe_range, stream};
 
 fn cpu_heavy(x: u64) -> u64 {
     let mut r = x;
@@ -267,6 +267,148 @@ fn test_try_filter_collect_panic_drop_accounting() {
     assert!(
         dropped <= max_out,
         "outputs must never double-drop (dropped {dropped} > {max_out})"
+    );
+}
+
+// ── pipe_range: zero-materialization generation core ──
+
+#[test]
+fn test_pipe_range_collect_correctness() {
+    // Non-zero start exercises the `base + i` item arithmetic; the size
+    // forces the parallel generation path (not `prefers_serial`).
+    let r: Vec<usize> = pipe_range(1_000_000..1_020_000)
+        .map(|i: usize| i.wrapping_mul(3).wrapping_add(7))
+        .collect();
+    let expected: Vec<usize> = (1_000_000..1_020_000)
+        .map(|i: usize| i.wrapping_mul(3).wrapping_add(7))
+        .collect();
+    assert_eq!(r, expected);
+}
+
+#[test]
+fn test_pipe_range_type_changing_maps() {
+    let r: Vec<u64> = pipe_range(0..4_000)
+        .map(|i: usize| i as u64 + 1)
+        .map(|x: u64| x * 10)
+        .collect();
+    assert_eq!(r.len(), 4_000);
+    assert_eq!(r[0], 10);
+    assert_eq!(r[3_999], 40_000);
+}
+
+#[test]
+fn test_pipe_range_empty_and_singleton() {
+    let r: Vec<usize> = pipe_range(0..0).map(|i: usize| i + 1).collect();
+    assert_eq!(r, Vec::<usize>::new());
+    let r: Vec<usize> = pipe_range(42..43).map(|i: usize| i + 1).collect();
+    assert_eq!(r, vec![43]);
+}
+
+#[test]
+fn test_pipe_range_serial_pool_arm() {
+    // Single-worker pool takes `prefers_serial` — the inline serial arm.
+    let r: Vec<usize> = pipe_range(0..10_000)
+        .with_compute_workers(1)
+        .map(|i: usize| i * 2)
+        .collect();
+    assert_eq!(r.len(), 10_000);
+    assert_eq!(r[123], 246);
+}
+
+#[test]
+fn test_pipe_range_filter_chain() {
+    // Filter chains materialize the indices (documented fallback) —
+    // correctness must match the plain `pipe(range)` result exactly.
+    let r: Vec<usize> = pipe_range(0..10_000)
+        .map(|i: usize| i + 1)
+        .filter(|x: &usize| x % 3 == 0)
+        .collect();
+    let expected: Vec<usize> = (0..10_000).map(|i| i + 1).filter(|x| x % 3 == 0).collect();
+    assert_eq!(r, expected);
+}
+
+#[test]
+fn test_pipe_range_try_map_try_collect() {
+    let r: Result<Vec<u64>, &str> = pipe_range(0..10_000)
+        .map(|i: usize| i as u64)
+        .try_map(|x: u64| {
+            if x == 9_999 {
+                Err("boom")
+            } else {
+                Ok(x + 1)
+            }
+        })
+        .try_collect();
+    assert_eq!(r.unwrap_err(), "boom");
+
+    let ok: Vec<u64> = pipe_range(0..1_000)
+        .map(|i: usize| i as u64)
+        .try_map(|x: u64| Ok::<_, &str>(x + 1))
+        .try_collect()
+        .unwrap();
+    assert_eq!(ok.len(), 1_000);
+    assert_eq!(ok[999], 1_000);
+}
+
+#[test]
+fn test_pipe_range_for_each() {
+    use std::sync::{Arc, Mutex};
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s = seen.clone();
+    pipe_range(0..8_000)
+        .map(|i: usize| i * 2)
+        .for_each(move |x: usize| s.lock().unwrap().push(x));
+    let mut seen = seen.lock().unwrap();
+    seen.sort_unstable();
+    let expected: Vec<usize> = (0..8_000).map(|i| i * 2).collect();
+    assert_eq!(*seen, expected);
+}
+
+/// Panic through the generation core: every *constructed* output must be
+/// dropped exactly once (leaf guard + sibling-cleanup accounting), even
+/// though no input buffer exists to account for.
+#[test]
+fn test_pipe_range_panic_drop_accounting() {
+    struct DropCounter {
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let n: usize = if cfg!(miri) {
+        500
+    } else {
+        20_000
+    };
+    let drops = Arc::new(AtomicUsize::new(0));
+    let constructed = Arc::new(AtomicUsize::new(0));
+    let (d, c) = (drops.clone(), constructed.clone());
+    let panic_at = n / 3;
+
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let out: Vec<DropCounter> = pipe_range(0..n)
+            .map(move |i: usize| {
+                assert!(i != panic_at, "boom");
+                c.fetch_add(1, Ordering::Relaxed);
+                DropCounter { drops: d.clone() }
+            })
+            .collect();
+        // Unreachable in practice (the map above panics at `panic_at`); if
+        // scheduling somehow avoided it, `out`'s drop still keeps the
+        // accounting below valid.
+        drop(out);
+    }));
+    assert!(
+        r.is_err(),
+        "panic must propagate through the generation core"
+    );
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        constructed.load(Ordering::Relaxed),
+        "every constructed output must be dropped exactly once (no leak, no double drop)"
     );
 }
 
@@ -1405,7 +1547,7 @@ fn test_workload_custom_correctness() {
 fn test_workload_custom_try_collect() {
     let r: Result<Vec<u64>, &str> = pipe(0..1_000)
         .with_workload(Workload::Custom(NonZeroUsize::new(4).unwrap()))
-        .try_map(|x: u64| Ok(x + 1))
+        .try_map(|x: u64| Ok::<_, &str>(x + 1))
         .try_collect();
     assert_eq!(r.unwrap(), (1..=1_000).collect::<Vec<_>>());
 }

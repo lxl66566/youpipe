@@ -183,6 +183,73 @@ fn bench_lightweight_owned_cold(c: &mut Criterion) {
     group.finish();
 }
 
+/// Input-materialization caliber for the owning `pipe()` entry (todo perf
+/// #9): a non-`Vec` input is materialized with a serial O(n) fill on the
+/// driver thread before the parallel phase (`Vec` inputs ride std's
+/// `vec::IntoIter` collect specialization for free). Rows, everything inside
+/// the timed region:
+///
+/// - `range_input` — `pipe(0..n)`: serial iota fill + parallel map + input free;
+/// - `vec_input` — `pipe(v.clone())`: warm memcpy rebuild + parallel map + input free;
+/// - `borrowed_floor` — `pipe_ref(&v)`: engine only, the reference for how much of `range_input` is
+///   input materialization rather than engine;
+/// - `range_gen` — `pipe_range(0..n)`: the zero-materialization generation core (items generated in
+///   the leaves, no input buffer).
+///
+/// 1M/4M (8/32 MB) avoid the 100K whole-group collapse regime; the sizes are
+/// the anchors documented to stay clean at +-1% in-group.
+fn bench_input_materialize(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sync_lightweight_input_materialize");
+    for size in [1_000_000usize, 4_000_000] {
+        let data: Vec<u64> = (0..size as u64).collect();
+
+        group.throughput(Throughput::Elements(size as u64));
+        group.bench_function(BenchmarkId::new("range_input", size), |b| {
+            b.iter(|| {
+                let r: Vec<u64> = youpipe::pipe(0..size as u64)
+                    .map(|x| black_box(x.wrapping_add(1)))
+                    .collect();
+                black_box(r)
+            });
+        });
+
+        group.bench_with_input(BenchmarkId::new("vec_input", size), &data, |b, data| {
+            b.iter(|| {
+                let r: Vec<u64> = youpipe::pipe(data.clone())
+                    .map(|x| black_box(x.wrapping_add(1)))
+                    .collect();
+                black_box(r)
+            });
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("borrowed_floor", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let r: Vec<u64> = youpipe::pipe_ref(data)
+                        .map(|&x| black_box(x.wrapping_add(1)))
+                        .collect();
+                    black_box(r)
+                });
+            },
+        );
+
+        // The generation core (`pipe_range`): items generated in the leaves,
+        // no input buffer. usize items (the generation core's input type);
+        // same width as the u64 rows on this target.
+        group.bench_function(BenchmarkId::new("range_gen", size), |b| {
+            b.iter(|| {
+                let r: Vec<u64> = youpipe::pipe_range(0..size)
+                    .map(|x: usize| black_box((x as u64).wrapping_add(1)))
+                    .collect();
+                black_box(r)
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_try_collect(c: &mut Criterion) {
     let mut group = c.benchmark_group("try_collect");
     for size in [10_000, 100_000] {
@@ -381,6 +448,7 @@ criterion_group! {
         bench_for_each_vs_rayon,
         bench_filter_chain,
         bench_lightweight_owned_cold,
+        bench_input_materialize,
         bench_nested_on_pool
 }
 
