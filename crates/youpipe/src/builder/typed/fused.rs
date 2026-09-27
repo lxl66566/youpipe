@@ -2066,7 +2066,10 @@ where
     let in_ptr = input.as_ptr();
     let n = input.len();
 
-    let mut out = Vec::new();
+    // Pre-allocate for the all-survive worst case (rayon's filter does the
+    // same); when most items are filtered out the over-allocation is bounded
+    // by the leaf input length and avoids log-many reallocs + partial memcpys.
+    let mut out = Vec::with_capacity(n);
     let mut g = FilterGuard { input, pos: 0 };
 
     while g.pos < n {
@@ -2170,7 +2173,10 @@ where
     let in_ptr = input.as_ptr();
     let n = input.len();
 
-    let mut out = Vec::new();
+    // Pre-allocate for the all-survive worst case (rayon's filter does the
+    // same); when most items are filtered out the over-allocation is bounded
+    // by the leaf input length and avoids log-many reallocs + partial memcpys.
+    let mut out = Vec::with_capacity(n);
     let mut g = FilterGuard { input, pos: 0 };
 
     while g.pos < n {
@@ -3540,10 +3546,15 @@ where
     S::Output: Send,
 {
     if splits_left == 0 || end - start <= 1 {
-        return input[start..end]
-            .iter()
-            .filter_map(|item| stages.apply(item))
-            .collect();
+        // Pre-allocate for the all-survive worst case, matching the owned
+        // leaves and `join_fused_try_collect_by_ref` (rayon does the same).
+        let mut out = Vec::with_capacity(end - start);
+        for item in &input[start..end] {
+            if let Some(o) = stages.apply(item) {
+                out.push(o);
+            }
+        }
+        return out;
     }
     let mid = start + (end - start) / 2;
     let (l, r) = pool.join(
