@@ -491,6 +491,95 @@ fn bench_filter_selectivity(c: &mut Criterion) {
     group.finish();
 }
 
+
+/// Reduce-terminal family: the `.map(f).sum()` shape (todo perf #3) across
+/// borrowed/owned calibers, against rayon's `.map().sum()` and the old
+/// materialize-then-sum path (`collect()` + serial fold) the reduce core
+/// replaces. The map is the lightweight `x + 1` shape — where the removed
+/// output-buffer cost dominates the story (cpu-heavy maps amortize it).
+fn bench_reduce_family(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sync_reduce");
+    for size in [1_000, 10_000, 100_000, 1_000_000] {
+        let data: Vec<u64> = (0..size).collect();
+
+        group.throughput(Throughput::Elements(size));
+
+        // youpipe reduce core, borrowed input (warm slice — the
+        // `sync_lightweight` caliber).
+        group.bench_with_input(
+            BenchmarkId::new("youpipe_sum_borrowed", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let s: u64 = youpipe::pipe_ref(data)
+                        .map(|&x| black_box(x.wrapping_add(1)))
+                        .sum();
+                    black_box(s)
+                });
+            },
+        );
+
+        // youpipe reduce core, owned input (fresh clone — the owning-API
+        // caliber; the clone is paid identically on every side of an A/B).
+        group.bench_with_input(
+            BenchmarkId::new("youpipe_sum_owned", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let s: u64 = youpipe::pipe(data.clone())
+                        .map(|x| black_box(x.wrapping_add(1)))
+                        .sum();
+                    black_box(s)
+                });
+            },
+        );
+
+        // The old path: materialize the whole output `Vec`, then fold it
+        // serially — what `.sum()` used to require.
+        group.bench_with_input(
+            BenchmarkId::new("youpipe_collect_sum_borrowed", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let v: Vec<u64> = youpipe::pipe_ref(data)
+                        .map(|&x| black_box(x.wrapping_add(1)))
+                        .collect();
+                    let s: u64 = v.iter().sum();
+                    black_box(s)
+                });
+            },
+        );
+
+        // rayon cross-library anchor (doubles as the drift control).
+        group.bench_with_input(
+            BenchmarkId::new("rayon_sum", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let s: u64 = data
+                        .par_iter()
+                        .map(|&x| black_box(x.wrapping_add(1)))
+                        .sum();
+                    black_box(s)
+                });
+            },
+        );
+
+        // sequential floor.
+        group.bench_with_input(
+            BenchmarkId::new("sequential_sum", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    let s: u64 = data.iter().map(|&x| black_box(x.wrapping_add(1))).sum();
+                    black_box(s)
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = common::criterion();
@@ -498,6 +587,7 @@ criterion_group! {
         bench_par_map_vs_rayon,
         bench_pipeline_fusion,
         bench_lightweight_work,
+        bench_reduce_family,
         bench_try_collect,
         bench_for_each_vs_rayon,
         bench_filter_chain,
