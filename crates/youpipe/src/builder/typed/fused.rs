@@ -48,9 +48,12 @@ type PanicPayload = Box<dyn Any + Send>;
 // The transient pools from (2)/(3) are owned by `ExecPool::Owned` and live on
 // the stack frame of the terminal method (`.collect()` / `.for_each()` / …),
 // outliving all uses of the `&ComputePool` reference it hands out. Dropping
-// it at the end of the terminal call tears down the worker threads — correct
-// for a one-shot pipeline, but a per-call ~ms cost that tight loops should
-// avoid by pre-creating a pool and using `with_compute_pool` instead.
+// one at the end of the terminal call parks it in the process-wide
+// recycling cache (see `ComputePool::new`) instead of joining the workers,
+// so the next same-sized terminal reuses it for an `Arc` clone — tight
+// loops no longer pay per-call construction. Pools whose threads must
+// really be gone go through `ComputePool::clear_cached_pools` or a
+// user-owned `with_compute_pool` handle.
 
 /// The compute pool that a fused terminal (`.collect()` / `.for_each()` / …)
 /// drives its fork-join work through.
@@ -58,8 +61,9 @@ pub(crate) enum ExecPool<'a> {
     /// A borrowed reference — either the global pool or a user-supplied pool.
     Ref(&'a ComputePool),
     /// A transient pool created from an oversubscribe factor or a non-default
-    /// worker budget. Owned so it is dropped (and its worker threads joined)
-    /// when the terminal returns.
+    /// worker budget. Dropped when the terminal returns — through
+    /// `ComputePool::new` the drop parks it in the process-wide recycling
+    /// cache rather than joining the workers.
     Owned(ComputePool),
 }
 
@@ -3363,10 +3367,12 @@ impl<S, I, O> Pipe<S, I, O> {
     /// terminal on a transient pool of exactly this many threads, and
     /// [`Pipe::with_oversubscribe`] multiplies it (`budget × factor`). An
     /// explicit [`Pipe::with_compute_pool`] always takes precedence and the
-    /// budget is ignored. For repeated terminal calls prefer pre-creating a
-    /// pool once (transient pools pay a per-call ~ms construction cost).
-    /// Streaming knobs (`buffer_size`, `io_concurrency`, …) have no effect on
-    /// the fused path.
+    /// budget is ignored. Transient pools resolve through the process-wide
+    /// recycling cache ([`ComputePool::new`](crate::ComputePool::new)):
+    /// dropped pools park instead of joining, and
+    /// `ComputePool::clear_cached_pools` reclaims their threads when they
+    /// must really be gone. Streaming knobs (`buffer_size`,
+    /// `io_concurrency`, …) have no effect on the fused path.
     #[must_use]
     pub fn with_compute_workers(mut self, n: usize) -> Self {
         self.config.set_compute_workers(n);
@@ -3388,8 +3394,10 @@ impl<S, I, O> Pipe<S, I, O> {
     ///
     /// `ComputePool` is cheap to clone (`Arc` + one atomic), so the pool can
     /// be created once and reused across many `collect()` / `for_each()`
-    /// calls — important for tight loops where per-call pool construction
-    /// (~ms) would dominate.
+    /// calls. A transient pool is also cheap after its first use (recycled
+    /// through the cache, see [`ComputePool::new`](crate::ComputePool::new));
+    /// an explicit pool still wins when several pipelines should share one
+    /// budget or outlive the cache's parking window.
     ///
     /// (Pool sizes like 128 fit blocking-IO oversubscription; kept small
     /// here so the example also runs under miri's single emulated worker.)
@@ -3453,11 +3461,13 @@ impl<S, I, O> Pipe<S, I, O> {
     /// # `with_oversubscribe` vs `with_compute_pool`
     ///
     /// `with_oversubscribe(factor)` creates a **transient** pool at
-    /// `.collect()` / `.for_each()` time and drops it when the terminal
-    /// returns. That is fine for a one-shot pipeline, but in a tight loop the
-    /// per-call pool construction (~ms for thread spawn + priming) dominates.
-    /// For repeated calls, pre-create the pool and use
-    /// [`Pipe::with_compute_pool`]:
+    /// `.collect()` / `.for_each()` time and parks it in the process-wide
+    /// recycling cache when the terminal returns (see
+    /// [`ComputePool::new`](crate::ComputePool::new)) — after the first call
+    /// the same-sized pool is reused, so tight loops no longer pay thread
+    /// spawn + priming. An explicit [`Pipe::with_compute_pool`] is still the
+    /// right tool when several pipelines should share one budget or the
+    /// parked threads must be reclaimed deterministically:
     ///
     /// ```rust
     /// use youpipe::{ComputePool, pipe};
