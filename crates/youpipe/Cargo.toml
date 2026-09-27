@@ -53,6 +53,13 @@ harness           = false
 name              = "io_async"
 required-features = ["tokio-runtime"]
 
+# Tight-loop cost of the transient pools behind `with_compute_workers(n)` /
+# `with_oversubscribe(f)` vs a pre-created `with_compute_pool` handle (see the
+# bench file's module docs).
+[[bench]]
+harness = false
+name    = "pool_reuse"
+
 # Horizontal cross-library comparison (youpipe vs rayon vs tokio vs futures vs
 # std threads), JSON-exporting, self-interleaved. See perf/plot-horizontal.py.
 [[bench]]
