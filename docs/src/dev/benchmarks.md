@@ -234,6 +234,64 @@ The owned + filter caliber (`youpipe_try_filter_owned`, `MAY_FILTER == true`
 rounds; the 100K base side had one outlier round that inflated its spread —
 every post-change round beat every pre-change round).
 
+### Filter-chain collect: leaf pre-allocation, honest merge cost, count-then-place (2026-09-27)
+
+Filter chains (`MAY_FILTER == true`) cannot use the index-based core
+(output cardinality is unknown up front), so leaves build per-leaf `Vec`s
+and the tree concatenates them. Three rounds of work on that path:
+
+**Leaf pre-allocation** (rayon's shape): `filter_leaf` / `filter_try_leaf`
+grew from `Vec::new()` and `join_fused_collect_by_ref` used
+`filter_map(..).collect()` — log-many reallocs + partial memcpys per leaf —
+while sibling `join_fused_try_collect_by_ref` already pre-allocated.
+Unified to `Vec::with_capacity(leaf_input_len)` (all-survive is the exact
+worst case; over-allocation bounded by the leaf input when items are
+filtered out). Isolated per-id A/B vs the branch point (6 interleaved
+rounds, 33 % selectivity): **100K −6.2 % borrowed / −7.1 % owned / −4.5 %
+try+owned** (dominant 25–32/36 pairwise), **1K owned −4.6 % stable**; 10K
+is a wash (−0.6 %…+2.7 %, 3–21/36 — the try+owned 10K row read as a
+dominant regression over the first 3 rounds and dissolved with 6; fused
+recompile layout noise covers the residual lean).
+
+**Merge cost, honestly stated.** The range-tree comments claimed "each
+surviving item moves exactly once"; in reality every internal node's
+`l.extend(r)` reserves and memcpys one child's `Vec` — O(depth) moves per
+survivor, so the merge tree's output-side cost scales with the survivor
+count. (The measured win over the old `Vec::split_off` tree came from never
+copying the *input* side, not single-move outputs.) Comments corrected.
+
+**`filter_selectivity` group** (keep 10/50/90 %, borrowed caliber, 10K/100K)
+anchors the survival-rate axis; the rayon rows double as drift controls for
+same-binary knob A/Bs.
+
+**Count-then-place (`YOUPIPE_FILTER_CTP=1`, default off)** — opt-in
+two-pass by-ref filter collect: pass 1 counts survivors per leaf, a
+sequential scan turns counts into output offsets, pass 2 re-runs the chain
+and writes survivors straight into one exactly-sized buffer (each survivor
+moves exactly once; no per-leaf `Vec`s, no tree merges). Cost is flat in
+selectivity: stage closures run TWICE over the input (observable for
+side-effecting/interior-mutable closures) plus a second fork/join wave.
+Same-binary knob A/B (5 interleaved rounds, 32-core, borrowed):
+
+| shape @100K | merge tree | count-then-place | Δ |
+| ----------- | ---------- | ---------------- | --- |
+| keep 10 % | 31.9 µs | 45.0 µs | **+41.3 %** |
+| keep 33 % (`sync_filter`) | 54.1 µs | 37.3 µs | **−31.1 %** |
+| keep 50 % | 77.4 µs | 48.7 µs | **−37.1 %** |
+| keep 90 % | 106.6 µs | 52.8 µs | **−50.5 %** |
+
+All eight rows stable (25/25 or 0/25 pairwise); at 10K ctp loses across
+the board (+28…+75 %, the fixed second wave dominates) and the owned-path
+control reads −0.1 % (the knob must not — and does not — touch it). The
+crossover sits near ~25 % selectivity at 100K: the merge tree scales with
+survivors, count-then-place with the input. The original hypothesis
+("count-then-place for LOW-selectivity batches") is inverted — the knob
+pays off for filters that KEEP most items on ≥ 100K batches. Owned /
+scoped / try filter paths keep the merge tree: their stages consume items
+by value, so a counting pass cannot re-run them. A single-stage-pass
+variant (write survivors input-indexed + compact once, todo #20) may
+dominate everywhere.
+
 ### `for_each()` vs rayon (`sync_for_each`, cpu_heavy per item, borrowed input)
 
 | Size | youpipe `for_each` | rayon `for_each` |
