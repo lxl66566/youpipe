@@ -249,9 +249,11 @@ worst case; over-allocation bounded by the leaf input when items are
 filtered out). Isolated per-id A/B vs the branch point (6 interleaved
 rounds, 33 % selectivity): **100K −6.2 % borrowed / −7.1 % owned / −4.5 %
 try+owned** (dominant 25–32/36 pairwise), **1K owned −4.6 % stable**; 10K
-is a wash (−0.6 %…+2.7 %, 3–21/36 — the try+owned 10K row read as a
-dominant regression over the first 3 rounds and dissolved with 6; fused
-recompile layout noise covers the residual lean).
+is a wash (−0.9 %…+2.9 % across sessions, 0–21/36 — which 10K row leans
++2…3 % flips between sessions; fused recompile layout noise covers it,
+while every 100K row improves in every session: the post-landing
+confirmation run read −13.9 % borrowed / −6.4 % owned @100K, −6.4 %
+@1K owned).
 
 **Merge cost, honestly stated.** The range-tree comments claimed "each
 surviving item moves exactly once"; in reality every internal node's
