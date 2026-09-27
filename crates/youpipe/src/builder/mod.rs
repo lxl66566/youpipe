@@ -14,5 +14,6 @@ pub use typed::{
 // `ExecPool` so `ScopedPipe` can resolve the oversubscribe / custom-pool
 // hint identically to `Pipe`.
 pub(crate) use typed::{
-    fused_collect_scoped, fused_for_each_scoped, fused_try_collect_scoped, resolve_exec_pool,
+    fused_collect_scoped, fused_fold_scoped, fused_for_each_scoped, fused_reduce_scoped,
+    fused_try_collect_scoped, fused_try_fold_scoped, fused_try_reduce_scoped, resolve_exec_pool,
 };

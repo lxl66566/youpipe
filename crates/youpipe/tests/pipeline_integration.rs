@@ -2269,3 +2269,227 @@ fn test_unbalanced_try_collect_err_drop_accounting() {
         "every written output must drop exactly once on Err"
     );
 }
+
+// ── reduce terminals (todo perf #3) ──
+
+/// All reduce terminals vs the sequential equivalent: owned + borrowed,
+/// filter chains, the fold/count conveniences, and the stream fuse path.
+#[test]
+fn test_reduce_terminals_match_sequential() {
+    use youpipe::pipe_ref;
+    let data: Vec<u64> = (0..20_057u64)
+        .map(|i| i.wrapping_mul(2_654_435_761))
+        .collect();
+    let f = |&x: &u64| x.wrapping_mul(3).wrapping_add(7);
+    let g = |x: u64| x.wrapping_mul(3).wrapping_add(7);
+    let mapped: Vec<u64> = data.iter().map(|&x| g(x)).collect();
+
+    let expected_sum: u64 = mapped.iter().copied().sum();
+    let expected_min = mapped.iter().copied().min();
+    let expected_max = mapped.iter().copied().max();
+    let expected_digit_sum: u64 = mapped.iter().map(|x| x % 10).sum();
+
+    // Borrowed core.
+    let s: u64 = pipe_ref(&data).map(f).sum();
+    assert_eq!(s, expected_sum);
+    assert_eq!(pipe_ref(&data).map(f).min(), expected_min);
+    assert_eq!(pipe_ref(&data).map(f).max(), expected_max);
+    assert_eq!(
+        pipe_ref(&data).map(f).count(),
+        mapped.len(),
+        "count is post-filter cardinality"
+    );
+    assert_eq!(
+        pipe_ref(&data)
+            .map(f)
+            .fold(0u64, |a, x: u64| a + x % 10, |a, b| a + b),
+        expected_digit_sum,
+        "fold with a different accumulator type"
+    );
+    assert_eq!(
+        pipe_ref(&data).map(f).reduce(u64::wrapping_add),
+        Some(expected_sum)
+    );
+
+    // Owned core.
+    let s: u64 = pipe(data.clone()).map(g).sum();
+    assert_eq!(s, expected_sum);
+
+    // Filter chain: only survivors fold.
+    let kept: u64 = mapped.iter().copied().filter(|x| x % 3 == 0).sum();
+    let s: u64 = pipe_ref(&data)
+        .map(f)
+        .filter(|&x: &u64| x % 3 == 0)
+        .sum();
+    assert_eq!(s, kept);
+    assert_eq!(
+        pipe_ref(&data).map(f).filter(|&x: &u64| x % 3 == 0).count(),
+        mapped.iter().filter(|x| *x % 3 == 0).count()
+    );
+
+    // try variants (no-filter fast path + filter path).
+    let r = pipe_ref(&data)
+        .try_map(|&x| -> Result<u64, &str> { Ok(f(&x)) })
+        .try_reduce(u64::wrapping_add);
+    assert_eq!(r, Ok(Some(expected_sum)));
+    let r = pipe_ref(&data)
+        .try_map(|&x| -> Result<u64, &str> { Ok(f(&x)) })
+        .filter(|&x: &u64| x % 3 == 0)
+        .try_fold(0u64, |a, x: u64| a + x % 10, |a, b| a + b);
+    let kept_digits: u64 = mapped
+        .iter()
+        .copied()
+        .filter(|x| x % 3 == 0)
+        .map(|x| x % 10)
+        .sum();
+    assert_eq!(r, Ok(kept_digits));
+
+    // Stream fuse path: pure sync chain reduces on the fused core.
+    let s: u64 = stream(data.iter().copied()).stage(g).sum();
+    assert_eq!(s, expected_sum);
+    assert_eq!(
+        stream(data.iter().copied())
+            .stage(g)
+            .reduce(u64::wrapping_add),
+        Some(expected_sum)
+    );
+    assert_eq!(stream(0..1000u64).stage(|x| x * 2).count(), 1000);
+}
+
+/// Empty and fully-filtered inputs: `None` / identity returns everywhere.
+#[test]
+fn test_reduce_empty_inputs() {
+    use youpipe::{pipe_ref, stream};
+    let empty: Vec<u64> = Vec::new();
+    assert_eq!(
+        pipe(empty.clone()).map(|x: u64| x + 1).reduce(|a, b| a + b),
+        None
+    );
+    assert_eq!(pipe_ref(&empty).map(|&x| x + 1).reduce(|a, b| a + b), None);
+    assert_eq!(pipe_ref(&empty).map(|&x| x + 1).min(), None);
+    assert_eq!(pipe_ref(&empty).map(|&x| x + 1).max(), None);
+    let s: u64 = pipe_ref(&empty).map(|&x| x + 1).sum();
+    assert_eq!(s, 0);
+    assert_eq!(pipe_ref(&empty).map(|&x| x + 1).count(), 0);
+    assert_eq!(
+        pipe_ref(&empty)
+            .map(|&x| x + 1)
+            .fold(42u64, |a, x: u64| a + x, |a, b| a + b),
+        42
+    );
+    // Everything filtered out reduces to None.
+    assert_eq!(
+        pipe_ref(&(0..100u64).collect::<Vec<_>>())
+            .map(|&x| x)
+            .filter(|_: &u64| false)
+            .reduce(|a, b| a + b),
+        None
+    );
+    // try + stream empties.
+    let r: Result<Option<u64>, &str> = pipe(empty)
+        .try_map(|x| -> Result<u64, &str> { Ok(x + 1) })
+        .try_reduce(|a, b| a + b);
+    assert_eq!(r, Ok(None));
+    let s: u64 = stream(Vec::<u64>::new()).stage(|x: u64| x + 1).sum();
+    assert_eq!(s, 0);
+    assert_eq!(stream(Vec::<u64>::new()).stage(|x: u64| x + 1).count(), 0);
+}
+
+/// A panicking stage inside a reduce leaf must drop every owned input item
+/// exactly once (the reduce leaf guard's unread-tail cleanup + the tree's
+/// propagation), matching the collect terminals' contract.
+#[allow(clippy::cast_possible_truncation)] // test sizes fit usize everywhere
+#[test]
+fn test_reduce_panic_drop_accounting() {
+    struct DropCounter {
+        drops: Arc<AtomicUsize>,
+        val: u64,
+    }
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let n: u64 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let boom_at = n / 2;
+    let drops = Arc::new(AtomicUsize::new(0));
+    let d = drops.clone();
+    let items: Vec<DropCounter> = (0..n)
+        .map(|i| DropCounter {
+            drops: d.clone(),
+            val: i,
+        })
+        .collect();
+
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        pipe(items)
+            .map(move |c: DropCounter| {
+                assert!(c.val != boom_at, "boom at {boom_at}");
+                c.val
+            })
+            .reduce(u64::wrapping_add)
+    }));
+    assert!(r.is_err(), "panic must propagate through the reduce tree");
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        n as usize,
+        "every input must drop exactly once on panic"
+    );
+}
+
+/// try_reduce short-circuits on the first Err: the error propagates and
+/// every owned input item drops exactly once.
+#[allow(clippy::cast_possible_truncation)] // test sizes fit usize everywhere
+#[test]
+fn test_try_reduce_short_circuits() {
+    use youpipe::pipe_ref;
+    struct InCounter {
+        drops: Arc<AtomicUsize>,
+        val: u64,
+    }
+    impl Drop for InCounter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let n: u64 = if cfg!(miri) { 2_000 } else { 65_536 };
+    let drops = Arc::new(AtomicUsize::new(0));
+    let d = drops.clone();
+    let items: Vec<InCounter> = (0..n)
+        .map(|i| InCounter {
+            drops: d.clone(),
+            val: i,
+        })
+        .collect();
+
+    let r: Result<Option<u64>, &str> = pipe(items)
+        .try_map(move |c: InCounter| {
+            if c.val % 3 == 1 {
+                Err("odd man out")
+            } else {
+                Ok(c.val)
+            }
+        })
+        .try_reduce(u64::wrapping_add);
+    assert_eq!(r, Err("odd man out"));
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        n as usize,
+        "every input must drop exactly once on Err"
+    );
+
+    // Borrowed variant: error at a fixed index, deterministic first error.
+    let data: Vec<u64> = (0..10_000u64).collect();
+    let r: Result<Option<u64>, &str> = pipe_ref(&data)
+        .try_map(|&x| -> Result<u64, &str> {
+            if x == 5_000 {
+                Err("stop")
+            } else {
+                Ok(x)
+            }
+        })
+        .try_reduce(|a, b| a + b);
+    assert_eq!(r, Err("stop"));
+}

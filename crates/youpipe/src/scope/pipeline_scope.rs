@@ -3,8 +3,9 @@ use std::marker::PhantomData;
 use crate::{
     builder::{
         Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, PipelineConfig,
-        StageMarker, SyncMap, TryMap, Workload, fused_collect_scoped, fused_for_each_scoped,
-        fused_try_collect_scoped,
+        StageMarker, SyncMap, TryMap, Workload, fused_collect_scoped, fused_fold_scoped,
+        fused_for_each_scoped, fused_reduce_scoped, fused_try_collect_scoped, fused_try_fold_scoped,
+        fused_try_reduce_scoped,
     },
     executor::compute::ComputePool,
 };
@@ -459,6 +460,57 @@ where
         let pool = exec.as_pool();
         fused_try_collect_scoped(self.items, self.stages, self.config.workload, pool)
     }
+
+    /// Execute the fused fallible pipeline and reduce the outputs,
+    /// short-circuiting on the first error — the scoped counterpart of
+    /// [`TryPipe::try_reduce`](crate::TryPipe::try_reduce) (no output `Vec`;
+    /// see it for the failure-path cleanup and the associativity contract).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain or `op`.
+    pub fn try_reduce<F>(self, op: F) -> Result<Option<O>, E>
+    where
+        F: Fn(O, O) -> O + Sync,
+    {
+        let exec = crate::builder::resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        fused_try_reduce_scoped(self.items, self.stages, op, self.config.workload, pool)
+    }
+
+    /// Execute the fused fallible pipeline, folding outputs into an
+    /// accumulator of a different type — the scoped counterpart of
+    /// [`TryPipe::try_fold`](crate::TryPipe::try_fold).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain, `f` or `combine`.
+    pub fn try_fold<A, F, C>(self, init: A, f: F, combine: C) -> Result<A, E>
+    where
+        A: Clone + Send + Sync,
+        F: Fn(A, O) -> A + Sync,
+        C: Fn(A, A) -> A + Sync,
+    {
+        let exec = crate::builder::resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        fused_try_fold_scoped(
+            self.items,
+            self.stages,
+            init,
+            f,
+            combine,
+            self.config.workload,
+            pool,
+        )
+    }
 }
 
 impl<S, I, O> ScopedPipe<'_, S, I, O>
@@ -520,6 +572,67 @@ where
         );
         let pool = exec.as_pool();
         fused_for_each_scoped(self.items, self.stages, f, self.config.workload, pool);
+    }
+
+    /// Execute the fused pipeline and reduce the outputs into a single
+    /// value — no output `Vec` is allocated. The scoped counterpart of
+    /// [`Pipe::reduce`](crate::Pipe::reduce) (see it for the tree-combine
+    /// shape and the associativity contract).
+    ///
+    /// ```rust
+    /// # use youpipe::scope;
+    /// let table: Vec<u64> = (0..100).collect();
+    /// let sum = scope(|s| {
+    ///     s.pipe(&table).map(|&x| x * 2).reduce(|a: u64, b| a + b)
+    /// });
+    /// assert_eq!(sum, Some(2 * (0..100u64).sum::<u64>()));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain or `op`.
+    pub fn reduce<F>(self, op: F) -> Option<O>
+    where
+        F: Fn(O, O) -> O + Sync,
+    {
+        let exec = crate::builder::resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        fused_reduce_scoped(self.items, self.stages, op, self.config.workload, pool)
+    }
+
+    /// Execute the fused pipeline, folding outputs into an accumulator of a
+    /// **different type** — the scoped counterpart of
+    /// [`Pipe::fold`](crate::Pipe::fold) (see it for the associativity
+    /// contract).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain, `f` or `combine`.
+    pub fn fold<A, F, C>(self, init: A, f: F, combine: C) -> A
+    where
+        A: Clone + Send + Sync,
+        F: Fn(A, O) -> A + Sync,
+        C: Fn(A, A) -> A + Sync,
+    {
+        let exec = crate::builder::resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        fused_fold_scoped(
+            self.items,
+            self.stages,
+            init,
+            f,
+            combine,
+            self.config.workload,
+            pool,
+        )
     }
 }
 

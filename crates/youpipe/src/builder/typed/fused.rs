@@ -4,6 +4,7 @@
 use core::arch::x86_64::{_mm_sfence, _mm_stream_si64};
 use std::{
     any::Any,
+    cell::UnsafeCell,
     marker::PhantomData,
     num::NonZeroUsize,
     ops::Range,
@@ -17,8 +18,10 @@ use std::{
 use super::{
     slots::Slots,
     traits::{
-        Filter, FusedOp, FusedSink, FusedStage, FusedTryOp, FusedTryStage, Identity,
-        InfallibleChain, MapErr, RangeOp, RangeTryOp, SinkOp, StageMarker, SyncMap, TryMap,
+        CountReducer, Filter, FoldReducer, FusedOp, FusedReduce, FusedSink, FusedStage,
+        FusedTryOp, FusedTryReduce, FusedTryStage, Identity, InfallibleChain, MapErr,
+        OptionReducer, RangeOp, RangeReduce, RangeTryOp, ReduceOp, Reducer, SinkOp, StageMarker,
+        SumReducer, SyncMap, TryMap, TryReduceOp,
     },
 };
 use crate::{
@@ -551,6 +554,42 @@ where
     }
     let plan = SplitPlan::new(n, num_threads, workload);
     par_index_collect(items, op, plan, pool)
+}
+
+/// Fused-core entry for the streaming reduce pass-through
+/// (`StageSpawn::fuse_exec_reduce`): fold `op` over `items` with `reducer`
+/// exactly like `Pipe::reduce` does for a no-filter chain — trivial-batch
+/// serial shortcut, then `SplitPlan` + the hybrid-dispatch reduce core.
+///
+/// Streaming callers reach this only after the pass-through eligibility
+/// guards passed (pure `SyncStage` chain, no cancellation, no per-stage
+/// pins), same contract as [`fused_pass_collect`].
+pub(super) fn fused_pass_reduce<T, R, OP>(
+    items: Vec<T>,
+    op: &OP,
+    reducer: &R,
+    workload: Workload,
+    pool: &ComputePool,
+) -> R::Acc
+where
+    T: Send,
+    OP: RangeOp<T>,
+    R: Reducer<OP::Out>,
+{
+    let n = items.len();
+    let num_threads = pool.num_workers();
+    if prefers_serial(n, num_threads) {
+        // Covers the empty batch too: the reducer's identity IS the fold of
+        // zero items.
+        let mut acc = reducer.identity();
+        for item in items {
+            acc = reducer.fold(acc, op.apply(item));
+        }
+        return acc;
+    }
+    let plan = SplitPlan::new(n, num_threads, workload);
+    let rop = RangeReduce(op, reducer);
+    par_reduce(items, &rop, plan, pool)
 }
 
 // ── Hybrid flat/tree top-level dispatch ──
@@ -1342,6 +1381,13 @@ fn onpool_hybrid_mode() -> OnpoolHybrid {
     })
 }
 
+/// Top-level chunk count of a hybrid dispatch — shared by `hybrid_dispatch`
+/// and the reduce strategies' slot geometry (see [`ChunkSlots`]): the two
+/// must agree, or a chunk's start index would map to the wrong slot.
+fn hybrid_num_chunks(n: usize, plan: SplitPlan, num_threads: usize) -> usize {
+    Ord::min(num_threads + plan.chunk_slack, n).max(1)
+}
+
 /// Hybrid top-level dispatcher. Splits `[0, n)` into `num_chunks` contiguous
 /// ranges (`num_threads + plan.chunk_slack`, see [`UNBALANCED_CHUNK_SLACK`]).
 /// Chunk 0 is run **inline on the driver thread** (mirrors rayon's
@@ -1394,7 +1440,7 @@ where
     // per-chunk tree is shallower: total leaf count stays ≈ num_threads *
     // oversplit (matching the single-tree path), just distributed across the
     // chunks instead of grown from one root.
-    let num_chunks = Ord::min(num_threads + plan.chunk_slack, n).max(1);
+    let num_chunks = hybrid_num_chunks(n, plan, num_threads);
     // With slack, use floor(log2(num_chunks)): a slack-sized count (33..48)
     // keeps the same per-chunk tree depth as 32 chunks, preserving the total
     // leaf budget fine-grained stealing needs (ceil would coarsen one level —
@@ -1758,6 +1804,799 @@ where
             // frees memory, no per-slot drops.
             drop(input);
         },
+    }
+}
+
+// ── Reduce core (reduce / fold / sum / count / min / max) ──
+//
+// The aggregation counterpart of `for_each`'s structural win: a reduce
+// terminal never allocates an output buffer. Each leaf folds its disjoint
+// range into one partial accumulator, and the tree combines partials
+// bottom-up through `join` returns — the combine runs on whatever worker
+// finishes each subtree, in parallel. Contrast with the collect path, where
+// a `.map(f).sum()` shape must pay an n-slot `Slots` allocation + n slot
+// writes + a serial fold over the materialized `Vec`.
+//
+// Chunk-level integration reuses `hybrid_dispatch` unchanged:
+// `ReduceStrategy`'s chunk driver runs `par_reduce_rec` and publishes the
+// chunk's partial into its one-shot [`ChunkSlots`] cell; the driver folds
+// the cells in chunk order (= input order, deterministic left-to-right)
+// after the latch. Publication is a plain store to the chunk's own cell —
+// no shared lock (a `Mutex<Vec>` here serialized the tail of small batches;
+// see the `ChunkSlots` doc for the measured numbers).
+//
+// Panic safety is structural for the tree itself — a partial is a plain
+// local value moved through `join`, so a panicking leaf's partial drops
+// with the unwind and the waited-out sibling's partial drops inside
+// `join`'s machinery. The one cleanup hook is `cleanup_success_chunk` ->
+// `ChunkSlots::drop_published`, eagerly dropping each successful chunk's
+// published partial on failure paths (the slot box's own drop is the
+// backstop). The leaf guard owns only the input tail (owned input) —
+// exactly the `for_each` leaf shape.
+
+/// Owned-input reduce leaf: fold `input` into one partial accumulator.
+fn reduce_leaf<T, OP>(input: &[T], op: &OP) -> OP::Acc
+where
+    T: Send,
+    OP: ReduceOp<T>,
+{
+    let in_ptr = input.as_ptr();
+    let n = input.len();
+
+    // Unwind cleanup — input half only (no output buffer exists; the
+    // partial `acc` is a local and drops naturally).
+    let mut g = LeafCleanup::<T, (), false, true> {
+        in_ptr,
+        out_ptr: ptr::null_mut(),
+        n,
+        written: 0,
+    };
+
+    let mut acc = op.identity();
+    while g.written < n {
+        let i = g.written;
+        // SAFETY: disjoint index; slot i is init (input). The read moves the
+        // item out of the slot, leaving it uninit — never re-read.
+        let item = unsafe { ptr::read(in_ptr.add(i)) };
+        acc = op.fold(acc, item);
+        g.written = i + 1;
+    }
+
+    // Success: disarm the cleanup Drop.
+    std::mem::forget(g);
+    acc
+}
+
+/// Owned-input fallible reduce leaf — short-circuits on the first `Err`.
+/// On `Err`, the accumulator was moved into `try_fold` (gone with it), and
+/// the guard drops the unread input tail before disarming. Panics unwind
+/// through the guard the same way (the partial `acc` drops as a local).
+fn reduce_try_leaf<T, OP>(input: &[T], op: &OP) -> Result<OP::Acc, OP::Error>
+where
+    T: Send,
+    OP: TryReduceOp<T>,
+{
+    let in_ptr = input.as_ptr();
+    let n = input.len();
+
+    // Unwind cleanup — input half only (see `reduce_leaf`).
+    let mut g = LeafCleanup::<T, (), false, true> {
+        in_ptr,
+        out_ptr: ptr::null_mut(),
+        n,
+        written: 0,
+    };
+
+    let mut acc = op.identity();
+    while g.written < n {
+        let i = g.written;
+        // SAFETY: disjoint index; slot i is init (input).
+        let item = unsafe { ptr::read(in_ptr.add(i)) };
+        match op.try_fold(acc, item) {
+            Ok(a) => {
+                acc = a;
+                g.written = i + 1;
+            },
+            Err(e) => {
+                // SAFETY: `written == i`; slots `(i, n)` are still init.
+                unsafe { g.cleanup() };
+                std::mem::forget(g);
+                return Err(e);
+            },
+        }
+    }
+
+    // Success: disarm the cleanup Drop.
+    std::mem::forget(g);
+    Ok(acc)
+}
+
+/// Borrowed-input reduce leaf — no guard at all: the input is shared
+/// (never consumed) and no output buffer exists, so a panic in `op` leaves
+/// nothing to clean in this leaf.
+fn reduce_leaf_by_ref<'i, E, OP>(input: &'i [E], op: &OP) -> OP::Acc
+where
+    E: Sync,
+    OP: ReduceOp<&'i E>,
+{
+    let mut acc = op.identity();
+    for item in input {
+        acc = op.fold(acc, item);
+    }
+    acc
+}
+
+/// Borrowed-input fallible reduce leaf.
+fn reduce_try_leaf_by_ref<'i, E, OP>(input: &'i [E], op: &OP) -> Result<OP::Acc, OP::Error>
+where
+    E: Sync,
+    OP: TryReduceOp<&'i E>,
+{
+    let mut acc = op.identity();
+    for item in input {
+        acc = op.try_fold(acc, item)?;
+    }
+    Ok(acc)
+}
+
+/// Value-carrying divide-and-conquer over the owned input. Unlike
+/// [`par_tree_rec`] (unit results + failure-cleanup hooks), the reduce
+/// tree's `join` returns both child partials and the node combines them —
+/// there is no shared buffer, so there is no sibling-drop path at all; a
+/// panicking subtree's unwind propagates and every partial (a local value)
+/// drops naturally.
+fn par_reduce_rec<T, OP>(
+    pool: &ComputePool,
+    input: &Slots<T>,
+    op: &OP,
+    start: usize,
+    end: usize,
+    splits_left: usize,
+) -> OP::Acc
+where
+    T: Send,
+    OP: ReduceOp<T>,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: this leaf owns the disjoint range `[start, end)`
+        // exclusively; the slots are init.
+        let in_slice = unsafe { input.as_slice(start, end) };
+        return reduce_leaf(in_slice, op);
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = pool.join(
+        || par_reduce_rec(pool, input, op, start, mid, splits_left - 1),
+        || par_reduce_rec(pool, input, op, mid, end, splits_left - 1),
+    );
+    op.combine(l, r)
+}
+
+/// Borrowed-input counterpart of [`par_reduce_rec`].
+fn par_reduce_rec_by_ref<'i, E, OP>(
+    pool: &ComputePool,
+    input: &'i [E],
+    op: &OP,
+    start: usize,
+    end: usize,
+    splits_left: usize,
+) -> OP::Acc
+where
+    E: Sync,
+    OP: ReduceOp<&'i E>,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: disjoint range — this leaf owns `[start, end)`
+        // exclusively; the input slice is shared and init.
+        let in_slice = unsafe { input.get_unchecked(start..end) };
+        return reduce_leaf_by_ref(in_slice, op);
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = pool.join(
+        || par_reduce_rec_by_ref(pool, input, op, start, mid, splits_left - 1),
+        || par_reduce_rec_by_ref(pool, input, op, mid, end, splits_left - 1),
+    );
+    op.combine(l, r)
+}
+
+/// Fallible owned-input tree. On `Err` every partial is already gone (the
+/// failing side's partial dropped inside its leaf, the `Ok` sibling's
+/// dropped as a moved value in the match arm below) and every input slot of
+/// the failing side is resolved by its leaf cleanup; the `Ok` sibling fully
+/// consumed its own range. Panics unwind (same as [`par_reduce_rec`]).
+fn par_reduce_try_rec<T, OP>(
+    pool: &ComputePool,
+    input: &Slots<T>,
+    op: &OP,
+    start: usize,
+    end: usize,
+    splits_left: usize,
+) -> Result<OP::Acc, OP::Error>
+where
+    T: Send,
+    OP: TryReduceOp<T>,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: this leaf owns the disjoint range `[start, end)`
+        // exclusively; the slots are init.
+        let in_slice = unsafe { input.as_slice(start, end) };
+        return reduce_try_leaf(in_slice, op);
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = pool.join(
+        || par_reduce_try_rec(pool, input, op, start, mid, splits_left - 1),
+        || par_reduce_try_rec(pool, input, op, mid, end, splits_left - 1),
+    );
+    match (l, r) {
+        (Ok(l), Ok(r)) => Ok(op.combine(l, r)),
+        // The `Ok` sibling's partial (if any) drops here as a moved value.
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    }
+}
+
+/// Borrowed-input fallible tree — counterpart of [`par_reduce_try_rec`].
+fn par_reduce_try_rec_by_ref<'i, E, OP>(
+    pool: &ComputePool,
+    input: &'i [E],
+    op: &OP,
+    start: usize,
+    end: usize,
+    splits_left: usize,
+) -> Result<OP::Acc, OP::Error>
+where
+    E: Sync,
+    OP: TryReduceOp<&'i E>,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: disjoint range — this leaf owns `[start, end)`
+        // exclusively; the input slice is shared and init.
+        let in_slice = unsafe { input.get_unchecked(start..end) };
+        return reduce_try_leaf_by_ref(in_slice, op);
+    }
+    let mid = start + (end - start) / 2;
+    let (l, r) = pool.join(
+        || par_reduce_try_rec_by_ref(pool, input, op, start, mid, splits_left - 1),
+        || par_reduce_try_rec_by_ref(pool, input, op, mid, end, splits_left - 1),
+    );
+    match (l, r) {
+        (Ok(l), Ok(r)) => Ok(op.combine(l, r)),
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    }
+}
+
+/// One-shot mailbox per top-level chunk: `Empty` until the chunk's tree
+/// finishes, then `Full(partial)` — the reduce core's publication surface.
+///
+/// Zero shared contention by construction: every chunk writes exactly its
+/// own cell (a plain store, sequenced before its latch `set`), and only the
+/// driver reads cells, after the latch wait. The first design used a
+/// `Mutex<Vec<(start, Acc)>>` with one push per chunk — correct, but the
+/// ~`num_threads` pushes pile up on the single lock when the per-chunk work
+/// is short, serializing the batch tail: measured +80…+112 % vs
+/// collect-then-sum at 1K and +40…+73 % at 10K (the win at 100K/1M, where
+/// publication overlaps real compute, was −40 %/−80 %). Per-chunk cells
+/// remove the shared line entirely; unpublished (`Empty`) cells are simply
+/// skipped by the combine, which also covers the on-pool single-tree path
+/// (one `run_chunk` over `[0, n)` publishes only chunk 0's cell).
+struct ChunkSlots<A> {
+    slots: Box<[UnsafeCell<ChunkCell<A>>]>,
+    /// Chunk geometry of the dispatch (`n = num_chunks * chunk + rem`):
+    /// chunk `i` covers `[i*chunk + min(i, rem), …)` — the driver's boundary
+    /// formula, inverted by [`ChunkSlots::chunk_of`].
+    chunk: usize,
+    rem: usize,
+}
+
+enum ChunkCell<A> {
+    Empty,
+    Full(A),
+}
+
+// SAFETY: access is governed by the one-shot mailbox discipline documented
+// on `ChunkSlots` — each cell is written by exactly one chunk (plain store
+// before its SeqCst latch `set`) and read only by the driver after the
+// latch wait; `A: Send` covers the partial crossing threads.
+unsafe impl<A: Send> Send for ChunkSlots<A> {}
+unsafe impl<A: Send> Sync for ChunkSlots<A> {}
+
+impl<A> ChunkSlots<A> {
+    /// Allocate `num_chunks` empty cells for an `n`-item dispatch (geometry
+    /// from [`hybrid_num_chunks`], matching the driver's split).
+    fn new(n: usize, num_chunks: usize) -> Self {
+        Self {
+            slots: (0..num_chunks)
+                .map(|_| UnsafeCell::new(ChunkCell::Empty))
+                .collect(),
+            chunk: n / num_chunks,
+            rem: n % num_chunks,
+        }
+    }
+
+    /// The top-level chunk ordinal owning `start` — the inverse of the
+    /// driver's boundary formula `start(i) = i*chunk + min(i, rem)`.
+    fn chunk_of(&self, start: usize) -> usize {
+        // `chunk >= 1` always (num_chunks <= n), so both divisors are
+        // non-zero; the front block holds the `rem` wider chunks.
+        let front = self.rem * (self.chunk + 1);
+        if start < front {
+            start / (self.chunk + 1)
+        } else {
+            self.rem + (start - front) / self.chunk
+        }
+    }
+
+    /// Publish a completed chunk's partial (plain store to the chunk's own
+    /// cell; the latch publishes it to the driver).
+    fn publish(&self, start: usize, acc: A) {
+        let i = self.chunk_of(start);
+        // SAFETY: this chunk's cell is exclusively ours until the driver
+        // reads it (one-shot discipline); the previous state is `Empty`
+        // (no value to drop).
+        unsafe { *self.slots[i].get() = ChunkCell::Full(acc) };
+    }
+
+    /// Drop a published partial — the failure-path cleanup for a successful
+    /// chunk (failed chunks never published).
+    ///
+    /// # Safety
+    ///
+    /// The chunk owning `start` must have published exactly once and must
+    /// not be read afterwards.
+    unsafe fn drop_published(&self, start: usize) {
+        let i = self.chunk_of(start);
+        // SAFETY: contract above; the take leaves `Empty`, so the box's own
+        // drop never sees a live value again (no double-drop).
+        let cell = unsafe { &mut *self.slots[i].get() };
+        if matches!(*cell, ChunkCell::Full(_)) {
+            *cell = ChunkCell::Empty;
+        }
+    }
+
+    /// Fold every published partial left-to-right (chunk ordinal = input
+    /// order). Runs once, on the driver, after the latch. Each cell is
+    /// swapped to `Empty` as it is consumed, so the box's own drop never
+    /// sees a live value (no double-drop for `Drop` accumulators).
+    fn combine(self, mut f: impl FnMut(A, A) -> A) -> A {
+        let mut acc: Option<A> = None;
+        for cell in &self.slots {
+            // SAFETY: every published cell was written before its chunk's
+            // latch `set`; the driver's wait orders those stores before
+            // this read (one-shot: `combine` consumes the slots, so each
+            // cell is touched exactly once). `Empty` cells — chunks that
+            // never ran, only possible via the on-pool single-tree
+            // shortcut — are skipped.
+            match unsafe { ptr::replace(cell.get(), ChunkCell::Empty) } {
+                ChunkCell::Full(a) => {
+                    acc = Some(match acc {
+                        Some(x) => f(x, a),
+                        None => a,
+                    });
+                },
+                ChunkCell::Empty => {},
+            }
+        }
+        acc.expect("hybrid_dispatch always runs at least one chunk")
+    }
+}
+
+/// Hybrid strategy for the owned-input reduce terminals: each chunk's tree
+/// produces one partial, published into the chunk's [`ChunkSlots`] cell.
+struct ReduceStrategy<'a, T, OP>
+where
+    OP: ReduceOp<T>,
+{
+    op: &'a OP,
+    /// Per-chunk partial cells (see [`ChunkSlots`]); the driver combines
+    /// them in chunk order after the latch. On failure,
+    /// `cleanup_success_chunk` drops exactly the published cells.
+    slots: ChunkSlots<OP::Acc>,
+    _marker: PhantomData<fn(&T)>,
+}
+
+impl<T, OP> HybridStrategy<Slots<T>> for ReduceStrategy<'_, T, OP>
+where
+    T: Send,
+    OP: ReduceOp<T>,
+{
+    type Failure = PanicPayload;
+
+    #[inline]
+    fn run_chunk(
+        &self,
+        pool: &ComputePool,
+        input: &Slots<T>,
+        start: usize,
+        end: usize,
+        splits: usize,
+    ) -> Result<(), PanicPayload> {
+        let acc = par_reduce_rec(pool, input, self.op, start, end, splits);
+        self.slots.publish(start, acc);
+        Ok(())
+    }
+
+    #[inline]
+    fn run_sequential(
+        &self,
+        input: &Slots<T>,
+        start: usize,
+        end: usize,
+    ) -> Result<(), PanicPayload> {
+        // SAFETY: disjoint range — the driver owns `[start, end)`
+        // exclusively; the slots are init.
+        let in_slice = unsafe { input.as_slice(start, end) };
+        let acc = reduce_leaf(in_slice, self.op);
+        self.slots.publish(start, acc);
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn cleanup_success_chunk(&self, start: usize, _end: usize) {
+        // Drop this successful chunk's published partial so the caller can
+        // free the slot box without leaking accumulator state (a failed
+        // batch has no user-visible accumulator).
+        // SAFETY: the dispatcher only calls this for chunks whose
+        // `run_chunk` returned `Ok(())` — exactly the publishers.
+        unsafe { self.slots.drop_published(start) };
+    }
+}
+
+/// Hybrid strategy for the borrowed-input reduce terminals — the
+/// [`ReduceStrategy`] counterpart over the `&'i [E]` input handle.
+struct ReduceByRefStrategy<'a, 'i, E, OP>
+where
+    OP: ReduceOp<&'i E>,
+{
+    op: &'a OP,
+    /// See [`ReduceStrategy::slots`].
+    slots: ChunkSlots<OP::Acc>,
+    _marker: PhantomData<fn(&'i E)>,
+}
+
+impl<'i, E, OP> HybridStrategy<&'i [E]> for ReduceByRefStrategy<'_, 'i, E, OP>
+where
+    E: Sync,
+    OP: ReduceOp<&'i E>,
+{
+    type Failure = PanicPayload;
+
+    #[inline]
+    fn run_chunk(
+        &self,
+        pool: &ComputePool,
+        input: &&'i [E],
+        start: usize,
+        end: usize,
+        splits: usize,
+    ) -> Result<(), PanicPayload> {
+        let acc = par_reduce_rec_by_ref(pool, input, self.op, start, end, splits);
+        self.slots.publish(start, acc);
+        Ok(())
+    }
+
+    #[inline]
+    fn run_sequential(
+        &self,
+        input: &&'i [E],
+        start: usize,
+        end: usize,
+    ) -> Result<(), PanicPayload> {
+        // SAFETY: disjoint range — the driver owns `[start, end)`
+        // exclusively; the input slice is shared and init.
+        let in_slice = unsafe { input.get_unchecked(start..end) };
+        let acc = reduce_leaf_by_ref(in_slice, self.op);
+        self.slots.publish(start, acc);
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn cleanup_success_chunk(&self, start: usize, _end: usize) {
+        // SAFETY: dispatcher contract — successful publishers only.
+        unsafe { self.slots.drop_published(start) };
+    }
+}
+
+/// Hybrid strategy for the owned-input fallible reduce terminals
+/// (`try_reduce` / `try_fold`): the tree short-circuits on the first `Err`
+/// exactly like [`TryStrategy`]'s, and only successful chunks publish.
+struct ReduceTryStrategy<'a, T, E, OP>
+where
+    OP: TryReduceOp<T, Error = E>,
+{
+    op: &'a OP,
+    /// See [`ReduceStrategy::slots`]; a chunk's partial is published only
+    /// after its tree returned `Ok`.
+    slots: ChunkSlots<OP::Acc>,
+    _marker: PhantomData<fn(&T, E)>,
+}
+
+impl<T, E, OP> HybridStrategy<Slots<T>> for ReduceTryStrategy<'_, T, E, OP>
+where
+    T: Send,
+    E: Send + 'static,
+    OP: TryReduceOp<T, Error = E>,
+{
+    type Failure = TryFailure<E>;
+
+    #[inline]
+    fn run_chunk(
+        &self,
+        pool: &ComputePool,
+        input: &Slots<T>,
+        start: usize,
+        end: usize,
+        splits: usize,
+    ) -> Result<(), TryFailure<E>> {
+        let acc = par_reduce_try_rec(pool, input, self.op, start, end, splits)
+            .map_err(TryFailure::Error)?;
+        self.slots.publish(start, acc);
+        Ok(())
+    }
+
+    #[inline]
+    fn run_sequential(
+        &self,
+        input: &Slots<T>,
+        start: usize,
+        end: usize,
+    ) -> Result<(), TryFailure<E>> {
+        // SAFETY: disjoint range — the driver owns `[start, end)`
+        // exclusively; the slots are init.
+        let in_slice = unsafe { input.as_slice(start, end) };
+        let acc = reduce_try_leaf(in_slice, self.op).map_err(TryFailure::Error)?;
+        self.slots.publish(start, acc);
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn cleanup_success_chunk(&self, start: usize, _end: usize) {
+        // SAFETY: dispatcher contract — successful publishers only.
+        unsafe { self.slots.drop_published(start) };
+    }
+}
+
+/// Hybrid strategy for the borrowed-input fallible reduce terminals.
+struct ReduceTryByRefStrategy<'a, 'i, E, F, OP>
+where
+    OP: TryReduceOp<&'i E, Error = F>,
+{
+    op: &'a OP,
+    /// See [`ReduceStrategy::slots`].
+    slots: ChunkSlots<OP::Acc>,
+    _marker: PhantomData<fn(&'i E, E, F)>,
+}
+
+impl<'i, E, F, OP> HybridStrategy<&'i [E]> for ReduceTryByRefStrategy<'_, 'i, E, F, OP>
+where
+    E: Sync,
+    F: Send + 'static,
+    OP: TryReduceOp<&'i E, Error = F>,
+{
+    type Failure = TryFailure<F>;
+
+    #[inline]
+    fn run_chunk(
+        &self,
+        pool: &ComputePool,
+        input: &&'i [E],
+        start: usize,
+        end: usize,
+        splits: usize,
+    ) -> Result<(), TryFailure<F>> {
+        let acc = par_reduce_try_rec_by_ref(pool, input, self.op, start, end, splits)
+            .map_err(TryFailure::Error)?;
+        self.slots.publish(start, acc);
+        Ok(())
+    }
+
+    #[inline]
+    fn run_sequential(
+        &self,
+        input: &&'i [E],
+        start: usize,
+        end: usize,
+    ) -> Result<(), TryFailure<F>> {
+        // SAFETY: disjoint range — the driver owns `[start, end)`
+        // exclusively; the input slice is shared and init.
+        let in_slice = unsafe { input.get_unchecked(start..end) };
+        let acc = reduce_try_leaf_by_ref(in_slice, self.op).map_err(TryFailure::Error)?;
+        self.slots.publish(start, acc);
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn cleanup_success_chunk(&self, start: usize, _end: usize) {
+        // SAFETY: dispatcher contract — successful publishers only.
+        unsafe { self.slots.drop_published(start) };
+    }
+}
+
+/// Drive the reduce core over an owned batch, then combine the published
+/// chunk partials in input order.
+///
+/// # Panics
+///
+/// Propagates any panic raised by the op (after the leaf guards dropped
+/// every unread input slot; published partials drop with the strategy).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_reduce<T, OP>(items: Vec<T>, op: &OP, plan: SplitPlan, pool: &ComputePool) -> OP::Acc
+where
+    T: Send,
+    OP: ReduceOp<T>,
+{
+    let n = items.len();
+    debug_assert!(n > 0);
+    let num_threads = pool.num_workers();
+    let input = Slots::from_vec(items);
+    let strategy = ReduceStrategy {
+        op,
+        slots: ChunkSlots::new(n, hybrid_num_chunks(n, plan, num_threads)),
+        _marker: PhantomData,
+    };
+    let result = hybrid_dispatch(
+        pool,
+        &input,
+        &ErasedStrategy::from(&strategy),
+        n,
+        plan,
+        num_threads,
+    )
+    .err();
+    // Every input slot is resolved on both paths: successful chunks consumed
+    // their whole range; failed chunks' guards dropped their unread tails.
+    drop(input);
+    if let Some(f) = result {
+        // Published partials were dropped by the strategy's cleanup hook.
+        resume_panic(f);
+    }
+    strategy.slots.combine(|l, r| op.combine(l, r))
+}
+
+/// Drive the reduce core over a borrowed `&'i [E]` — counterpart of
+/// [`par_reduce`].
+///
+/// # Panics
+///
+/// Propagates any panic raised by the op.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_reduce_by_ref<'i, E, OP>(
+    input: &'i [E],
+    op: &OP,
+    plan: SplitPlan,
+    pool: &ComputePool,
+) -> OP::Acc
+where
+    E: Sync,
+    OP: ReduceOp<&'i E>,
+{
+    let n = input.len();
+    debug_assert!(n > 0);
+    let num_threads = pool.num_workers();
+    let strategy = ReduceByRefStrategy {
+        op,
+        slots: ChunkSlots::new(n, hybrid_num_chunks(n, plan, num_threads)),
+        _marker: PhantomData,
+    };
+    let result = hybrid_dispatch(
+        pool,
+        &input,
+        &ErasedStrategy::from(&strategy),
+        n,
+        plan,
+        num_threads,
+    )
+    .err();
+    if let Some(f) = result {
+        resume_panic(f);
+    }
+    strategy.slots.combine(|l, r| op.combine(l, r))
+}
+
+/// Drive the fallible reduce core over an owned batch.
+///
+/// # Panics
+///
+/// Propagates any panic raised by the op (mirrors `par_index_try_collect`'s
+/// panic path).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_reduce_try<T, OP>(
+    items: Vec<T>,
+    op: &OP,
+    plan: SplitPlan,
+    pool: &ComputePool,
+) -> Result<OP::Acc, OP::Error>
+where
+    T: Send,
+    OP: TryReduceOp<T>,
+    OP::Error: 'static,
+{
+    let n = items.len();
+    debug_assert!(n > 0);
+    let num_threads = pool.num_workers();
+    let input = Slots::from_vec(items);
+    let strategy = ReduceTryStrategy {
+        op,
+        slots: ChunkSlots::new(n, hybrid_num_chunks(n, plan, num_threads)),
+        _marker: PhantomData,
+    };
+    // Downcast the erased op failure back to `TryFailure<OP::Error>`.
+    let result = hybrid_dispatch(
+        pool,
+        &input,
+        &ErasedStrategy::from(&strategy),
+        n,
+        plan,
+        num_threads,
+    )
+    .err()
+    .map(|f| match f {
+        ErasedFailure::Op(b) => match b.downcast::<TryFailure<OP::Error>>() {
+            Ok(tf) => *tf,
+            Err(_) => unreachable!("try reduce strategy only records TryFailure"),
+        },
+        ErasedFailure::Panic(p) => TryFailure::Panic(p),
+    });
+    match result {
+        None => {
+            drop(input);
+            Ok(strategy.slots.combine(|l, r| op.combine(l, r)))
+        },
+        Some(TryFailure::Error(e)) => {
+            // Published partials were dropped by the cleanup hook; the rest
+            // of the batch's state resolved inside the trees.
+            drop(input);
+            Err(e)
+        },
+        Some(TryFailure::Panic(p)) => {
+            drop(input);
+            panic::resume_unwind(p);
+        },
+    }
+}
+
+/// Drive the fallible reduce core over a borrowed `&'i [E]`.
+///
+/// # Panics
+///
+/// Propagates any panic raised by the op.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn par_reduce_try_by_ref<'i, E, OP>(
+    input: &'i [E],
+    op: &OP,
+    plan: SplitPlan,
+    pool: &ComputePool,
+) -> Result<OP::Acc, OP::Error>
+where
+    E: Sync,
+    OP: TryReduceOp<&'i E>,
+    OP::Error: 'static,
+{
+    let n = input.len();
+    debug_assert!(n > 0);
+    let num_threads = pool.num_workers();
+    let strategy = ReduceTryByRefStrategy {
+        op,
+        slots: ChunkSlots::new(n, hybrid_num_chunks(n, plan, num_threads)),
+        _marker: PhantomData,
+    };
+    let result = hybrid_dispatch(
+        pool,
+        &input,
+        &ErasedStrategy::from(&strategy),
+        n,
+        plan,
+        num_threads,
+    )
+    .err()
+    .map(|f| match f {
+        ErasedFailure::Op(b) => match b.downcast::<TryFailure<OP::Error>>() {
+            Ok(tf) => *tf,
+            Err(_) => unreachable!("try reduce strategy only records TryFailure"),
+        },
+        ErasedFailure::Panic(p) => TryFailure::Panic(p),
+    });
+    match result {
+        None => Ok(strategy.slots.combine(|l, r| op.combine(l, r))),
+        Some(TryFailure::Error(e)) => Err(e),
+        Some(TryFailure::Panic(p)) => panic::resume_unwind(p),
     }
 }
 
@@ -2864,6 +3703,248 @@ where
         let op = FusedSink(stages, f);
         par_for_each(items, &op, plan, pool);
     }
+
+    /// Execute the fused pipeline and reduce the outputs into a single
+    /// value — **no output `Vec` is allocated**.
+    ///
+    /// The aggregation counterpart of [`for_each`](Self::for_each)'s
+    /// structural win: each parallel leaf folds its range into one partial
+    /// accumulator and the tree combines partials in parallel, instead of
+    /// materializing an `n`-slot output buffer (`Vec<O>`) just to fold it
+    /// away again. For `.map(f).sum()`-shaped workloads this removes the
+    /// output allocation, the `n` slot writes, and the serial fold.
+    ///
+    /// Filter stages are honoured: items dropped by an upstream filter are
+    /// simply not folded.
+    ///
+    /// `op` should be **associative** — outputs are combined as a
+    /// deterministic tree over input order, but the exact association
+    /// depends on the split layout (batch size, worker count), so a
+    /// non-associative `op` (e.g. float `+` under reordering) may produce
+    /// run-to-run differences.
+    ///
+    /// Returns `None` for an empty input (or when a filter drops every
+    /// item).
+    ///
+    /// ```rust
+    /// # use youpipe::pipe;
+    /// let max = pipe(0..1000).map(|x: i64| x * 3).reduce(i64::max);
+    /// assert_eq!(max, Some(3 * 999));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain or `op`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn reduce<F>(self, op: F) -> Option<O>
+    where
+        F: Fn(O, O) -> O + Send + Sync + 'static,
+    {
+        let items = self.items;
+        let stages = self.stages;
+        let n = items.len();
+        if n == 0 {
+            return None;
+        }
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        let num_threads = pool.num_workers();
+        if prefers_serial(n, num_threads) {
+            // Trivial case: plain sequential reduce, no chunk machinery.
+            if S::MAY_FILTER {
+                return items
+                    .into_iter()
+                    .filter_map(|item| stages.apply(item))
+                    .reduce(op);
+            }
+            return items
+                .into_iter()
+                .map(|item| stages.apply_pure(item))
+                .reduce(op);
+        }
+        let plan = SplitPlan::new(n, num_threads, self.config.workload);
+        let rop = FusedReduce(stages, OptionReducer(op));
+        par_reduce(items, &rop, plan, pool)
+    }
+
+    /// Execute the fused pipeline, folding outputs into an accumulator of a
+    /// **different type** — no output `Vec` is allocated (see
+    /// [`reduce`](Self::reduce) for the core's shape).
+    ///
+    /// Each parallel leaf seeds a partial from `init.clone()` and folds its
+    /// range with `f`; the tree combines partials with `combine`, and the
+    /// driver finally combines the per-chunk partials left-to-right in
+    /// input order. For the result to be independent of the split layout,
+    /// `f`/`combine` must form an associative pair over the lifted domain —
+    /// e.g. `(0, |a, x| a + x, |a, b| a + b)` for sums, or `String`
+    /// concatenation pairs if partial order matters (the driver's
+    /// left-to-right order keeps concatenation correct for a commutative
+    /// combine, and for append-only shapes when each leaf's fold is
+    /// order-preserving).
+    ///
+    /// Returns `init` unchanged for an empty input.
+    ///
+    /// ```rust
+    /// # use youpipe::pipe;
+    /// let lens = pipe(["alpha".to_string(), "beta".to_string()])
+    ///     .fold(0usize, |a, s: String| a + s.len(), |a, b| a + b);
+    /// assert_eq!(lens, 9);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain, `f` or `combine`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn fold<A, F, C>(self, init: A, f: F, combine: C) -> A
+    where
+        A: Clone + Send + Sync + 'static,
+        F: Fn(A, O) -> A + Send + Sync + 'static,
+        C: Fn(A, A) -> A + Send + Sync + 'static,
+    {
+        let items = self.items;
+        let stages = self.stages;
+        let n = items.len();
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        let num_threads = pool.num_workers();
+        if n == 0 || prefers_serial(n, num_threads) {
+            // Serial fold: a single accumulator, no per-leaf `init` clones.
+            let mut acc = init;
+            if S::MAY_FILTER {
+                for item in items {
+                    if let Some(o) = stages.apply(item) {
+                        acc = f(acc, o);
+                    }
+                }
+            } else {
+                for item in items {
+                    acc = f(acc, stages.apply_pure(item));
+                }
+            }
+            return acc;
+        }
+        let plan = SplitPlan::new(n, num_threads, self.config.workload);
+        let rop = FusedReduce(stages, FoldReducer { init, f, combine });
+        par_reduce(items, &rop, plan, pool)
+    }
+
+    /// Execute the fused pipeline and sum the outputs — the zero-copy
+    /// `.map(f).sum()` shape (see [`reduce`](Self::reduce)).
+    ///
+    /// Empty input folds to the additive identity (`0` for numeric types —
+    /// [`Sum`](std::iter::Sum) over an empty iterator).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn sum(self) -> O
+    where
+        O: std::iter::Sum + Send,
+    {
+        let items = self.items;
+        let stages = self.stages;
+        let n = items.len();
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        let num_threads = pool.num_workers();
+        if n == 0 || prefers_serial(n, num_threads) {
+            if S::MAY_FILTER {
+                return items
+                    .into_iter()
+                    .filter_map(|item| stages.apply(item))
+                    .sum();
+            }
+            return items.into_iter().map(|item| stages.apply_pure(item)).sum();
+        }
+        let plan = SplitPlan::new(n, num_threads, self.config.workload);
+        let rop = FusedReduce(stages, SumReducer(PhantomData));
+        par_reduce(items, &rop, plan, pool)
+    }
+
+    /// Execute the fused pipeline and count the outputs (post-filter) — no
+    /// output buffer (see [`reduce`](Self::reduce)). The stage chain still
+    /// runs on every item.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn count(self) -> usize {
+        let items = self.items;
+        let stages = self.stages;
+        let n = items.len();
+        if n == 0 {
+            return 0;
+        }
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        let num_threads = pool.num_workers();
+        if prefers_serial(n, num_threads) {
+            if S::MAY_FILTER {
+                return items
+                    .into_iter()
+                    .filter_map(|item| stages.apply(item))
+                    .count();
+            }
+            // The chain still runs on every item (side-effecting maps);
+            // `map(..).count()` would draw a clippy flag for ignoring the
+            // mapped values, so spell the loop out.
+            let mut c = 0usize;
+            for item in items {
+                let _ = stages.apply_pure(item);
+                c += 1;
+            }
+            return c;
+        }
+        let plan = SplitPlan::new(n, num_threads, self.config.workload);
+        let rop = FusedReduce(stages, CountReducer);
+        par_reduce(items, &rop, plan, pool)
+    }
+
+    /// Execute the fused pipeline and return the minimum output —
+    /// `reduce(Ord::min)` without naming the op (see [`reduce`](Self::reduce)
+    /// for the shape and associativity notes). Returns `None` for an empty
+    /// (or fully filtered) input.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain.
+    pub fn min(self) -> Option<O>
+    where
+        O: Ord,
+    {
+        self.reduce(Ord::min)
+    }
+
+    /// Execute the fused pipeline and return the maximum output —
+    /// `reduce(Ord::max)` (see [`min`](Self::min)).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain.
+    pub fn max(self) -> Option<O>
+    where
+        O: Ord,
+    {
+        self.reduce(Ord::max)
+    }
 }
 
 // ── TryPipe (fallible fused pipeline) ──
@@ -3063,6 +4144,100 @@ where
             let op = FusedTryOp(stages);
             par_index_try_collect(items, &op, plan, pool)
         }
+    }
+
+    /// Execute the fused fallible pipeline and reduce the outputs,
+    /// short-circuiting on the first error — the fallible counterpart of
+    /// [`Pipe::reduce`] (no output `Vec`; partials combined up the tree).
+    ///
+    /// On `Err`, every partial accumulator is dropped (the failing chunk's
+    /// partials inside its tree, the completed chunks' partials with the
+    /// strategy) and the input's unread slots are dropped by the leaf
+    /// guards — nothing leaks to the caller. Filter stages are honoured:
+    /// items dropped by a filter are not folded and cause no error. `op`
+    /// should be associative (see [`Pipe::reduce`]).
+    ///
+    /// Returns `Ok(None)` for an empty input (or a fully filtered one).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain or `op`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn try_reduce<F>(self, op: F) -> Result<Option<O>, E>
+    where
+        F: Fn(O, O) -> O + Send + Sync + 'static,
+    {
+        let items = self.items;
+        let stages = self.stages;
+        let n = items.len();
+        if n == 0 {
+            return Ok(None);
+        }
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        let num_threads = pool.num_workers();
+        if prefers_serial(n, num_threads) {
+            let mut acc: Option<O> = None;
+            for item in items {
+                if let Some(o) = stages.try_apply(item)? {
+                    acc = Some(match acc {
+                        Some(a) => op(a, o),
+                        None => o,
+                    });
+                }
+            }
+            return Ok(acc);
+        }
+        let plan = SplitPlan::new(n, num_threads, self.config.workload);
+        let rop = FusedTryReduce(stages, OptionReducer(op));
+        par_reduce_try(items, &rop, plan, pool)
+    }
+
+    /// Execute the fused fallible pipeline, folding outputs into an
+    /// accumulator of a different type — the fallible counterpart of
+    /// [`Pipe::fold`] (see it for the associativity contract). The first
+    /// `Err` short-circuits (see [`try_reduce`](Self::try_reduce) for the
+    /// failure-path cleanup).
+    ///
+    /// Returns `Ok(init)` for an empty input.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain, `f` or `combine`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn try_fold<A, F, C>(self, init: A, f: F, combine: C) -> Result<A, E>
+    where
+        A: Clone + Send + Sync + 'static,
+        F: Fn(A, O) -> A + Send + Sync + 'static,
+        C: Fn(A, A) -> A + Send + Sync + 'static,
+    {
+        let items = self.items;
+        let stages = self.stages;
+        let n = items.len();
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        let num_threads = pool.num_workers();
+        if n == 0 || prefers_serial(n, num_threads) {
+            // Serial fold: a single accumulator, no per-leaf `init` clones.
+            let mut acc = init;
+            for item in items {
+                if let Some(o) = stages.try_apply(item)? {
+                    acc = f(acc, o);
+                }
+            }
+            return Ok(acc);
+        }
+        let plan = SplitPlan::new(n, num_threads, self.config.workload);
+        let rop = FusedTryReduce(stages, FoldReducer { init, f, combine });
+        par_reduce_try(items, &rop, plan, pool)
     }
 }
 
@@ -4230,6 +5405,160 @@ where
     }
 }
 
+/// `pub(crate)` entry point for the scoped reduce terminal — the
+/// [`fused_collect_scoped`] counterpart: same dispatch logic as
+/// `Pipe::reduce` without the `'static` bounds on the stage chain (driven
+/// by `crate::scope::ScopedPipe::reduce`). Soundness rests on the same
+/// `ComputePool::join` invariant as [`fused_collect_scoped`].
+pub(crate) fn fused_reduce_scoped<S, T, F>(
+    items: Vec<T>,
+    stages: S,
+    op: F,
+    workload: Workload,
+    pool: &ComputePool,
+) -> Option<S::Output>
+where
+    S: FusedStage<T> + Sync,
+    T: Send,
+    S::Output: Send,
+    F: Fn(S::Output, S::Output) -> S::Output + Sync,
+{
+    let n = items.len();
+    if n == 0 {
+        return None;
+    }
+    let num_threads = pool.num_workers();
+    if prefers_serial(n, num_threads) {
+        if S::MAY_FILTER {
+            return items
+                .into_iter()
+                .filter_map(|item| stages.apply(item))
+                .reduce(op);
+        }
+        return items
+            .into_iter()
+            .map(|item| stages.apply_pure(item))
+            .reduce(op);
+    }
+    let plan = SplitPlan::new(n, num_threads, workload);
+    let rop = FusedReduce(stages, OptionReducer(op));
+    par_reduce(items, &rop, plan, pool)
+}
+
+/// `pub(crate)` entry point for the scoped fold terminal — the
+/// [`fused_reduce_scoped`] counterpart over a different accumulator type
+/// (driven by `crate::scope::ScopedPipe::fold`).
+pub(crate) fn fused_fold_scoped<S, T, A, F, C>(
+    items: Vec<T>,
+    stages: S,
+    init: A,
+    f: F,
+    combine: C,
+    workload: Workload,
+    pool: &ComputePool,
+) -> A
+where
+    S: FusedStage<T> + Sync,
+    T: Send,
+    S::Output: Send,
+    A: Clone + Send + Sync,
+    F: Fn(A, S::Output) -> A + Sync,
+    C: Fn(A, A) -> A + Sync,
+{
+    let n = items.len();
+    let num_threads = pool.num_workers();
+    if n == 0 || prefers_serial(n, num_threads) {
+        let mut acc = init;
+        for item in items {
+            if let Some(o) = stages.apply(item) {
+                acc = f(acc, o);
+            }
+        }
+        return acc;
+    }
+    let plan = SplitPlan::new(n, num_threads, workload);
+    let rop = FusedReduce(stages, FoldReducer { init, f, combine });
+    par_reduce(items, &rop, plan, pool)
+}
+
+/// `pub(crate)` entry point for the scoped fallible reduce terminal
+/// (`ScopedTryPipe::try_reduce`). Same dispatch logic as
+/// `TryPipe::try_reduce` minus the `'static` bounds on the stage chain;
+/// `E` keeps its `'static` bound (the hybrid dispatcher's type-erased
+/// failure slot downcasts by concrete type — same caveat as
+/// [`fused_try_collect_scoped`]).
+pub(crate) fn fused_try_reduce_scoped<S, T, E, F>(
+    items: Vec<T>,
+    stages: S,
+    op: F,
+    workload: Workload,
+    pool: &ComputePool,
+) -> Result<Option<S::Output>, E>
+where
+    S: FusedTryStage<T, Error = E> + Sync,
+    T: Send,
+    S::Output: Send,
+    E: Send + 'static,
+    F: Fn(S::Output, S::Output) -> S::Output + Sync,
+{
+    let n = items.len();
+    if n == 0 {
+        return Ok(None);
+    }
+    let num_threads = pool.num_workers();
+    if prefers_serial(n, num_threads) {
+        let mut acc: Option<S::Output> = None;
+        for item in items {
+            if let Some(o) = stages.try_apply(item)? {
+                acc = Some(match acc {
+                    Some(a) => op(a, o),
+                    None => o,
+                });
+            }
+        }
+        return Ok(acc);
+    }
+    let plan = SplitPlan::new(n, num_threads, workload);
+    let rop = FusedTryReduce(stages, OptionReducer(op));
+    par_reduce_try(items, &rop, plan, pool)
+}
+
+/// `pub(crate)` entry point for the scoped fallible fold terminal
+/// (`ScopedTryPipe::try_fold`).
+pub(crate) fn fused_try_fold_scoped<S, T, A, E, F, C>(
+    items: Vec<T>,
+    stages: S,
+    init: A,
+    f: F,
+    combine: C,
+    workload: Workload,
+    pool: &ComputePool,
+) -> Result<A, E>
+where
+    S: FusedTryStage<T, Error = E> + Sync,
+    T: Send,
+    S::Output: Send,
+    A: Clone + Send + Sync,
+    E: Send + 'static,
+    F: Fn(A, S::Output) -> A + Sync,
+    C: Fn(A, A) -> A + Sync,
+{
+    let n = items.len();
+    let num_threads = pool.num_workers();
+    if n == 0 || prefers_serial(n, num_threads) {
+        let mut acc = init;
+        for item in items {
+            if let Some(o) = stages.try_apply(item)? {
+                acc = f(acc, o);
+            }
+        }
+        return Ok(acc);
+    }
+    let plan = SplitPlan::new(n, num_threads, workload);
+    let rop = FusedTryReduce(stages, FoldReducer { init, f, combine });
+    par_reduce_try(items, &rop, plan, pool)
+}
+
 // ── pub(super) borrowed-input entry points ──
 //
 // Driven by `crate::builder::PipeRef` (`pipe_ref`). Identical dispatch logic
@@ -4350,6 +5679,84 @@ where
         let op = FusedTryOp(stages);
         par_index_try_collect_by_ref(input, &op, plan, pool)
     }
+}
+
+/// Entry point for the borrowed-input reduce terminals, generic over the
+/// accumulator [`Reducer`] (driven by `PipeRef::reduce` / `fold` / `sum` /
+/// `count` in borrowed.rs — the conveniences are one-line reducer choices).
+pub(super) fn fused_reduce_by_ref<'i, S, E, R>(
+    input: &'i [E],
+    stages: S,
+    reducer: R,
+    workload: Workload,
+    pool: &ComputePool,
+) -> R::Acc
+where
+    S: FusedStage<&'i E> + Sync,
+    E: Sync,
+    S::Output: Send,
+    R: Reducer<S::Output>,
+{
+    let n = input.len();
+    if n == 0 {
+        return reducer.identity();
+    }
+    let num_threads = pool.num_workers();
+    if prefers_serial(n, num_threads) {
+        let mut acc = reducer.identity();
+        if S::MAY_FILTER {
+            for item in input {
+                if let Some(o) = stages.apply(item) {
+                    acc = reducer.fold(acc, o);
+                }
+            }
+        } else {
+            for item in input {
+                acc = reducer.fold(acc, stages.apply_pure(item));
+            }
+        }
+        return acc;
+    }
+    let plan = SplitPlan::new(n, num_threads, workload);
+    let rop = FusedReduce(stages, reducer);
+    par_reduce_by_ref(input, &rop, plan, pool)
+}
+
+/// Entry point for the borrowed-input fallible reduce terminals
+/// (`TryPipeRef::try_reduce` / `try_fold`). `E` (the error type) keeps its
+/// `'static` bound — the hybrid dispatcher's type-erased failure slot
+/// downcasts by concrete type (same caveat as `fused_try_collect_by_ref`).
+pub(super) fn fused_try_reduce_by_ref<'i, S, E, F, R>(
+    input: &'i [E],
+    stages: S,
+    reducer: R,
+    workload: Workload,
+    pool: &ComputePool,
+) -> Result<R::Acc, F>
+where
+    S: FusedTryStage<&'i E, Error = F> + Sync,
+    E: Sync,
+    S::Output: Send,
+    F: Send + 'static,
+    R: Reducer<S::Output>,
+{
+    let n = input.len();
+    if n == 0 {
+        return Ok(reducer.identity());
+    }
+    let num_threads = pool.num_workers();
+    if prefers_serial(n, num_threads) {
+        let mut acc = reducer.identity();
+        for item in input {
+            if let Some(o) = stages.try_apply(item)? {
+                acc = reducer.fold(acc, o);
+            }
+        }
+        return Ok(acc);
+    }
+    let plan = SplitPlan::new(n, num_threads, workload);
+    let rop = FusedTryReduce(stages, reducer);
+    par_reduce_try_by_ref(input, &rop, plan, pool)
 }
 
 #[cfg(test)]

@@ -276,6 +276,265 @@ where
     }
 }
 
+// ── Reducer / ReduceOp: accumulator terminals (reduce/fold/sum/…) ──
+//
+// The reduction terminals are the aggregation counterpart of `for_each`'s
+// structural win: `.map(f).sum()` on the collect path must materialize the
+// whole `Vec<O>` (n-slot `Slots` allocation + n slot writes + a serial fold
+// afterwards), while the reduce core never allocates an output buffer —
+// each leaf folds its range into one partial accumulator and the tree
+// combines partials bottom-up (see `par_reduce_rec` in fused.rs).
+//
+// Two layers, mirroring `RangeOp`/`SinkOp`:
+//   * [`Reducer`] covers the accumulator side (seed / per-item fold /
+//     partial-combine) and is fed **post-stage** outputs;
+//   * [`ReduceOp`] / [`TryReduceOp`] wrap a stage chain + a `Reducer` into
+//     the item-level op the core's leaves drive.
+
+/// Accumulator-side combinator, fed **post-stage** outputs by the
+/// [`ReduceOp`] wrappers.
+pub trait Reducer<O>: Sync {
+    /// Partial-accumulator type. Must be `Send` — partials cross threads
+    /// through `pool::join`.
+    type Acc: Send;
+    /// Seed for a fresh partial — called once per leaf / driver chunk.
+    fn identity(&self) -> Self::Acc;
+    /// Fold one output into `acc`. Called once per surviving item (items
+    /// dropped by a `Filter` never reach it).
+    fn fold(&self, acc: Self::Acc, item: O) -> Self::Acc;
+    /// Combine two partials — at tree internal nodes and the driver's final
+    /// pass. `fold`/`combine` must form an associative pair for the result
+    /// to be independent of the (split-layout-dependent) association.
+    fn combine(&self, lhs: Self::Acc, rhs: Self::Acc) -> Self::Acc;
+}
+
+/// `reduce(op)` reducer: `Acc = Option<O>` — `None` until the first item,
+/// so empty input and empty filter survival naturally fold to `None`.
+pub(crate) struct OptionReducer<F>(pub(crate) F);
+
+impl<O, F> Reducer<O> for OptionReducer<F>
+where
+    O: Send,
+    F: Fn(O, O) -> O + Sync,
+{
+    type Acc = Option<O>;
+
+    fn identity(&self) -> Option<O> {
+        None
+    }
+
+    #[inline]
+    fn fold(&self, acc: Option<O>, item: O) -> Option<O> {
+        Some(match acc {
+            Some(a) => (self.0)(a, item),
+            None => item,
+        })
+    }
+
+    #[inline]
+    fn combine(&self, lhs: Option<O>, rhs: Option<O>) -> Option<O> {
+        match (lhs, rhs) {
+            (Some(a), Some(b)) => Some((self.0)(a, b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
+    }
+}
+
+/// `fold(init, f, combine)` reducer: `Acc = A`, each partial seeded from
+/// `init.clone()` (one clone per leaf — cheap for numeric accumulators,
+/// the documented cost for heavy ones).
+pub(crate) struct FoldReducer<A, F, C> {
+    pub(crate) init: A,
+    pub(crate) f: F,
+    pub(crate) combine: C,
+}
+
+impl<O, A, F, C> Reducer<O> for FoldReducer<A, F, C>
+where
+    A: Clone + Send + Sync,
+    F: Fn(A, O) -> A + Sync,
+    C: Fn(A, A) -> A + Sync,
+{
+    type Acc = A;
+
+    fn identity(&self) -> A {
+        self.init.clone()
+    }
+
+    #[inline]
+    fn fold(&self, acc: A, item: O) -> A {
+        (self.f)(acc, item)
+    }
+
+    #[inline]
+    fn combine(&self, lhs: A, rhs: A) -> A {
+        (self.combine)(lhs, rhs)
+    }
+}
+
+/// `sum()` reducer: `Acc = O` via [`iter::Sum`] — the identity is the empty
+/// sum and fold/combine are two-element sums (fully inlined to `+` for the
+/// numeric types this terminal targets).
+pub(crate) struct SumReducer<O>(pub(crate) std::marker::PhantomData<fn() -> O>);
+
+impl<O> Reducer<O> for SumReducer<O>
+where
+    O: std::iter::Sum + Send,
+{
+    type Acc = O;
+
+    fn identity(&self) -> O {
+        std::iter::empty().sum()
+    }
+
+    #[inline]
+    fn fold(&self, acc: O, item: O) -> O {
+        std::iter::once(acc).chain(std::iter::once(item)).sum()
+    }
+
+    #[inline]
+    fn combine(&self, lhs: O, rhs: O) -> O {
+        std::iter::once(lhs).chain(std::iter::once(rhs)).sum()
+    }
+}
+
+/// `count()` reducer: `Acc = usize`, one increment per surviving item.
+pub(crate) struct CountReducer;
+
+impl<O> Reducer<O> for CountReducer {
+    type Acc = usize;
+
+    fn identity(&self) -> usize {
+        0
+    }
+
+    #[inline]
+    fn fold(&self, acc: usize, _item: O) -> usize {
+        acc + 1
+    }
+
+    #[inline]
+    fn combine(&self, lhs: usize, rhs: usize) -> usize {
+        lhs + rhs
+    }
+}
+
+/// Item-level fold op for the reduce core — the `SinkOp` sibling that
+/// returns a partial accumulator instead of `()`. Wraps a stage chain and
+/// a [`Reducer`]: `fold` applies the (possibly filtering) chain per item and
+/// folds the surviving output.
+pub(super) trait ReduceOp<T>: Sync {
+    type Acc: Send;
+    fn identity(&self) -> Self::Acc;
+    fn fold(&self, acc: Self::Acc, item: T) -> Self::Acc;
+    fn combine(&self, lhs: Self::Acc, rhs: Self::Acc) -> Self::Acc;
+}
+
+/// Stage-chain + [`Reducer`] wrapper for the infallible reduce terminals.
+pub(super) struct FusedReduce<S, R>(pub(super) S, pub(super) R);
+
+impl<S, R, I> ReduceOp<I> for FusedReduce<S, R>
+where
+    S: FusedStage<I> + Sync,
+    S::Output: Send,
+    R: Reducer<S::Output>,
+{
+    type Acc = R::Acc;
+
+    fn identity(&self) -> Self::Acc {
+        self.1.identity()
+    }
+
+    #[inline]
+    fn fold(&self, acc: Self::Acc, item: I) -> Self::Acc {
+        if S::MAY_FILTER {
+            match self.0.apply(item) {
+                Some(o) => self.1.fold(acc, o),
+                None => acc,
+            }
+        } else {
+            // Pure path — never constructs an `Option` (same rationale as
+            // `RangeOp`/`FusedOp`).
+            self.1.fold(acc, self.0.apply_pure(item))
+        }
+    }
+
+    #[inline]
+    fn combine(&self, lhs: Self::Acc, rhs: Self::Acc) -> Self::Acc {
+        self.1.combine(lhs, rhs)
+    }
+}
+
+/// Item-level fold op for the fallible reduce core: folds short-circuit on
+/// the first `Err`.
+pub(super) trait TryReduceOp<T>: Sync {
+    type Acc: Send;
+    type Error: Send;
+    fn identity(&self) -> Self::Acc;
+    fn try_fold(&self, acc: Self::Acc, item: T) -> Result<Self::Acc, Self::Error>;
+    fn combine(&self, lhs: Self::Acc, rhs: Self::Acc) -> Self::Acc;
+}
+
+/// Stage-chain + [`Reducer`] wrapper for the fallible reduce terminals
+/// (`try_reduce` / `try_fold`).
+pub(super) struct FusedTryReduce<S, R>(pub(super) S, pub(super) R);
+
+impl<S, R, I> TryReduceOp<I> for FusedTryReduce<S, R>
+where
+    S: FusedTryStage<I> + Sync,
+    S::Output: Send,
+    S::Error: Send,
+    R: Reducer<S::Output>,
+{
+    type Acc = R::Acc;
+    type Error = S::Error;
+
+    fn identity(&self) -> Self::Acc {
+        self.1.identity()
+    }
+
+    #[inline]
+    fn try_fold(&self, acc: Self::Acc, item: I) -> Result<Self::Acc, Self::Error> {
+        match self.0.try_apply(item)? {
+            Some(o) => Ok(self.1.fold(acc, o)),
+            None => Ok(acc),
+        }
+    }
+
+    #[inline]
+    fn combine(&self, lhs: Self::Acc, rhs: Self::Acc) -> Self::Acc {
+        self.1.combine(lhs, rhs)
+    }
+}
+
+/// [`ReduceOp`] over a bare [`RangeOp`] — the streaming pass-through's
+/// entry into the reduce core (`fused_pass_reduce`), where the composed
+/// chain is a `RangeOp`, not a `FusedStage`.
+pub(super) struct RangeReduce<'a, OP: ?Sized, R: ?Sized>(pub(super) &'a OP, pub(super) &'a R);
+
+impl<T, OP, R> ReduceOp<T> for RangeReduce<'_, OP, R>
+where
+    OP: ?Sized + RangeOp<T>,
+    R: ?Sized + Reducer<OP::Out>,
+{
+    type Acc = R::Acc;
+
+    fn identity(&self) -> Self::Acc {
+        self.1.identity()
+    }
+
+    #[inline]
+    fn fold(&self, acc: Self::Acc, item: T) -> Self::Acc {
+        self.1.fold(acc, self.0.apply(item))
+    }
+
+    #[inline]
+    fn combine(&self, lhs: Self::Acc, rhs: Self::Acc) -> Self::Acc {
+        self.1.combine(lhs, rhs)
+    }
+}
+
 // ── FusedTryStage trait (fallible chain) ──
 
 /// Compile-time fused stage for a fallible pipeline. The chain threads

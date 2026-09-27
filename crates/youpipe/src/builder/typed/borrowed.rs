@@ -15,8 +15,10 @@ use super::{
     Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, StageMarker, SyncMap,
     TryMap,
     fused::{
-        fused_collect_by_ref, fused_for_each_by_ref, fused_try_collect_by_ref, resolve_exec_pool,
+        fused_collect_by_ref, fused_for_each_by_ref, fused_reduce_by_ref, fused_try_collect_by_ref,
+        fused_try_reduce_by_ref, resolve_exec_pool,
     },
+    traits::{CountReducer, FoldReducer, OptionReducer, SumReducer},
 };
 use crate::{
     builder::{PipelineConfig, Workload},
@@ -269,6 +271,151 @@ where
         let pool = exec.as_pool();
         fused_for_each_by_ref(self.items, self.stages, f, self.config.workload, pool);
     }
+
+    /// Execute the fused pipeline and reduce the outputs into a single
+    /// value — no output `Vec` is allocated. The borrowed counterpart of
+    /// [`Pipe::reduce`](crate::Pipe::reduce) (see it for the tree-combine
+    /// shape and the associativity contract). Filter stages are honoured.
+    ///
+    /// Returns `None` for an empty input (or when a filter drops every
+    /// item).
+    ///
+    /// ```rust
+    /// # use youpipe::pipe_ref;
+    /// let data: Vec<u64> = (0..1000).collect();
+    /// let sum = pipe_ref(&data).map(|&x| x * 2).reduce(|a, b| a + b);
+    /// assert_eq!(sum, Some(2 * (0..1000u64).sum::<u64>()));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain or `op`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn reduce<F>(self, op: F) -> Option<O>
+    where
+        F: Fn(O, O) -> O + Sync,
+    {
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        fused_reduce_by_ref(
+            self.items,
+            self.stages,
+            OptionReducer(op),
+            self.config.workload,
+            pool,
+        )
+    }
+
+    /// Execute the fused pipeline, folding outputs into an accumulator of a
+    /// **different type** — the borrowed counterpart of
+    /// [`Pipe::fold`](crate::Pipe::fold) (see it for the associativity
+    /// contract). Returns `init` for an empty input.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain, `f` or `combine`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn fold<A, F, C>(self, init: A, f: F, combine: C) -> A
+    where
+        A: Clone + Send + Sync,
+        F: Fn(A, O) -> A + Sync,
+        C: Fn(A, A) -> A + Sync,
+    {
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        fused_reduce_by_ref(
+            self.items,
+            self.stages,
+            FoldReducer { init, f, combine },
+            self.config.workload,
+            pool,
+        )
+    }
+
+    /// Execute the fused pipeline and sum the outputs — the zero-copy
+    /// `.map(f).sum()` shape (see [`reduce`](Self::reduce)). Empty input
+    /// folds to the additive identity.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn sum(self) -> O
+    where
+        O: std::iter::Sum + Send,
+    {
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        fused_reduce_by_ref(
+            self.items,
+            self.stages,
+            SumReducer(PhantomData),
+            self.config.workload,
+            pool,
+        )
+    }
+
+    /// Execute the fused pipeline and count the outputs (post-filter) — no
+    /// output buffer (see [`reduce`](Self::reduce)). The stage chain still
+    /// runs on every item.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn count(self) -> usize {
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        fused_reduce_by_ref(
+            self.items,
+            self.stages,
+            CountReducer,
+            self.config.workload,
+            pool,
+        )
+    }
+
+    /// Execute the fused pipeline and return the minimum output —
+    /// `reduce(Ord::min)` (see [`reduce`](Self::reduce)).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain.
+    pub fn min(self) -> Option<O>
+    where
+        O: Ord,
+    {
+        self.reduce(Ord::min)
+    }
+
+    /// Execute the fused pipeline and return the maximum output —
+    /// `reduce(Ord::max)` (see [`min`](Self::min)).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain.
+    pub fn max(self) -> Option<O>
+    where
+        O: Ord,
+    {
+        self.reduce(Ord::max)
+    }
 }
 
 /// A fallible fused pipeline over a **borrowed** input slice. Obtained from
@@ -439,6 +586,64 @@ where
         );
         let pool = exec.as_pool();
         fused_try_collect_by_ref(self.items, self.stages, self.config.workload, pool)
+    }
+
+    /// Execute the fused fallible pipeline and reduce the outputs,
+    /// short-circuiting on the first error — the borrowed counterpart of
+    /// [`TryPipe::try_reduce`](crate::TryPipe::try_reduce) (no output `Vec`;
+    /// see it for the failure-path cleanup and associativity contract).
+    /// Filter stages are honoured; filtered items cause no error.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain or `op`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn try_reduce<F>(self, op: F) -> Result<Option<O>, E>
+    where
+        F: Fn(O, O) -> O + Sync,
+    {
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        fused_try_reduce_by_ref(
+            self.items,
+            self.stages,
+            OptionReducer(op),
+            self.config.workload,
+            pool,
+        )
+    }
+
+    /// Execute the fused fallible pipeline, folding outputs into an
+    /// accumulator of a different type — the borrowed counterpart of
+    /// [`TryPipe::try_fold`](crate::TryPipe::try_fold).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain, `f` or `combine`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub fn try_fold<A, F, C>(self, init: A, f: F, combine: C) -> Result<A, E>
+    where
+        A: Clone + Send + Sync,
+        F: Fn(A, O) -> A + Sync,
+        C: Fn(A, A) -> A + Sync,
+    {
+        let exec = resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        fused_try_reduce_by_ref(
+            self.items,
+            self.stages,
+            FoldReducer { init, f, combine },
+            self.config.workload,
+            pool,
+        )
     }
 }
 
