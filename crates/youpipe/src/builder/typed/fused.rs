@@ -2000,7 +2000,11 @@ impl SplitPlan {
 // cardinality is unknown up front), so each leaf produces its own `Vec` and
 // the tree concatenates. The ranges are disjoint indices into a shared
 // `Slots` input — the replacement for the old `Vec::split_off` merge, which
-// paid one allocation + memcpy per internal node.
+// paid one allocation + memcpy of the *input* half per internal node. The
+// output side is NOT single-move: every internal node's `l.extend(r)`
+// reserves and memcpys one child's `Vec` into the other's, so a surviving
+// item is moved O(depth) times (once into its leaf's `Vec`, then once per
+// merge level above it).
 //
 // Filter chains deliberately stay on the single tree even for off-pool
 // callers (unlike the no-filter terminals' hybrid dispatch). A/B (2026-09,
@@ -2089,7 +2093,9 @@ where
 }
 
 /// Recursive range-based filter collect. Each leaf claims the disjoint range
-/// `[start, end)` and produces its own `Vec`; internal nodes concatenate.
+/// `[start, end)` and produces its own `Vec`; internal nodes concatenate via
+/// `l.extend(r)` — one reserve + memcpy of one side per node, i.e. O(depth)
+/// moves per surviving item (see the section comment).
 ///
 /// On panic the unwinding side's guard drops its unread input tail and every
 /// partial `Vec` drops naturally, so internal nodes need no cleanup match
@@ -2132,10 +2138,13 @@ where
 /// A/B vs the old `Vec::split_off` tree (5 interleaved rounds, 32-core,
 /// `sync_filter/youpipe_filter_map_owned`): 100 k −6…−9 % (stable — every
 /// round of the range tree beat every round of the split_off tree), 1 k/10 k
-/// within round spread (+1…+2 %, rounds interleave). The split_off merge paid
-/// one allocation + memcpy per internal node (~n·levels/2 item moves across
-/// the tree); the range tree moves each surviving item exactly once, into its
-/// leaf's `Vec`.
+/// within round spread (+1…+2 %, rounds interleave). The split_off tree paid
+/// one allocation + memcpy of the *input* half per internal node (~n·levels/2
+/// input item moves before any stage work); the range tree shares the input
+/// via `Slots`, so the input is never copied. Outputs are still concatenated
+/// level by level — `l.extend(r)` moves one side per internal node, so each
+/// surviving item is moved O(depth) times, not once; the measured win comes
+/// from eliminating the input-side copies, not single-move outputs.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn fused_filter_collect<T, S>(
     items: Vec<T>,
@@ -2260,10 +2269,10 @@ where
 /// `MAY_FILTER` `try_collect` chains, which cannot use the index-based fast
 /// path (output cardinality is unknown up front).
 ///
-/// Replaced the old `Vec::split_off` tree (one allocation + memcpy per
-/// internal node); the range tree moves each surviving item exactly once,
-/// into its leaf's `Vec` — the same measured −6…−9 % shape as the infallible
-/// port (see [`fused_filter_collect`]).
+/// Replaced the old `Vec::split_off` tree (one allocation + input-half memcpy
+/// per internal node); same shape as [`fused_filter_collect`] — the input is
+/// shared via ranges (never copied), outputs still concatenate level by level
+/// (`extend` moves one side per internal node, O(depth) moves per survivor).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn fused_try_filter_collect<T, S>(
     items: Vec<T>,
@@ -3529,8 +3538,10 @@ where
 }
 
 /// Borrowed-input merge-based collect for fused stages that may filter —
-/// counterpart of [`join_fused_collect`] with `Vec::split_off` replaced by
-/// index ranges (no per-level reallocation; the input is shared).
+/// counterpart of [`fused_filter_collect`] with the input shared by index
+/// ranges instead of `Vec::split_off`. The output side still concatenates
+/// level by level (`extend` may reserve + memcpy one side per internal node,
+/// O(depth) moves per surviving item).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn join_fused_collect_by_ref<'i, S, E>(
     pool: &ComputePool,
