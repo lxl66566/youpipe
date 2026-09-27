@@ -370,6 +370,59 @@ fn bench_filter_chain(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_filter_selectivity(c: &mut Criterion) {
+    // Survival-rate shapes for the borrowed filter collect (the merge tree's
+    // output-side cost scales with survivor count; ~33% already exists as
+    // `sync_filter`). Anchors the low/mid/high ends for selectivity-sensitive
+    // experiments (e.g. the count-then-place knob). rayon rows double as
+    // drift controls in same-binary knob A/Bs.
+    let mut group = c.benchmark_group("filter_selectivity");
+    for size in [10_000, 100_000] {
+        let data: Vec<u64> = (0..size).collect();
+        // (name, keep-rate) — `keep90` inverts the predicate so the chain
+        // shape (map / filter / map) stays identical across rates.
+        let shapes: [(&str, fn(&u64) -> bool); 3] = [
+            ("keep10", |&x: &u64| x % 10 == 0),
+            ("keep50", |&x: &u64| x % 2 == 0),
+            ("keep90", |&x: &u64| x % 10 != 0),
+        ];
+
+        group.throughput(Throughput::Elements(size));
+        for (name, keep) in shapes {
+            group.bench_with_input(
+                BenchmarkId::new(format!("youpipe_{name}"), size),
+                &data,
+                |b, data| {
+                    b.iter(|| {
+                        let r: Vec<u64> = youpipe::pipe_ref(data)
+                            .map(|&x| x + 1)
+                            .filter(keep)
+                            .map(|x| x * 2)
+                            .collect();
+                        black_box(r)
+                    });
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new(format!("rayon_{name}"), size),
+                &data,
+                |b, data| {
+                    b.iter(|| {
+                        black_box(
+                            data.par_iter()
+                                .map(|&x| x + 1)
+                                .filter(keep)
+                                .map(|x| x * 2)
+                                .collect::<Vec<u64>>(),
+                        )
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = common::criterion();
@@ -380,6 +433,7 @@ criterion_group! {
         bench_try_collect,
         bench_for_each_vs_rayon,
         bench_filter_chain,
+        bench_filter_selectivity,
         bench_lightweight_owned_cold,
         bench_nested_on_pool
 }
