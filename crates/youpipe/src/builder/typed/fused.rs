@@ -4346,22 +4346,31 @@ impl<R> Drop for PlaceLeafGuard<R> {
 /// leaf guard drops the written prefix; fully completed siblings' outputs
 /// leak when the root frees the buffer — the same accepted panic-path
 /// precedent as the index-try collect ("init slots may leak").
+struct FilterPlaceCtx<'i, 'a, S, E>
+where
+    S: FusedStage<&'i E>,
+{
+    input: &'i [E],
+    stages: &'a S,
+    output: &'a Slots<S::Output>,
+    offsets: &'a [usize],
+    counts: &'a [usize],
+}
+
 fn place_filter_rec<'i, S, E>(
     pool: &ComputePool,
-    input: &'i [E],
-    stages: &S,
-    output: &Slots<S::Output>,
+    ctx: &FilterPlaceCtx<'i, '_, S, E>,
     start: usize,
     end: usize,
     splits_left: usize,
-    offsets: &[usize],
-    counts: &[usize],
     leaf_base: usize,
 ) where
     S: FusedStage<&'i E> + Sync,
     E: Sync,
     S::Output: Send,
 {
+    let (input, stages, output, offsets, counts) =
+        (ctx.input, ctx.stages, ctx.output, ctx.offsets, ctx.counts);
     if splits_left == 0 || end - start <= 1 {
         let off = offsets[leaf_base];
         let cnt = counts[leaf_base];
@@ -4390,34 +4399,8 @@ fn place_filter_rec<'i, S, E>(
     let mid = start + (end - start) / 2;
     let left_leaves = split_leaf_count(mid - start, splits_left - 1);
     pool.join(
-        || {
-            place_filter_rec(
-                pool,
-                input,
-                stages,
-                output,
-                start,
-                mid,
-                splits_left - 1,
-                offsets,
-                counts,
-                leaf_base,
-            )
-        },
-        || {
-            place_filter_rec(
-                pool,
-                input,
-                stages,
-                output,
-                mid,
-                end,
-                splits_left - 1,
-                offsets,
-                counts,
-                leaf_base + left_leaves,
-            )
-        },
+        || place_filter_rec(pool, ctx, start, mid, splits_left - 1, leaf_base),
+        || place_filter_rec(pool, ctx, mid, end, splits_left - 1, leaf_base + left_leaves),
     );
 }
 
@@ -4453,7 +4436,14 @@ where
     let counts: Vec<usize> = counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
 
     let output = Slots::uninit(total);
-    place_filter_rec(pool, input, stages, &output, 0, n, depth, &offsets, &counts, 0);
+    let ctx = FilterPlaceCtx {
+        input,
+        stages,
+        output: &output,
+        offsets: &offsets,
+        counts: &counts,
+    };
+    place_filter_rec(pool, &ctx, 0, n, depth, 0);
     // Every output slot is init (each leaf filled exactly its count).
     output.into_vec()
 }

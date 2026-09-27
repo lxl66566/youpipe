@@ -443,12 +443,13 @@ fn bench_filter_selectivity(c: &mut Criterion) {
     // `sync_filter`). Anchors the low/mid/high ends for selectivity-sensitive
     // experiments (e.g. the count-then-place knob). rayon rows double as
     // drift controls in same-binary knob A/Bs.
+    type Pred = fn(&u64) -> bool;
     let mut group = c.benchmark_group("filter_selectivity");
     for size in [10_000, 100_000] {
         let data: Vec<u64> = (0..size).collect();
         // (name, keep-rate) — `keep90` inverts the predicate so the chain
         // shape (map / filter / map) stays identical across rates.
-        let shapes: [(&str, fn(&u64) -> bool); 3] = [
+        let shapes: [(&str, Pred); 3] = [
             ("keep10", |&x: &u64| x % 10 == 0),
             ("keep50", |&x: &u64| x % 2 == 0),
             ("keep90", |&x: &u64| x % 10 != 0),
