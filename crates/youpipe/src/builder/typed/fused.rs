@@ -9,7 +9,7 @@ use std::{
     panic, ptr,
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -3618,6 +3618,241 @@ where
     }
 }
 
+// ── Count-then-place by-ref filter collect (YOUPIPE_FILTER_CTP) ──
+//
+// Two-pass alternative to the merge tree for `pipe_ref(..).filter(..)`
+// collects: pass 1 counts survivors per leaf, a sequential scan turns the
+// counts into output offsets, pass 2 re-runs the chain and writes survivors
+// straight into ONE exactly-sized output buffer — every survivor moves
+// exactly once, no per-leaf `Vec` allocations, no tree merges. Trade-offs:
+//   * stage closures run TWICE over the input — a loss for expensive stages
+//     and an observable difference for side-effecting (interior-mutable)
+//     closures;
+//   * two fork/join waves instead of one;
+//   * flat in selectivity: the merge tree's cost scales with survivors
+//     (O(depth) `extend` moves each), this path's with the input.
+// Opt-in (`YOUPIPE_FILTER_CTP=1`, default off — the merge tree wins at low
+// selectivity and small batches). Same-binary knob A/B (5 interleaved
+// rounds, 32-core, 100K borrowed): keep90 −50.5 %, keep50 −37.1 %, keep33
+// −31.1 % (all 25/25 stable); keep10 +41.3 %, every 10K shape +28…+75 %
+// (all 0/25) — crossover ≈ 25 % selectivity at 100K. Owned/try filter paths
+// keep the merge tree: their stages consume items by value, so a count pass
+// cannot re-run them. See docs/src/dev/benchmarks.md (filter-chain collect).
+
+/// Whether by-ref filter collects use count-then-place. Parsed once from
+/// `YOUPIPE_FILTER_CTP`: unset/`"0"` → off (merge tree), `"1"` → on. Invalid
+/// values panic at first use — see `nt_store_policy` for why failing loudly
+/// beats silently misreading a knob.
+fn filter_ctp_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("YOUPIPE_FILTER_CTP") {
+        Err(_) => false,
+        Ok(v) => match v.as_str() {
+            "0" => false,
+            "1" => true,
+            other => panic!(
+                "YOUPIPE_FILTER_CTP: invalid value {other:?} (leave unset or \"0\" for the \
+                 merge tree, \"1\" for count-then-place)"
+            ),
+        },
+    })
+}
+
+/// Number of leaves the range-split recursion produces for a `len`-item
+/// range with `splits` levels left — mirrors the `mid = len / 2` split of
+/// [`par_filter_rec`] exactly, so leaf ordinals can be threaded top-down
+/// (left subtree first) without touching the tree itself.
+fn split_leaf_count(len: usize, splits: usize) -> usize {
+    if splits == 0 || len <= 1 {
+        1
+    } else {
+        split_leaf_count(len - len / 2, splits - 1) + split_leaf_count(len / 2, splits - 1)
+    }
+}
+
+/// Pass 1: count this subtree's survivors into `counts[leaf_base + i]` (one
+/// Relaxed store per leaf — disjoint indices, synchronized by `pool.join`
+/// before the scan reads them). Outputs produced by `apply` drop here.
+fn count_filter_rec<'i, S, E>(
+    pool: &ComputePool,
+    input: &'i [E],
+    stages: &S,
+    start: usize,
+    end: usize,
+    splits_left: usize,
+    counts: &[AtomicUsize],
+    leaf_base: usize,
+) -> usize
+where
+    S: FusedStage<&'i E> + Sync,
+    E: Sync,
+{
+    if splits_left == 0 || end - start <= 1 {
+        let mut c = 0;
+        for item in &input[start..end] {
+            if stages.apply(item).is_some() {
+                c += 1;
+            }
+        }
+        counts[leaf_base].store(c, Ordering::Relaxed);
+        return c;
+    }
+    let mid = start + (end - start) / 2;
+    let left_leaves = split_leaf_count(mid - start, splits_left - 1);
+    let (l, r) = pool.join(
+        || count_filter_rec(pool, input, stages, start, mid, splits_left - 1, counts, leaf_base),
+        || {
+            count_filter_rec(
+                pool,
+                input,
+                stages,
+                mid,
+                end,
+                splits_left - 1,
+                counts,
+                leaf_base + left_leaves,
+            )
+        },
+    );
+    l + r
+}
+
+/// Pass 2 leaf guard: drops this leaf's written output prefix on unwind.
+/// Raw pointer for the same Tree Borrows reason as `TryRefLeafGuard`.
+struct PlaceLeafGuard<R> {
+    out_ptr: *mut R,
+    written: usize,
+}
+
+impl<R> Drop for PlaceLeafGuard<R> {
+    fn drop(&mut self) {
+        // SAFETY: `written` reflects completed iterations at the unwind
+        // point; the borrowed input needs nothing.
+        unsafe {
+            for j in 0..self.written {
+                ptr::drop_in_place(self.out_ptr.add(j));
+            }
+        }
+    }
+}
+
+/// Pass 2: write leaf `leaf_base`'s survivors into the leaf's slice of the
+/// shared output buffer (`offsets`/`counts` from the scan). On unwind the
+/// leaf guard drops the written prefix; fully completed siblings' outputs
+/// leak when the root frees the buffer — the same accepted panic-path
+/// precedent as the index-try collect ("init slots may leak").
+fn place_filter_rec<'i, S, E>(
+    pool: &ComputePool,
+    input: &'i [E],
+    stages: &S,
+    output: &Slots<S::Output>,
+    start: usize,
+    end: usize,
+    splits_left: usize,
+    offsets: &[usize],
+    counts: &[usize],
+    leaf_base: usize,
+) where
+    S: FusedStage<&'i E> + Sync,
+    E: Sync,
+    S::Output: Send,
+{
+    if splits_left == 0 || end - start <= 1 {
+        let off = offsets[leaf_base];
+        let cnt = counts[leaf_base];
+        // SAFETY: this leaf owns the disjoint output range
+        // `[off, off + cnt)` exclusively; the slots are uninit.
+        let out_slice = unsafe { output.as_mut_slice(off, off + cnt) };
+        let in_ptr = input[start..end].as_ptr();
+        let out_ptr = out_slice.as_mut_ptr();
+        let mut g = PlaceLeafGuard { out_ptr, written: 0 };
+        for i in 0..(end - start) {
+            // SAFETY: shared read of input slot i (borrowed input, no moves).
+            let item = unsafe { &*in_ptr.add(i) };
+            if let Some(o) = stages.apply(item) {
+                // Bounds-checked store (NOT a raw write): a non-deterministic
+                // predicate that keeps more items in pass 2 than pass 1
+                // counted must panic here, not write past the leaf's slice.
+                out_slice[g.written] = o;
+                g.written += 1;
+            }
+        }
+        debug_assert_eq!(g.written, cnt);
+        // Success: disarm the cleanup Drop.
+        std::mem::forget(g);
+        return;
+    }
+    let mid = start + (end - start) / 2;
+    let left_leaves = split_leaf_count(mid - start, splits_left - 1);
+    pool.join(
+        || {
+            place_filter_rec(
+                pool,
+                input,
+                stages,
+                output,
+                start,
+                mid,
+                splits_left - 1,
+                offsets,
+                counts,
+                leaf_base,
+            )
+        },
+        || {
+            place_filter_rec(
+                pool,
+                input,
+                stages,
+                output,
+                mid,
+                end,
+                splits_left - 1,
+                offsets,
+                counts,
+                leaf_base + left_leaves,
+            )
+        },
+    );
+}
+
+/// Drive the two-pass count-then-place filter collect (see the section
+/// comment). `depth` is the same split budget the merge tree would use.
+fn fused_filter_collect_by_ref_ctp<'i, S, E>(
+    pool: &ComputePool,
+    input: &'i [E],
+    stages: &S,
+    depth: usize,
+) -> Vec<S::Output>
+where
+    S: FusedStage<&'i E> + Sync,
+    E: Sync,
+    S::Output: Send,
+{
+    let n = input.len();
+    let leaves = split_leaf_count(n, depth);
+    let counts: Vec<AtomicUsize> = (0..leaves).map(|_| AtomicUsize::new(0)).collect();
+    count_filter_rec(pool, input, stages, 0, n, depth, &counts, 0);
+
+    // Sequential scan over ≤ a few hundred leaf counts: offsets[i] is leaf
+    // i's start in the shared output buffer, total its exact length.
+    let mut total = 0;
+    let offsets: Vec<usize> = counts
+        .iter()
+        .map(|c| {
+            let o = total;
+            total += c.load(Ordering::Relaxed);
+            o
+        })
+        .collect();
+    let counts: Vec<usize> = counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+
+    let output = Slots::uninit(total);
+    place_filter_rec(pool, input, stages, &output, 0, n, depth, &offsets, &counts, 0);
+    // Every output slot is init (each leaf filled exactly its count).
+    output.into_vec()
+}
+
 // ── pub(crate) scoped entry point ──
 
 /// `pub(crate)` entry point for scoped pipelines. Identical dispatch logic to
@@ -3794,6 +4029,9 @@ where
     }
     let plan = SplitPlan::new(n, num_threads, workload);
     if S::MAY_FILTER {
+        if filter_ctp_enabled() {
+            return fused_filter_collect_by_ref_ctp(pool, input, &stages, plan.depth);
+        }
         join_fused_collect_by_ref(pool, input, &stages, 0, n, plan.depth)
     } else {
         let op = FusedOp(stages);
@@ -4066,6 +4304,46 @@ mod tests {
             .try_collect();
         let expected: Vec<i32> = (1..=1000).collect();
         assert_eq!(result.unwrap(), expected);
+    }
+
+    /// Count-then-place by-ref filter collect: identical output to the merge
+    /// tree across selectivity shapes, split depths (including depths that
+    /// hit the `len <= 1` early exit) and the empty-output edge (0%
+    /// survival → `Slots::uninit(0)`). Drives the ctp driver directly — the
+    /// env knob is a process-global `OnceLock` and is covered by the
+    /// same-binary knob A/B instead.
+    #[test]
+    fn test_filter_ctp_by_ref_matches_merge_tree() {
+        let pool = ComputePool::global();
+        let data: Vec<u64> = (0..10_007).collect();
+
+        // keep: all / none / ~1/3 — `(x + 1) % k == 0` after the first map.
+        for (name, keep) in [
+            ("all", 1u64),
+            ("none", 10_000),
+            ("third", 3),
+        ] {
+            let stages = SyncMap {
+                prev: Filter {
+                    prev: SyncMap { prev: Identity, f: |x: &u64| x + 1 },
+                    f: move |&x: &u64| x % keep == 0,
+                },
+                f: |x: u64| x * 2,
+            };
+            let expected: Vec<u64> = data
+                .iter()
+                .map(|&x| x + 1)
+                .filter(|&x| x % keep == 0)
+                .map(|x| x * 2)
+                .collect();
+
+            for depth in [0, 1, 6, 20] {
+                let merged = join_fused_collect_by_ref(pool, &data, &stages, 0, data.len(), depth);
+                let ctp = fused_filter_collect_by_ref_ctp(pool, &data, &stages, depth);
+                assert_eq!(merged, expected, "merge tree, keep={name} depth={depth}");
+                assert_eq!(ctp, expected, "count-then-place, keep={name} depth={depth}");
+            }
+        }
     }
 
     /// `nt_store_enabled`'s Auto tier: threshold math and eligibility. Runs
