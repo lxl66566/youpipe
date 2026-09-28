@@ -548,8 +548,11 @@ merging populations regresses monotonically with per-channel worker count
 so fusion only concentrates MPMC/collector contention. The async/fence rows
 are dominated by a bistable convoy pathology unrelated to fusion (a zero-CPU
 `bump.fence.bump` chain costs 226 ms @100K; the two-sync-prefix async chain
-samples bimodally 23↔244 ms) — tracked as todo P1 #4, with `fence_infra`
-kept in the family as the canary.
+samples bimodally 23↔244 ms) — with `fence_infra` kept in the family as the
+canary. Attributed 2026-09-29 (per-item park+wake trickle at
+serial-supplier→crowd channel interfaces; boundary matrix, perf/trace
+signatures and fix directions in [streaming.md](streaming.md) "Convoy
+collapse forensics", harness = `youpipe-bench` binary `convoy-probe`).
 
 ### Expand-Heavy — owned `Vec` vs push-style expansion (`expand_heavy`)
 

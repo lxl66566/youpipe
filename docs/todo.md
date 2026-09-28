@@ -76,9 +76,17 @@
   疑似 anchor+burst recv 的 convoy 双稳（recv-loop 注释记录过 8-worker
   形态）。async-only 链 83 ms 另受 feeder 单线程推送率限制（15–32 个
   sync 生产者并发推送时无此限制）。
-- 方向：hotpath / horizontal-counters 归因——mixed 通道背压唤醒风暴 vs
-  fence 批量释放节奏 vs burst-drain 争用塌缩；修复后再评估 2+ sync 前缀
-  的 async 链是否还需要形态侧缓解。
+- 方向：**已归因**（2026-09-29，`convoy-probe` harness，数据与结论见
+  dev/streaming.md "Convoy collapse forensics"）：根因是假设 3 的修正
+  形态——burst-drain 失效，串行供应者（feeder job / fence forwarder）→
+  ≥10–12 消费者人群的通道接口逐 item park+wake（~2 µs/item，80% 内核
+  调度器周期）；假设 1（mixed 通道背压）与假设 2（fence 批量节奏）证伪
+  （async 侧 `RegistryMulti` 异步 waker 扇出为放大器，与 todo #1 的
+  collector 侧逐 item park 同根）。修复候选（未实施）：worker recv 环
+  anchor 前自适应自旋（活动门控）/ forwarder 按 chunk 批量 send /
+  crossfire `SPIN_LIMIT`·`fire()` 扇出策略（fork 内，须活动门控）。
+  实施任一修复后用 `sync_fuse` 家族 + `convoy-probe` 边界矩阵复测，
+  再评估 2+ sync 前缀的 async 链是否还需形态侧缓解。
 - 验证：`sync_fuse` 家族（canary `fence_infra` + async/fence/cancel 形状）。
 
 ### 5. [P1] `ordered()` + `expand()`：批量 payload 方案
