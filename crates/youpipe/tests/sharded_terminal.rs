@@ -142,7 +142,7 @@ fn sharded_terminal_semantics() {
         })
         .run();
     assert!(
-        cancelled.len() <= n_cancel as usize,
+        cancelled.len() <= usize::try_from(n_cancel).unwrap(),
         "cancelled run returned {} items",
         cancelled.len()
     );
