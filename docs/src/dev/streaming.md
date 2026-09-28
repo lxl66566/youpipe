@@ -140,7 +140,7 @@ introduction.
 the 3-stage variant runs 36 ms, and a two-sync-prefix → `stage_async` chain
 flips between 23 and 244 ms across runs of the same shape (fusion-of-
 adjacent-sync-stages was falsified on this evidence; the pathology itself is
-tracked as todo P1 #3, canary `sync_fuse/fence_infra`).
+tracked as todo P1 #4, canary `sync_fuse/fence_infra`).
 
 ## Pool-wide parking lease (deadlock freedom across concurrent runs)
 
@@ -158,7 +158,7 @@ behind them in the injector FIFO — can never be popped. This was reproduced
 deterministically (4 barrier-aligned 2-stage runs, 5/5 hangs; gdb: every
 worker parked on `Tx::send`, collectors on `MpscReceiver::recv`, the fused
 victim on `LockLatch::wait`) and is one confirmed component of the
-intermittent `pipeline_integration` hang (todo P1 #2).
+intermittent `pipeline_integration` hang (todo P1 #14).
 
 The fix is a **pool-wide lease** (`Registry::parking_slots` +
 `ParkingLease` in `stream.rs`): before submitting its first job, a run

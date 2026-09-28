@@ -548,7 +548,7 @@ merging populations regresses monotonically with per-channel worker count
 so fusion only concentrates MPMC/collector contention. The async/fence rows
 are dominated by a bistable convoy pathology unrelated to fusion (a zero-CPU
 `bump.fence.bump` chain costs 226 ms @100K; the two-sync-prefix async chain
-samples bimodally 23↔244 ms) — tracked as todo P1 #3, with `fence_infra`
+samples bimodally 23↔244 ms) — tracked as todo P1 #4, with `fence_infra`
 kept in the family as the canary.
 
 ### Expand-Heavy — owned `Vec` vs push-style expansion (`expand_heavy`)
@@ -952,7 +952,7 @@ any other value panics (the `=off` trap above is now a loud failure).
 shrink toward the ±2 % noise floor where the balance gets
 machine-dependent; known write-once shapes below the threshold can
 force it on. The remaining occupancy deficit (~1–4 pt) stays tracked as
-todo P1 #2.
+todo P1 #3.
 ## Attributing the 2M/4M fused-collect gap (2026-09-25)
 
 Single-shape single-library runs of the horizontal binary itself

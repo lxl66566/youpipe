@@ -159,7 +159,7 @@ hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
 # Forwards to the vendored crossfire's `trace_log` (log::debug! per
 # send/recv/wake episode). Off by default: the log volume is huge and the
 # feature exists purely to instrument reproduction runs of intermittent
-# lost-wakeup hangs (todo P1 #2).
+# lost-wakeup hangs (todo P1 #14).
 crossfire-trace = ["crossfire/trace_log", "dep:log"]
 # ── Async runtime backend for streaming `.stage_async(..)` stages ──
 # The fused CPU path (`pipe` / `scope`) is fully sync and needs no backend.

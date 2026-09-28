@@ -18,7 +18,23 @@
 
 ## 性能
 
-### 1. [P1] zstd_shape 残余差距（capped/uniform 落后）
+### 1. [P0] streaming 终端通道扇入：collector 侧单点定速
+
+- 证据（2026-09-28 hotpath `stream-engine` 场景，youpipe-bench）：真实流引擎
+  1M×30 无序单级（x+1）每 item 端到端 ~365 ns，`drain_unordered` 占 wall
+  99.8%，而 worker 侧可见活动（sleep+no_work_found+find_work+steal）合计仅
+  0.4%——生产者几乎全程阻塞在 crossfire 内部（探针不可见），引擎被 collector
+  侧数据面单独定速，比通道裸容量（44–85 Melem/s）慢 ~20×。
+- 方向：两步——(a) 前置零风险：`handoff/channel.rs` 数据面探针（现有 72 探针
+  零覆盖 send/recv/try_recv）+ hotpath 补 ordered / for_each / fence /
+  async-stage 场景；(b) 主攻：per-worker SPSC 分片终通道 + collector 轮询
+  burst-drain，或 crossfire 批量 recv 接口。
+- 风险：MPSC 是当年 in-pipeline 剖析选出（MPMC recv 侧 CAS 主导，streaming.md
+  "MPSC Channels"），分片把复用开销移回 collector 侧；burst 边界泊车已证伪一次
+  （e1684fc→aa842a6，dead-ends.md）；stream 家族 ±10% 漂移，必须隔离交替。
+- 关联：#4（convoy 双稳）疑为同一数据面争用的形态侧表现，(a) 的探针两边复用。
+
+### 2. [P1] zstd_shape 残余差距（capped/uniform 落后）
 
 - 现状：wide-tier 边界 64→48 已落地（scheduler.md "Wide-tier boundary
   scan"，heavy-tail n=3000 vs-rayon 收至 +2.5%）；opt-in
@@ -33,7 +49,7 @@
   透传）；cheap 侧档位经算术核对不随边界变化（cpu_unbalanced n=200/5000
   均未跨 48）。
 
-### 2. [P1] fused 批间泊车/唤醒占用亏损（默认路径残余）
+### 3. [P1] fused 批间泊车/唤醒占用亏损（默认路径残余）
 
 - 现状：归因与收束记录见 benchmarks.md（"Attributing the 2M/4M
   fused-collect gap"、"NT-store attribution"）：空闲工人泊车 + futex 唤醒
@@ -47,9 +63,9 @@
 - 验证：`cpu_balanced` 1M/2M/4M 隔离 A/B + `horizontal-counters`（youpipe-bench）
   复查 task-clock / ctx-switch / migration。
 
-### 3. [P1] streaming 多种群交接的吞吐塌缩（sync→async / fence）
+### 4. [P1] streaming 多种群交接的吞吐塌缩（sync→async / fence）
 
-- 现状（2026-09-29，由相邻 sync 融合证伪 bench 发现，数据见
+- 现状（2026-09-28，由相邻 sync 融合证伪 bench 发现，数据见
   dead-ends.md「streaming 相邻 sync stage 编译期自动融合」）：
   `stage(f1).stage(f2).stage_async(g)` @100K 独立进程稳定 ~237 ms
   （2.4 µs/item），而单 sync 前缀 25.9 ms、手动复合前缀 24.0 ms；同形状
@@ -65,7 +81,7 @@
   的 async 链是否还需要形态侧缓解。
 - 验证：`sync_fuse` 家族（canary `fence_infra` + async/fence/cancel 形状）。
 
-### 4. [P1] `ordered()` + `expand()`：批量 payload 方案
+### 5. [P1] `ordered()` + `expand()`：批量 payload 方案
 
 2026-10 设计分析确认三条硬约束，实现前必须先解决（详见 dev/core-types.md
 对应记录）：
@@ -86,7 +102,7 @@
 顺带收益：与 crossfire per-thread waker（设计 C，dev/crossfire-waker-designs.md
 §11）叠加后每组的 channel hop 数减少。
 
-### 5. [P1] StageOptions 类型分裂与零值语义统一
+### 6. [P1] StageOptions 类型分裂与零值语义统一
 
 - **无效旋钮静默忽略**：`workers` 对 async stage 无意义（async 扇出只读
   `io_concurrency`/`buffer`）、`io_concurrency` 对 sync stage 无意义——
@@ -100,14 +116,14 @@
   （六处 `.max(1)`），与 `Workload::Custom(NonZeroUsize)` 的纪律不一致。
   统一为 assert! 或 NonZero 入参，一次 breaking 收敛。
 
-### 6. [P1] 取消的部分输出语义
+### 7. [P1] 取消的部分输出语义
 
 取消时 feeder/worker break，collector 排干通道即返回——中途取消产出静默
 截断的 `Vec`，与正常短 run 不可区分；`run()` / `for_each` / `with_cancel`
 均未文档化。至少补文档；更优：`RunOutcome` 或 `try_run_checked` 报告
 `Cancelled { emitted }`（collector 排干后查 token 即可）。
 
-### 7. [P2] API 小项包
+### 8. [P2] API 小项包
 
 - `StreamPipe` 缺 `with_workload`：纯 sync 链 pass-through 到 fused 路径
   时会读 `config.workload`，目前唯一入口 `with_config` 是整体替换；
@@ -127,7 +143,7 @@
 
 ## 代码健康（重构/坏味道）
 
-### 8. [P1] 终端 prologue 十处复制
+### 9. [P1] 终端 prologue 十处复制
 
 `n==0` 短路 → `resolve_exec_pool` → `prefers_serial` 串行回退（含
 MAY_FILTER 分派）→ `SplitPlan::new` → MAY_FILTER 两路核心选择——同一序列
@@ -136,7 +152,7 @@ scoped 三件、by_ref 三件、`fused_pass_collect`）。split 策略或串行�
 就要改十处。抽 `terminal_plan(n, config, pool) -> Plan { Serial, Parallel(
 SplitPlan) }` + 共享串行回退 helper；prologue 每 run 一次，零热路径风险。
 
-### 9. [P1] StageSpawn 五路 spawn 体 × 四 stage 类型
+### 10. [P1] StageSpawn 五路 spawn 体 × 四 stage 类型
 
 每 stage 类型手写 `spawn`/`spawn_single`/`spawn_for_async`/
 `spawn_async_feeder`/`spawn_async_feeder_single`，~15 个近同体（stream.rs
@@ -150,7 +166,7 @@ Mpsc/MixedAsync），每 stage 一个泛型 `spawn_into`，五方法变单行委
 收编 `_single` 孪生。回归防护（try_exec 的终端 Single-variant debug_assert）
 重构期作安全网。
 
-### 10. [P1] 六 builder × 五 setter 复制
+### 11. [P1] 六 builder × 五 setter 复制
 
 Pipe/TryPipe/PipeRef/TryPipeRef/ScopedPipe/ScopedTryPipe 各手抄
 `with_config`/`with_workload`/`with_compute_workers`/`with_compute_pool`/
@@ -159,7 +175,7 @@ Pipe/TryPipe/PipeRef/TryPipeRef/ScopedPipe/ScopedTryPipe 各手抄
 有记录）。抽内部 `ExecOptions { config, compute_pool, oversubscribe }` 被
 move 进各 builder + setter 宏，加字段只改一处。
 
-### 11. [P2] 死代码清理
+### 12. [P2] 死代码清理
 
 pool/mod.rs 模块级 `#![allow(dead_code)]`（"Scope/spawn infrastructure not
 yet wired"）已掩盖真死代码（repo 内零调用者，2026-09 核实）：`spawn_static`
@@ -169,7 +185,7 @@ yet wired"）已掩盖真死代码（repo 内零调用者，2026-09 核实）：
 `CancellationToken::reset`（sync/cancel.rs，仅自测调用；复活 token 对在飞
 worker 是脚枪）。删项后摘掉模块级 allow，让编译器重新把关。
 
-### 12. [P2] 正确性相邻与杂项
+### 13. [P2] 正确性相邻与杂项
 
 - `FenceBarrier::reuse` 对非空批仅 debug_assert，release 静默丢弃——改
   total API（非空时 append 回 buffer）消灭契约；
@@ -198,3 +214,13 @@ worker 是脚枪）。删项后摘掉模块级 allow，让编译器重新把关�
   （应为 `StageSpawn::has_expand`）；`stage_buffer` floor 措辞
   "downstream_workers * 4" 与调用点传本 stage 自身 worker 数不符
   （stream.rs 两处）。
+
+### 14. [P1] `pipeline_integration` 间歇性 hang 残余
+
+- 现状：pool-wide parking lease（74211b1）修复了确定的并发预算成分后，hang
+  仍偶发（2026-09-28 又一次：并行 cargo test 下某测试二进制 107 线程全部
+  futex wait、13 分钟 0 CPU，kill 后其余测试正常）。Cargo.toml 的
+  `crossfire-trace` feature 即为其取证插桩。
+- 方向：复现时用 `crossfire-trace` + gdb 取证（lost-wakeup 假设优先）；关注
+  fence pool-job 化（41e0a6a）后的新交互面。
+- 验证：并行 harness 反复跑 `pipeline_integration`；无确定性复现前不动代码。

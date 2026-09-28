@@ -1791,7 +1791,7 @@ fn test_compute_workers_pin_survives_compute_pool() {
 
 // ── Streaming liveness: worker budget vs pool size ──
 
-/// Regression (the intermittent `pipeline_integration` hang, todo P1 #2):
+/// Regression (the intermittent `pipeline_integration` hang, todo P1 #14):
 /// the streaming run's liveness budget was computed per run against the
 /// **full** pool, so concurrent full-budget runs on a shared pool jointly
 /// oversubscribed it — every worker parked on a full/empty inter-stage
