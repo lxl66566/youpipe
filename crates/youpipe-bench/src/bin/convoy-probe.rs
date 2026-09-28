@@ -201,6 +201,10 @@ fn run_shape(c: &Cfg, data: &[u64], tokio_handle: Option<&tokio::runtime::Handle
         pipe
     };
     let r: Vec<u64> = match c.shape.as_str() {
+        // The strongest sharded-terminal shape (sharded_term/single_*): one
+        // stage, streaming forced by the cancel token — the terminal fan-in
+        // data plane dominates (todo #1 soak cell).
+        "single" => pipe.with_cancel(never).stage_with(opts, f).run(),
         // Known-fast anchor: two sync populations, streaming forced by the
         // cancel token (fused pass-through declines).
         "sync2" => pipe
@@ -258,7 +262,7 @@ fn run_shape(c: &Cfg, data: &[u64], tokio_handle: Option<&tokio::runtime::Handle
                 )
                 .run()
         },
-        other => panic!("unknown shape {other:?} (sync2|fence|fence3|async2|async1|async0)"),
+        other => panic!("unknown shape {other:?} (single|sync2|fence|fence3|async2|async1|async0)"),
     };
     let dt = t0.elapsed().as_secs_f64() * 1e3;
     (r.len(), dt)
