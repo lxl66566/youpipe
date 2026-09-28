@@ -204,8 +204,129 @@ introduction.
 `stage(bump).fence(Chunked(500)).stage(bump)` chain runs 226 ms @100K while
 the 3-stage variant runs 36 ms, and a two-sync-prefix → `stage_async` chain
 flips between 23 and 244 ms across runs of the same shape (fusion-of-
-adjacent-sync-stages was falsified on this evidence; the pathology itself is
-tracked as todo P1 #4, canary `sync_fuse/fence_infra`).
+adjacent-sync-stages was falsified on this evidence; canary
+`sync_fuse/fence_infra`). Fully attributed 2026-09-29 — see the next
+section.
+
+### Convoy collapse forensics (`convoy-probe`, 2026-09-29)
+
+The bistability above is attributed with a dedicated harness
+(`crates/youpipe-bench/src/bin/convoy-probe.rs`): one shape × R in-process
+runs, per-run wall time plus per-thread `/proc` context-switch deltas
+grouped by thread name (`yp-pool` = stage workers / feeder / forwarder,
+`tokio-worker`, `main`), optional crossfire episode dump
+(`--features crossfire-trace` + `CONVOY_TRACE_PATH`). Calibre: 100 K `u64`
+items, `taskset -c 1-31` (pool = 31 threads), 8 runs per cell; bistable
+cells report min–max because the median is a mode mixture that shifts
+across processes. "parks/run" = voluntary switches of the `yp-pool` group —
+the futex-park proxy.
+
+**The collapsed regime is a per-item park+wake trickle, not a contention
+meltdown.** Signatures of the slow mode (`stage(bump).fence(Chunked(500))
+.stage(bump)`, 14+14 workers, ~208 ms median):
+
+- ~195 K voluntary parks per run ≈ **2 per item**; the collector parks
+  ~1 K/run. The surgical cells pin it exactly: `--w1 1 --w2 20`
+  (1.19 µs/item) shows **100.5 K parks/run = one park + one crossfire
+  `fire()` wake per item** on the fence-output channel (1 serial producer →
+  20 parked consumers); `--w1 20 --w2 1` shows 232 parks/run — the
+  zero-park pipelined regime.
+- perf stat per run: 170 K context-switches, 2 037 cpu-migrations,
+  9.2 G cycles / 3.9 G instructions (IPC 0.42), vs the fast cell's
+  938 / 16 / 2.3 G / 0.35 G. perf record: **80.6 % of cycles in the kernel
+  scheduler** (futex wake/wait, `yield_task_fair`, `select_task_rq_fair`);
+  top user symbols: crossfire `blocking_tx::Tx<mpmc::Array>::send` 7.9 %,
+  youpipe `SyncReceiver::try_recv`/`recv` 3.7 / 3.0 %, `parking_lot
+  RawMutex::lock_slow` 1.0 % (the `RegistryMulti` waker-queue mutex).
+- crossfire-trace episode classes (n = 2 000, tracing itself distorts
+  timing — only the class mix is usable): anchor `recv` entered ~1.9×/item,
+  real parks ~2×/item, `wake rx` 1.7×/item, `wake tx` ~0.02×/item —
+  producers essentially never park on `Full`; **bursts never form** (the
+  anchor is re-entered before the burst `try_recv` ever sees a second
+  item).
+
+Mechanism: crossfire's blocking recv parks after a fixed 6-PAUSE spin
+(`Backoff::SPIN_LIMIT`, crossfire `backoff.rs`) — far shorter than any
+inter-arrival gap set by a parked serial neighbour (~1–2 µs wake RTT).
+Whenever a channel's supply side is a single rate-limited entity (feeder
+job, fence forwarder) and its demand side is a crowd (≳ 10–12 workers),
+the channel hovers empty, every arrival wakes one-of-many parked consumers,
+and the wake RTT becomes the pipeline's clock: wall ≈ items × RTT
+(100 K × ~2 µs ≈ 200 ms). Each additional serial-supplier→crowd interface
+adds one more park per item (the 14+14 default has two — feeder→stage1 and
+forwarder→stage2 — hence 2/item).
+
+Boundary matrix (fence shape, medians in ms; w1/w2 = stage workers around
+the fence; "auto" = 14/14):
+
+| cell | med | note |
+| --- | --- | --- |
+| w1/w2 = 20/1, 24/1 | 25–28 | zero-park; upstream population irrelevant |
+| 1/1, 2/2, 4/4, 8/8 | 5–31 | fast (process-to-process spread at the small end) |
+| 9/9 → 14/14 (auto) | 49 → 209 | cliff on **w2** ≈ 10–13, not on w1 |
+| 1/15, 1/20, 1/24 | 35 → 113 | slow via the fence-output crowd alone |
+| 15/15, 16/16 (both dedicated mode) | 209, 50 | pool and dedicated both collapse |
+| chunk 1/10/64/500/5000/Barrier @14/14 | 189–225 | batch rhythm irrelevant |
+| per-stage buffer 64…4096 @14/14 | 203–211 | depth of every non-feeder channel irrelevant |
+| per-stage buffer 16 384 / config 4096 | 75 / 71 | partial: fast mode returns (min ≈ 22), unstable mixture |
+| buffer = n (feeder inline) | 25 | fully rescued |
+| `--cost cpu` @14/14 vs 8/8 | 210 / 12.5 | CPU work neither triggers nor rescues |
+
+async family (`stage(f1).stage(f2).stage_async(g)`): collapses from a
+smaller total than the fence family — 4+4 bimodal 26↔175 across processes,
+8+8 ≈ 200, auto 15+15 ≈ 230, and **every asymmetry stays slow** (15/1 =
+151, 1/8 = 228, 8/2 = 118): both the feeder→stage1 crowd and the
+mixed-mode channel's async waker fan-out contribute (`io_concurrency` = 128
+tasks register in one `RegistryMulti`; a `fire()` wake fans out to the
+whole queued crowd), and the async terminal adds a collector-side park
+stream (main ≈ 2.2 parks/item in slow runs — the todo #1 signature). The
+immune references: single sync prefix `.stage(f).stage_async(g)` = 26 ms,
+async-only = 79 ms (feeder-paced), and pure sync 15→15 (`sync2` anchor) =
+22.8 ms with **31 parks/run at full pool occupancy** — balanced populations
+keep a backlog, so consumer bursts always re-form and nobody parks.
+
+Bistability seeding is cross-run pool state: 500 ms idling between runs
+restores the fast mode (median 21 ms); back-to-back runs stay collapsed;
+fresh processes mostly start collapsed (independent-process medians
+239/164/155 ms).
+
+Hypothesis verdicts (todo #4):
+
+1. **mixed-channel backpressure wake storm — falsified as the root cause**:
+   the fence family reproduces the full pathology with no async anywhere;
+   the mixed channel's async `RegistryMulti` fan-out is an amplifier in the
+   async shape, not the common denominator (single-prefix async chains are
+   fast).
+2. **fence `Chunked` release rhythm — falsified**: chunk sweep is flat.
+3. **burst-drain contention collapse — confirmed in corrected form**: the
+   pathology is burst-drain *failing to engage* — no bursts ever form, so
+   there is nothing for the burst winners to drain; the collapse is one
+   park + one wake per item at every serial-supplier→crowd interface.
+
+Fix directions (candidates, not implemented): (a) **pre-anchor adaptive
+spin** in the youpipe recv loops (`spawn_stage` / `spawn_expand_stage` /
+`forward_fenced`): before the blocking `recv()`, spin on `try_recv` for a
+bounded budget gated on recent channel activity, so consumers ride out
+trickle gaps and bursts re-form while genuinely idle stages still park —
+attacks both interfaces of the fence shape and the worker side of the async
+shape; (b) **forwarder batch-send**: let the fence forwarder push a
+released chunk with `try_send` and park at most once per chunk boundary,
+removing the fence-output interface's per-item send parks; (c)
+crossfire-level: a larger pre-park spin for blocking recv or a wake-one
+(not wake-all-queued) `fire()` policy in `RegistryMulti` — the fork is
+in-repo, but global backoff widening is a falsified pattern in the pool
+context (dead-ends.md), so any widening must be activity-gated rather than
+a constant.
+
+Same-root notes: todo #1 (terminal fan-in) is the collector-side face of
+the same serial-endpoint × crowd park/wake economy — the 2.2
+collector-side parks/item in slow async runs are exactly the
+`drain_unordered` occupancy reported there, so a sharded terminal channel
+(#1) and a pre-anchor spin (#4a) fix opposite ends of one pathology. The
+`yield_now()` crossfire performs after every full-channel send completion
+(`blocking_tx::return_ok!`) supplies the scheduler churn seen under strace
+(~16 `sched_yield` per item in slow runs) and is worth keeping in mind for
+the #14 hang forensics.
 
 ## Pool-wide parking lease (deadlock freedom across concurrent runs)
 
