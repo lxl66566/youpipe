@@ -108,9 +108,6 @@ worker 同形，计入 parking lease），dedicated 模式保留线程；顺带�
 
 ### 8. [P2] API 小项包
 
-- **文档失实（快修）**：`Workload::Unbalanced` 文档说 "Always 8× oversplit"
-  （builder/config.rs 两处），实际 `unbalanced_oversplit()` 默认 32
-  （fused.rs，`YOUPIPE_OVERSPLIT` 可调）；
 - `StreamPipe` 缺 `with_workload`：纯 sync 链 pass-through 到 fused 路径
   时会读 `config.workload`，目前唯一入口 `with_config` 是整体替换；
 - `Pipe::filter` 缺 `map` 有的 `O: Send + 'static` bound——非 Send 输出
@@ -173,12 +170,6 @@ worker 是脚枪）。删项后摘掉模块级 allow，让编译器重新把关�
 
 ### 13. [P2] 正确性相邻与杂项
 
-- **ReorderBuffer 窗口溢出静默丢数据**：`insert` 慢路径里 slot 被占且
-  tag 不同（两 seq 别名同槽 = 容量前置被超）时，debug/release 均无信号、
-  直接丢旧项（state/reorder.rs；重复 seq 分支有 debug_assert，别名分支没
-  有）。窗口 clamp 上限 1 Mi，深乱序可达。扩 debug_assert 覆盖别名分支 +
-  release 侧 `dropped` 计数器，collector 校验 `collected + dropped ==
-  expected`；
 - `FenceBarrier::reuse` 对非空批仅 debug_assert，release 静默丢弃——改
   total API（非空时 append 回 buffer）消灭契约；
 - feeder-slot 预测 `n > buffer_size.max(4)` 手抄了 buffer floor

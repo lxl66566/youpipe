@@ -29,10 +29,13 @@ struct Slot<T> {
 /// The buffer uses power-of-two masking, so sequence numbers are mapped to
 /// slots via `seq & mask`. If the number of *simultaneously outstanding*
 /// (un-flushed) items ever exceeds `capacity`, two distinct sequence numbers
-/// alias the same slot and the older item is **silently dropped**. Callers
-/// must size the buffer to at least the maximum out-of-order window. The
-/// streaming collectors clamp the window to `[1 Ki, 1 Mi]` slots, which is
-/// ample for realistic worker counts.
+/// alias the same slot and the older item is **dropped**. Callers must size
+/// the buffer to at least the maximum out-of-order window. The streaming
+/// collectors clamp the window to `[1 Ki, 1 Mi]` slots, which is ample for
+/// realistic worker counts. Every such drop is counted ([`Self::dropped`])
+/// and asserted in debug builds, so an overflow can no longer go unnoticed;
+/// the ordered collectors additionally validate `emitted + dropped ==
+/// expected` after the drain (see `state::stream`).
 ///
 /// The slot array is allocated lazily on the first out-of-order arrival: an
 /// in-order stream (the common case) never touches it, so constructing the
@@ -42,6 +45,11 @@ pub struct ReorderBuffer<T> {
     next_expected: u64,
     len: usize,
     mask: usize,
+    /// Items dropped by an occupied-slot overwrite (window-overflow alias or
+    /// duplicate seq). A plain `usize`: the buffer is confined to the single
+    /// collector thread (`insert_into`/`flush_*` all take `&mut self` from
+    /// the drain loops), so no atomic is needed on the hot path.
+    dropped: usize,
 }
 
 impl<T> ReorderBuffer<T> {
@@ -56,6 +64,7 @@ impl<T> ReorderBuffer<T> {
             next_expected: 0,
             len: 0,
             mask: cap - 1,
+            dropped: 0,
         }
     }
 
@@ -110,11 +119,27 @@ impl<T> ReorderBuffer<T> {
             // contract, e.g. `expand`) or — with a different tag — the
             // capacity precondition violated (outstanding window >
             // capacity, two seqs aliasing one slot). The older item is
-            // dropped to avoid a leak; see the type-level doc.
-            debug_assert_ne!(
-                slot.tag, tag,
-                "duplicate seq {seq} — ReorderBuffer is single-item-per-seq; use without `expand`"
-            );
+            // dropped to avoid a leak and counted either way, keeping the
+            // collector's `emitted + dropped == expected` accounting closed
+            // (see `dropped`); see the type-level doc.
+            if slot.tag == tag {
+                debug_assert!(
+                    false,
+                    "duplicate seq {seq} — ReorderBuffer is single-item-per-seq; use without \
+                     `expand`"
+                );
+            } else {
+                // `slot.tag - 1` (the resident seq) is computed inline: a
+                // `let` binding would be unused in release builds.
+                debug_assert!(
+                    false,
+                    "seq {seq} aliases seq {} in slot {idx} — outstanding window exceeded \
+                     capacity {}; the older item was dropped",
+                    slot.tag - 1, // tag != UNOCCUPIED, so no underflow
+                    self.slots.len()
+                );
+            }
+            self.dropped += 1;
             unsafe { slot.item.assume_init_drop() };
             self.len -= 1;
         }
@@ -207,6 +232,14 @@ impl<T> ReorderBuffer<T> {
         self.next_expected
     }
 
+    /// Items dropped by occupied-slot overwrites so far (window-overflow
+    /// alias or duplicate seq). Release builds expose the count without
+    /// panicking; debug builds additionally assert at the drop site.
+    #[must_use]
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
     pub fn reset(&mut self) {
         for slot in &mut self.slots {
             if slot.tag != UNOCCUPIED {
@@ -216,6 +249,7 @@ impl<T> ReorderBuffer<T> {
         }
         self.len = 0;
         self.next_expected = 0;
+        self.dropped = 0;
     }
 }
 
@@ -314,6 +348,29 @@ mod tests {
         assert_eq!(buf.insert(3, 30), Vec::<i32>::new());
         assert_eq!(buf.insert(1, 10), Vec::<i32>::new());
         assert!(buf.len() <= 2);
+    }
+
+    /// Window smaller than the reorder span: seqs 3 and 1 alias slot 1 of a
+    /// 2-slot window (3 & 1 == 1 & 1 == 1). The older item (seq 3) must be
+    /// counted as dropped, and the accounting `emitted + dropped == inserted`
+    /// must close — the invariant the ordered collector validates per run.
+    #[test]
+    fn test_alias_drop_is_counted() {
+        let mut buf = ReorderBuffer::<i32>::new(2);
+        let mut out = Vec::new();
+        let inserted = 3;
+        buf.insert_into(0, 10, &mut |i| out.push(i)); // fast path, emitted
+        buf.insert_into(3, 30, &mut |i| out.push(i)); // buffered in slot 1
+        assert_eq!(buf.dropped(), 0);
+        buf.insert_into(1, 20, &mut |i| out.push(i)); // aliases seq 3 — old item dropped
+        assert_eq!(buf.dropped(), 1);
+        for item in buf.flush_remaining() {
+            out.push(item);
+        }
+        // seq 3's item (30) is gone; 0, 1 were emitted; 3 never re-inserted.
+        assert_eq!(out, vec![10, 20]);
+        assert_eq!(out.len() + buf.dropped(), inserted);
+        assert!(buf.is_empty());
     }
 
     /// The slot array stays unallocated while arrivals are in order: the

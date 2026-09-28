@@ -11,6 +11,9 @@
 //! #   hotpath-profile [size] [heavy|light] [iters]
 //! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- 10000 heavy 200
 //! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- 1000000 light 20
+//!
+//! # true streaming engine (defeat the fused pass-through — see run_stream_engine):
+//! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- stream-engine 1000000 30
 //! ```
 //!
 //! For machine-readable output (A/B comparisons), override without touching the
@@ -65,6 +68,19 @@ fn main() {
                 .unwrap_or(100);
             run_stream(size, iters);
         },
+        Some("stream-engine") => {
+            let size: usize = args
+                .get(2)
+                .map(String::as_str)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000);
+            let iters: usize = args
+                .get(3)
+                .map(String::as_str)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100);
+            run_stream_engine(size, iters);
+        },
         Some(size) => {
             let size: usize = size.parse().expect("size must be a usize");
             let light = args.get(2).map(String::as_str) == Some("light");
@@ -104,6 +120,28 @@ fn run_stream(size: usize, iters: usize) {
         black_box(out);
     }
     println!("ran stream size={size} iters={iters}");
+}
+
+/// True-streaming-engine scenario: identical shape to `run_stream` but with a
+/// dormant `CancellationToken`. The pure-sync `stream()` chain would otherwise
+/// ride the fused pass-through (`fuse_exec` eligibility excludes any cancel
+/// token), so the feeder / crossfire channels / stage workers / collector
+/// drain would never execute and the hotpath report would show only the fused
+/// core. The token is never fired; its per-item atomic load is the price of
+/// keeping the streaming path observable.
+fn run_stream_engine(size: usize, iters: usize) {
+    let token = CancellationToken::new();
+    let data: Vec<u64> = (0..size as u64).collect();
+    for _ in 0..iters {
+        let v = data.clone();
+        let out: Vec<u64> = v
+            .stream()
+            .with_cancel(token.clone())
+            .stage(|x: u64| black_box(x.wrapping_add(1)))
+            .run();
+        black_box(out);
+    }
+    println!("ran stream-engine size={size} iters={iters}");
 }
 
 fn run_focused(size: usize, light: bool, iters: usize) {

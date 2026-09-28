@@ -9,8 +9,9 @@
 /// - `Balanced` — items cost roughly the same. Little stealing slack is needed, so oversplit is
 ///   adaptive (`1` for small batches, `4` for large). Right default for the vast majority of
 ///   workloads.
-/// - `Unbalanced` — a few items are far slower than the rest (skewed tail). Always `8×` oversplit
-///   so an idle worker can steal a slow sibling's remaining leaves, shrinking tail latency.
+/// - `Unbalanced` — a few items are far slower than the rest (skewed tail). Always `32×` oversplit
+///   (runtime-tunable via the `YOUPIPE_OVERSPLIT` env var) so an idle worker can steal a slow
+///   sibling's remaining leaves, shrinking tail latency.
 /// - `Custom(factor)` — pick the oversplit factor yourself. `Custom(1)` is the coarsest tree (one
 ///   leaf per worker, minimal dispatch overhead); `Custom(16)` is very fine-grained stealing for
 ///   extreme skew. The useful envelope on large machines is roughly `4..=16`.
@@ -35,8 +36,9 @@ pub enum Workload {
     /// Adaptive oversplit (see above). Right choice for most workloads.
     #[default]
     Balanced,
-    /// Always `8×` oversplit. Costs more dispatch overhead per batch, so only
-    /// opt in when the tail is genuinely uneven.
+    /// Always `32×` oversplit (`YOUPIPE_OVERSPLIT` env override). Costs more
+    /// dispatch overhead per batch, so only opt in when the tail is genuinely
+    /// uneven.
     Unbalanced,
     /// Manual oversplit factor, independent of batch size.
     Custom(std::num::NonZeroUsize),

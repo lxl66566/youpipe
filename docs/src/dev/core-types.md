@@ -6,7 +6,7 @@
 ```rust
 pub enum Workload {
     Balanced,               // default; adaptive oversplit (1× for small batches, 4× for large)
-    Unbalanced,             // 8× oversplit for finer-grained stealing of skewed tails
+    Unbalanced,             // 32× oversplit (YOUPIPE_OVERSPLIT-overridable) for skewed tails
     Custom(NonZeroUsize),   // pin the oversplit factor manually
 }
 ```
@@ -22,8 +22,9 @@ streaming stages). It selects the fork/join oversplit factor
   fork/join dispatch overhead for stealing slack it does not need; above that
   threshold it uses 4×.
 - `Unbalanced` — a few items are far slower than the rest (skewed tail). Always
-  uses 8× oversplit so an idle worker can steal a slow sibling's remaining
-  leaves, shrinking tail latency. Opt in only when the tail is genuinely uneven.
+  uses 32× oversplit (runtime-tunable via the `YOUPIPE_OVERSPLIT` env var) so an
+  idle worker can steal a slow sibling's remaining leaves, shrinking tail
+  latency. Opt in only when the tail is genuinely uneven.
 - `Custom(n)` — pin the oversplit factor regardless of batch size: full manual
   control for benchmarking or known-skew profiles outside the two presets
   (`1` = coarsest tree, `16` = very fine-grained stealing).
