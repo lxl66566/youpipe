@@ -526,6 +526,31 @@ per-run setup cost (feeder, channel allocation, runtime entry) is a
 larger fraction of the ~9 ms total, so tokio's simpler spawn-per-item model
 still leads there.
 
+### Adjacent-sync fusion A/B (`sync_fuse`, 2026-09-29)
+
+Evidence bench for the falsified "fuse adjacent sync stages in streaming
+topology" idea (verdict + probe data in dead-ends.md). Same-binary knob A/B
+(`YOUPIPE_SYNC_FUSE_VARIANT=split|merged`, 5 per-id isolated interleaved
+rounds, median): `split` runs the sync stages as separate worker populations,
+`merged` hand-composes them into one closure — identical async/fence/cancel
+tails on both sides.
+
+| shape              | split @1K | merged @1K | split @100K | merged @100K |
+| ------------------ | --------- | ---------- | ----------- | ----------- |
+| cancel_pair_cpu    | 279 µs    | 317 µs     | 24.6 ms     | 29.8 ms     |
+| cancel_quad_cpu    | 260 µs    | 315 µs     | 22.2 ms     | 29.9 ms     |
+| async_pair_cpu     | 482 µs    | 521 µs     | 236.9 ms    | 25.1 ms     |
+| fence_pair_cpu     | 1.17 ms   | 1.64 ms    | 36.2 ms     | 209.1 ms    |
+
+Stable-regime rows (pure-sync chains forced onto streaming by `with_cancel`):
+merging populations regresses monotonically with per-channel worker count
+(8 W → 222 ns/item, 16 W → 246 ns, 31 W → 298 ns) — channel hops pipeline,
+so fusion only concentrates MPMC/collector contention. The async/fence rows
+are dominated by a bistable convoy pathology unrelated to fusion (a zero-CPU
+`bump.fence.bump` chain costs 226 ms @100K; the two-sync-prefix async chain
+samples bimodally 23↔244 ms) — tracked as todo P1 #3, with `fence_infra`
+kept in the family as the canary.
+
 ### Expand-Heavy — owned `Vec` vs push-style expansion (`expand_heavy`)
 
 Matrix: fan-out ∈ {4, 64} × cost ∈ {cheap, cpu} at 10 K inputs; throughput
