@@ -376,6 +376,28 @@ impl<T: Send + 'static> RecvItem<T> for SyncReceiver<T> {
     }
 }
 
+/// `try_recv`-only subset shared by the sync and async MPSC receivers, so
+/// the sharded terminals' round-robin burst pass (`ShardSet::drain_pass`)
+/// is written once for both flavours (the full `RecvItem` cannot cover the
+/// async side: its `recv` returns a future, not a blocking call).
+pub trait TryRecvItem<T> {
+    fn try_recv(&self) -> Result<T, TryRecvError>;
+}
+
+impl<T: Send + 'static> TryRecvItem<T> for MpscReceiver<T> {
+    #[inline]
+    fn try_recv(&self) -> Result<T, TryRecvError> {
+        MpscReceiver::try_recv(self)
+    }
+}
+
+impl<T: Send + Unpin + 'static> TryRecvItem<T> for MpscAsyncReceiver<T> {
+    #[inline]
+    fn try_recv(&self) -> Result<T, TryRecvError> {
+        MpscAsyncReceiver::try_recv(self)
+    }
+}
+
 /// Async counterpart to [`RecvItem`]: `recv().await` and `try_recv`. Both
 /// [`AsyncReceiver`] (MPMC) and [`MpscAsyncReceiver`] (MPSC) implement this
 /// so the async collector can drain either backing with one implementation,

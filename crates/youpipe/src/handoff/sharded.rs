@@ -17,8 +17,17 @@
 //! stream ends when every shard has closed — a worker that exits early (or
 //! panics and drops its sender mid-run) merely closes its own shard while
 //! the others keep flowing.
+//!
+//! Two flavours over one [`ShardSet`] core: the sync flavour
+//! ([`sharded_mpsc_channel`]) serves sync/expand terminals; the async
+//! flavour ([`sharded_mpsc_async_channel`]) serves the async terminal whose
+//! producers are runtime tasks sending via `send().await` (todo #1
+//! residual (c)).
 
-use super::channel::{ChannelError, MpscReceiver, MpscSender, TryRecvError, mpsc_channel};
+use super::channel::{
+    ChannelError, MpscAsyncReceiver, MpscAsyncSender, MpscReceiver, MpscSender, TryRecvError,
+    TryRecvItem, mpsc_async_channel, mpsc_channel,
+};
 
 /// Minimum per-shard capacity. Below this the ring degenerates into a
 /// producer/consumer ping-pong (park on every `Full`), which the
@@ -45,19 +54,64 @@ pub fn sharded_mpsc_channel<T: Send + 'static>(
         txs.push(tx);
         rxs.push(rx);
     }
-    (txs, ShardedReceiver {
-        rxs,
-        closed: vec![false; shards],
-        cursor: 0,
-        open: shards,
-    })
+    (
+        txs,
+        ShardedReceiver {
+            inner: ShardSet {
+                rxs,
+                closed: vec![false; shards],
+                cursor: 0,
+                open: shards,
+            },
+        },
+    )
 }
 
-/// Sole consumer of a [`sharded_mpsc_channel`]: owns all shard receivers and
-/// aggregates them into one logical stream. **Not `Clone`** — single
-/// consumer, same contract as [`MpscReceiver`].
-pub struct ShardedReceiver<T: Send + 'static> {
-    rxs: Vec<MpscReceiver<T>>,
+/// Create `shards` independent bounded async MPSC channels presenting one
+/// logical fan-in — the async-terminal flavour of [`sharded_mpsc_channel`].
+/// The producers are runtime tasks (`io_concurrency` of them) sending via
+/// [`MpscAsyncSender::send`](super::channel::MpscAsyncSender::send).await.
+///
+/// Unlike the sync constructor, senders here MAY be shared by several tasks:
+/// the caller caps `shards` at the runtime's worker-thread count (only that
+/// many tasks can send concurrently), so a large-`io_concurrency` stage has
+/// each shard shared by `io_concurrency / shards` tasks — per-ring
+/// contention drops from `io_concurrency`-way to that quotient while the
+/// collector's pass cost stays bounded by `shards`.
+#[must_use]
+pub fn sharded_mpsc_async_channel<T: Send + Unpin + 'static>(
+    shards: usize,
+    total_capacity: usize,
+) -> (Vec<MpscAsyncSender<T>>, ShardedAsyncReceiver<T>) {
+    let per = (total_capacity / shards.max(1)).max(MIN_SHARD_BUFFER);
+    let mut txs = Vec::with_capacity(shards);
+    let mut rxs = Vec::with_capacity(shards);
+    for _ in 0..shards {
+        let (tx, rx) = mpsc_async_channel(per);
+        txs.push(tx);
+        rxs.push(rx);
+    }
+    (
+        txs,
+        ShardedAsyncReceiver {
+            inner: ShardSet {
+                rxs,
+                closed: vec![false; shards],
+                cursor: 0,
+                open: shards,
+            },
+        },
+    )
+}
+
+/// Receiver-side core shared by both flavours: the shard receivers, the
+/// closed marks, the rotating cursor and the open count, plus the
+/// round-robin burst pass. The anchor (blocking `recv` vs awaited `recv`)
+/// is flavour-specific and lives on the wrappers — everything else is
+/// channel-shape logic that must not drift between the sync and async
+/// terminals.
+struct ShardSet<R> {
+    rxs: Vec<R>,
     /// Closed shards are never polled again — `try_recv`/`recv` on a closed
     /// crossfire channel re-reads its disconnect state every call, which
     /// would burn a scan slot per pass after a worker exits early.
@@ -69,7 +123,7 @@ pub struct ShardedReceiver<T: Send + 'static> {
     open: usize,
 }
 
-impl<T: Send + 'static> ShardedReceiver<T> {
+impl<R> ShardSet<R> {
     /// One full burst pass: walk every shard round-robin from `cursor`,
     /// draining each until `Empty`, feeding `sink`. Returns `false` once
     /// every shard has closed (EOF) — items sunk in the closing pass are
@@ -81,7 +135,14 @@ impl<T: Send + 'static> ShardedReceiver<T> {
     /// (burst winners absorb the backlog while the ring's cache lines are
     /// hot), and the rotating `cursor` bounds any single shard's head start
     /// to one pass.
-    pub(crate) fn drain_pass<S: FnMut(T)>(&mut self, sink: &mut S) -> bool {
+    ///
+    /// `T` sits on the method (not the impl) so `ShardSet<R>` needs no
+    /// unconstrained parameter — the item type is fully determined by
+    /// `R: TryRecvItem<T>` at the call site.
+    fn drain_pass<T, S: FnMut(T)>(&mut self, sink: &mut S) -> bool
+    where
+        R: TryRecvItem<T>,
+    {
         let n = self.rxs.len();
         for k in 0..n {
             let i = (self.cursor + k) % n;
@@ -89,7 +150,9 @@ impl<T: Send + 'static> ShardedReceiver<T> {
                 continue;
             }
             loop {
-                match self.rxs[i].try_recv() {
+                // UFCS: both wrappers also expose an inherent `try_recv`,
+                // which would otherwise shadow the trait method.
+                match TryRecvItem::try_recv(&self.rxs[i]) {
                     Ok(item) => sink(item),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Closed) => {
@@ -102,6 +165,21 @@ impl<T: Send + 'static> ShardedReceiver<T> {
         }
         self.cursor = (self.cursor + 1) % n;
         self.open > 0
+    }
+}
+
+/// Sole consumer of a [`sharded_mpsc_channel`]: owns all shard receivers and
+/// aggregates them into one logical stream. **Not `Clone`** — single
+/// consumer, same contract as [`MpscReceiver`].
+pub struct ShardedReceiver<T: Send + 'static> {
+    inner: ShardSet<MpscReceiver<T>>,
+}
+
+impl<T: Send + 'static> ShardedReceiver<T> {
+    /// One full burst pass (see [`ShardSet::drain_pass`]). Returns `false`
+    /// once every shard has closed (EOF).
+    pub(crate) fn drain_pass<S: FnMut(T)>(&mut self, sink: &mut S) -> bool {
+        self.inner.drain_pass(sink)
     }
 
     /// Anchor: every shard is empty but at least one is still open — block
@@ -118,20 +196,77 @@ impl<T: Send + 'static> ShardedReceiver<T> {
     /// always wakes with the run still making progress. Items landing in
     /// other shards while we park are picked up by the next burst pass.
     pub(crate) fn recv_anchor(&mut self) -> Result<T, ChannelError> {
-        let n = self.rxs.len();
+        let n = self.inner.rxs.len();
         for k in 0..n {
-            let i = (self.cursor + k) % n;
-            if self.closed[i] {
+            let i = (self.inner.cursor + k) % n;
+            if self.inner.closed[i] {
                 continue;
             }
-            match self.rxs[i].recv() {
+            match self.inner.rxs[i].recv() {
                 Ok(item) => {
-                    self.cursor = (i + 1) % n;
+                    self.inner.cursor = (i + 1) % n;
                     return Ok(item);
                 },
                 Err(ChannelError::Closed) => {
-                    self.closed[i] = true;
-                    self.open -= 1;
+                    self.inner.closed[i] = true;
+                    self.inner.open -= 1;
+                },
+            }
+        }
+        Err(ChannelError::Closed)
+    }
+}
+
+/// Async counterpart of [`ShardedReceiver`]: aggregates the async terminal's
+/// shard receivers into one logical stream for the sole async collector.
+/// **Not `Clone`** (single consumer); also `!Sync` like the underlying
+/// [`MpscAsyncReceiver`] — it lives on the one thread driving the
+/// collector's `block_on`.
+pub struct ShardedAsyncReceiver<T: Send + Unpin + 'static> {
+    inner: ShardSet<MpscAsyncReceiver<T>>,
+}
+
+impl<T: Send + Unpin + 'static> ShardedAsyncReceiver<T> {
+    /// One full burst pass (see [`ShardSet::drain_pass`]). Returns `false`
+    /// once every shard has closed (EOF).
+    pub(crate) fn drain_pass<S: FnMut(T)>(&mut self, sink: &mut S) -> bool {
+        self.inner.drain_pass(sink)
+    }
+
+    /// Awaited counterpart of [`ShardedReceiver::recv_anchor`]: park on the
+    /// first open shard from `cursor`; `Err` once every shard has closed.
+    ///
+    /// # Waker semantics (why one shard, not an any-of-N await)
+    ///
+    /// Awaiting one shard's `recv()` registers the collector task's waker
+    /// with that shard only — crossfire's MPSC receiver registry is a
+    /// per-channel single-slot `WeakCell`, so aggregating wakers across
+    /// shards means re-registering with every open shard per park cycle
+    /// (`ArcWaker::new_async` allocates on each registration — the
+    /// per-thread immortal-waker cache only covers *blocking* wakers).
+    /// At shard counts in the tens that allocation traffic per wake would
+    /// exceed the anchor cost it replaces. The one-shard anchor instead
+    /// trades wake latency for batching — items landing in other shards
+    /// wait for the next burst pass, the same trade the sync receiver
+    /// makes (measured as a net win there, todo #1). Liveness argument is
+    /// identical to the sync anchor: every open shard's producer task
+    /// either sends (waking us), awaits its upstream (progress elsewhere
+    /// eventually feeds it), or drops its sender (closing the shard).
+    pub(crate) async fn recv_anchor(&mut self) -> Result<T, ChannelError> {
+        let n = self.inner.rxs.len();
+        for k in 0..n {
+            let i = (self.inner.cursor + k) % n;
+            if self.inner.closed[i] {
+                continue;
+            }
+            match self.inner.rxs[i].recv().await {
+                Ok(item) => {
+                    self.inner.cursor = (i + 1) % n;
+                    return Ok(item);
+                },
+                Err(ChannelError::Closed) => {
+                    self.inner.closed[i] = true;
+                    self.inner.open -= 1;
                 },
             }
         }
@@ -142,6 +277,7 @@ impl<T: Send + 'static> ShardedReceiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
 
     /// EOF aggregation: shards close independently (their senders drop at
     /// different times) and the receiver keeps delivering from the open ones
@@ -218,6 +354,88 @@ mod tests {
                 Err(ChannelError::Closed) => break,
             }
         }
+        assert_eq!(seen, vec![42]);
+    }
+
+    /// Async EOF aggregation (mirror of the sync test): shard 0's task exits
+    /// before producing, the others keep flowing; the anchor skips closed
+    /// shards and the stream ends only when the last shard closes. Producers
+    /// use `try_send` from the test thread — the sender side needs no
+    /// runtime, only the collector's anchor is driven by `block_on`.
+    #[test]
+    fn async_eof_aggregates_across_shards() {
+        let (txs, mut rx) = sharded_mpsc_async_channel::<usize>(3, 33);
+        let mut it = txs.into_iter();
+        let tx0 = it.next().unwrap();
+        let rest: Vec<_> = it.collect();
+        for tx in &rest {
+            for v in 0..5 {
+                tx.try_send(v).unwrap();
+            }
+        }
+        drop(tx0);
+        for tx in &rest {
+            tx.try_send(999).unwrap();
+        }
+        drop(rest);
+
+        let got = block_on(async {
+            let mut got = Vec::new();
+            while rx.drain_pass(&mut |v: usize| got.push(v)) {
+                match rx.recv_anchor().await {
+                    Ok(v) => got.push(v),
+                    Err(ChannelError::Closed) => break,
+                }
+            }
+            got
+        });
+        let mut expected: Vec<usize> = (0..5).flat_map(|v| [v, v]).collect();
+        expected.extend([999, 999]);
+        let mut got = got;
+        got.sort_unstable();
+        assert_eq!(got, expected);
+    }
+
+    /// Async anchor parks on the live shard (skipping the closed one) and is
+    /// woken by a send from another OS thread — the waker round-trip through
+    /// `block_on`'s park-based executor must deliver the item exactly once.
+    #[test]
+    fn async_anchor_parks_until_send() {
+        let (txs, mut rx) = sharded_mpsc_async_channel::<usize>(2, 16);
+        let mut it = txs.into_iter();
+        let tx0 = it.next().unwrap();
+        let tx1 = it.next().unwrap();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            tx0.try_send(42).unwrap();
+        });
+        drop(tx1);
+        let mut seen = block_on(async {
+            let mut seen = Vec::new();
+            assert!(
+                rx.drain_pass(&mut |v: usize| seen.push(v)),
+                "shard 0 still open while the producer sleeps"
+            );
+            assert_eq!(seen, []);
+            match rx.recv_anchor().await {
+                Ok(v) => seen.push(v),
+                Err(ChannelError::Closed) => panic!("anchor closed while shard 0 is alive"),
+            }
+            seen
+        });
+        producer.join().unwrap();
+        let rest = block_on(async {
+            let mut got = Vec::new();
+            while rx.drain_pass(&mut |v: usize| got.push(v)) {
+                match rx.recv_anchor().await {
+                    Ok(v) => got.push(v),
+                    Err(ChannelError::Closed) => break,
+                }
+            }
+            got
+        });
+        seen.extend(rest);
+        seen.sort_unstable();
         assert_eq!(seen, vec![42]);
     }
 }
