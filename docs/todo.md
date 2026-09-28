@@ -108,9 +108,6 @@ worker 同形，计入 parking lease），dedicated 模式保留线程；顺带�
 
 ### 8. [P2] API 小项包
 
-- **文档失实（快修）**：`Workload::Unbalanced` 文档说 "Always 8× oversplit"
-  （builder/config.rs 两处），实际 `unbalanced_oversplit()` 默认 32
-  （fused.rs，`YOUPIPE_OVERSPLIT` 可调）；
 - `StreamPipe` 缺 `with_workload`：纯 sync 链 pass-through 到 fused 路径
   时会读 `config.workload`，目前唯一入口 `with_config` 是整体替换；
 - `Pipe::filter` 缺 `map` 有的 `O: Send + 'static` bound——非 Send 输出
