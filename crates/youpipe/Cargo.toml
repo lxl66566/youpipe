@@ -39,6 +39,11 @@ name              = "unbalanced"
 required-features = ["tokio-runtime"]
 
 [[bench]]
+harness           = false
+name              = "sync_fuse"
+required-features = ["tokio-runtime"]
+
+[[bench]]
 harness = false
 name    = "channel_bench"
 
