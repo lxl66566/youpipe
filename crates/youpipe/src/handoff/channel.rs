@@ -13,6 +13,17 @@ macro_rules! trace_ch {
     };
 }
 
+// ── hotpath data-plane probes (feature-gated, zero-cost when off) ──
+//
+// Every crossfire wrapper below carries `#[hotpath::measure(impl_type)]`,
+// making the data plane attributable: producers blocked inside crossfire
+// previously showed zero worker-side activity (todo P0 #1 evidence). Caliber:
+// - attribution only — the per-call guard inflates absolute ns/item; compare distributions across
+//   scenarios, never against unprobed wall time.
+// - generic methods aggregate all `T` monomorphizations under one label.
+// - the trait impls (SendItem/RecvItem/AsyncRecvItem) delegate to these inherent methods, so every
+//   call funnels through exactly one probe.
+
 /// Blocking MPMC sender.
 pub struct SyncSender<T: Send + 'static> {
     tx: crossfire::MTx<mpmc::Array<T>>,
@@ -36,12 +47,14 @@ pub fn channel<T: Send + 'static>(capacity: usize) -> (SyncSender<T>, SyncReceiv
 }
 
 impl<T: Send + 'static> SyncSender<T> {
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SyncSender"))]
     pub fn send(&self, item: T) -> Result<(), ChannelError> {
         #[cfg(feature = "crossfire-trace")]
         trace_ch!(&**self.tx, "tx send");
         self.tx.send(item).map_err(|_| ChannelError::Closed)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SyncSender"))]
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         self.tx.try_send(item).map_err(|e| match e {
             crossfire::TrySendError::Full(v) => TrySendError::Full(v),
@@ -59,12 +72,14 @@ impl<T: Send + 'static> Clone for SyncSender<T> {
 }
 
 impl<T: Send + 'static> SyncReceiver<T> {
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SyncReceiver"))]
     pub fn recv(&self) -> Result<T, ChannelError> {
         #[cfg(feature = "crossfire-trace")]
         trace_ch!(&**self.rx, "rx recv");
         self.rx.recv().map_err(|_| ChannelError::Closed)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SyncReceiver"))]
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         self.rx.try_recv().map_err(|e| match e {
             crossfire::TryRecvError::Empty => TryRecvError::Empty,
@@ -117,10 +132,12 @@ pub fn sync_async_channel<T: Send + Unpin + 'static>(
 }
 
 impl<T: Send + Unpin + 'static> AsyncSender<T> {
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncSender"))]
     pub async fn send(&self, item: T) -> Result<(), ChannelError> {
         self.tx.send(item).await.map_err(|_| ChannelError::Closed)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncSender"))]
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         self.tx.try_send(item).map_err(|e| match e {
             crossfire::TrySendError::Full(v) => TrySendError::Full(v),
@@ -138,10 +155,12 @@ impl<T: Send + Unpin + 'static> Clone for AsyncSender<T> {
 }
 
 impl<T: Send + Unpin + 'static> AsyncReceiver<T> {
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncReceiver"))]
     pub async fn recv(&self) -> Result<T, ChannelError> {
         self.rx.recv().await.map_err(|_| ChannelError::Closed)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncReceiver"))]
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         self.rx.try_recv().map_err(|e| match e {
             crossfire::TryRecvError::Empty => TryRecvError::Empty,
@@ -193,6 +212,7 @@ pub fn mpsc_channel<T: Send + 'static>(capacity: usize) -> (MpscSender<T>, MpscR
 }
 
 impl<T: Send + 'static> MpscSender<T> {
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscSender"))]
     pub fn send(&self, item: T) -> Result<(), ChannelError> {
         #[cfg(feature = "crossfire-trace")]
         trace_ch!(&**self.tx, "tx send");
@@ -216,12 +236,14 @@ impl<T: Send + 'static> Clone for MpscSender<T> {
 }
 
 impl<T: Send + 'static> MpscReceiver<T> {
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscReceiver"))]
     pub fn recv(&self) -> Result<T, ChannelError> {
         #[cfg(feature = "crossfire-trace")]
         trace_ch!(&*self.rx, "rx recv");
         self.rx.recv().map_err(|_| ChannelError::Closed)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscReceiver"))]
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         self.rx.try_recv().map_err(|e| match e {
             crossfire::TryRecvError::Empty => TryRecvError::Empty,
@@ -257,10 +279,12 @@ pub struct MpscAsyncSender<T: Send + Unpin + 'static> {
 }
 
 impl<T: Send + Unpin + 'static> MpscAsyncSender<T> {
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncSender"))]
     pub async fn send(&self, item: T) -> Result<(), ChannelError> {
         self.tx.send(item).await.map_err(|_| ChannelError::Closed)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncSender"))]
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         self.tx.try_send(item).map_err(|e| match e {
             crossfire::TrySendError::Full(v) => TrySendError::Full(v),
@@ -291,10 +315,12 @@ pub fn mpsc_async_channel<T: Send + Unpin + 'static>(
 }
 
 impl<T: Send + Unpin + 'static> MpscAsyncReceiver<T> {
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncReceiver"))]
     pub async fn recv(&self) -> Result<T, ChannelError> {
         self.rx.recv().await.map_err(|_| ChannelError::Closed)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncReceiver"))]
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         self.rx.try_recv().map_err(|e| match e {
             crossfire::TryRecvError::Empty => TryRecvError::Empty,
