@@ -92,7 +92,72 @@ MPSC backing with one implementation.
 channel backings (MPMC vs MPSC, sync vs async) so `spawn_stage` and the
 collector functions are generic without virtual dispatch.
 
-### Worker recv loops: anchor + burst-drain
+#### Sharded terminal fan-in (per-worker SPSC rings)
+
+Even on the MPSC backing, the terminal fan-in is still a **multi-producer**
+ring: every terminal worker's `send` runs `compare_exchange` on the same
+`sender` cursor (crossfire `array_queue_mpsc::push_with_ptr`), so producers
+contend with each other per item and the collector's dequeue shares those
+cache lines — the hotpath audit (todo #1, 2026-09-28) found the engine paced
+by exactly this collector-side data plane (~365 ns/item, ~20x the channel's
+bare capacity).
+
+`YOUPIPE_SHARDED_TERM=1` (opt-in, default off) swaps the terminal channel
+for **one SPSC ring per worker** (`handoff/sharded.rs`):
+
+```
+          OFF (one shared MPSC ring)          ON (per-worker SPSC shards)
+                                        w1 ──[ring 1]──┐
+w1 ─┐                                   w2 ──[ring 2]──┤ round-robin
+w2 ─┼──[one ring, CAS on send]── collector   ...       ├── burst pass +
+wk ─┘                                   wk ──[ring k]──┘ anchor block
+```
+
+The producer's CAS has no contenders, the collector's `store`-based
+dequeue owns each shard's cache lines, and a slow worker parks on its own
+ring instead of holding the shared one. Channel shape only — worker count,
+parking-lease budget, and every semantic contract are unchanged.
+
+Collector loop (`drain_*_sharded`, `state/stream.rs`): a full round-robin
+**burst pass** drains each shard until `Empty` (same per-shard burst shape
+as the stage workers' recv loops; the pass start rotates for fairness),
+then an **anchor** blocks on the first open shard from the rotating cursor.
+Blocking on one shard is deadlock-free: every open shard's producer either
+sends (waking the anchor), parks upstream (progress elsewhere feeds it), or
+drops its sender (closing the shard) — the anchor always wakes with the run
+progressing; items landing in other shards meanwhile are picked up by the
+next pass. Boundary parking is NOT used (falsified for burst rhythms,
+e1684fc → aa842a6) — the anchor parks on crossfire's own spin-then-park
+recv.
+
+EOF aggregation: a shard reports `Closed` only after its sole sender is
+dropped *and* the ring is drained, so the stream ends when every shard has
+closed. A worker that exits early (panic unwind drops its sender) merely
+closes its own shard while the others keep flowing — same contract as the
+shared ring's all-senders-drop, verified by the `handoff::sharded` unit
+tests and the `tests/sharded_terminal.rs` end-to-end suite (unordered,
+ordered — the `ReorderBuffer` never depended on arrival order —, expand,
+fence mid-chain, for_each, cancel, small-worker shapes).
+
+Per-shard capacity is `max(4, buffer / workers)`: the aggregate stays at
+the single-channel backpressure point while each ring keeps enough slack
+for the burst rhythm. Scope: sync and expand terminals (both feeder
+flavours); a single-worker terminal never shards (one SPSC ring already is
+the plain channel), and async terminals keep the single MPSC backing (no
+async shard aggregation was built).
+
+A/B (`sharded_term` evidence bench, 5-round isolated interleaved same-binary
+knob runs, 32 cores): **no regression anywhere**, all 12 ids dominant or
+stable improvements — 100K: single cheap −31.7 %, single cpu −29.1 %,
+ordered −29.6 %, expand cheap −58.5 %, workers2 −23.2 %, multi2 −8.0 %;
+1K: −4.9 % … −42.5 % (workers2 included, so no auto threshold is needed).
+Full table in benchmarks.md. Default stays off pending broader soak (fence
+/ convoy interactions, todo #4); the pathological long-run convoy seen on
+the OFF side during smoke (26-core burn, collector spinning inside
+crossfire `_read`'s stamp wait) did not reproduce on the ON side — tracked
+under todo #4.
+
+## Worker recv loops: anchor + burst-drain
 
 Every sync consumer loop (`spawn_stage` / `spawn_expand_stage` workers, the
 fence forwarder) uses a two-phase recv loop: one blocking `recv` anchors the
