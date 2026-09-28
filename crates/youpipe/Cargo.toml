@@ -43,6 +43,13 @@ harness           = false
 name              = "sync_fuse"
 required-features = ["tokio-runtime"]
 
+# Sharded terminal fan-in A/B (todo #1): same-binary runtime knob
+# YOUPIPE_SHARDED_TERM selects the terminal channel shape. See the bench
+# file's module docs.
+[[bench]]
+harness = false
+name    = "sharded_term"
+
 [[bench]]
 harness = false
 name    = "channel_bench"
