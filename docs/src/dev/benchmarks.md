@@ -633,6 +633,104 @@ approximate under load because its per-thread batch queue drops events):
   the later `available_parallelism` find shows most of that wall was syscall
   overhead hotpath does not attribute to a function, not wake latency.
 
+### Data-plane probes & true-streaming baseline (2026-09-29)
+
+Follow-up to the `stream-engine` finding (todo P0 #1: 1 M×30 unordered
+single stage at ~365 ns/item, worker-side pool activity 0.4 %): none of the
+72 probes covered the crossfire wrappers in
+`crates/youpipe/src/handoff/channel.rs`, so producers blocked *inside*
+crossfire were invisible. Every wrapper now carries
+`#[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = ...))]`
+(feature-gated, zero-cost when off):
+
+- MPMC sync: `SyncSender::{send,try_send}`, `SyncReceiver::{recv,try_recv}`
+- MPMC async: `AsyncSender::{send,try_send}`, `AsyncReceiver::{recv,try_recv}`
+- MPSC sync: `MpscSender::send`, `MpscReceiver::{recv,try_recv}`
+- MPSC async: `MpscAsyncSender::{send,try_send}`,
+  `MpscAsyncReceiver::{recv,try_recv}`
+
+The `SendItem`/`RecvItem`/`AsyncRecvItem` trait impls delegate to these
+inherent methods, so every call funnels through exactly one probe (no
+double counting; all `T` monomorphizations aggregate under one label).
+`hotpath-profile` gained four true-streaming scenarios (dormant cancel
+token where the chain is pure sync, the `run_stream_engine` trick):
+`stream-engine-ordered`, `stream-engine-foreach`, `stream-engine-fence`
+(Chunked 500), `stream-engine-async`. Run ONE scenario per process
+invocation — the `HotpathGuard` aggregates function stats over the whole
+process, so a mixed run merges the per-scenario numbers.
+
+**Caliber: attribution only.** The per-call guard inflates absolute
+per-item cost ~2.6× (unordered 1 M: 957 ns/item probed vs 365 ns
+unprobed); compare distributions and ratios, never unprobed wall time.
+The guard itself is cheap — the same probe reads p50 40 ns on
+`SyncReceiver::try_recv`, so the 551 ns p50 on `MpscReceiver::try_recv`
+is channel cost, not instrumentation. Call counts on the hottest probes
+undercount ~24 % (hotpath's per-thread batch queue drops events);
+durations average over sampled calls.
+
+Baseline (32-core, unpinned, release, 1 M items; "% wall" sums aggregate
+thread time, so >100 % means multi-threaded):
+
+| scenario (iters) | ns/item probed | collector drain | inside the collector |
+| --- | --- | --- | --- |
+| unordered ×30 | 957 | `drain_unordered` 99.9 % | `try_recv` 60 % (p50 551 ns), `recv` anchors 33 % (9.4 M × ~1 µs, burst ≈ 3.2) |
+| ordered ×20 | 1 103 | `drain_ordered` 99.9 % | `try_recv` 91 % (p50 972 ns), anchors 4 % (burst ≈ 24) |
+| for_each ×20 | 990 | `drain_unordered` 99.9 % | `try_recv` 70 % (p50 712 ns), anchors 25 % — same shape as `.run()` |
+| fence ×5 | 1 868 | `drain_unordered` 99.8 % | anchors 94 % (4.2 M × 2.09 µs, burst ≈ 1.2), `try_recv` 1 % |
+| async ×10 | 392 | `drain_unordered_async` 99.3 % | anchors 63 % (0.96 M × 2.5 µs), `try_recv` 11 % (p50 20 ns) |
+
+Producer-side (worker thread budget ≈ 31 workers × wall):
+
+- **Terminal fan-in send**: unordered `MpscSender::send` p50 401 ns (fast
+  path) but p90 65 µs / p99 193 µs — workers park inside crossfire for
+  552 s aggregate = **62 % of the worker budget** (ordered: 64 %, avg
+  32 µs). This is the previously invisible "producer blocked in
+  crossfire".
+- **Input-side anchor** (`SyncReceiver::recv`, waiting for the single
+  feeder): 36 % of the worker budget (avg 34.6 µs). Cross-check: pool
+  activity (`sleep` + `no_work_found` + `find_work` + `steal`) totals
+  ~1.7 s aggregate ≈ 0.2 % of the worker budget — the "0.4 % worker
+  activity" reading reproduces, and the missing ~98 % is now accounted
+  for: ~62 % parked in terminal `send` + ~36 % parked in input `recv`.
+- **Feeder**: `SyncSender::send` 901 ns avg × 30 M = 94 % of the wall —
+  the single feeder thread is saturated pushing into the 31-thief MPMC
+  ring, a co-bottleneck within ~6 % of the collector's 957 ns/item.
+- **Fence shape inverts the picture**: terminal fan-in uncontended
+  (`MpscSender::send` p50 30 ns), waiting dominates instead — stage-2
+  workers block on `SyncReceiver::recv` avg 30.7 µs at chunk boundaries
+  and the collector starves (burst 1.2, anchor 2.09 µs ≈ 94 % of wall).
+  Stop-and-go convoy, a distinct pathology from fan-in (todo #4).
+- **Async mixed chain** is the healthiest shape (392 ns/item): the async
+  consumers absorb per-item awaits overlapped (10 M `AsyncReceiver::recv`
+  avg 43 µs each — the per-item waker round-trip the burst-drain
+  collector exists to avoid), and the collector's `MpscAsyncReceiver`
+  side is nearly free (try_recv p50 20 ns).
+
+Attribution verdict for todo #1 (single-stage shape): **fan-in contention,
+cache-line form** — the collector's `try_recv` pays ~550–1000 ns/item
+(~20–40× the 23 ns/item raw MPSC capacity) because 31 senders' ring
+updates invalidate the line the single collector polls; backpressure
+pacing (worker parks) is the propagated effect, not the cause; a wakeup
+storm is ruled out (anchors are 1–2 µs waits, pool wakes ≈ 0.2 % of
+worker budget). This supports the (b) direction — per-worker SPSC shards
+or a burst-recv interface remove the shared-line fan-in. Caveat for (b):
+the feeder-side MPMC send (901 ns, 94 % of feeder) sits within ~6 % of
+the collector's pace, so terminal-channel sharding alone may just move
+the critical path to the feeder; a batched recv interface relieves both
+sides. Ordered mode's +15 % is not reorder cost (invisible, ≤ 6 %
+residual) but a higher per-call `try_recv` under bigger bursts.
+
+Reproduce:
+
+```sh
+for s in stream-engine stream-engine-ordered stream-engine-foreach \
+         stream-engine-fence stream-engine-async; do
+  HOTPATH_OUTPUT_FORMAT=json-pretty HOTPATH_OUTPUT_PATH=/tmp/$s.json \
+    cargo run --release -p youpipe-bench --bin hotpath-profile \
+      --features hotpath -- $s 1000000 30
+done
+```
+
 ### Final criterion verdict (2026-09 round, clean 4-pass interleaved A/B)
 
 Baseline = `9b31fb0` (crates.io st3 0.4 / concurrent-queue 2.5) vs this
