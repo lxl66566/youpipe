@@ -137,10 +137,11 @@ introduction.
 
 ## Pool-wide parking lease (deadlock freedom across concurrent runs)
 
-A channel-parking job — a non-inline feeder, a sync/expand stage worker —
-holds its pool worker until the run's channels drain: it never returns to
-`find_work` while parked inside a crossfire send/recv. The per-run liveness
-budget (`feeder + Σ stage workers ≤ pool_threads`, computed in `try_exec`)
+A channel-parking job — a non-inline feeder, a sync/expand stage worker, a
+fence forwarder — holds its pool worker until the run's channels drain: it
+never returns to `find_work` while parked inside a crossfire send/recv. The
+per-run liveness budget (`feeder + Σ stage workers + Σ fences ≤
+pool_threads`, computed in `try_exec`)
 is therefore only sound while a **single** run uses the pool. Concurrent
 full-budget runs on a shared pool (the global pool under the parallel test
 harness, or multi-threaded user code) each individually fit yet jointly
@@ -154,9 +155,10 @@ intermittent `pipeline_integration` hang (todo P1 #2).
 
 The fix is a **pool-wide lease** (`Registry::parking_slots` +
 `ParkingLease` in `stream.rs`): before submitting its first job, a run
-computes its upper bound of parking jobs (`feeder_slot + explicit_workers +
-unpinned_stages × min(per_stage, n)`, where the feeder slot is predicted
-against the smallest possible buffer so it never misses the pool-job case)
+computes its upper bound of parking jobs (`feeder_slot + fences +
+explicit_workers + unpinned_stages × min(per_stage, n)`, where the feeder
+slot is predicted against the smallest possible buffer so it never misses
+the pool-job case, and each fence contributes exactly one forwarder job)
 and atomically CAS-leases that many slots from the registry
 (`try_reserve_parking`, total ≤ `num_threads`). A run that does not fit the
 remaining capacity — or executes on a worker of the same pool (nested
@@ -175,9 +177,14 @@ is all noise. Regression tests:
 pre-fix),
 `test_concurrent_pinned_runs_mixed_admission_no_deadlock`.
 
-Note the lease deliberately does **not** cover: fence forwarders and
-async-bridge threads (dedicated OS threads already), async consumers
-(runtime tasks), and fused chunks (finite, never park on channels).
+Note the lease deliberately does **not** cover: async-bridge threads
+(dedicated OS threads already), async consumers (runtime tasks), and fused
+chunks (finite, never park on channels). Fence forwarders **are** covered
+(since the pool-job conversion, 2026-10): in pool mode the forwarder is
+submitted through `StreamCtx::spawn_stage_jobs` like a one-worker stage —
+parks on the mid channel, wrapped by the lease's per-job drop guard, and
+the `fences` term reserves its slot up front. In the dedicated-thread
+fallback it keeps the pre-conversion shape (one OS thread per fence).
 
 ---
 
@@ -218,9 +225,20 @@ A fence lets the caller decide how strictly two adjacent stages are isolated, vi
 Data flow:
 
 1. Stage1 workers pull from `in_rx` → process → send to `mid_tx`
-2. Fence thread **eagerly drains** `mid_rx` into a `FenceBarrier<T>`, releasing batches to `fenced_tx` per `mode` (immediately in `Chunked`, or all at once on disconnect in `Barrier`)
+2. The fence forwarder **eagerly drains** `mid_rx` into a `FenceBarrier<T>`, releasing batches to `fenced_tx` per `mode` (immediately in `Chunked`, or all at once on disconnect in `Barrier`)
 3. Stage2 workers pull from `fenced_rx` → process → send to `out_tx`
 
 Stage completion is signalled purely by channel disconnect (all sender clones dropped) — no per-stage counter barrier is needed. Eager draining is essential: it prevents stage 1 from blocking on a full `mid` channel, which previously deadlocked when `items.len()` exceeded the channel buffer.
+
+Forwarder placement (2026-10): in pool mode the forwarder is a **leased
+pool job** (see "Pool-wide parking lease"), same shape as a one-worker
+stage — this removed the per-run `thread::spawn` + join (measured −3.8 %
+on `stream_pipeline/with_fence/1K`, 61 µs/run, 25/25 dominant; 100 K noise
+— see benchmarks.md) that the feeder side shed earlier. When the lease cannot host the
+run, or `run()` executes on a worker of the same pool, the forwarder keeps
+a dedicated OS thread. `fence_with(StageOptions, mode)` reads the fence's
+output-channel capacity from `StageOptions::buffer` (only meaningful knob —
+the forwarder is single-threaded); `fence(mode)` keeps the default
+(`buffer_size` with the `parallelism * 4` floor).
 
 Batch-allocation recycling: `push` hands each full chunk to the forwarder via `mem::take`, which historically dropped the allocation and regrew the next batch from capacity 0 (`log2(k)` reallocs per batch). `FenceBarrier::reuse` lets the forwarder return the drained `Vec`; the next flush swaps it in, so the steady state is zero allocator traffic per batch (−23 % on `stream_pipeline/with_fence/100 K`).

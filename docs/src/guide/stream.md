@@ -75,6 +75,9 @@ let r: Vec<i32> = (0..1000).stream()
 
 `FenceMode::Barrier` maximizes isolation at the cost of overlap and peak
 memory; `FenceMode::Chunked(k)` is the right default for mixed CPU/IO loads.
+`fence_with(StageOptions, mode)` pins the fence's output-channel capacity
+via `StageOptions::buffer` — a tight buffer pushes backpressure onto the
+upstream stage sooner.
 
 ## Expansion and cancellation
 

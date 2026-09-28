@@ -55,16 +55,7 @@ hop，而等价 fused 链单遍完成（`FuseCompose` 已具备闭包复合能�
 spawn 链游走时对相邻 unpinned `SyncStage` 合并成单 worker 池，任一侧 pin
 `workers`/`buffer` 即放弃。投机项：先 bench 后落地。
 
-### 4. [P2] fence 的每 run 专线程
-
-每个 `FenceLink` 变体 `std::thread::spawn`（stream.rs 五处，~30–80 µs/
-fence/run，feeder 侧同款成本曾被专门移除），且 fence 是唯一没有
-StageOptions 的链类型（buffer 硬编码为 `ctx.buffer_size(parallelism)`）。
-pool 模式下可作为 leased pool job（parks 在 mid channel 上，与 stage
-worker 同形，计入 parking lease），dedicated 模式保留线程；顺带提供
-`fence_with(StageOptions, mode)`。
-
-### 5. [P1] `ordered()` + `expand()`：批量 payload 方案
+### 4. [P1] `ordered()` + `expand()`：批量 payload 方案
 
 2026-10 设计分析确认三条硬约束，实现前必须先解决（详见 dev/core-types.md
 对应记录）：
@@ -85,7 +76,7 @@ worker 同形，计入 parking lease），dedicated 模式保留线程；顺带�
 顺带收益：与 crossfire per-thread waker（设计 C，dev/crossfire-waker-designs.md
 §11）叠加后每组的 channel hop 数减少。
 
-### 6. [P1] StageOptions 类型分裂与零值语义统一
+### 5. [P1] StageOptions 类型分裂与零值语义统一
 
 - **无效旋钮静默忽略**：`workers` 对 async stage 无意义（async 扇出只读
   `io_concurrency`/`buffer`）、`io_concurrency` 对 sync stage 无意义——
@@ -99,14 +90,14 @@ worker 同形，计入 parking lease），dedicated 模式保留线程；顺带�
   （六处 `.max(1)`），与 `Workload::Custom(NonZeroUsize)` 的纪律不一致。
   统一为 assert! 或 NonZero 入参，一次 breaking 收敛。
 
-### 7. [P1] 取消的部分输出语义
+### 6. [P1] 取消的部分输出语义
 
 取消时 feeder/worker break，collector 排干通道即返回——中途取消产出静默
 截断的 `Vec`，与正常短 run 不可区分；`run()` / `for_each` / `with_cancel`
 均未文档化。至少补文档；更优：`RunOutcome` 或 `try_run_checked` 报告
 `Cancelled { emitted }`（collector 排干后查 token 即可）。
 
-### 8. [P2] API 小项包
+### 7. [P2] API 小项包
 
 - `StreamPipe` 缺 `with_workload`：纯 sync 链 pass-through 到 fused 路径
   时会读 `config.workload`，目前唯一入口 `with_config` 是整体替换；
@@ -126,7 +117,7 @@ worker 同形，计入 parking lease），dedicated 模式保留线程；顺带�
 
 ## 代码健康（重构/坏味道）
 
-### 9. [P1] 终端 prologue 十处复制
+### 8. [P1] 终端 prologue 十处复制
 
 `n==0` 短路 → `resolve_exec_pool` → `prefers_serial` 串行回退（含
 MAY_FILTER 分派）→ `SplitPlan::new` → MAY_FILTER 两路核心选择——同一序列
@@ -135,7 +126,7 @@ scoped 三件、by_ref 三件、`fused_pass_collect`）。split 策略或串行�
 就要改十处。抽 `terminal_plan(n, config, pool) -> Plan { Serial, Parallel(
 SplitPlan) }` + 共享串行回退 helper；prologue 每 run 一次，零热路径风险。
 
-### 10. [P1] StageSpawn 五路 spawn 体 × 四 stage 类型
+### 9. [P1] StageSpawn 五路 spawn 体 × 四 stage 类型
 
 每 stage 类型手写 `spawn`/`spawn_single`/`spawn_for_async`/
 `spawn_async_feeder`/`spawn_async_feeder_single`，~15 个近同体（stream.rs
@@ -149,7 +140,7 @@ Mpsc/MixedAsync），每 stage 一个泛型 `spawn_into`，五方法变单行委
 收编 `_single` 孪生。回归防护（try_exec 的终端 Single-variant debug_assert）
 重构期作安全网。
 
-### 11. [P1] 六 builder × 五 setter 复制
+### 10. [P1] 六 builder × 五 setter 复制
 
 Pipe/TryPipe/PipeRef/TryPipeRef/ScopedPipe/ScopedTryPipe 各手抄
 `with_config`/`with_workload`/`with_compute_workers`/`with_compute_pool`/
@@ -158,7 +149,7 @@ Pipe/TryPipe/PipeRef/TryPipeRef/ScopedPipe/ScopedTryPipe 各手抄
 有记录）。抽内部 `ExecOptions { config, compute_pool, oversubscribe }` 被
 move 进各 builder + setter 宏，加字段只改一处。
 
-### 12. [P2] 死代码清理
+### 11. [P2] 死代码清理
 
 pool/mod.rs 模块级 `#![allow(dead_code)]`（"Scope/spawn infrastructure not
 yet wired"）已掩盖真死代码（repo 内零调用者，2026-09 核实）：`spawn_static`
@@ -168,7 +159,7 @@ yet wired"）已掩盖真死代码（repo 内零调用者，2026-09 核实）：
 `CancellationToken::reset`（sync/cancel.rs，仅自测调用；复活 token 对在飞
 worker 是脚枪）。删项后摘掉模块级 allow，让编译器重新把关。
 
-### 13. [P2] 正确性相邻与杂项
+### 12. [P2] 正确性相邻与杂项
 
 - `FenceBarrier::reuse` 对非空批仅 debug_assert，release 静默丢弃——改
   total API（非空时 append 回 buffer）消灭契约；
