@@ -23,6 +23,16 @@
 #   * gives every (round, side) its own CRITERION_HOME so aggregates only
 #     ever read fresh `new/estimates.json` files — no stale-base reads
 #
+# Memory lesson (2026-09-29, found the hard way): this box runs earlyoom
+# (-m5,3; avoid-list covers only sshd/systemd/journald) with 14 GB RAM, and
+# the default 32-way release `cargo bench --no-run` of a fresh worktree
+# drove it below the threshold — earlyoom SIGKILLed the compile silently
+# (no kernel OOM line, no cargo error in this script's log; the run just
+# vanished at the "side X: cargo bench --no-run" line, twice). If a run
+# dies there, export CARGO_BUILD_JOBS=6 (or similar) and pre-build both
+# worktrees before re-running — the materialized worktrees are reused, so
+# the pre-build carries over and the script skips straight to the rounds.
+#
 # Afterwards `compare.py <outdir>` aggregates per-id medians across rounds.
 #
 # Usage:

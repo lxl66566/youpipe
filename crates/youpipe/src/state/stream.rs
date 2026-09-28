@@ -1,5 +1,5 @@
 use crate::{
-    handoff::{AsyncRecvItem, RecvItem, ShardedReceiver, TryRecvError},
+    handoff::{AsyncRecvItem, RecvItem, ShardedAsyncReceiver, ShardedReceiver, TryRecvError},
     state::ReorderBuffer,
     sync::CancellationToken,
 };
@@ -288,6 +288,72 @@ pub(crate) fn drain_ordered_sharded<O, S: FnMut(O)>(
             break;
         }
         match rx.recv_anchor() {
+            Ok((seq, item)) => buffer.insert_into(seq, item, &mut sink),
+            Err(_) => break,
+        }
+    }
+    for item in buffer.flush_remaining() {
+        sink(item);
+    }
+    if let OrderedAccounting::Validate { cancel } = accounting {
+        verify_ordered_accounting(&buffer, emitted, expected_items, cancel);
+    }
+}
+
+/// Async counterpart of [`drain_unordered_sharded`]: the burst pass is the
+/// same round-robin over every shard (plain `try_recv`, no awaiting); only
+/// the anchor awaits one open shard (see
+/// [`ShardedAsyncReceiver::recv_anchor`](crate::handoff::ShardedAsyncReceiver::recv_anchor)
+/// for the one-shard waker rationale). EOF is the aggregation of all shards
+/// closing.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) async fn drain_unordered_async_sharded<O, S: FnMut(O)>(
+    rx: &mut ShardedAsyncReceiver<(u64, O)>,
+    mut sink: S,
+) where
+    O: Send + Unpin + 'static,
+{
+    loop {
+        let mut tagged_sink = |(_, item): (u64, O)| sink(item);
+        if !rx.drain_pass(&mut tagged_sink) {
+            return;
+        }
+        match rx.recv_anchor().await {
+            Ok((_, item)) => sink(item),
+            Err(_) => return,
+        }
+    }
+}
+
+/// Async counterpart of [`drain_ordered_sharded`]: identical to the
+/// single-channel async loop except the burst pass fans across shards —
+/// ordering never depended on channel arrival order ([`ReorderBuffer`]
+/// re-sequences by `seq`), so sharding is transparent to the ordered
+/// contract. Accounting and the window-overflow semantics are shared
+/// verbatim.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) async fn drain_ordered_async_sharded<O, S: FnMut(O)>(
+    rx: &mut ShardedAsyncReceiver<(u64, O)>,
+    expected_items: usize,
+    accounting: OrderedAccounting<'_>,
+    mut sink: S,
+) where
+    O: Send + Unpin + 'static,
+{
+    let capacity = expected_items.next_power_of_two().clamp(1 << 10, 1 << 20);
+    let mut buffer = ReorderBuffer::new(capacity);
+    // See `drain_ordered` for the accounting counter.
+    let mut emitted = 0usize;
+    let mut sink = |item: O| {
+        emitted += 1;
+        sink(item);
+    };
+    loop {
+        let mut tagged_sink = |(seq, item): (u64, O)| buffer.insert_into(seq, item, &mut sink);
+        if !rx.drain_pass(&mut tagged_sink) {
+            break;
+        }
+        match rx.recv_anchor().await {
             Ok((seq, item)) => buffer.insert_into(seq, item, &mut sink),
             Err(_) => break,
         }
