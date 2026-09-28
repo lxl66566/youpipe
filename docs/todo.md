@@ -32,9 +32,13 @@
   （26 核满转、collector 卡 crossfire `_read` stamp 自旋，smoke 单次观察）而
   ON 侧未复现，提示分片可能顺带缓解 #4，但单次观察不作结论；默认翻转需要
   多 seed soak + #4 交互验证。
-- 残余方向：(a) 数据面探针（现有 72 探针零覆盖 send/recv/try_recv）+ hotpath
-  补 ordered / for_each / fence / async-stage 场景；(c) async 终端的分片聚合
-  （当前 async Single 保持单通道 MPSC）；(d) crossfire 批量 recv 接口。
+- 数据面探针已落地（2026-09-29，channel.rs 15 探针 + hotpath 5 个
+  true-streaming 场景，读数 benchmarks.md "true-streaming"）——try_recv p50
+  551 ns/item（31 sender cache-line 乒乓）、feeder 侧 send 901 ns/item 占
+  feeder 线程 94%。
+- 残余方向：(c) async 终端的分片聚合（当前 async Single 保持单通道 MPSC）；
+  (d) crossfire 批量 recv 接口（fork 在库内可改；同时缓解 collector 侧
+  try_recv 与 feeder 侧 send 两端 per-item 原子成本）。
 - 风险记录：MPSC 是当年 in-pipeline 剖析选出（streaming.md "MPSC Channels"），
   分片把复用开销移回 collector 侧——实测无回归（每 pass k−1 次失败 try_recv
   被突发摊销）；burst 边界泊车未用（已证伪，e1684fc→aa842a6）。
