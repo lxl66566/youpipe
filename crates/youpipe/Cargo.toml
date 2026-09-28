@@ -65,6 +65,13 @@ harness           = false
 name              = "io_async"
 required-features = ["tokio-runtime"]
 
+# Async-terminal flavour of the sharded-terminal A/B (todo #1 residual (c)):
+# same-binary runtime-knob runs over immune-to-convoy async shapes.
+[[bench]]
+harness           = false
+name              = "sharded_term_async"
+required-features = ["tokio-runtime"]
+
 # Tight-loop cost of the transient pools behind `with_compute_workers(n)` /
 # `with_oversubscribe(f)` vs a pre-created `with_compute_pool` handle (see the
 # bench file's module docs).
