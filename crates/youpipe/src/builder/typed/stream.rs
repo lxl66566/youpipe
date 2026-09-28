@@ -41,8 +41,8 @@ use crate::{
 // collector
 //
 // Stages may be sync (run on `ComputePool`), async (run on an `AsyncRuntime`
-// backend via runtime tasks), or a fence (forward-fence thread between
-// adjacent stages).
+// backend via runtime tasks), or a fence (a forwarder parking on its input
+// channel between adjacent stages — a leased pool job in pool mode).
 
 /// True iff `cancel` is set and the pipeline should stop feeding new work.
 #[inline]
@@ -104,7 +104,7 @@ type FeederPanicSlot = Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>
 /// drop so unwinds are covered) plus the never-spawned remainder here.
 pub(crate) struct ParkingLease {
     registry: Arc<Registry>,
-    /// Reserved upper bound: `feeder_slot + explicit_workers +
+    /// Reserved upper bound: `feeder_slot + fences + explicit_workers +
     /// unpinned_stages * min(per_stage, n)`.
     reserved: usize,
     /// Jobs wrapped so far; never exceeds `reserved`.
@@ -190,7 +190,8 @@ impl Feeder {
 /// sender, and proceeds to collect — draining the output and unblocking
 /// workers. The pool path is only taken when [`StreamPipe::try_exec`] has
 /// leased a slot for it through the pool-wide [`ParkingLease`] (on top of
-/// every sync stage's workers), so the feeder job is always schedulable even
+/// every sync stage's workers and every fence forwarder), so the feeder job
+/// is always schedulable even
 /// with other runs resident on the same pool. The dedicated-thread path is
 /// trivially safe: the OS schedules the thread independently of the pool.
 ///
@@ -451,10 +452,11 @@ fn spawn_expand_stage<I, N, Tx, R>(
 /// Draining `mid_rx` eagerly (rather than waiting on a separate barrier
 /// first) is what keeps stage 1 from blocking on a full channel: this is the
 /// fix for the previous wait-before-drain deadlock.
-#[allow(clippy::needless_pass_by_value)] // runs inside a `thread::spawn(move …)`:
-// owning `mid_rx` / `fenced_tx` by value lets them drop (and close the channel)
-// when the forwarder returns, which is how the downstream stage detects "no
-// more items" — taking them by reference would keep the channel open forever.
+#[allow(clippy::needless_pass_by_value)] // runs inside a pool job / dedicated
+// thread (see `spawn_forwarder`): owning `mid_rx` / `fenced_tx` by value lets
+// them drop (and close the channel) when the forwarder returns, which is how
+// the downstream stage detects "no more items" — taking them by reference
+// would keep the channel open forever.
 fn forward_fenced<M, Tx>(
     mid_rx: Receiver<(u64, M)>,
     fenced_tx: Tx,
@@ -524,6 +526,34 @@ fn forward_fenced<M, Tx>(
             }
         }
     }
+}
+
+/// Spawn the fence forwarder for one run: a **leased pool job** in pool
+/// mode — it parks on the mid channel exactly like a stage worker, so it
+/// must (and does, via the `fences` term of the reservation computed in
+/// [`StreamPipe::try_exec`]) count against the run's [`ParkingLease`] — or
+/// a dedicated OS thread in the dedicated-thread fallback (lease did not
+/// fit, or `run()` itself executes on a worker of the same pool).
+///
+/// Routed through [`StreamCtx::spawn_stage_jobs`] so both modes reuse the
+/// stage workers' panic policy (pool jobs and dedicated threads abort the
+/// process on panic — `forward_fenced` itself contains no user code, this
+/// is just the shared safety net) and the lease's per-job slot release.
+fn spawn_forwarder<M, Tx, R>(
+    ctx: &StreamCtx<'_, R>,
+    mid_rx: Receiver<(u64, M)>,
+    fenced_tx: Tx,
+    mode: FenceMode,
+    expected: usize,
+) where
+    M: Send + Unpin + 'static,
+    Tx: SendItem<(u64, M)>,
+    R: AsyncRuntime,
+{
+    let cancel = ctx.cancel.clone();
+    ctx.spawn_stage_jobs(vec![move || {
+        forward_fenced(mid_rx, fenced_tx, mode, expected, cancel.as_ref());
+    }]);
 }
 
 // ── StreamPipe (data-first chainable streaming pipeline) ──
@@ -632,6 +662,11 @@ impl StageOptions {
 pub struct StageBudget {
     /// Number of stages that consume compute-pool worker slots.
     pub stages: usize,
+    /// Number of fence links: each runs one channel-parking forwarder, a
+    /// leased pool job in pool mode. The runner reserves one lease slot per
+    /// fence on top of the stage workers and deducts them from the
+    /// stage-worker division (see `try_exec`).
+    pub fences: usize,
     /// Number of those stages that pinned their worker count via
     /// `StageOptions::workers`.
     pub explicit_stages: usize,
@@ -753,11 +788,15 @@ pub struct AsyncStage<Prev, F> {
 
 /// Fence link: inserts a [`FenceBarrier`] between two stages. The type is
 /// unchanged (it's a passthrough at the item level), but the runtime topology
-/// gains a forwarder thread that batches / barriers per `mode`.
+/// gains a forwarder that batches / barriers per `mode`.
 #[derive(Clone)]
 pub struct FenceLink<Prev> {
     pub(super) prev: Prev,
     pub(super) mode: FenceMode,
+    /// Only `buffer` is meaningful here (the forwarder is single-threaded —
+    /// `workers` / `io_concurrency` are ignored, the same convention as
+    /// `io_concurrency` on sync stages).
+    pub(super) opts: StageOptions,
 }
 
 /// Marker trait for a streaming stage chain that knows how to spawn itself
@@ -769,14 +808,13 @@ pub struct FenceLink<Prev> {
 /// The final receiver is wrapped in [`FinalRx`] so the collector knows whether
 /// to drain synchronously or via the async runtime.
 ///
-/// Returns the number of stages in this chain that consume compute-pool
-/// worker slots (sync stages + expand stages). Fence links and async stages
-/// don't count — fences run on a dedicated thread, async stages run on the
-/// async runtime. The runner uses this (via [`StageBudget`]) to divide the
-/// pool budget across stages so the total blocking jobs across all sync
-/// stages never exceeds the pool size, preventing the "stage 1 holds all pool
-/// threads → stage 2 can't start → deadlock" failure mode that bit the
-/// pre-fusion API.
+/// Returns the worker-budget summary of this chain (via [`StageBudget`]):
+/// sync and expand stages consume stage-worker slots, fence links one
+/// forwarder slot each (a channel-parking pool job in pool mode), async
+/// stages none (they run on the async runtime). The runner uses it to divide
+/// the pool budget across the chain so the total blocking jobs never exceed
+/// the pool size, preventing the "stage 1 holds all pool threads → stage 2
+/// can't start → deadlock" failure mode that bit the pre-fusion API.
 pub trait StageSpawn<In: Send + Unpin + 'static> {
     type Out: Send + Unpin + 'static;
     fn spawn<R: AsyncRuntime>(
@@ -1112,11 +1150,12 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// equally across the unpinned sync stages (clamped to ≥ 1). A stage's
     /// actual worker count is resolved in `StreamCtx::stage_workers`, which
     /// consults the stage's own `StageOptions` before falling back here.
-    /// Bridges and fences (which have no options of their own) use this value
-    /// directly.
+    /// Bridges (which have no options of their own) use this value directly;
+    /// fences use it only as the fallback for their `StageOptions::buffer`
+    /// pin, via `stage_buffer`.
     pub per_stage_parallelism: usize,
-    /// When `true`, sync/expand stage workers (and a non-inline feeder) run
-    /// as dedicated OS threads instead of pool jobs. Chosen by
+    /// When `true`, sync/expand stage workers, fence forwarders (and a
+    /// non-inline feeder) run as dedicated OS threads instead of pool jobs. Chosen by
     /// [`StreamPipe::try_exec`] when the pool-wide parking lease cannot host
     /// the run's whole upper bound of channel-parking jobs (pool busy with
     /// other runs' leases, or more sync stages than available pool slots),
@@ -1204,9 +1243,9 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
         granted
     }
 
-    /// Dispatch a stage's worker closures: one batched pool submission in
-    /// pool mode, one dedicated OS thread per worker in dedicated-thread
-    /// mode. Threads are detached — workers always terminate on channel
+    /// Dispatch a batch of the run's channel-parking jobs (stage workers,
+    /// or the single fence-forwarder job): one batched pool submission in
+    /// pool mode, one dedicated OS thread per job in dedicated-thread mode. Threads are detached — workers always terminate on channel
     /// disconnect (see [`spawn_stage`]), and the collector only returns once
     /// every sender is dropped, so no thread outlives the run's usefulness.
     ///
@@ -1676,14 +1715,9 @@ where
         ctx: &StreamCtx<'_, R>,
     ) -> FinalRx<Prev::Out> {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
-        let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
+        let buffer = ctx.stage_buffer(&self.opts, ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = channel::<(u64, Prev::Out)>(buffer);
-        let mode = self.mode;
-        let expected = ctx.n;
-        let cancel = ctx.cancel.clone();
-        std::thread::spawn(move || {
-            forward_fenced(mid_rx, fenced_tx, mode, expected, cancel.as_ref());
-        });
+        spawn_forwarder(ctx, mid_rx, fenced_tx, self.mode, ctx.n);
         FinalRx::Sync(fenced_rx)
     }
 
@@ -1696,14 +1730,9 @@ where
         Self: Sized,
     {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
-        let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
+        let buffer = ctx.stage_buffer(&self.opts, ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = mpsc_channel::<(u64, Prev::Out)>(buffer);
-        let mode = self.mode;
-        let expected = ctx.n;
-        let cancel = ctx.cancel.clone();
-        std::thread::spawn(move || {
-            forward_fenced(mid_rx, fenced_tx, mode, expected, cancel.as_ref());
-        });
+        spawn_forwarder(ctx, mid_rx, fenced_tx, self.mode, ctx.n);
         FinalRx::SyncSingle(fenced_rx)
     }
 
@@ -1714,18 +1743,14 @@ where
         ctx: &StreamCtx<'_, R>,
     ) -> AsyncReceiver<(u64, Prev::Out)> {
         // Direct handoff: the fence forwarder writes the mixed-mode sender
-        // directly. It already runs on a dedicated OS thread, so blocking on
-        // `send` under backpressure is its natural behaviour — no extra bridge
-        // needed between the fence and a downstream async stage.
+        // directly. It runs on a pool worker (an OS thread) or a dedicated
+        // thread, so blocking on `send` under backpressure is its natural
+        // behaviour — no extra bridge needed between the fence and a
+        // downstream async stage.
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
-        let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
+        let buffer = ctx.stage_buffer(&self.opts, ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = sync_async_channel::<(u64, Prev::Out)>(buffer);
-        let mode = self.mode;
-        let expected = ctx.n;
-        let cancel = ctx.cancel.clone();
-        std::thread::spawn(move || {
-            forward_fenced(mid_rx, fenced_tx, mode, expected, cancel.as_ref());
-        });
+        spawn_forwarder(ctx, mid_rx, fenced_tx, self.mode, ctx.n);
         fenced_rx
     }
 
@@ -1739,14 +1764,9 @@ where
         // converted to sync exactly once (at the fence's own input) instead of
         // up front plus per level.
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
-        let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
+        let buffer = ctx.stage_buffer(&self.opts, ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = channel::<(u64, Prev::Out)>(buffer);
-        let mode = self.mode;
-        let expected = ctx.n;
-        let cancel = ctx.cancel.clone();
-        std::thread::spawn(move || {
-            forward_fenced(mid_rx, fenced_tx, mode, expected, cancel.as_ref());
-        });
+        spawn_forwarder(ctx, mid_rx, fenced_tx, self.mode, ctx.n);
         FinalRx::Sync(fenced_rx)
     }
 
@@ -1757,20 +1777,18 @@ where
         ctx: &StreamCtx<'_, R>,
     ) -> FinalRx<Prev::Out> {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
-        let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
+        let buffer = ctx.stage_buffer(&self.opts, ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = mpsc_channel::<(u64, Prev::Out)>(buffer);
-        let mode = self.mode;
-        let expected = ctx.n;
-        let cancel = ctx.cancel.clone();
-        std::thread::spawn(move || {
-            forward_fenced(mid_rx, fenced_tx, mode, expected, cancel.as_ref());
-        });
+        spawn_forwarder(ctx, mid_rx, fenced_tx, self.mode, ctx.n);
         FinalRx::SyncSingle(fenced_rx)
     }
 
     fn stage_budget(&self) -> StageBudget {
-        // Fence runs on a dedicated thread, doesn't consume a pool slot.
-        self.prev.stage_budget()
+        // The forwarder is a channel-parking pool job in pool mode — one
+        // leased slot, reserved by `try_exec` on top of the stage workers.
+        let mut budget = self.prev.stage_budget();
+        budget.fences += 1;
+        budget
     }
 
     fn first_consumer_is_async(&self) -> Option<bool> {
@@ -2470,11 +2488,26 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// - [`FenceMode::Chunked`] releases batches as soon as they form so the two sides overlap —
     ///   the right default for mixed CPU/IO loads.
     pub fn fence(self, mode: FenceMode) -> StreamPipe<FenceLink<S>, I, O, R> {
+        self.fence_with(StageOptions::new(), mode)
+    }
+
+    /// [`Self::fence`] with per-link tuning — see [`StageOptions`]. The only
+    /// meaningful knob is [`StageOptions::buffer`]: the fence's **output**
+    /// channel capacity (the fence is single-threaded, so `workers` /
+    /// `io_concurrency` are ignored). A tight buffer increases backpressure
+    /// onto the upstream stage; the default (`buffer_size` with the
+    /// `parallelism * 4` floor) favours throughput.
+    pub fn fence_with(
+        self,
+        opts: StageOptions,
+        mode: FenceMode,
+    ) -> StreamPipe<FenceLink<S>, I, O, R> {
         StreamPipe {
             items: self.items,
             stages: FenceLink {
                 prev: self.stages,
                 mode,
+                opts,
             },
             config: self.config,
             cancel: self.cancel,
@@ -3018,7 +3051,7 @@ where
         //
         // Liveness invariant (pool mode): every blocking job the run parks
         // on a pool thread must be simultaneously schedulable — that is
-        // `feeder(≤1) + Σ stage workers ≤ pool_threads`. A worker parked
+        // `feeder(≤1) + Σ stage workers + Σ fence forwarders ≤ pool_threads`. A worker parked
         // inside a crossfire send/recv never returns to the pool's find_work
         // loop, so a job left queued while every thread is parked deadlocks
         // the run (reproduced pre-fix: 4 stages on a 4-thread pool with
@@ -3069,13 +3102,22 @@ where
                 // CAS the whole grant in one piece — `try_reserve_parking`
                 // revalidates against the live counter, so a stale snapshot can
                 // only under-promise (per_stage too small), never over-admit.
+                // Each fence forwarder is one channel-parking pool job for
+                // the whole run: it takes a lease slot (never returned until
+                // the run drains) and is deducted from the stage-worker
+                // division up front, exactly like the feeder slot. Skipping
+                // this term re-opens the shared-pool deadlock for chains
+                // with fences (regression-tested in
+                // `test_fence_forwarder_counts_in_parking_lease_no_deadlock`).
+                let fences = budget.fences;
                 let used = pool.registry().parking_used();
-                let live_slots = pool_threads.saturating_sub(used + feeder_slot);
+                let live_slots = pool_threads.saturating_sub(used + feeder_slot + fences);
                 let per_stage = budget.default_workers(workers_budget.min(live_slots));
                 // Upper bound of granted workers: pins are additionally clamped
                 // to `n` by `stage_workers`, so this never under-reserves.
                 let unpinned = budget.stages.saturating_sub(budget.explicit_stages);
-                let need = feeder_slot + budget.explicit_workers + unpinned * per_stage.min(n);
+                let need =
+                    feeder_slot + fences + budget.explicit_workers + unpinned * per_stage.min(n);
                 if need <= pool_threads && pool.registry().try_reserve_parking(need) {
                     let lease = ParkingLease {
                         registry: Arc::clone(pool.registry()),
@@ -3297,6 +3339,23 @@ mod tests {
     /// `Feeder::finish` re-raises the caught feeder-job payload (the
     /// panic-propagation contract inherited from the old feeder thread's
     /// `join`) and is a no-op for the inline variant.
+    /// Fence links report one forwarder slot each in `StageBudget` — the
+    /// lease reservation in `try_exec` counts them alongside stage workers
+    /// (regression guard for the pool-job conversion).
+    #[test]
+    fn test_fence_links_counted_in_stage_budget() {
+        let pipe = stream(0..8u64)
+            .stage(|x: u64| x + 1)
+            .fence(FenceMode::Barrier)
+            .fence(FenceMode::Chunked(NonZeroUsize::new(4).unwrap()))
+            .expand_emit(|x: u64, out: &mut Vec<u64>| out.push(x));
+        let budget = pipe.stages.stage_budget();
+        assert_eq!(budget.stages, 2);
+        assert_eq!(budget.fences, 2);
+        assert_eq!(budget.explicit_stages, 0);
+        assert_eq!(budget.explicit_workers, 0);
+    }
+
     #[test]
     fn test_feeder_finish_resumes_payload() {
         let slot: FeederPanicSlot = Arc::new(std::sync::Mutex::new(Some(

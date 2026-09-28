@@ -631,6 +631,30 @@ fn test_stream_with_fence_chunked() {
     assert_eq!(result, expected);
 }
 
+/// `fence_with` reads the fence's output-channel capacity from
+/// `StageOptions` (previously hardcoded to `ctx.buffer_size(parallelism)`);
+/// a tight buffer must still deliver every item in both modes.
+#[test]
+fn test_stream_fence_with_options_buffer() {
+    use youpipe::StageOptions;
+
+    for mode in [
+        FenceMode::Barrier,
+        FenceMode::Chunked(NonZeroUsize::new(7).unwrap()),
+    ] {
+        let r: Vec<u64> = stream(0..500u64)
+            .stage(|x| x + 1)
+            .fence_with(StageOptions::new().buffer(2), mode)
+            .stage(|x| x * 2)
+            .run();
+        let mut expected: Vec<u64> = (0..500u64).map(|x| (x + 1) * 2).collect();
+        expected.sort_unstable();
+        let mut got = r;
+        got.sort_unstable();
+        assert_eq!(got, expected);
+    }
+}
+
 #[test]
 fn test_stream_with_fence_full_barrier() {
     let items: Vec<i32> = (0..50).collect();
@@ -1849,6 +1873,42 @@ fn test_concurrent_pinned_runs_mixed_admission_no_deadlock() {
         lens
     });
     assert_eq!(r, vec![1000; 12]);
+}
+
+/// Regression (fence forwarders as leased pool jobs): each fence is one
+/// channel-parking pool job in pool mode and MUST enter the run's lease
+/// reservation. The shape below deadlocks deterministically without the
+/// `fences` term: the reservation (feeder + 6 + 1 pinned workers = 8) admits
+/// the run on the 8-thread pool, but the forwarder is a 9th parking job —
+/// the injector FIFO pops [feeder, stage-1 ×6, forwarder] onto the 8
+/// workers, the stage-2 job stays queued, and the run wedges with every
+/// worker parked (feeder on a full stage-1 channel, stage 1 on a full mid
+/// channel, forwarder on a full fenced channel that only the queued stage-2
+/// job would drain). With the term, the reservation is 9 > 8 and the run
+/// takes the dedicated-thread fallback instead.
+#[test]
+#[cfg_attr(miri, ignore)] // thread-count stress the interpreter cannot pace
+fn test_fence_forwarder_counts_in_parking_lease_no_deadlock() {
+    use youpipe::StageOptions;
+
+    let r: Vec<u64> = run_with_deadlock_watchdog(|| {
+        stream(0..2000u64)
+            .with_compute_pool(youpipe::ComputePool::new(8))
+            .stage_with(StageOptions::new().workers(6), |x| {
+                x.wrapping_mul(3).wrapping_add(1)
+            })
+            .fence(FenceMode::Chunked(NonZeroUsize::new(64).unwrap()))
+            .stage_with(StageOptions::new().workers(1), |x| x ^ 0x5a5a)
+            .run()
+    });
+    assert_eq!(r.len(), 2000);
+    let mut sorted = r;
+    sorted.sort_unstable();
+    let mut expected: Vec<u64> = (0..2000u64)
+        .map(|x| (x.wrapping_mul(3).wrapping_add(1)) ^ 0x5a5a)
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(sorted, expected);
 }
 
 /// Helper: run `f` on a helper thread and require completion within 30 s, so
