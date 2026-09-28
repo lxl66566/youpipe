@@ -206,6 +206,8 @@ isolated interleaved A/B); 100K noise (the family's ±20 % round drift).
 
 Capacity contract: because of the bitmask mapping, the number of simultaneously outstanding (un-flushed) items must stay below the slot count or two distinct `seq`s alias the same slot and the older item is dropped. Callers size the buffer to at least the maximum out-of-order window; the streaming collectors clamp it to `[1 Ki, 1 Mi]` slots.
 
+Drop observability: an occupied-slot overwrite (window-overflow alias, or a duplicate `seq` from an `expand` misuse) drops the older item, counts it in `ReorderBuffer::dropped`, and trips a `debug_assert` at the drop site. The ordered collectors validate `emitted + dropped == expected` after the drain in debug builds (a fired cancel token exempts the equality — a cancelled run legitimately emits fewer items); release builds keep only the counter — a window overflow never panics there. The clamp means an alias requires > 1 Mi simultaneously outstanding items, far past realistic worker counts.
+
 ---
 
 A fence lets the caller decide how strictly two adjacent stages are isolated, via `FenceMode`:

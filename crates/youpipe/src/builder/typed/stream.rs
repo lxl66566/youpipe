@@ -22,7 +22,7 @@ use crate::{
     },
     pool::Registry,
     runtime::{AsyncRuntime, DefaultRuntime},
-    state::{FenceBarrier, FenceMode, run_ordered_collect},
+    state::{FenceBarrier, FenceMode, OrderedAccounting, drain_ordered, drain_ordered_async},
     sync::CancellationToken,
 };
 
@@ -1360,7 +1360,13 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
         R: Reducer<B>,
     {
         // The recursion bottomed out: `downstream` IS the composed chain.
-        Ok(fused_pass_reduce(items, &downstream, reducer, workload, pool))
+        Ok(fused_pass_reduce(
+            items,
+            &downstream,
+            reducer,
+            workload,
+            pool,
+        ))
     }
 
     #[cfg(feature = "tokio-runtime")]
@@ -2558,13 +2564,20 @@ trait Terminal<T>: Sized {
     type Out: Send + 'static;
     /// Result for an empty input (nothing is spawned at all).
     fn drain_empty(self) -> Self::Out;
-    fn drain_sync<R: RecvItem<(u64, T)>>(self, rx: R, ordered: bool, n: usize) -> Self::Out;
+    fn drain_sync<R: RecvItem<(u64, T)>>(
+        self,
+        rx: R,
+        ordered: bool,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Self::Out;
     #[cfg(feature = "tokio-runtime")]
     fn drain_async<R: AsyncRecvItem<(u64, T)>>(
         self,
         rx: R,
         ordered: bool,
         n: usize,
+        cancel: Option<&CancellationToken>,
     ) -> impl Future<Output = Self::Out>;
 }
 
@@ -2578,8 +2591,14 @@ impl<T: Send + Unpin + 'static> Terminal<T> for VecCollector {
         Vec::new()
     }
 
-    fn drain_sync<R: RecvItem<(u64, T)>>(self, rx: R, ordered: bool, n: usize) -> Vec<T> {
-        collect_sync(rx, ordered, n)
+    fn drain_sync<R: RecvItem<(u64, T)>>(
+        self,
+        rx: R,
+        ordered: bool,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Vec<T> {
+        collect_sync(rx, ordered, n, cancel)
     }
 
     #[cfg(feature = "tokio-runtime")]
@@ -2588,8 +2607,9 @@ impl<T: Send + Unpin + 'static> Terminal<T> for VecCollector {
         rx: R,
         ordered: bool,
         n: usize,
+        cancel: Option<&CancellationToken>,
     ) -> Vec<T> {
-        collect_async(rx, ordered, n).await
+        collect_async(rx, ordered, n, cancel).await
     }
 }
 
@@ -2605,13 +2625,25 @@ impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<T> for ForEachCollector<F>
 
     fn drain_empty(self) {}
 
-    fn drain_sync<R: RecvItem<(u64, T)>>(self, rx: R, ordered: bool, n: usize) {
-        for_each_sync(rx, ordered, n, self.f);
+    fn drain_sync<R: RecvItem<(u64, T)>>(
+        self,
+        rx: R,
+        ordered: bool,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) {
+        for_each_sync(rx, ordered, n, cancel, self.f);
     }
 
     #[cfg(feature = "tokio-runtime")]
-    async fn drain_async<R: AsyncRecvItem<(u64, T)>>(self, rx: R, ordered: bool, n: usize) {
-        for_each_async(rx, ordered, n, self.f).await;
+    async fn drain_async<R: AsyncRecvItem<(u64, T)>>(
+        self,
+        rx: R,
+        ordered: bool,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) {
+        for_each_async(rx, ordered, n, cancel, self.f).await;
     }
 }
 
@@ -2619,14 +2651,14 @@ impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<T> for ForEachCollector<F>
 /// [`drain_unordered`]/[`drain_ordered`] loops with the user closure as the
 /// sink.
 #[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
-fn for_each_sync<R, T, F>(rx: R, ordered: bool, n: usize, f: F)
+fn for_each_sync<R, T, F>(rx: R, ordered: bool, n: usize, cancel: Option<&CancellationToken>, f: F)
 where
     R: RecvItem<(u64, T)>,
     T: Send + Unpin + 'static,
     F: FnMut(T),
 {
     if ordered {
-        crate::state::drain_ordered(&rx, n, f);
+        drain_ordered(&rx, n, OrderedAccounting::Validate { cancel }, f);
     } else {
         crate::state::drain_unordered(&rx, f);
     }
@@ -2637,14 +2669,19 @@ where
 /// closure as the sink.
 #[cfg(feature = "tokio-runtime")]
 #[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
-async fn for_each_async<R, T, F>(rx: R, ordered: bool, n: usize, f: F)
-where
+async fn for_each_async<R, T, F>(
+    rx: R,
+    ordered: bool,
+    n: usize,
+    cancel: Option<&CancellationToken>,
+    f: F,
+) where
     R: AsyncRecvItem<(u64, T)>,
     T: Send + Unpin + 'static,
     F: FnMut(T),
 {
     if ordered {
-        crate::state::drain_ordered_async(&rx, n, f).await;
+        drain_ordered_async(&rx, n, OrderedAccounting::Validate { cancel }, f).await;
     } else {
         crate::state::drain_unordered_async(&rx, f).await;
     }
@@ -3227,18 +3264,22 @@ where
             "terminal channel must be MPSC (Single variant)"
         );
 
+        // `ctx.cancel` feeds the ordered drain's accounting check: a fired
+        // token legitimately shortens the stream, exempting the equality
+        // form (see `OrderedAccounting`).
+        let cancel = ctx.cancel.as_ref();
         let results = match final_rx {
-            FinalRx::Sync(rx) => terminal.drain_sync(rx, ordered, n),
-            FinalRx::SyncSingle(rx) => terminal.drain_sync(rx, ordered, n),
+            FinalRx::Sync(rx) => terminal.drain_sync(rx, ordered, n, cancel),
+            FinalRx::SyncSingle(rx) => terminal.drain_sync(rx, ordered, n, cancel),
             #[cfg(feature = "tokio-runtime")]
             FinalRx::Async(rx) => {
                 let pool = ctx.acquire_async()?;
-                pool.block_on(terminal.drain_async(rx, ordered, n))
+                pool.block_on(terminal.drain_async(rx, ordered, n, cancel))
             },
             #[cfg(feature = "tokio-runtime")]
             FinalRx::AsyncSingle(rx) => {
                 let pool = ctx.acquire_async()?;
-                pool.block_on(terminal.drain_async(rx, ordered, n))
+                pool.block_on(terminal.drain_async(rx, ordered, n, cancel))
             },
         };
 
@@ -3248,23 +3289,29 @@ where
 }
 
 /// Sync collector: drains `rx` into a `Vec` via the shared drain loops —
-/// ordered through [`run_ordered_collect`], unordered through
-/// [`drain_unordered`](crate::state) with a `Vec` push sink.
+/// ordered through [`drain_ordered`](crate::state) (with accounting
+/// validation), unordered through [`drain_unordered`](crate::state) with a
+/// `Vec` push sink.
 #[allow(clippy::needless_pass_by_value)]
 // `rx` is the terminal drain of the
 // pipeline: `run` passes the sole receiver by value to express "consume fully".
-fn collect_sync<R, T>(rx: R, ordered: bool, n: usize) -> Vec<T>
+fn collect_sync<R, T>(rx: R, ordered: bool, n: usize, cancel: Option<&CancellationToken>) -> Vec<T>
 where
     R: RecvItem<(u64, T)>,
     T: Send + Unpin + 'static,
 {
+    let mut results = Vec::with_capacity(n);
     if ordered {
-        run_ordered_collect(&rx, n)
+        // Not `run_ordered_collect`: the internal drain validates the
+        // `emitted + dropped == n` accounting (the public helper cannot —
+        // see `OrderedAccounting`).
+        drain_ordered(&rx, n, OrderedAccounting::Validate { cancel }, |item| {
+            results.push(item);
+        });
     } else {
-        let mut results = Vec::with_capacity(n);
         crate::state::drain_unordered(&rx, |item| results.push(item));
-        results
     }
+    results
 }
 
 /// Async collector: drains `rx` into a `Vec` via the shared async drain
@@ -3276,14 +3323,22 @@ where
 /// variant eliminates the per-item `lock cmpxchg` that the MPMC ring buffer
 /// pays on every `recv`.
 #[cfg(feature = "tokio-runtime")]
-async fn collect_async<R, T>(rx: R, ordered: bool, n: usize) -> Vec<T>
+async fn collect_async<R, T>(
+    rx: R,
+    ordered: bool,
+    n: usize,
+    cancel: Option<&CancellationToken>,
+) -> Vec<T>
 where
     R: AsyncRecvItem<(u64, T)>,
     T: Send + Unpin + 'static,
 {
     let mut results = Vec::with_capacity(n);
     if ordered {
-        crate::state::drain_ordered_async(&rx, n, |item| results.push(item)).await;
+        drain_ordered_async(&rx, n, OrderedAccounting::Validate { cancel }, |item| {
+            results.push(item);
+        })
+        .await;
     } else {
         crate::state::drain_unordered_async(&rx, |item| results.push(item)).await;
     }

@@ -1,7 +1,46 @@
 use crate::{
     handoff::{AsyncRecvItem, RecvItem, TryRecvError},
     state::ReorderBuffer,
+    sync::CancellationToken,
 };
+
+/// Whether the ordered drains may validate their post-run accounting
+/// (`emitted + dropped == expected`). The internal streaming terminal always
+/// validates — a fired cancel token exempts the equality form because a
+/// cancelled run legitimately emits fewer items (feeder and stage workers
+/// stop early). The public [`run_ordered_collect`] cannot validate:
+/// external callers feed arbitrary sender counts, so its `expected_items` is
+/// a capacity hint, not an item-count contract.
+#[derive(Clone, Copy)]
+pub(crate) enum OrderedAccounting<'a> {
+    Validate {
+        cancel: Option<&'a CancellationToken>,
+    },
+    Skip,
+}
+
+/// Post-drain accounting check shared by the ordered collectors: every item
+/// the run fed must be either emitted or counted as dropped by the
+/// [`ReorderBuffer`]. Debug-only; release builds keep just the counter
+/// ([`ReorderBuffer::dropped`]) — a window overflow never panics there.
+fn verify_ordered_accounting<T>(
+    buffer: &ReorderBuffer<T>,
+    emitted: usize,
+    expected_items: usize,
+    cancel: Option<&CancellationToken>,
+) {
+    let dropped = buffer.dropped();
+    debug_assert!(
+        emitted + dropped <= expected_items,
+        "ordered drain emitted {emitted} + dropped {dropped} items, more than the \
+         {expected_items} fed"
+    );
+    debug_assert!(
+        cancel.is_some_and(CancellationToken::is_cancelled) || emitted + dropped == expected_items,
+        "ordered drain accounting: emitted {emitted} + dropped {dropped} != {expected_items} \
+         expected — items vanished without being counted as dropped"
+    );
+}
 
 // ── Shared terminal-drain loops ──
 //
@@ -55,8 +94,12 @@ where
 /// Burst-drains like [`drain_unordered`]; ordering is unaffected — the
 /// [`ReorderBuffer`] re-sequences by `seq` regardless of arrival order.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) fn drain_ordered<R, O>(rx: &R, expected_items: usize, mut sink: impl FnMut(O))
-where
+pub(crate) fn drain_ordered<R, O>(
+    rx: &R,
+    expected_items: usize,
+    accounting: OrderedAccounting<'_>,
+    mut sink: impl FnMut(O),
+) where
     R: RecvItem<(u64, O)>,
     O: Send + 'static,
 {
@@ -67,6 +110,13 @@ where
     // sane.
     let capacity = expected_items.next_power_of_two().clamp(1 << 10, 1 << 20);
     let mut buffer = ReorderBuffer::new(capacity);
+    // Count emissions for the post-drain accounting check; the counter folds
+    // into the sink closure, so the per-item cost is one increment.
+    let mut emitted = 0usize;
+    let mut sink = |item: O| {
+        emitted += 1;
+        sink(item);
+    };
     loop {
         // Burst-drain: pop everything already queued without blocking.
         loop {
@@ -76,6 +126,9 @@ where
                 Err(TryRecvError::Closed) => {
                     for item in buffer.flush_remaining() {
                         sink(item);
+                    }
+                    if let OrderedAccounting::Validate { cancel } = accounting {
+                        verify_ordered_accounting(&buffer, emitted, expected_items, cancel);
                     }
                     return;
                 },
@@ -87,6 +140,9 @@ where
         } else {
             for item in buffer.flush_remaining() {
                 sink(item);
+            }
+            if let OrderedAccounting::Validate { cancel } = accounting {
+                verify_ordered_accounting(&buffer, emitted, expected_items, cancel);
             }
             return;
         }
@@ -133,6 +189,7 @@ where
 pub(crate) async fn drain_ordered_async<R, O>(
     rx: &R,
     expected_items: usize,
+    accounting: OrderedAccounting<'_>,
     mut sink: impl FnMut(O),
 ) where
     R: AsyncRecvItem<(u64, O)>,
@@ -140,6 +197,12 @@ pub(crate) async fn drain_ordered_async<R, O>(
 {
     let capacity = expected_items.next_power_of_two().clamp(1 << 10, 1 << 20);
     let mut buffer = ReorderBuffer::new(capacity);
+    // See `drain_ordered` for the accounting counter.
+    let mut emitted = 0usize;
+    let mut sink = |item: O| {
+        emitted += 1;
+        sink(item);
+    };
     loop {
         loop {
             match rx.try_recv() {
@@ -148,6 +211,9 @@ pub(crate) async fn drain_ordered_async<R, O>(
                 Err(TryRecvError::Closed) => {
                     for item in buffer.flush_remaining() {
                         sink(item);
+                    }
+                    if let OrderedAccounting::Validate { cancel } = accounting {
+                        verify_ordered_accounting(&buffer, emitted, expected_items, cancel);
                     }
                     return;
                 },
@@ -158,6 +224,9 @@ pub(crate) async fn drain_ordered_async<R, O>(
         } else {
             for item in buffer.flush_remaining() {
                 sink(item);
+            }
+            if let OrderedAccounting::Validate { cancel } = accounting {
+                verify_ordered_accounting(&buffer, emitted, expected_items, cancel);
             }
             return;
         }
@@ -181,6 +250,91 @@ where
     O: Send + 'static,
 {
     let mut results = Vec::with_capacity(expected_items);
-    drain_ordered(input_rx, expected_items, |item| results.push(item));
+    drain_ordered(input_rx, expected_items, OrderedAccounting::Skip, |item| {
+        results.push(item);
+    });
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handoff::channel;
+
+    /// Window overflow through the real drain loop. The window clamp
+    /// (`next_power_of_two().clamp(1 Ki, 1 Mi)`) only lets an alias happen
+    /// when the outstanding count exceeds the 1 Mi cap, so this feeds
+    /// `1 Mi + 1` items while skipping seq 0, then seq 0 to unblock the
+    /// prefix. Two aliases fire: seq `1 Mi + 1` lands on seq 1's slot, and
+    /// the late seq 0 lands on seq `1 Mi`'s slot (slot 0 — by then the
+    /// window has wrapped). A feeder thread is required — sending 1M items
+    /// into a bounded channel from the drain thread itself would deadlock on
+    /// backpressure. Both drops are counted and the post-drain accounting
+    /// (`emitted + dropped == expected`, no cancel token) must close exactly.
+    #[test]
+    fn drain_ordered_counts_window_overflow_drops() {
+        const SPAN: u64 = (1 << 20) + 1; // seqs 1..=SPAN, skipping seq 0
+        const DROPPED: usize = 2; // seqs 1 and 1 Mi (both aliased, see doc)
+        let expected: usize = usize::try_from(SPAN).unwrap() + 1; // + seq 0
+        let (tx, rx) = channel::<(u64, u64)>(1024);
+        let feeder = std::thread::spawn(move || {
+            for seq in 1..=SPAN {
+                tx.send((seq, seq)).unwrap();
+            }
+            tx.send((0, 0)).unwrap();
+        });
+        let mut out = Vec::new();
+        drain_ordered(
+            &rx,
+            expected,
+            OrderedAccounting::Validate { cancel: None },
+            |i| {
+                out.push(i);
+            },
+        );
+        feeder.join().unwrap();
+        // expected fed == SPAN + 1 emitted + DROPPED; seqs 1 and 1 Mi were
+        // overwritten. (The accounting check inside `drain_ordered` already
+        // asserted `emitted + dropped == expected`; these asserts pin down
+        // WHICH items vanished.)
+        assert_eq!(out.len(), expected - DROPPED);
+        assert_eq!(out[0], 0, "seq 0 unblocks the prefix flush");
+        assert!(!out.contains(&1), "the first aliased item must not survive");
+        assert!(
+            !out.contains(&(1 << 20)),
+            "the second aliased item must not survive"
+        );
+        let mut sorted = out.clone();
+        sorted.sort_unstable();
+        let expected_items: Vec<u64> = (0..=SPAN).filter(|&s| s != 1 && s != (1 << 20)).collect();
+        assert_eq!(sorted, expected_items);
+    }
+
+    /// A fired cancel token exempts the equality form: the run fed fewer
+    /// items than `expected_items` (feeder stopped early) and must not trip
+    /// the debug assertion.
+    #[test]
+    fn drain_ordered_cancelled_run_skips_equality() {
+        // Capacity >= item count: the sends happen before the drain on this
+        // same thread, so a bounded send would deadlock on backpressure.
+        let (tx, rx) = channel::<(u64, u64)>(16);
+        for seq in 0..10u64 {
+            tx.send((seq, seq)).unwrap();
+        }
+        drop(tx);
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut out = Vec::new();
+        drain_ordered(
+            &rx,
+            100,
+            OrderedAccounting::Validate {
+                cancel: Some(&token),
+            },
+            |i| {
+                out.push(i);
+            },
+        );
+        assert_eq!(out, (0..10).collect::<Vec<_>>());
+    }
 }
