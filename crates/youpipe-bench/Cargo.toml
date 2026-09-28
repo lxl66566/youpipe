@@ -27,6 +27,10 @@ publish      = false
 # this crate never run instrumented: the perf-event and file-encrypt benches
 # would otherwise count the probe bookkeeping as framework cost.
 hotpath = ["youpipe/hotpath", "dep:hotpath"]
+# Forwards youpipe's crossfire-trace (log::debug! per send/recv/wake episode)
+# into convoy-probe's raw-file logger (CONVOY_TRACE_PATH). Huge volume; only
+# for small-n forensics runs.
+crossfire-trace = ["youpipe/crossfire-trace", "dep:log"]
 
 [dependencies]
 aes-gcm   = "0.10"
@@ -34,6 +38,8 @@ aes-gcm   = "0.10"
 # `HotpathGuard` in the profile binary must share one global state.
 hotpath   = { version = "0.24", optional = true }
 getrandom = "0.2"
+# Only for the `crossfire-trace` forensics feature (convoy-probe logger).
+log       = { version = "0.4", optional = true, features = ["std"] }
 rayon     = "1"
 tokio     = { version = "1", features = ["fs", "rt-multi-thread"] }
 youpipe   = { path = "../youpipe", default-features = true }
@@ -64,6 +70,11 @@ required-features = ["hotpath"]
 # per-iteration times (perf stat / perf record sessions) + allocator/VMA probe.
 [[bin]]
 name = "horizontal-counters"
+
+# Streaming convoy bistability forensics (todo P1 #4): one shape, many runs,
+# per-run wall + per-thread ctxt-switch deltas by thread group.
+[[bin]]
+name = "convoy-probe"
 
 # Lab bench (publish = false): intentionally not inheriting the workspace lint set.
 [lints]
