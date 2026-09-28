@@ -116,3 +116,26 @@
   crossfire #70 假 Disconnected 窗口）。结论：crossfire mpsc 保留；微基准
   （无竞争稳态）与 in-pipeline（burst 节奏 + park 往返）两种口径的矛盾
   以此收束——当初切 crossfire 的 in-pipeline profiling 依据仍成立。
+- **streaming 相邻 sync stage 编译期自动融合**（2026-09-29，`sync_fuse`
+  家族同 binary knob A/B：`YOUPIPE_SYNC_FUSE_VARIANT=split|merged`，5 轮
+  per-id 隔离交错，32 核）：核心前提"相邻 sync stage 间每 item 一次
+  channel hop 可省"在稳态不成立——hop 是流水化的（各 channel 并发推进），
+  稳态每 item 成本由**每 channel 争用**主导，融合把两个 15W 种群并成一个
+  31W 种群、争用集中反而更慢。纯 sync streaming 链（`with_cancel` 强制
+  streaming）全面回退：pair @100K **+21.2 %**（24.6→29.8 ms）、@1K
+  +13.6 %；quad @100K **+34.6 %**（22.2→29.9 ms）、@1K +21.1 %；cheap
+  形状同向（+20.2 %/+13.0 %）；每 item 成本随单 channel worker 数单调
+  （8W 222 ns / 16W 246 ns / 31W 298 ns，quad-split/pair-split/pair-merged）。
+  async 尾链的表面大胜（`stage(f1).stage(f2).stage_async(g)` @100K
+  237 ms → 手动复合 25 ms，−89.4 %）经探针证伪为**双稳态 convoy 病态**
+  而非融合收益：同形状逐 run 双稳（探针 5 采样 [23, 24, 53, 151,
+  244] ms；独立进程复跑三组中位 239/164/155 ms，进程内亦混有快慢 run），
+  单 sync 前缀 25.9 ms / 复合前缀 24.0 ms / async-only 83 ms
+  （后者受 feeder 单线程推送率限制）；fence 链的表面 +477…+563 % 回退
+  同属该病态——零负载 `stage(bump).fence(Chunked(500)).stage(bump)` 即
+  226 ms @100K，与是否融合无关（canary：`sync_fuse/fence_infra`；另立
+  todo 跟踪）。结论：不做自动融合；convoy 病态才是该形状的正解。曾验证
+  过落地方案的可编译性（`SyncStage` 加 pin 标记类型参数 + 泛型 `stage`
+  移入 sealed-marker-bounded 固有 impl，两块固有 impl 不重叠、解析命中
+  融合版），如未来病态修复后重开此方向可复用该设计（注意 E0592：两个
+  无界的同名固有方法 impl 不允许）。

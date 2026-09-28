@@ -47,13 +47,23 @@
 - 验证：`cpu_balanced` 1M/2M/4M 隔离 A/B + `horizontal-counters`（youpipe-bench）
   复查 task-clock / ctx-switch / migration。
 
-### 3. [P2] streaming 相邻 sync stage 融合
+### 3. [P1] streaming 多种群交接的吞吐塌缩（sync→async / fence）
 
-整链 fuse 仅在纯 sync、无 pin、无 cancel 时触发（`fuse_exec` 谱系）；
-`stream(..).stage(a).stage(b)` 是两个 worker 种群 + 每 item 一次 channel
-hop，而等价 fused 链单遍完成（`FuseCompose` 已具备闭包复合能力）。可在
-spawn 链游走时对相邻 unpinned `SyncStage` 合并成单 worker 池，任一侧 pin
-`workers`/`buffer` 即放弃。投机项：先 bench 后落地。
+- 现状（2026-09-29，由相邻 sync 融合证伪 bench 发现，数据见
+  dead-ends.md「streaming 相邻 sync stage 编译期自动融合」）：
+  `stage(f1).stage(f2).stage_async(g)` @100K 独立进程稳定 ~237 ms
+  （2.4 µs/item），而单 sync 前缀 25.9 ms、手动复合前缀 24.0 ms；同形状
+  逐 run 双稳（探针 5 采样 [23, 24, 53, 151, 244] ms；独立进程复跑三组
+  中位 239/164/155 ms）。零负载
+  `stage(bump).fence(Chunked(500)).stage(bump)` 226 ms；3-stage fence
+  （10W/阶段）36 ms，4W pin 113–121 ms——病态方向随 worker 数非单调，
+  疑似 anchor+burst recv 的 convoy 双稳（recv-loop 注释记录过 8-worker
+  形态）。async-only 链 83 ms 另受 feeder 单线程推送率限制（15–32 个
+  sync 生产者并发推送时无此限制）。
+- 方向：hotpath / horizontal-counters 归因——mixed 通道背压唤醒风暴 vs
+  fence 批量释放节奏 vs burst-drain 争用塌缩；修复后再评估 2+ sync 前缀
+  的 async 链是否还需要形态侧缓解。
+- 验证：`sync_fuse` 家族（canary `fence_infra` + async/fence/cancel 形状）。
 
 ### 4. [P2] fence 的每 run 专线程
 

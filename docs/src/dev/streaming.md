@@ -135,6 +135,13 @@ throughput of 2 workers (best case unreachable; convoy bistability). The
 terminal collectors have used the same shape since their burst-drain
 introduction.
 
+2026-09: the same bistability shows up shape-dependent at scale — a zero-CPU
+`stage(bump).fence(Chunked(500)).stage(bump)` chain runs 226 ms @100K while
+the 3-stage variant runs 36 ms, and a two-sync-prefix → `stage_async` chain
+flips between 23 and 244 ms across runs of the same shape (fusion-of-
+adjacent-sync-stages was falsified on this evidence; the pathology itself is
+tracked as todo P1 #3, canary `sync_fuse/fence_infra`).
+
 ## Pool-wide parking lease (deadlock freedom across concurrent runs)
 
 A channel-parking job — a non-inline feeder, a sync/expand stage worker —
