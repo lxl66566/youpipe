@@ -1,6 +1,11 @@
-use std::{cell::Cell, marker::PhantomData, num::NonZeroUsize, sync::Arc};
 #[cfg(feature = "tokio-runtime")]
-use std::{future::Future, sync::OnceLock};
+use std::future::Future;
+use std::{
+    cell::Cell,
+    marker::PhantomData,
+    num::NonZeroUsize,
+    sync::{Arc, OnceLock},
+};
 
 use super::{
     fused::{fused_pass_collect, fused_pass_reduce},
@@ -17,12 +22,15 @@ use crate::{
     builder::config::{PipelineConfig, Workload},
     executor::compute::ComputePool,
     handoff::{
-        MpscReceiver, Receiver, RecvItem, SendItem, SyncSender, TryRecvError, channel::channel,
-        mpsc_channel,
+        MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, ShardedReceiver, SyncSender,
+        TryRecvError, channel::channel, mpsc_channel, sharded_mpsc_channel,
     },
     pool::Registry,
     runtime::{AsyncRuntime, DefaultRuntime},
-    state::{FenceBarrier, FenceMode, OrderedAccounting, drain_ordered, drain_ordered_async},
+    state::{
+        FenceBarrier, FenceMode, OrderedAccounting, drain_ordered, drain_ordered_async,
+        drain_ordered_sharded, drain_unordered_sharded,
+    },
     sync::CancellationToken,
 };
 
@@ -77,6 +85,26 @@ fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
         });
     });
     s_rx
+}
+
+// ── Sharded terminal channel (runtime knob, todo #1) ──
+//
+// `YOUPIPE_SHARDED_TERM=1` swaps the terminal stage's output channel from
+// one shared MPSC ring to one SPSC ring per worker (see `handoff/sharded.rs`
+// for the contention rationale). Runtime knob — not a config field — so A/B
+// benchmarks compare the same binary (recompiles swing tight benchmarks
+// ±30 % through pure code layout). Default off.
+static SHARDED_TERM: OnceLock<bool> = OnceLock::new();
+
+fn sharded_term_enabled() -> bool {
+    *SHARDED_TERM.get_or_init(|| match std::env::var("YOUPIPE_SHARDED_TERM") {
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" || v.is_empty() => false,
+        Ok(other) => {
+            panic!("YOUPIPE_SHARDED_TERM: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
+        },
+        Err(_) => false,
+    })
 }
 
 /// Caught panic payload from a pool-submitted feeder job, re-raised on the
@@ -297,17 +325,42 @@ fn spawn_stage<I, O, Tx, R>(
     Tx: SendItem<(u64, O)>,
     R: AsyncRuntime,
 {
+    // Shared-sender topology: every worker clones the one output sender.
+    let mut txs: Vec<_> = (0..parallelism.saturating_sub(1))
+        .map(|_| tx.clone())
+        .collect();
+    txs.push(tx);
+    spawn_stage_fanout::<I, O, Tx, R>(ctx, rx, txs, stage);
+}
+
+/// Core of [`spawn_stage`] taking **one sender per worker** instead of one
+/// shared sender to clone. `Tx` is deliberately not `Clone`-bounded: the
+/// sharded terminal path passes one distinct sender per worker (each owns a
+/// SPSC shard — cloning would reintroduce the multi-producer ring). Worker
+/// bodies are identical either way; only sender ownership differs.
+#[allow(clippy::needless_pass_by_value)] // same ownership-transfer rationale as `spawn_stage`
+fn spawn_stage_fanout<I, O, Tx, R>(
+    ctx: &StreamCtx<'_, R>,
+    rx: Receiver<(u64, I)>,
+    txs: Vec<Tx>,
+    stage: impl Fn(I) -> O + Send + Sync + 'static,
+) where
+    I: Send + Unpin + 'static,
+    O: Send + Unpin + 'static,
+    Tx: SendItem<(u64, O)>,
+    R: AsyncRuntime,
+{
     let stage = Arc::new(stage);
     // Collect all worker closures and submit as a single batch. This reduces
     // injector-queue notification overhead from N SeqCst fences + N JEC
     // increments (one per `submit`) down to 1 (one `submit_batch`), which
     // measurably helps the small-workload case where per-run fixed cost
     // dominates.
-    let jobs: Vec<_> = (0..parallelism)
-        .map(|_| {
+    let jobs: Vec<_> = txs
+        .into_iter()
+        .map(|tx| {
             let stage = stage.clone();
             let rx = rx.clone();
-            let tx = tx.clone();
             let worker_cancel = ctx.cancel.clone();
             move || {
                 'outer: loop {
@@ -348,7 +401,6 @@ fn spawn_stage<I, O, Tx, R>(
         .collect();
     ctx.spawn_stage_jobs(jobs);
     drop(rx);
-    drop(tx);
 }
 
 /// Like [`spawn_stage`] but expands each input into 0..N outputs via `expand`.
@@ -374,12 +426,34 @@ fn spawn_expand_stage<I, N, Tx, R>(
     Tx: SendItem<(u64, N)>,
     R: AsyncRuntime,
 {
+    // Shared-sender topology: every worker clones the one output sender.
+    let mut txs: Vec<_> = (0..parallelism.saturating_sub(1))
+        .map(|_| tx.clone())
+        .collect();
+    txs.push(tx);
+    spawn_expand_stage_fanout::<I, N, Tx, R>(ctx, rx, txs, expand);
+}
+
+/// Per-worker-senders core of [`spawn_expand_stage`] — same split rationale as
+/// [`spawn_stage_fanout`] (sharded terminal passes one SPSC shard per worker).
+#[allow(clippy::needless_pass_by_value)] // same ownership-transfer rationale as `spawn_stage`
+fn spawn_expand_stage_fanout<I, N, Tx, R>(
+    ctx: &StreamCtx<'_, R>,
+    rx: Receiver<(u64, I)>,
+    txs: Vec<Tx>,
+    expand: impl Fn(I, &mut Vec<N>) + Send + Sync + 'static,
+) where
+    I: Send + Unpin + 'static,
+    N: Send + Unpin + 'static,
+    Tx: SendItem<(u64, N)>,
+    R: AsyncRuntime,
+{
     let expand = Arc::new(expand);
-    let jobs: Vec<_> = (0..parallelism)
-        .map(|_| {
+    let jobs: Vec<_> = txs
+        .into_iter()
+        .map(|tx| {
             let expand = expand.clone();
             let rx = rx.clone();
-            let tx = tx.clone();
             let worker_cancel = ctx.cancel.clone();
             move || {
                 // Per-worker scratch buffer, reused across items (cleared
@@ -431,7 +505,6 @@ fn spawn_expand_stage<I, N, Tx, R>(
         .collect();
     ctx.spawn_stage_jobs(jobs);
     drop(rx);
-    drop(tx);
 }
 
 /// Fence forwarder: drains `mid_rx` into a [`FenceBarrier`] and releases
@@ -1084,7 +1157,7 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
                     });
                 });
             },
-            FinalRx::SyncSingle(_) | FinalRx::AsyncSingle(_) => {
+            FinalRx::SyncSingle(_) | FinalRx::SyncSharded(_) | FinalRx::AsyncSingle(_) => {
                 unreachable!(
                     "spawn_for_async calls self.spawn() which never returns Single variants"
                 )
@@ -1102,6 +1175,11 @@ pub enum FinalRx<T: Send + Unpin + 'static> {
     /// (store-based dequeue, lock-free waker registry) because the collector
     /// is the sole consumer. Produced by [`StageSpawn::spawn_single`].
     SyncSingle(MpscReceiver<(u64, T)>),
+    /// Per-worker sharded variant — every terminal worker owns one SPSC
+    /// ring; the collector round-robin burst-drains them all and EOF is the
+    /// aggregation of every shard closing. Produced by the
+    /// `YOUPIPE_SHARDED_TERM=1` terminal path (see `handoff/sharded.rs`).
+    SyncSharded(ShardedReceiver<(u64, T)>),
     #[cfg(feature = "tokio-runtime")]
     Async(AsyncReceiver<(u64, T)>),
     #[cfg(feature = "tokio-runtime")]
@@ -1122,6 +1200,9 @@ fn finalize_prev_rx<T: Send + Unpin + 'static, R: AsyncRuntime>(
         FinalRx::Sync(r) => r,
         FinalRx::SyncSingle(_) => {
             unreachable!("prev.spawn() never returns SyncSingle")
+        },
+        FinalRx::SyncSharded(_) => {
+            unreachable!("prev.spawn() never returns SyncSharded")
         },
         #[cfg(feature = "tokio-runtime")]
         FinalRx::Async(r) => bridge_async_to_sync::<_, R>(r, ctx),
@@ -1166,6 +1247,12 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// dedicated threads keep such chains deadlock-free at the cost of one
     /// `thread::spawn` per worker.
     pub dedicated_threads: bool,
+    /// Runtime knob `YOUPIPE_SHARDED_TERM` (read once per run in
+    /// [`StreamPipe::try_exec`]): when set, a multi-worker terminal sync /
+    /// expand stage fans its output channel into per-worker SPSC shards
+    /// (see `handoff/sharded.rs`). Channel shape only — worker count, the
+    /// parking lease budget, and every semantic contract are unchanged.
+    sharded_terminal: bool,
     /// The pool-capacity lease backing pool mode (`dedicated_threads ==
     /// false`); `None` in dedicated mode. Every channel-parking job
     /// submitted for this run is wrapped through [`ParkingLease::wrap_job`].
@@ -1212,6 +1299,14 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
         self.config.buffer_size.max(parallelism * 4)
     }
 
+    /// Whether this run's terminal stage should shard its output channel:
+    /// the knob is on and the stage is actually multi-worker. A
+    /// single-worker terminal already IS one SPSC ring (one sender, one
+    /// receiver) — sharding it would only rename the channel.
+    fn sharded_terminal(&self, parallelism: usize) -> bool {
+        self.sharded_terminal && parallelism > 1
+    }
+
     /// Resolve a stage's worker count: the stage's explicit
     /// `StageOptions::workers` pin, or the runner-computed default division.
     /// Clamped to `[1, n]` (a stage never gets more workers than items).
@@ -1245,9 +1340,9 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
 
     /// Dispatch a batch of the run's channel-parking jobs (stage workers,
     /// or the single fence-forwarder job): one batched pool submission in
-    /// pool mode, one dedicated OS thread per job in dedicated-thread mode. Threads are detached — workers always terminate on channel
-    /// disconnect (see [`spawn_stage`]), and the collector only returns once
-    /// every sender is dropped, so no thread outlives the run's usefulness.
+    /// pool mode, one dedicated OS thread per job in dedicated-thread mode. Threads are detached —
+    /// workers always terminate on channel disconnect (see [`spawn_stage`]), and the collector
+    /// only returns once every sender is dropped, so no thread outlives the run's usefulness.
     ///
     /// Pool mode wraps each job through the run's [`ParkingLease`] so its
     /// leased slot is returned exactly when the worker leaves the job.
@@ -1458,6 +1553,14 @@ where
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        if ctx.sharded_terminal(parallelism) {
+            // YOUPIPE_SHARDED_TERM=1: one SPSC ring per worker instead of one
+            // shared ring — removes both the send-side producer CAS
+            // contention and the collector's shared cache lines (todo #1).
+            let (txs, out_rx) = sharded_mpsc_channel::<(u64, M)>(parallelism, buffer);
+            spawn_stage_fanout::<_, _, MpscSender<(u64, M)>, R>(ctx, mid_rx, txs, self.f);
+            return FinalRx::SyncSharded(out_rx);
+        }
         let (out_tx, out_rx) = mpsc_channel::<(u64, M)>(buffer);
         spawn_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::SyncSingle(out_rx)
@@ -1516,6 +1619,13 @@ where
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        if ctx.sharded_terminal(parallelism) {
+            // See `SyncStage::spawn_single` — the feeder being async changes
+            // nothing about the terminal fan-in shape.
+            let (txs, out_rx) = sharded_mpsc_channel::<(u64, M)>(parallelism, buffer);
+            spawn_stage_fanout::<_, _, MpscSender<(u64, M)>, R>(ctx, mid_rx, txs, self.f);
+            return FinalRx::SyncSharded(out_rx);
+        }
         let (out_tx, out_rx) = mpsc_channel::<(u64, M)>(buffer);
         spawn_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::SyncSingle(out_rx)
@@ -1633,6 +1743,13 @@ where
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        if ctx.sharded_terminal(parallelism) {
+            // See `SyncStage::spawn_single`; expand workers benefit from the
+            // same send-side de-contention as plain sync workers.
+            let (txs, out_rx) = sharded_mpsc_channel::<(u64, N)>(parallelism, buffer);
+            spawn_expand_stage_fanout::<_, _, MpscSender<(u64, N)>, R>(ctx, mid_rx, txs, self.f);
+            return FinalRx::SyncSharded(out_rx);
+        }
         let (out_tx, out_rx) = mpsc_channel::<(u64, N)>(buffer);
         spawn_expand_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::SyncSingle(out_rx)
@@ -2092,6 +2209,9 @@ where
         },
         FinalRx::SyncSingle(_) => {
             unreachable!("spawn_async_feeder path never produces SyncSingle")
+        },
+        FinalRx::SyncSharded(_) => {
+            unreachable!("spawn_async_feeder path never produces SyncSharded")
         },
         FinalRx::Async(prev_async_rx) => {
             // NOTE(perf): this bridge task is NOT redundant — do not try to
@@ -2593,13 +2713,24 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
 /// How a streaming run drains the final receiver: into a `Vec` (`.run()`) or
 /// item-by-item through a closure (`.for_each()` — no output `Vec`
 /// materialised).
-trait Terminal<T>: Sized {
+trait Terminal<T: Send>: Sized {
     type Out: Send + 'static;
     /// Result for an empty input (nothing is spawned at all).
     fn drain_empty(self) -> Self::Out;
     fn drain_sync<R: RecvItem<(u64, T)>>(
         self,
         rx: R,
+        ordered: bool,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Self::Out;
+    /// Sharded-terminal counterpart of [`Self::drain_sync`] — the collector
+    /// aggregates the per-worker shards instead of draining one receiver
+    /// (`YOUPIPE_SHARDED_TERM=1` path). No async analogue: the async
+    /// terminal stages keep the single-channel MPSC backing.
+    fn drain_sync_sharded(
+        self,
+        rx: ShardedReceiver<(u64, T)>,
         ordered: bool,
         n: usize,
         cancel: Option<&CancellationToken>,
@@ -2632,6 +2763,16 @@ impl<T: Send + Unpin + 'static> Terminal<T> for VecCollector {
         cancel: Option<&CancellationToken>,
     ) -> Vec<T> {
         collect_sync(rx, ordered, n, cancel)
+    }
+
+    fn drain_sync_sharded(
+        self,
+        rx: ShardedReceiver<(u64, T)>,
+        ordered: bool,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Vec<T> {
+        collect_sync_sharded(rx, ordered, n, cancel)
     }
 
     #[cfg(feature = "tokio-runtime")]
@@ -2668,6 +2809,16 @@ impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<T> for ForEachCollector<F>
         for_each_sync(rx, ordered, n, cancel, self.f);
     }
 
+    fn drain_sync_sharded(
+        self,
+        rx: ShardedReceiver<(u64, T)>,
+        ordered: bool,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) {
+        for_each_sync_sharded(rx, ordered, n, cancel, self.f);
+    }
+
     #[cfg(feature = "tokio-runtime")]
     async fn drain_async<R: AsyncRecvItem<(u64, T)>>(
         self,
@@ -2678,6 +2829,29 @@ impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<T> for ForEachCollector<F>
     ) {
         for_each_async(rx, ordered, n, cancel, self.f).await;
     }
+}
+
+/// Sharded counterpart of [`collect_sync`] — same ordered/unordered split
+/// over the shard-aggregating drain loops.
+#[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
+fn collect_sync_sharded<T>(
+    mut rx: ShardedReceiver<(u64, T)>,
+    ordered: bool,
+    n: usize,
+    cancel: Option<&CancellationToken>,
+) -> Vec<T>
+where
+    T: Send + Unpin + 'static,
+{
+    let mut results = Vec::with_capacity(n);
+    if ordered {
+        drain_ordered_sharded(&mut rx, n, OrderedAccounting::Validate { cancel }, |item| {
+            results.push(item);
+        });
+    } else {
+        drain_unordered_sharded(&mut rx, |item| results.push(item));
+    }
+    results
 }
 
 /// Item-by-item drain of a sync final receiver — the shared
@@ -2694,6 +2868,25 @@ where
         drain_ordered(&rx, n, OrderedAccounting::Validate { cancel }, f);
     } else {
         crate::state::drain_unordered(&rx, f);
+    }
+}
+
+/// Sharded counterpart of [`for_each_sync`].
+#[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
+fn for_each_sync_sharded<T, F>(
+    mut rx: ShardedReceiver<(u64, T)>,
+    ordered: bool,
+    n: usize,
+    cancel: Option<&CancellationToken>,
+    f: F,
+) where
+    T: Send + Unpin + 'static,
+    F: FnMut(T),
+{
+    if ordered {
+        drain_ordered_sharded(&mut rx, n, OrderedAccounting::Validate { cancel }, f);
+    } else {
+        drain_unordered_sharded(&mut rx, f);
     }
 }
 
@@ -3131,41 +3324,41 @@ where
         // (reserved but inline) merely over-reserves by one slot, returned
         // by the lease's drop.
         let feeder_slot = usize::from(n > config.buffer_size.max(4));
-        let (lease, dedicated_threads, per_stage_parallelism, run_live_slots) =
-            if pool.is_on_this_pool() {
-                (None, true, budget.default_workers(workers_budget), 0)
+        let (lease, dedicated_threads, per_stage_parallelism, run_live_slots) = if pool
+            .is_on_this_pool()
+        {
+            (None, true, budget.default_workers(workers_budget), 0)
+        } else {
+            // Snapshot the pool's lease load, size this run against it, and
+            // CAS the whole grant in one piece — `try_reserve_parking`
+            // revalidates against the live counter, so a stale snapshot can
+            // only under-promise (per_stage too small), never over-admit.
+            // Each fence forwarder is one channel-parking pool job for
+            // the whole run: it takes a lease slot (never returned until
+            // the run drains) and is deducted from the stage-worker
+            // division up front, exactly like the feeder slot. Skipping
+            // this term re-opens the shared-pool deadlock for chains
+            // with fences (regression-tested in
+            // `test_fence_forwarder_counts_in_parking_lease_no_deadlock`).
+            let fences = budget.fences;
+            let used = pool.registry().parking_used();
+            let live_slots = pool_threads.saturating_sub(used + feeder_slot + fences);
+            let per_stage = budget.default_workers(workers_budget.min(live_slots));
+            // Upper bound of granted workers: pins are additionally clamped
+            // to `n` by `stage_workers`, so this never under-reserves.
+            let unpinned = budget.stages.saturating_sub(budget.explicit_stages);
+            let need = feeder_slot + fences + budget.explicit_workers + unpinned * per_stage.min(n);
+            if need <= pool_threads && pool.registry().try_reserve_parking(need) {
+                let lease = ParkingLease {
+                    registry: Arc::clone(pool.registry()),
+                    reserved: need,
+                    spawned: Cell::new(0),
+                };
+                (Some(lease), false, per_stage, live_slots)
             } else {
-                // Snapshot the pool's lease load, size this run against it, and
-                // CAS the whole grant in one piece — `try_reserve_parking`
-                // revalidates against the live counter, so a stale snapshot can
-                // only under-promise (per_stage too small), never over-admit.
-                // Each fence forwarder is one channel-parking pool job for
-                // the whole run: it takes a lease slot (never returned until
-                // the run drains) and is deducted from the stage-worker
-                // division up front, exactly like the feeder slot. Skipping
-                // this term re-opens the shared-pool deadlock for chains
-                // with fences (regression-tested in
-                // `test_fence_forwarder_counts_in_parking_lease_no_deadlock`).
-                let fences = budget.fences;
-                let used = pool.registry().parking_used();
-                let live_slots = pool_threads.saturating_sub(used + feeder_slot + fences);
-                let per_stage = budget.default_workers(workers_budget.min(live_slots));
-                // Upper bound of granted workers: pins are additionally clamped
-                // to `n` by `stage_workers`, so this never under-reserves.
-                let unpinned = budget.stages.saturating_sub(budget.explicit_stages);
-                let need =
-                    feeder_slot + fences + budget.explicit_workers + unpinned * per_stage.min(n);
-                if need <= pool_threads && pool.registry().try_reserve_parking(need) {
-                    let lease = ParkingLease {
-                        registry: Arc::clone(pool.registry()),
-                        reserved: need,
-                        spawned: Cell::new(0),
-                    };
-                    (Some(lease), false, per_stage, live_slots)
-                } else {
-                    (None, true, budget.default_workers(workers_budget), 0)
-                }
-            };
+                (None, true, budget.default_workers(workers_budget), 0)
+            }
+        };
         // Per-run worker budget in pool mode: the leased capacity minus the
         // feeder slot. `unpinned * per_stage ≤ live_slots - explicit` by the
         // `default_workers` division, so `stage_workers`' clamping grants
@@ -3183,6 +3376,7 @@ where
             n,
             per_stage_parallelism,
             dedicated_threads,
+            sharded_terminal: sharded_term_enabled(),
             lease,
             worker_slots_left: Cell::new(worker_slots_left),
             stages_left: Cell::new(stages_left),
@@ -3297,13 +3491,16 @@ where
         // non-Single variant.
         #[cfg(feature = "tokio-runtime")]
         debug_assert!(
-            matches!(final_rx, FinalRx::SyncSingle(_) | FinalRx::AsyncSingle(_)),
-            "terminal channel must be MPSC (Single variant)"
+            matches!(
+                final_rx,
+                FinalRx::SyncSingle(_) | FinalRx::SyncSharded(_) | FinalRx::AsyncSingle(_)
+            ),
+            "terminal channel must be single-consumer (Single or Sharded variant)"
         );
         #[cfg(not(feature = "tokio-runtime"))]
         debug_assert!(
-            matches!(final_rx, FinalRx::SyncSingle(_)),
-            "terminal channel must be MPSC (Single variant)"
+            matches!(final_rx, FinalRx::SyncSingle(_) | FinalRx::SyncSharded(_)),
+            "terminal channel must be single-consumer (Single or Sharded variant)"
         );
 
         // `ctx.cancel` feeds the ordered drain's accounting check: a fired
@@ -3313,6 +3510,7 @@ where
         let results = match final_rx {
             FinalRx::Sync(rx) => terminal.drain_sync(rx, ordered, n, cancel),
             FinalRx::SyncSingle(rx) => terminal.drain_sync(rx, ordered, n, cancel),
+            FinalRx::SyncSharded(rx) => terminal.drain_sync_sharded(rx, ordered, n, cancel),
             #[cfg(feature = "tokio-runtime")]
             FinalRx::Async(rx) => {
                 let pool = ctx.acquire_async()?;

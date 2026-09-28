@@ -526,6 +526,50 @@ per-run setup cost (feeder, channel allocation, runtime entry) is a
 larger fraction of the ~9 ms total, so tokio's simpler spawn-per-item model
 still leads there.
 
+### Sharded terminal fan-in A/B (`sharded_term`, 2026-09-29)
+
+Evidence bench for todo #1 (collector-side fan-in pacing the engine):
+`YOUPIPE_SHARDED_TERM=0/1` selects one shared MPSC terminal ring vs one
+SPSC ring per terminal worker, same binary (`bench_ab.sh -E`, 5 per-id
+isolated interleaved rounds, 32 cores, median-of-round-medians). Every
+shape is forced onto the streaming topology by an inert `with_cancel`
+token; `cheap` = x+1 (channel-dominated), `cpu` = 50 mul-adds (~25 ns).
+
+| shape @1K              | off    | on     | Δ%     | verdict |
+| ---------------------- | ------ | ------ | ------ | ------- |
+| single_unordered_cheap | 307 µs | 272 µs | −11.4  | stable  |
+| single_unordered_cpu   | 305 µs | 274 µs | −10.3  | stable  |
+| single_ordered_cpu     | 308 µs | 276 µs | −10.5  | stable  |
+| multi2_cpu             | 273 µs | 260 µs | −4.9   | (dominant 25/25) |
+| workers2_cpu           | 51.0 µs | 41.7 µs | −18.2 | stable  |
+| expand_cheap           | 527 µs | 303 µs | −42.5  | stable  |
+
+| shape @100K            | off    | on     | Δ%     | verdict |
+| ---------------------- | ------ | ------ | ------ | ------- |
+| single_unordered_cheap | 29.9 ms | 20.4 ms | −31.7 | dominant |
+| single_unordered_cpu   | 29.9 ms | 21.2 ms | −29.1 | stable  |
+| single_ordered_cpu     | 29.7 ms | 20.9 ms | −29.6 | stable  |
+| multi2_cpu             | 24.3 ms | 22.4 ms | −8.0  | (dominant 25/25) |
+| workers2_cpu           | 4.44 ms | 3.41 ms | −23.2 | dominant |
+| expand_cheap           | 48.6 ms | 20.2 ms | −58.5 | stable  |
+
+No id regressed; every cross-side round pair favoured the ON side
+(25/25 or 20/20). `workers2` improving rules out a per-shard fixed-cost
+threshold, so the knob ships without an auto gate. Mechanism: the send-side
+`compare_exchange` contention and the shared-ring cache lines vanish; the
+collector pays a round-robin pass over k rings instead (k−1 failed
+`try_recv` per pass, amortised over the burst). Default remains off
+pending soak of fence/convoy interactions (todo #4): during smoke the OFF
+side entered the known long-run convoy burn (26 cores spinning, collector
+parked inside crossfire `_read`'s stamp wait) while the ON side ran clean
+— suggestive, not a verdict (single observation, no multi-seed).
+
+Control runs: `mixed_load/youpipe_stream_cpu` (fused pass-through — no
+terminal channel) off vs on is noise (+0.6 %/−0.1 %, 3 rounds), confirming
+the knob does not leak outside the streaming terminal path; the `sync_fuse`
+shapes are unaffected-to-better (`fence_infra/1K` −0.8 % noise — the
+todo #4 canary; `cancel_pair_cpu_split/100K` −7.9 %, 9/9 dominant).
+
 ### Adjacent-sync fusion A/B (`sync_fuse`, 2026-09-29)
 
 Evidence bench for the falsified "fuse adjacent sync stages in streaming

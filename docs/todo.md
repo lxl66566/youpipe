@@ -18,21 +18,27 @@
 
 ## 性能
 
-### 1. [P0] streaming 终端通道扇入：collector 侧单点定速
+### 1. [P0] streaming 终端通道扇入：分片已落地（opt-in），默认策略待 soak
 
-- 证据（2026-09-28 hotpath `stream-engine` 场景，youpipe-bench）：真实流引擎
-  1M×30 无序单级（x+1）每 item 端到端 ~365 ns，`drain_unordered` 占 wall
-  99.8%，而 worker 侧可见活动（sleep+no_work_found+find_work+steal）合计仅
-  0.4%——生产者几乎全程阻塞在 crossfire 内部（探针不可见），引擎被 collector
-  侧数据面单独定速，比通道裸容量（44–85 Melem/s）慢 ~20×。
-- 方向：两步——(a) 前置零风险：`handoff/channel.rs` 数据面探针（现有 72 探针
-  零覆盖 send/recv/try_recv）+ hotpath 补 ordered / for_each / fence /
-  async-stage 场景；(b) 主攻：per-worker SPSC 分片终通道 + collector 轮询
-  burst-drain，或 crossfire 批量 recv 接口。
-- 风险：MPSC 是当年 in-pipeline 剖析选出（MPMC recv 侧 CAS 主导，streaming.md
-  "MPSC Channels"），分片把复用开销移回 collector 侧；burst 边界泊车已证伪一次
-  （e1684fc→aa842a6，dead-ends.md）；stream 家族 ±10% 漂移，必须隔离交替。
-- 关联：#4（convoy 双稳）疑为同一数据面争用的形态侧表现，(a) 的探针两边复用。
+- 已落地（2026-09-29，`handoff/sharded.rs` + `drain_*_sharded`）：per-worker
+  SPSC 分片终通道，运行时旋钮 `YOUPIPE_SHARDED_TERM=1`（默认 off）。A/B
+  （`sharded_term` evidence bench，5 轮隔离交错同 binary）12 id 全部改善、
+  零回归、全部 dominant/stable：100K 单级 cheap/cpu −29…−32 %、expand
+  −58.5 %、workers2 −23.2 %、multi2 −8.0 %；1K −4.9…−42.5 %（含 workers2，
+  无需 auto 门槛）。读数与机制见 benchmarks.md "Sharded terminal fan-in
+  A/B"、streaming.md 对应小节。mixed_load（fused 路径）与 sync_fuse
+  fence_infra 对照均为噪声——旋钮不泄漏出 streaming 终端。
+- 遗留：默认 on/auto 未开——长跑 soak 中 OFF 侧出现过一次已知 convoy 病态
+  （26 核满转、collector 卡 crossfire `_read` stamp 自旋，smoke 单次观察）而
+  ON 侧未复现，提示分片可能顺带缓解 #4，但单次观察不作结论；默认翻转需要
+  多 seed soak + #4 交互验证。
+- 残余方向：(a) 数据面探针（现有 72 探针零覆盖 send/recv/try_recv）+ hotpath
+  补 ordered / for_each / fence / async-stage 场景；(c) async 终端的分片聚合
+  （当前 async Single 保持单通道 MPSC）；(d) crossfire 批量 recv 接口。
+- 风险记录：MPSC 是当年 in-pipeline 剖析选出（streaming.md "MPSC Channels"），
+  分片把复用开销移回 collector 侧——实测无回归（每 pass k−1 次失败 try_recv
+  被突发摊销）；burst 边界泊车未用（已证伪，e1684fc→aa842a6）。
+- 关联：#4（convoy 双稳）疑为同一数据面争用的形态侧表现（见上 soak 观察）。
 
 ### 2. [P1] zstd_shape 残余差距（capped/uniform 落后）
 
