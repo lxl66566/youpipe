@@ -570,7 +570,6 @@ the knob does not leak outside the streaming terminal path; the `sync_fuse`
 shapes are unaffected-to-better (`fence_infra/1K` −0.8 % noise — the
 todo #4 canary; `cancel_pair_cpu_split/100K` −7.9 %, 9/9 dominant).
 
-
 ### Sharded-terminal default-policy soak (pre-convoy-fix baseline, 2026-09-29)
 
 Multi-seed soak for the `YOUPIPE_SHARDED_TERM` default decision (todo #1),
@@ -627,6 +626,66 @@ Verdict: default stays **off**. The soak supports opt-in for
 contention-shaped terminals (`single`/fence families) but shows a real
 regression face on back-to-back sync2; the decision must be re-made after
 the convoy fix lands (#4) — this table is the pre-fix baseline.
+
+
+### Async sharded-terminal A/B (`sharded_term_async`, 2026-09-29)
+
+Evidence bench for todo #1 residual (c): the async terminal's fan-in —
+`io_concurrency` (128 by default) runtime tasks all `send().await` into one
+shared async MPSC ring. `YOUPIPE_SHARDED_TERM=0/1` swaps it for
+`min(io_concurrency, async_workers)` = 32 shard rings (4 tasks share each
+ring), same binary (`bench_ab.sh -E`), 32 cores, 10 interleaved rounds
+(5 combined + 5 per-id isolated; both halves agree round-for-round —
+median-of-round-medians below). Shapes are the convoy-immune family: the
+`async1_*` cells (one sync prefix into `stage_async`) are the direct (c)
+shape; `async0_*` (async-only chain) was fielded as a knob-insensitive
+leakage control — in fact its only stage IS the terminal, so the knob
+applies and it measures a second, send-dense terminal shape instead.
+
+| shape @100K     | off     | on      | Δ%    | verdict |
+| --------------- | ------- | ------- | ----- | ------- |
+| async1_cheap    | 26.8 ms | 38.4 ms | +43.3 | REGRESSION*stable* (0/100) |
+| async1_cpu      | 27.0 ms | 40.7 ms | +50.9 | REGRESSION*stable* (0/100) |
+| async1_ordered_cpu | 27.2 ms | 38.6 ms | +41.6 | REGRESSION*stable* (0/100) |
+| async0_cheap    | 72.7 ms | 30.9 ms | −57.5 | improvement*stable* (100/100) |
+
+| shape @1K       | off     | on      | Δ%    | verdict |
+| --------------- | ------- | ------- | ----- | ------- |
+| async1_cheap    | 1.31 ms | 1.35 ms | +3.2  | REGRESSION*dominant* (0/100) |
+| async1_cpu      | 1.31 ms | 1.36 ms | +3.8  | REGRESSION (1/100) |
+| async1_ordered_cpu | 1.31 ms | 1.34 ms | +2.5  | REGRESSION*dominant* (0/100) |
+| async0_cheap    | 1.26 ms | 1.16 ms | −8.4  | improvement*stable* (100/100) |
+
+Verdict: **the direct (c) shapes regress hard** — every async1 round on
+either side of the table is slower ON (0/100 cross-round wins @100K).
+Attribution (analysis, not a measured decomposition): sharding pays only
+where sender-cursor contention dominates the terminal. The async-only
+chain's feeder lets 128 tasks send densely into one ring (72.7 ms OFF, the
+slowest async reading of either side — contention-bound), so sharding
+removes contention and wins −57.5 %. The sync prefix in the async1 shapes
+throttles send density enough that the shared ring is cheap, and the
+one-shard anchor becomes the dominant cost: the async collector registers
+its recv waker with ONE shard per park (crossfire's per-channel waker
+slot; the any-of-N alternative would allocate per registration — see
+streaming.md "Async terminal flavour"), so while the other 31 rings are
+full their producer tasks park on space that only the collector's next
+burst pass can release — but the collector is itself parked waiting for
+the anchored shard's next item. Global pacing collapses onto the anchor
+ring's rhythm. With one shared ring the collector's waker is always on
+the only ring: every send wakes it directly, no pacing loss. The sync
+terminal does not pay this asymmetry because its producers are OS threads
+(a full ring parks the sender thread itself, not the whole stage's
+progress) and the sync anchor's blocking `recv` has no waker
+registration cost either.
+
+Consequences: the async flavour stays opt-in under the same
+`YOUPIPE_SHARDED_TERM` knob (default off either way) and **todo #1 (c) is
+recommended closed as falsified** — the profitable async0 shape is a
+feeder-saturated corner, not the target workload, and a mixed pipeline
+(sync terminal + async terminal) turning the knob on for the sync win
+pays +42…+51 % on the async side. If the sync default is ever flipped
+(post-#4 soak), the async side must first be decoupled from the knob or
+given an any-of-N anchor that does not pay per-shard waker allocations.
 
 ### Adjacent-sync fusion A/B (`sync_fuse`, 2026-09-29)
 

@@ -142,9 +142,9 @@ fence mid-chain, for_each, cancel, small-worker shapes).
 Per-shard capacity is `max(4, buffer / workers)`: the aggregate stays at
 the single-channel backpressure point while each ring keeps enough slack
 for the burst rhythm. Scope: sync and expand terminals (both feeder
-flavours); a single-worker terminal never shards (one SPSC ring already is
-the plain channel), and async terminals keep the single MPSC backing (no
-async shard aggregation was built).
+flavours) and the async terminal (see the async flavour subsection below);
+a single-worker terminal never shards (one SPSC ring already is the plain
+channel).
 
 A/B (`sharded_term` evidence bench, 5-round isolated interleaved same-binary
 knob runs, 32 cores): **no regression anywhere**, all 12 ids dominant or
@@ -156,6 +156,60 @@ Full table in benchmarks.md. Default stays off pending broader soak (fence
 the OFF side during smoke (26-core burn, collector spinning inside
 crossfire `_read`'s stamp wait) did not reproduce on the ON side — tracked
 under todo #4.
+
+#### Async terminal flavour (per-task-group async shards)
+
+The async terminal (`spawn_async_consumers_body_single` — both feeder
+flavours funnel there, 2026-10) is the same fan-in shape with runtime
+tasks as producers: `io_concurrency` tasks all `send().await` on one
+shared `MpscAsyncSender` clone set, so every send CASes the same sender
+cursor. Under the same `YOUPIPE_SHARDED_TERM` knob,
+`sharded_mpsc_async_channel` swaps it for one async shard ring per
+**task group**: the shard count is `min(io_concurrency, async_workers)` —
+only `async_workers` tasks can sit inside `send` concurrently (they run on
+that many runtime threads), so shards beyond that number cannot reduce
+producer contention and only add collector pass cost and per-run channel
+construction (a small run would otherwise build up to `io_concurrency`
+rings up front). Task `i` owns shard `i % shards` for its whole life, so a
+large fan-out shares each ring among `io_concurrency / shards` producers —
+per-ring contention drops from `io_concurrency`-way to that quotient. Both
+shapes drain through `drain_*_async_sharded`, the awaited analogue of the
+sync sharded loops (`FinalRx::AsyncSingle` / `FinalRx::AsyncSharded`).
+
+The anchor keeps the sync one-shard semantics: await the first open shard
+from the rotating cursor. Waker aggregation across shards (registering the
+collector task's waker with every open shard) was considered and rejected:
+crossfire's MPSC receiver registry is a per-channel single-slot `WeakCell`
+and `reg_waker_async` allocates a fresh `ArcWaker` per registration (the
+per-thread immortal-waker cache only covers *blocking* wakers), so an
+any-of-N await pays N allocations per wake — at shard counts in the tens
+that exceeds the anchor cost it replaces. The one-shard anchor trades wake
+latency for batching instead (items landing in other shards wait for the
+next burst pass), the same trade the sync side measured as a win. Liveness
+transfers verbatim: a shard's producers are live tasks that either send
+(firing that shard's recv waker), await upstream (progress elsewhere
+eventually feeds them), or drop their senders (closing the shard); a task
+that panics mid-run (tokio catches it, the runtime drops its sender)
+closes its shard while the others keep flowing — verified by
+`tests/sharded_terminal_async.rs` (unordered/ordered/expand/for_each,
+`io_concurrency` 1 / 2 / above `async_workers` sharing, producer panic,
+cancel, single-item input).
+
+Measured verdict (2026-09-29, `sharded_term_async` bench, 10 interleaved
+same-binary knob rounds): the async flavour **regresses the shapes it was
+built for** — one-sync-prefix-into-`stage_async` chains read +42…+51 %
+@100K (stable, 0/100 cross-round wins; +2.5…+3.8 % @1K). Only the
+async-only feeder-saturated chain improves (−57.5 % @100K, where 128
+tasks sending densely make single-ring sender contention dominate). The
+anchor trade the sync side measured as a win inverts here: with the
+collector's waker on ONE shard, a full ring's producers park on space only
+the collector's next burst pass releases — while the collector waits on
+the anchored shard's next item — so global pacing collapses onto the
+anchor ring's rhythm; with the single shared ring every send wakes the
+collector directly. Producers as runtime tasks (not OS threads) are what
+makes the asymmetry bite. The flavour stays opt-in under the same knob;
+(c) closed as falsified — readings and the mixed-pipeline warning in
+benchmarks.md "Async sharded-terminal A/B".
 
 ## Worker recv loops: anchor + burst-drain
 

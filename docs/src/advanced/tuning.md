@@ -13,7 +13,7 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `.fence(mode)` / `.fence_with(StageOptions, mode)` | isolation at one stage boundary (`buffer` pin) | streaming | downstream must not see partial upstream |
 | `StageOptions` | per-stage workers / io_concurrency / buffer | streaming | stages have unequal costs |
 | `ComputePool::new_pinned(n)` | workers pinned 1:1 to allowed CPUs | pools | tight loops of large saturated fused batches (**not** streaming — see [pools](pools.md)) |
-| `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker SPSC shards | streaming | multi-worker terminal stage is the bottleneck (see [dev/streaming](../dev/streaming.md)) |
+| `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker / per-task-group SPSC shards | streaming | multi-worker (sync) or high-fanout (async) terminal stage is the bottleneck (see [dev/streaming](../dev/streaming.md)) |
 
 `Workload` and `buffer_size`/`async_workers`/`io_concurrency` are disjoint: a
 fused `pipe()` ignores the streaming knobs (it has no channels and no async
@@ -68,15 +68,6 @@ eligible 8-byte outputs of at least 8 MiB (1 M items) per whole batch are
 written with non-temporal (streaming) stores that bypass the cache
 hierarchy — at those sizes removing read-for-ownership traffic and L3
 pollution dominates everything else. Runtime-overridable tri-state via
-`YOUPIPE_SHARDED_TERM`: unset/`"0"` = one shared MPSC terminal ring
-(default), `"1"` = one SPSC ring per terminal worker, round-robin
-burst-drained by the collector. Removes the send-side CAS contention and
-the shared-ring cache lines of the terminal fan-in; measured −5…−58 %
-across the `sharded_term` shapes with zero regressions (2026-09-29,
-opt-in while fence/convoy interactions soak). Channel shape only —
-worker count, backpressure budget, ordering and cancellation semantics
-are unchanged.
-
 `YOUPIPE_NT_STORE`: unset = auto, `"0"` = force off, `"1"` = force on
 (any other value panics — an early A/B passed `=off` and silently
 enabled NT on both sides).
@@ -92,6 +83,23 @@ threshold gains shrink toward ±2 % (output fits cache), which is why
 auto starts at 8 MiB; known write-once workloads below it can force the
 knob on (100 K items measured +9–11 %). Data in the developer guide's
 benchmarks notes ("NT-store attribution").
+## `YOUPIPE_SHARDED_TERM`: terminal fan-in sharding (streaming)
+
+Terminal-stage channel shape: unset/`"0"` = one shared MPSC terminal ring
+(default), `"1"` = one SPSC ring per terminal worker (sync/expand
+terminals) or per task group (async terminals, shards capped at
+`async_workers`), round-robin burst-drained by the collector. Removes the
+send-side CAS contention and the shared-ring cache lines of the terminal
+fan-in; sync shapes measured −5…−58 % with zero regressions (2026-09-29).
+The async flavour is a measured **loss** on sync-fed async terminals
+(+42…+51 % @100K: the one-shard anchor's waker asymmetry paces the whole
+fan-in; async-only feeder-saturated chains are the sole winner at
+−57.5 % — see [dev/benchmarks](../dev/benchmarks.md)), so mixed CPU/IO
+pipelines should leave the knob off unless the sync terminal dominates.
+Channel shape only — worker count, backpressure budget, ordering and
+cancellation semantics are unchanged. Default stays off pending the
+post-convoy-fix soak.
+
 ## Worker budget across stages (streaming)
 
 `compute_workers` is a **budget**, not a thread count. The runner first

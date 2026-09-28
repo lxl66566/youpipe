@@ -28,17 +28,29 @@
   无需 auto 门槛）。读数与机制见 benchmarks.md "Sharded terminal fan-in
   A/B"、streaming.md 对应小节。mixed_load（fused 路径）与 sync_fuse
   fence_infra 对照均为噪声——旋钮不泄漏出 streaming 终端。
-- 遗留：默认 on/auto 未开——长跑 soak 中 OFF 侧出现过一次已知 convoy 病态
-  （26 核满转、collector 卡 crossfire `_read` stamp 自旋，smoke 单次观察）而
-  ON 侧未复现，提示分片可能顺带缓解 #4，但单次观察不作结论；默认翻转需要
-  多 seed soak + #4 交互验证。
+- 遗留：默认 on/auto 未开。convoy 修复前基线 soak 已完成（2026-09-29，
+  convoy-probe `single` 形状，12 进程 × 12 run/格，144 样本）：OFF 侧病态
+  大规模复现（single 4.9% 塌缩 + 76% run 落争用模式、fence 45.1%、async2
+  82.6%），ON 侧 fence 塌缩减半（18.1%）且争用中位数大幅改善（single
+  −58%、fence −75%），但 sync2 出现真实回归面（back-to-back 节奏下 OFF 的
+  8.9 ms 流水线模式 ON 从未达到）；ON 侧无单调墙漂移、RSS 持平。默认维持
+  off；翻转决策等 #4 修复合并后复跑 soak 才最终权威（读数 benchmarks.md
+  "Sharded-terminal default-policy soak"）。
 - 数据面探针已落地（2026-09-29，channel.rs 15 探针 + hotpath 5 个
   true-streaming 场景，读数 benchmarks.md "true-streaming"）——try_recv p50
   551 ns/item（31 sender cache-line 乒乓）、feeder 侧 send 901 ns/item 占
   feeder 线程 94%。
-- 残余方向：(c) async 终端的分片聚合（当前 async Single 保持单通道 MPSC）；
-  (d) crossfire 批量 recv 接口（fork 在库内可改；同时缓解 collector 侧
-  try_recv 与 feeder 侧 send 两端 per-item 原子成本）。
+- 残余方向：(c) **已证伪关闭**（2026-09-29 落地 opt-in 后实测）：async 终端
+  分片（`sharded_mpsc_async_channel` + `drain_*_async_sharded`，同旋钮、
+  shard 数 min(io_concurrency, async_workers)）在目标形状上 stable 回归
+  +42…+51% @100K（0/100）——one-shard anchor 的 waker 不对称把全局节拍拖到
+  锚定环（生产者是 runtime task，满环 park 等空间而 collector 在等锚定环的
+  item）；仅 async-only feeder 饱和链受益 −57.5%。代码保留 opt-in（该形状
+  有真实收益），混合链开旋钮会伤 async 侧——翻转 sync 默认前必须先解耦
+  async 侧。读数 benchmarks.md "Async sharded-terminal A/B"、机制
+  streaming.md "Async terminal flavour"。(d) crossfire 批量 recv 接口
+  （fork 在库内可改；同时缓解 collector 侧 try_recv 与 feeder 侧 send 两端
+  per-item 原子成本）。
 - 风险记录：MPSC 是当年 in-pipeline 剖析选出（streaming.md "MPSC Channels"），
   分片把复用开销移回 collector 侧——实测无回归（每 pass k−1 次失败 try_recv
   被突发摊销）；burst 边界泊车未用（已证伪，e1684fc→aa842a6）。
