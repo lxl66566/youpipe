@@ -10,7 +10,7 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `with_buffer_size(n)` | channel capacity between stages | streaming | bursty producers, memory bounds |
 | `with_io_concurrency(n)` | in-flight async tasks per async stage | streaming | IO waits are cheap and plentiful |
 | `.ordered()` | reorder pass restoring input order | streaming | output must match input order |
-| `.fence(mode)` | isolation at one stage boundary | streaming | downstream must not see partial upstream |
+| `.fence(mode)` / `.fence_with(StageOptions, mode)` | isolation at one stage boundary (`buffer` pin) | streaming | downstream must not see partial upstream |
 | `StageOptions` | per-stage workers / io_concurrency / buffer | streaming | stages have unequal costs |
 | `ComputePool::new_pinned(n)` | workers pinned 1:1 to allowed CPUs | pools | tight loops of large saturated fused batches (**not** streaming — see [pools](pools.md)) |
 
@@ -117,15 +117,16 @@ pool (the global pool grants one worker per core) — see
 [pools](pools.md).
 
 The budget is enforced **pool-wide**: a run atomically leases its whole
-upper bound of channel-parking jobs (feeder + stage workers) from the pool,
-so concurrent `run()`s on a shared pool — including the global pool from
-multiple threads — cannot jointly oversubscribe it with parked workers.
-When the remaining lease capacity cannot host the run (busy pool, or more
-sync stages than pool slots), or `run()` is itself called on a worker of the
-same pool (nested pipelines park that worker in the collector for the whole
-run), the runner does not touch the pool at all: stage workers and the
-feeder run as dedicated OS threads — deadlock-free by construction, at the
-cost of one `thread::spawn` per worker.
+upper bound of channel-parking jobs (feeder + stage workers + fence
+forwarders) from the pool, so concurrent `run()`s on a shared pool —
+including the global pool from multiple threads — cannot jointly
+oversubscribe it with parked workers. When the remaining lease capacity
+cannot host the run (busy pool, or more sync stages than pool slots), or
+`run()` is itself called on a worker of the same pool (nested pipelines
+park that worker in the collector for the whole run), the runner does not
+touch the pool at all: stage workers, fence forwarders and the feeder run
+as dedicated OS threads — deadlock-free by construction, at the cost of one
+`thread::spawn` per job.
 
 ## `io_concurrency`: M:N async fan-out (streaming)
 

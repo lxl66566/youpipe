@@ -663,6 +663,32 @@ The vendored queue's loom suite also has a runtime trap: without upstream's
 CI setting `LOOM_MAX_PREEMPTIONS=2`, the `spsc`/`spsc_force` models run for
 an hour+ without completing; with it the whole suite finishes in seconds.
 
+## Fence forwarders as leased pool jobs (2026-09-28)
+
+The five `FenceLink` spawn sites replaced their per-run `std::thread::spawn`
+with a leased pool job routed through `StreamCtx::spawn_stage_jobs` (pool
+mode only; the dedicated-thread fallback keeps the OS thread), and
+`try_exec`'s lease reservation gained a `fences` term (see
+[streaming.md](streaming.md)). Verified with 5-round isolated interleaved
+A/B (`bench_ab.sh -1`, `stream_pipeline` families, base b2e25e8):
+
+- `with_fence/1K` **1.603 ms → 1.542 ms, −3.8 %** (25/25 dominant, spreads
+  1.7/2.6 %) — the removed thread spawn+join is the ~61 µs/fence fixed
+  cost, matching the 30–80 µs estimate from the feeder-side removal.
+- `with_fence/100K` −0.4 % noise: the fixed saving is ~0.03 % of a 209 ms
+  run, invisible by design.
+- No-fence regression check (`single_stage_unordered`, `multi_stage_2` at
+  1K/100K): all noise (±0.4 %, no dominance).
+
+Correctness: without the `fences` term the shape
+`stage_with(6) → fence → stage_with(1)` on an 8-thread pool admits
+feeder + 6 + forwarder + 1 = 9 parking jobs; the injector FIFO pops
+[feeder, stage-1 ×6, forwarder] onto the 8 workers and the queued stage-2
+job wedges the run with every worker parked on a full channel.
+`test_fence_forwarder_counts_in_parking_lease_no_deadlock` hits the 30 s
+watchdog without the term and completes (dedicated-thread fallback) with
+it.
+
 ## LLVM folds constant-iteration CPU work (2026-09-07)
 
 A fourth trap, found while chasing the expensive-item regime: the
@@ -901,7 +927,7 @@ any other value panics (the `=off` trap above is now a loud failure).
 shrink toward the ±2 % noise floor where the balance gets
 machine-dependent; known write-once shapes below the threshold can
 force it on. The remaining occupancy deficit (~1–4 pt) stays tracked as
-todo P1 #4.
+todo P1 #2.
 ## Attributing the 2M/4M fused-collect gap (2026-09-25)
 
 Single-shape single-library runs of the horizontal binary itself
