@@ -37,8 +37,18 @@
   551 ns/item（31 sender cache-line 乒乓）、feeder 侧 send 901 ns/item 占
   feeder 线程 94%。
 - 残余方向：(c) async 终端的分片聚合（当前 async Single 保持单通道 MPSC）；
-  (d) crossfire 批量 recv 接口（fork 在库内可改；同时缓解 collector 侧
-  try_recv 与 feeder 侧 send 两端 per-item 原子成本）。
+  (d) ~~crossfire 批量 recv 接口~~ 已落地（2026-09-30，fork `pop_batch`/
+  `try_push_batch` + wrapper + 全接入点，运行时旋钮 `YOUPIPE_BATCH_RECV`，
+  默认 off）：四组合 A/B（benchmarks.md "Batched ring ops four-combo"）
+  组合态 100K 1.4–4.1×（5/6 形状达 ≥1.6× 门槛）；batch 在 sharded 之上对
+  fan-in 形状 dominant 增益（workers2 −69 %、single_unordered_cpu −34 %、
+  multi2 −15 %）并消除 sharded 单开的双峰慢档，但单独启用在共享终端环上
+  双峰不稳定且 1K 形状有回归 → 保持 opt-in，与 `YOUPIPE_SHARDED_TERM`
+  成对启用为推荐矩阵（tuning.md）。探针：try_recv 882 ns/item →
+  ~352 ns/item 摘销，终端环 send 侧 1.74 µs → 90 ns（本轮最大收益）。
+  miri（tree-borrows）fork 6/6 + 集成 5/5 + drain 批量 3/3 绿；预先存在的
+  1M 项窗口溢出测试非 miri 可行（排除，非新代码）。后续观察：与 #4 修复
+  合并后复测 fence_infra canary（本轮 n=3 双峰不可判）。
 - 风险记录：MPSC 是当年 in-pipeline 剖析选出（streaming.md "MPSC Channels"），
   分片把复用开销移回 collector 侧——实测无回归（每 pass k−1 次失败 try_recv
   被突发摊销）；burst 边界泊车未用（已证伪，e1684fc→aa842a6）。

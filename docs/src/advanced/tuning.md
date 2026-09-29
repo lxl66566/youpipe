@@ -91,7 +91,13 @@ of one per item (fork extension — mechanism and the four-combo
 `sharded_term` × `batch_recv` verdict in [dev/streaming](../dev/streaming.md)
 and [dev/benchmarks](../dev/benchmarks.md)). Backpressure granularity,
 item order, capacity and cancellation semantics are unchanged; async
-terminals keep per-item recv.
+terminals keep per-item recv. Default off: on a shared terminal ring
+batching alone is bimodal at 100K (convoy mode, todo #4) and regresses
+short 1K runs; the recommended pairing is with
+`YOUPIPE_SHARDED_TERM=1`, where it takes dominant fan-in wins
+(`workers2` −69 %, `single_unordered_cpu` −34 %, `multi2` −15 %) and
+removes the sharded terminal's round-to-round bimodality (readings:
+[dev/benchmarks](../dev/benchmarks.md) "Batched ring ops four-combo").
 
 Why auto is safe for consumers that read the output right after collect
 (the feared DRAM round-trip): measured on the reference machine

@@ -570,6 +570,65 @@ the knob does not leak outside the streaming terminal path; the `sync_fuse`
 shapes are unaffected-to-better (`fence_infra/1K` −0.8 % noise — the
 todo #4 canary; `cancel_pair_cpu_split/100K` −7.9 %, 9/9 dominant).
 
+### Batched ring ops four-combo A/B (`sharded_term` × `batch_recv`, 2026-09-30)
+
+Evidence bench for todo #1 residual (d): four sides over the same
+binary (`bench_ab.sh -a/-b/-c/-d -E`, 5 per-id isolated interleaved
+rounds, 32 cores): base = both knobs off, batch = `YOUPIPE_BATCH_RECV=1`
+alone, shard = `YOUPIPE_SHARDED_TERM=1` alone, both = both on. Cap is
+the default 64.
+
+| shape @100K      | base    | batch alone | shard alone | both   | batch on shard | both/base |
+| ---------------- | ------- | ----------- | ----------- | ------ | -------------- | --------- |
+| single_unordered_cpu | 29.4 ms | 43.4 ms (bimodal 19.5–51) | 19.3 ms | 12.7 ms | −34.4 % (25/25 dom) | 2.32× |
+| single_unordered_cheap | 29.7 ms | 38.0 ms (bimodal) | 11.8 ms (bimodal 9.1–21) | 12.5 ms | +6.0 % (10/25) | 2.38× |
+| single_ordered_cpu | 29.6 ms | 28.4 ms (noise) | 9.5 ms (bimodal 8.5–20) | 10.0 ms | +4.8 % (mixed) | 2.95× |
+| expand_cheap     | 49.2 ms | 55.4 ms (noise) | 23.6 ms | 23.2 ms | −1.7 % (noise) | 2.11× |
+| multi2_cpu       | 25.6 ms | 16.8 ms (stable) | 21.9 ms | 18.7 ms | −14.7 % (25/25 dom) | 1.37× |
+| workers2_cpu     | 4.70 ms | 2.56 ms (stable) | 3.67 ms | 1.14 ms | −68.9 % (25/25 dom) | 4.12× |
+
+Readings:
+
+- **Cumulative criterion** (both vs base ≥1.6× at 100K): met on 5/6
+  shapes (2.1–4.1×); `multi2` lands at 1.37×.
+- **Batch's marginal on sharded** splits: dominant wins on the fan-in
+  shapes (`workers2` −69 %, `single_unordered_cpu` −34 %, `multi2`
+  −15 %), noise-to-slightly-negative on `expand`/`single_ordered`. The
+  +5 % medians on the cheap/ordered singles trade peak speed for
+  consistency: **shard-alone is bimodal there** (2/5 rounds at ~20 ms,
+  the todo #4 convoy mode) while both is tight (12.0–12.7 ms) — batch
+  removes the slow mode, not the median.
+- **Batch alone is not shippable as a default**: on the shared terminal
+  ring the single-stage 100K shapes go bimodal (19.5–51 ms rounds,
+  spread 35–73 % — same convoy mode, now amplified by the bigger claim
+  steps), and `workers2_cpu/1K` regresses +38 % (0/25). At 1K batch
+  alone wins −33 % on the single shapes (stable), `expand_cheap/1K`
+  with both is the one clear 1K negative (+17.5 % vs shard-alone).
+- **Hotpath probe** (same binary, env switch, `stream-engine` 1M × 30;
+  this session's paired off-side reads 882 ns — do not compare against
+  other sessions): collector `MpscReceiver::try_recv` 30 M calls p50
+  882 ns → `try_recv_batch` 8.79 M calls p50 100 ns (≈352 ns/item
+  amortised over ~3.4-item runs, one probe guard per batch). The
+  dominant win is on the OTHER side of the same ring: worker→terminal
+  `MpscSender::send` p50 1.74 µs → 90 ns, total thread-time 772 s →
+  324 s — batched draining keeps the ring off the full/stamp-wait
+  cliff. Feeder side: `try_send_batch` 469 K calls p50 380 ns (≈64/run)
+  + per-item tail at 20 ns. Engine pace 975.7 → 751.3 ms/iter (−23 %).
+- **Controls**: `mixed_load/youpipe_stream_cpu/100K` (fused, no
+  channels) −0.2 % noise — no leak off the streaming path. The
+  `sync_fuse` cancel_pair shapes are streaming-shaped (cancel token
+  declines fusion) and improve −6.8 %/−10.7 % (9/9 dominant) — real
+  gains at the integration points, not leaks. `fence_infra/100K` is
+  the documented todo #4 bistable canary: off caught one fast-mode
+  round (10.8 ms) in 3, on settled slow-mode throughout (122–131 ms) —
+  inconclusive at n=3 given the pathology; re-measure after #4 lands.
+
+Default policy: `YOUPIPE_BATCH_RECV` stays opt-in (default off). Pairing
+advice goes in the knob docs: enable together with `YOUPIPE_SHARDED_TERM`
+for fan-in shapes (dominant 25/25 wins) and where the sharded terminal
+shows round-to-round bimodality; keep it off for 1K expand-shaped short
+runs and do not enable it alone on a shared terminal ring.
+
 ### Adjacent-sync fusion A/B (`sync_fuse`, 2026-09-29)
 
 Evidence bench for the falsified "fuse adjacent sync stages in streaming
