@@ -55,6 +55,37 @@ impl<F: Flavor> ChannelShared<F> {
         Err(TryRecvError::Empty)
     }
 
+    /// youpipe fork extension (batch recv): claim a run of ready items with
+    /// amortized cursor updates. The per-item `on_recv` fire is preserved
+    /// exactly — each claimed item frees one slot for a parked producer, so
+    /// the batch must wake as many producers as the per-item path would.
+    /// Returns the count claimed (0 = nothing ready right now; use
+    /// `try_recv` to distinguish Empty from Disconnected).
+    #[inline(always)]
+    pub(crate) fn try_recv_batch(&self, out: &mut [MaybeUninit<F::Item>]) -> usize {
+        let n = self.inner.try_recv_batch(out);
+        for _ in 0..n {
+            self.on_recv();
+        }
+        n
+    }
+
+    /// youpipe fork extension (batch send): non-blocking prefix send with
+    /// the per-item `on_send` fire preserved (each new item owes one
+    /// consumer wake). Returns 0 once the receiver is dropped — callers
+    /// fall back to per-item `send` to obtain the `Disconnected` error.
+    #[inline(always)]
+    pub(crate) unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<F::Item>]) -> usize {
+        if self.is_rx_closed() {
+            return 0;
+        }
+        let n = self.inner.try_send_batch(values);
+        for _ in 0..n {
+            self.on_send();
+        }
+        n
+    }
+
     #[inline(always)]
     pub(crate) fn read_with_token(&self, token: Token) -> Result<F::Item, RecvError>
     where

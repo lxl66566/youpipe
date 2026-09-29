@@ -5,6 +5,7 @@ use crate::{shared::*, trace_log, AsyncRx, MAsyncRx, NotCloneable, ReceiverType}
 use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::sync::{atomic::Ordering, Arc};
 use std::time::{Duration, Instant};
@@ -192,6 +193,15 @@ impl<F: Flavor> Rx<F> {
     #[inline]
     pub fn try_recv(&self) -> Result<F::Item, TryRecvError> {
         self.shared.try_recv()
+    }
+
+    /// youpipe fork extension: non-blocking batch claim of the ready
+    /// prefix into `out`; returns the count. 0 means nothing is ready
+    /// right now — NOT an Empty/Closed verdict (call `try_recv` to
+    /// distinguish). Amortizes the ring cursor update over the batch.
+    #[inline]
+    pub fn try_recv_batch(&self, out: &mut [MaybeUninit<F::Item>]) -> usize {
+        self.shared.try_recv_batch(out)
     }
 
     /// Receives a message from the channel with a timeout.

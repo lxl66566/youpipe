@@ -87,6 +87,11 @@ impl<T> FlavorImpl for ArrayMpsc<T> {
     }
 
     #[inline]
+    fn try_recv_batch(&self, out: &mut [MaybeUninit<T>]) -> usize {
+        self.0.pop_batch(out)
+    }
+
+    #[inline]
     fn backoff_limit(&self) -> u16 {
         if self.0.capacity() > 10 {
             crate::backoff::DEFAULT_LIMIT
