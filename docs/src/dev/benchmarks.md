@@ -624,6 +624,28 @@ than items arrive. `FWD_BATCH` standalone: no rescue (fence-auto med
 205/165 ms); combined with the spin it is within noise. Both knobs stay
 default-off; per-shape guidance in [tuning](../advanced/tuning.md).
 
+evidence-bench confirmation (`bench_ab.sh -E`, 5 per-id isolated
+interleaved rounds, same binary, median):
+
+| id | off | `SPIN_ANCHOR=30` | Δ |
+| --- | --- | --- | --- |
+| `sync_fuse/fence_infra/100000` (canary) | 200.5 ms | 41.9 ms | −79 % dominant |
+| `sync_fuse/fence_pair_cpu_split/100000` | 33.6 ms | 24.4 ms | −27 % stable |
+| `sync_fuse/async_pair_cpu_split/100000` | 230.1 ms | 208.8 ms | −9 % (pathology remains) |
+| `sync_fuse/cancel_pair_cpu_split/100000` | 24.5 ms | 24.8 ms | +1 % noise |
+| `mixed_load/youpipe_stream_cpu/100000` (fused) | 39.7 µs | 39.3 µs | −1 % noise |
+| `pipeline_fusion/fused_3_stages/100000` (fused) | 23.3 µs | 23.2 µs | −0 % noise |
+| `horizontal/cpu_balanced/1M` (fused, direct) | 0.83 ms | 0.82 ms | noise |
+| `sharded_term/single_unordered_cpu/100000` (sharded on) | 21.7 ms | 21.3 ms | −2 % noise |
+| `sharded_term/multi2_cpu/100000` (sharded on) | 23.0 ms | 22.9 ms | −0 % noise |
+
+The criterion harness pins the canary's off side in the collapsed mode
+(200 ms stable, unlike the probe's process bistability), which is why the
+evidence-bench delta is even cleaner than the probe's. The last two rows
+are the `YOUPIPE_SHARDED_TERM` orthogonality check: with sharded on, the
+spin knob neither helps nor hurts — the two knobs act on disjoint
+interfaces.
+
 ### Expand-Heavy — owned `Vec` vs push-style expansion (`expand_heavy`)
 
 Matrix: fan-out ∈ {4, 64} × cost ∈ {cheap, cpu} at 10 K inputs; throughput
