@@ -822,6 +822,34 @@ are the `YOUPIPE_SHARDED_TERM` orthogonality check: with sharded on, the
 spin knob neither helps nor hurts — the two knobs act on disjoint
 interfaces.
 
+### Post-merge re-tests (convoy fix × batch recv, 2026-09-30)
+
+After both r5 branches landed, the worker recv loops were unified on one
+anchor head (`anchor_claim`: non-blocking claim → activity-gated spin
+window → blocking recv), so each branch's headline verdicts were
+re-confirmed on the merged binary (same-binary knob A/B, `bench_ab.sh -E`,
+per-id isolated, 3 interleaved rounds; harness = `convoy-probe`.
+Readings vs the branch tables above):
+
+| cell | knob off | knob on | Δ | verdict |
+| --- | --- | --- | --- | --- |
+| `sync_fuse/fence_infra/100000` | 188.3 ms (169–222, collapsed) | 45.5 ms (27.9–60.3) | −75.9 % | 9/9 dominant — branch: 200.5→41.9 ms ✔ |
+| `sync_fuse/fence_infra/1000` | 1.561 ms | 870 µs | −44.2 % | stable |
+| `sharded_term/workers2_cpu/100000` | 4.594 ms (base) | 1.101 ms (SHARDED+BATCH) | 4.17× | 9/9 — branch: 4.12× ✔ |
+| `sharded_term/single_unordered_cpu/100000` | 29.07 ms (base) | 11.02 ms (SHARDED+BATCH) | 2.64× | stable — branch: 2.32× ✔ |
+| `sharded_term/workers2_cpu/1000` | 54.2 µs | 27.4 µs | 1.98× | stable |
+| `sharded_term/single_unordered_cpu/1000` | 288 µs | 244 µs | 1.18× | stable |
+
+Both conclusions carry through the composition: the convoy fix survives
+the merged anchor (the canary's off side still pins the collapsed ~190 ms
+mode, the on side never exceeds 61 ms), and the batch+sharded pair keeps
+its ≥1.6× cumulative criterion on the fan-in cells while the base sides
+match the branch baselines (no default-path regression). The re-run also
+surfaced a pre-existing `sync_fuse` harness bug — `fence_infra` was
+registered inside the side loop, so an unset `YOUPIPE_SYNC_FUSE_VARIANT`
+tripped criterion 0.8's duplicate-ID panic before the 100 K cells ever
+registered (fixed alongside the merge, fc56019).
+
 ### Expand-Heavy — owned `Vec` vs push-style expansion (`expand_heavy`)
 
 Matrix: fan-out ∈ {4, 64} × cost ∈ {cheap, cpu} at 10 K inputs; throughput

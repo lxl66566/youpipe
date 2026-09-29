@@ -59,8 +59,12 @@
   成对启用为推荐矩阵（tuning.md）。探针：try_recv 882 ns/item →
   ~352 ns/item 摘销，终端环 send 侧 1.74 µs → 90 ns（本轮最大收益）。
   miri（tree-borrows）fork 6/6 + 集成 5/5 + drain 批量 3/3 绿；预先存在的
-  1M 项窗口溢出测试非 miri 可行（排除，非新代码）。后续观察：与 #4 修复
-  合并后复测 fence_infra canary（本轮 n=3 双峰不可判）。
+  1M 项窗口溢出测试非 miri 可行（排除，非新代码）。合并后复测（两分支
+  合入 main 后，worker 循环统一为 anchor_claim 三段式）：fence_infra
+  canary 100K off 188 ms 双峰 → SPIN=30 45 ms（−76 %，9/9）；
+  workers2/single_unordered 100K 组合态 4.17×/2.64×（分支 4.12×/2.32×）
+  ——两条分支结论均穿过合并成立，读数 benchmarks.md "Post-merge
+  re-tests"。
 - 风险记录：MPSC 是当年 in-pipeline 剖析选出（streaming.md "MPSC Channels"），
   分片把复用开销移回 collector 侧——实测无回归（每 pass k−1 次失败 try_recv
   被突发摊销）；burst 边界泊车未用（已证伪，e1684fc→aa842a6）。
@@ -124,6 +128,11 @@
   待候选 (c)；快 mode 下自旋开销的进一步收窄（预算上限/退避曲线）
   未探索。
 - 验证：`sync_fuse` 家族（canary `fence_infra` + async/fence/cancel 形状）。
+- 合并后复测（与 #1 (d) 合入同一 main 后）：fence_infra canary 100K
+  off 188.3 ms（169–222 双峰）/ SPIN=30 45.5 ms（27.9–60.3，−75.9 %，
+  9/9）；与分支持论一致（200.5→41.9）。复测顺带修了 sync_fuse 的
+  fence_infra 重复注册 panic（fc56019）。读数 benchmarks.md "Post-merge
+  re-tests"。
 
 ### 5. [P1] `ordered()` + `expand()`：批量 payload 方案
 
