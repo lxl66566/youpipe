@@ -14,6 +14,8 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `StageOptions` | per-stage workers / io_concurrency / buffer | streaming | stages have unequal costs |
 | `ComputePool::new_pinned(n)` | workers pinned 1:1 to allowed CPUs | pools | tight loops of large saturated fused batches (**not** streaming — see [pools](pools.md)) |
 | `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker / per-task-group SPSC shards | streaming | multi-worker (sync) or high-fanout (async) terminal stage is the bottleneck (see [dev/streaming](../dev/streaming.md)) |
+| `YOUPIPE_SPIN_ANCHOR` | adaptive pre-anchor `try_recv` spin window (µs) in sync worker recv loops | streaming | convoy collapse: serial supplier (feeder/fence) feeding ≥ ~10 workers, run times ~items × 2 µs (see [dev/streaming](../dev/streaming.md)) |
+| `YOUPIPE_FWD_BATCH` | fence forwarder pushes released batches via `try_send` | streaming | rarely useful alone; pairs with `YOUPIPE_SPIN_ANCHOR` on fence-heavy chains |
 
 `Workload` and `buffer_size`/`async_workers`/`io_concurrency` are disjoint: a
 fused `pipe()` ignores the streaming knobs (it has no channels and no async
@@ -71,6 +73,24 @@ pollution dominates everything else. Runtime-overridable tri-state via
 `YOUPIPE_NT_STORE`: unset = auto, `"0"` = force off, `"1"` = force on
 (any other value panics — an early A/B passed `=off` and silently
 enabled NT on both sides).
+
+`YOUPIPE_SPIN_ANCHOR=<µs>` (unset/`"0"` = off, suggested `20`–`30`):
+before each blocking recv, a sync stage/expand/fence worker spins
+`try_recv` for an adaptive budget gated on recent channel liveness — a
+park that returned within 4× the window doubles the budget, a quiet park
+quarters it to zero, so idle stages park exactly as before. This removes
+the convoy pathology (per-item futex park+wake at every
+serial-supplier→crowd channel: collapsed fence runs 180–254 ms → 27–57 ms
+@100K, parks 90–197K/run → 0.3–2.6K) at the cost of ~2–4× versus a lucky
+fast seed in shapes that were already fast, plus on-CPU spinning while a
+channel is live-but-sparse. Leave off unless the shape matches the
+pathology; it cannot help async-terminal chains (their slow mode parks on
+the send side and the collector, not the recv anchor).
+
+`YOUPIPE_FWD_BATCH=1`: the fence forwarder drains a released chunk with
+back-to-back `try_send`, parking at most once per full ring. Measured no
+independent win while downstream workers still park per item on recv; keep
+for chains that already run `YOUPIPE_SPIN_ANCHOR`.
 
 Why auto is safe for consumers that read the output right after collect
 (the feared DRAM round-trip): measured on the reference machine

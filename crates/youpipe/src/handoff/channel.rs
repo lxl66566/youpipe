@@ -218,12 +218,25 @@ impl<T: Send + 'static> MpscSender<T> {
         trace_ch!(&**self.tx, "tx send");
         self.tx.send(item).map_err(|_| ChannelError::Closed)
     }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscSender"))]
+    pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
+        self.tx.try_send(item).map_err(|e| match e {
+            crossfire::TrySendError::Full(v) => TrySendError::Full(v),
+            crossfire::TrySendError::Disconnected(v) => TrySendError::Closed(v),
+        })
+    }
 }
 
 impl<T: Send + 'static> SendItem<T> for MpscSender<T> {
     #[inline]
     fn send(&self, item: T) -> Result<(), ChannelError> {
         MpscSender::send(self, item)
+    }
+
+    #[inline]
+    fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
+        MpscSender::try_send(self, item)
     }
 }
 
@@ -347,12 +360,23 @@ pub trait SendItem<T>: Clone + Send + 'static {
     /// Deliver `item`, blocking until the channel has space. Returns
     /// `ChannelError::Closed` if all receivers have been dropped.
     fn send(&self, item: T) -> Result<(), ChannelError>;
+
+    /// Deliver `item` without blocking. Returns `Err(TrySendError::Full(item))`
+    /// when the bounded ring is full (the item is handed back) or
+    /// `Err(TrySendError::Closed(item))` when every receiver is gone. Used by
+    /// batch senders that park at most once per batch instead of per item.
+    fn try_send(&self, item: T) -> Result<(), TrySendError<T>>;
 }
 
 impl<T: Send + 'static> SendItem<T> for SyncSender<T> {
     #[inline]
     fn send(&self, item: T) -> Result<(), ChannelError> {
         SyncSender::send(self, item)
+    }
+
+    #[inline]
+    fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
+        SyncSender::try_send(self, item)
     }
 }
 
@@ -500,5 +524,21 @@ mod tests {
         ];
         all.sort_unstable();
         assert_eq!(all, vec![1, 2, 3, 4]);
+    }
+
+    /// MPSC try_send mirrors the MPMC semantics: Full hands the item back,
+    /// Closed after the receiver is dropped and the ring drained.
+    #[test]
+    fn test_mpsc_try_send() {
+        let (tx, rx) = mpsc_channel::<i32>(2);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        assert!(matches!(tx.try_send(3), Err(TrySendError::Full(3))));
+        assert_eq!(rx.try_recv().unwrap(), 1);
+        tx.try_send(3).unwrap();
+        assert_eq!(rx.recv().unwrap(), 2);
+        assert_eq!(rx.recv().unwrap(), 3);
+        drop(rx);
+        assert!(matches!(tx.try_send(4), Err(TrySendError::Closed(4))));
     }
 }

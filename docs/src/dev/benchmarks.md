@@ -715,6 +715,54 @@ serial-supplier→crowd channel interfaces; boundary matrix, perf/trace
 signatures and fix directions in [streaming.md](streaming.md) "Convoy
 collapse forensics", harness = `youpipe-bench` binary `convoy-probe`).
 
+### Convoy fix A/B (`YOUPIPE_SPIN_ANCHOR` / `YOUPIPE_FWD_BATCH`, 2026-09-30)
+
+Fix verdict for todo #4 (mechanism in [streaming.md](streaming.md) "Fix
+(a)+(b) landed"; all cells `convoy-probe` @100K, same binary, fresh
+process per cell, 3 interleaved off/on rounds — the off side collapses in
+~1/3 of processes so ranges, not medians, carry the verdict):
+
+| cell (fence family) | knob off | `SPIN_ANCHOR=30` |
+| --- | --- | --- |
+| fence auto 14/14 | 120–254 ms bimodal | 27–57 ms, no ≥180 run |
+| fence 9/9 | 12–107 ms drifting | 23–28 ms |
+| fence 1/15 (crowd at output) | 90–127 ms (lucky 5.5) | 24–33 ms |
+| fence 20/1 (pipelined ref) | 24–27 ms | 24–28 ms (untouched) |
+| soak 100K×10, 3 procs | mode wanders, 646 ms outlier | 26–107 ms, no ≥180 run |
+| yp-pool parks/run | 90–197 K (1–2/item) | 0.3–2.6 K |
+
+`async2/15-1` stays bimodal both ways (off 25–188, spin 29–309 ms): its
+slow mode parks on the collector (2.3/item) and the send side into the
+mixed async channel (1.2/item), not on the recv anchor — outside the
+knob's reach (attribution in streaming.md). Poll-ceiling sweep at spin=30:
+caps 1/8/16 regress or only partially heal the fence family (219/193/181 ms
+med) vs 64/128 (33–102 ms); tight polling bounces the ring stamps faster
+than items arrive. `FWD_BATCH` standalone: no rescue (fence-auto med
+205/165 ms); combined with the spin it is within noise. Both knobs stay
+default-off; per-shape guidance in [tuning](../advanced/tuning.md).
+
+evidence-bench confirmation (`bench_ab.sh -E`, 5 per-id isolated
+interleaved rounds, same binary, median):
+
+| id | off | `SPIN_ANCHOR=30` | Δ |
+| --- | --- | --- | --- |
+| `sync_fuse/fence_infra/100000` (canary) | 200.5 ms | 41.9 ms | −79 % dominant |
+| `sync_fuse/fence_pair_cpu_split/100000` | 33.6 ms | 24.4 ms | −27 % stable |
+| `sync_fuse/async_pair_cpu_split/100000` | 230.1 ms | 208.8 ms | −9 % (pathology remains) |
+| `sync_fuse/cancel_pair_cpu_split/100000` | 24.5 ms | 24.8 ms | +1 % noise |
+| `mixed_load/youpipe_stream_cpu/100000` (fused) | 39.7 µs | 39.3 µs | −1 % noise |
+| `pipeline_fusion/fused_3_stages/100000` (fused) | 23.3 µs | 23.2 µs | −0 % noise |
+| `horizontal/cpu_balanced/1M` (fused, direct) | 0.83 ms | 0.82 ms | noise |
+| `sharded_term/single_unordered_cpu/100000` (sharded on) | 21.7 ms | 21.3 ms | −2 % noise |
+| `sharded_term/multi2_cpu/100000` (sharded on) | 23.0 ms | 22.9 ms | −0 % noise |
+
+The criterion harness pins the canary's off side in the collapsed mode
+(200 ms stable, unlike the probe's process bistability), which is why the
+evidence-bench delta is even cleaner than the probe's. The last two rows
+are the `YOUPIPE_SHARDED_TERM` orthogonality check: with sharded on, the
+spin knob neither helps nor hurts — the two knobs act on disjoint
+interfaces.
+
 ### Expand-Heavy — owned `Vec` vs push-style expansion (`expand_heavy`)
 
 Matrix: fan-out ∈ {4, 64} × cost ∈ {cheap, cpu} at 10 K inputs; throughput
