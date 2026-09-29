@@ -247,25 +247,6 @@ fn bench_sync_fuse(c: &mut Criterion) {
                 },
             );
 
-            // fence_infra: pass-through stages around a Chunked(500) fence,
-            // no CPU work at all — a control anchor (identical on both
-            // sides, like mixed_load's rayon_par_iter). It exists because
-            // the step-1 A/B uncovered a bistable convoy pathology in this
-            // shape (~2.3 µs/item, 226 ms @100K in the probe, vs ~0.36 µs
-            // for the 3-stage fence chain): the canary keeps that mode
-            // observable for whoever fixes it (see dev/dead-ends.md and
-            // todo).
-            group.bench_with_input(BenchmarkId::new("fence_infra", size), &data, |b, data| {
-                b.iter_batched(
-                    || warm_clone(data),
-                    |v| {
-                        let r = stream(v).stage(bump).fence(chunked).stage(bump).run();
-                        bb(r)
-                    },
-                    BatchSize::PerIteration,
-                );
-            });
-
             // cancel_quad_cpu: four sync stages — how the saving scales with
             // the length of the adjacent sync run (5 populations / 4 hops vs
             // 2 / 1 in split vs merged... with the feeder: 5 vs 2 worker
@@ -297,6 +278,28 @@ fn bench_sync_fuse(c: &mut Criterion) {
                 },
             );
         }
+
+        // fence_infra: pass-through stages around a Chunked(500) fence,
+        // no CPU work at all — a control anchor (identical on both sides,
+        // like mixed_load's rayon_par_iter): the closure composes the same
+        // shape regardless of `side`, so it is registered OUTSIDE the side
+        // loop — a per-side registration trips criterion 0.8's unique-ID
+        // panic whenever both variants are enabled (variant unset), killing
+        // the process before the larger sizes register. It exists because
+        // the step-1 A/B uncovered a bistable convoy pathology in this shape
+        // (~2.3 µs/item, 226 ms @100K in the probe, vs ~0.36 µs for the
+        // 3-stage fence chain): the canary keeps that mode observable for
+        // whoever fixes it (see dev/dead-ends.md and todo).
+        group.bench_with_input(BenchmarkId::new("fence_infra", size), &data, |b, data| {
+            b.iter_batched(
+                || warm_clone(data),
+                |v| {
+                    let r = stream(v).stage(bump).fence(chunked).stage(bump).run();
+                    bb(r)
+                },
+                BatchSize::PerIteration,
+            );
+        });
     }
     group.finish();
 }
