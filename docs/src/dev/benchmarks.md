@@ -598,6 +598,32 @@ serial-supplier→crowd channel interfaces; boundary matrix, perf/trace
 signatures and fix directions in [streaming.md](streaming.md) "Convoy
 collapse forensics", harness = `youpipe-bench` binary `convoy-probe`).
 
+### Convoy fix A/B (`YOUPIPE_SPIN_ANCHOR` / `YOUPIPE_FWD_BATCH`, 2026-09-30)
+
+Fix verdict for todo #4 (mechanism in [streaming.md](streaming.md) "Fix
+(a)+(b) landed"; all cells `convoy-probe` @100K, same binary, fresh
+process per cell, 3 interleaved off/on rounds — the off side collapses in
+~1/3 of processes so ranges, not medians, carry the verdict):
+
+| cell (fence family) | knob off | `SPIN_ANCHOR=30` |
+| --- | --- | --- |
+| fence auto 14/14 | 120–254 ms bimodal | 27–57 ms, no ≥180 run |
+| fence 9/9 | 12–107 ms drifting | 23–28 ms |
+| fence 1/15 (crowd at output) | 90–127 ms (lucky 5.5) | 24–33 ms |
+| fence 20/1 (pipelined ref) | 24–27 ms | 24–28 ms (untouched) |
+| soak 100K×10, 3 procs | mode wanders, 646 ms outlier | 26–107 ms, no ≥180 run |
+| yp-pool parks/run | 90–197 K (1–2/item) | 0.3–2.6 K |
+
+`async2/15-1` stays bimodal both ways (off 25–188, spin 29–309 ms): its
+slow mode parks on the collector (2.3/item) and the send side into the
+mixed async channel (1.2/item), not on the recv anchor — outside the
+knob's reach (attribution in streaming.md). Poll-ceiling sweep at spin=30:
+caps 1/8/16 regress or only partially heal the fence family (219/193/181 ms
+med) vs 64/128 (33–102 ms); tight polling bounces the ring stamps faster
+than items arrive. `FWD_BATCH` standalone: no rescue (fence-auto med
+205/165 ms); combined with the spin it is within noise. Both knobs stay
+default-off; per-shape guidance in [tuning](../advanced/tuning.md).
+
 ### Expand-Heavy — owned `Vec` vs push-style expansion (`expand_heavy`)
 
 Matrix: fan-out ∈ {4, 64} × cost ∈ {cheap, cpu} at 10 K inputs; throughput
