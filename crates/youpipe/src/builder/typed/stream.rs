@@ -23,9 +23,8 @@ use crate::{
     builder::config::{PipelineConfig, Workload},
     executor::compute::ComputePool,
     handoff::{
-        ChannelError, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, ShardedReceiver,
-        SyncSender, TryRecvError, TrySendError, channel::channel, mpsc_channel,
-        sharded_mpsc_channel,
+        Claim, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, ShardedReceiver, SyncSender,
+        TrySendError, channel::channel, claim_poll, mpsc_channel, sharded_mpsc_channel,
     },
     pool::Registry,
     runtime::{AsyncRuntime, DefaultRuntime},
@@ -244,6 +243,91 @@ impl Feeder {
     }
 }
 
+/// The feeder push loop: seq-tag every item and push it downstream.
+///
+/// With `YOUPIPE_BATCH_RECV` on, items are staged in batches and the free
+/// prefix is claimed with one tail CAS per run (`try_send_batch`); the
+/// remainder goes through per-item blocking `send` — parking granularity
+/// (per item, only when full) and item order are exactly the per-item
+/// path's, so backpressure semantics are unchanged. The inline path
+/// (`items.len() <= buffer`, never blocks) shares this loop: batches of
+/// `cap` items are strictly fewer channel operations.
+///
+/// Abort parity with the per-item loop: staged-but-unsent items get their
+/// destructors run explicitly — a `Vec<MaybeUninit<_>>` drop would skip
+/// them, silently leaking every `I: Drop` on the cancel/closed paths.
+fn push_items<I: Send + 'static>(
+    items: Vec<I>,
+    feeder_tx: &SyncSender<(u64, I)>,
+    cancel: Option<&CancellationToken>,
+) {
+    let cap = crate::handoff::batch_recv_cap();
+    if cap == 0 {
+        for (seq, item) in items.into_iter().enumerate() {
+            if cancel_active(cancel) {
+                break;
+            }
+            if feeder_tx.send((seq as u64, item)).is_err() {
+                break;
+            }
+        }
+        return;
+    }
+    let mut staged: Vec<std::mem::MaybeUninit<(u64, I)>> = Vec::with_capacity(cap);
+    let mut iter = items.into_iter().enumerate();
+    'push: loop {
+        staged.clear();
+        for (seq, item) in iter.by_ref() {
+            if cancel_active(cancel) {
+                // SAFETY: every staged slot so far was initialized by the
+                // line below; Drop parity with the per-item path (see the
+                // doc comment) before abandoning the rest with `iter`.
+                for slot in &mut staged {
+                    unsafe { slot.assume_init_drop() };
+                }
+                return; // remaining items dropped: the run is aborting
+            }
+            staged.push(std::mem::MaybeUninit::new((seq as u64, item)));
+            if staged.len() == cap {
+                break;
+            }
+        }
+        if staged.is_empty() {
+            return;
+        }
+        // Contract (see `SyncSender::try_send_batch`): every staged slot
+        // was initialized just above; the returned prefix is moved out.
+        let sent = feeder_tx.try_send_batch(&mut staged);
+        let mut i = sent;
+        while i < staged.len() {
+            // Cancel parity with the historical per-item loop: check before
+            // every blocking send, not once per batch (a full channel with a
+            // stalled receiver must not park the feeder mid-batch after
+            // cancel fired).
+            if cancel_active(cancel) {
+                // SAFETY: slots from `i` on are still initialized (only
+                // staged[..i] were moved out); Drop parity, see above.
+                for slot in &mut staged[i..] {
+                    unsafe { slot.assume_init_drop() };
+                }
+                break 'push;
+            }
+            // SAFETY: the unsent tail was initialized above and stays
+            // owned by us (the moved-out prefix is skipped).
+            let (seq, item) = unsafe { staged[i].assume_init_read() };
+            i += 1;
+            if feeder_tx.send((seq, item)).is_err() {
+                // SAFETY: slots from `i` on are still initialized (only
+                // staged[..i] were moved out); Drop parity, see above.
+                for slot in &mut staged[i..] {
+                    unsafe { slot.assume_init_drop() };
+                }
+                break 'push;
+            }
+        }
+    }
+}
+
 /// Push `items` into the feeder channel.
 ///
 /// When all items fit in the channel buffer (`items.len() ≤ buffer`), push
@@ -296,28 +380,14 @@ fn feed_items<I: Send + 'static>(
     lease: Option<&ParkingLease>,
 ) -> Feeder {
     if items.len() <= buffer {
-        for (seq, item) in items.into_iter().enumerate() {
-            if cancel_active(cancel.as_ref()) {
-                break;
-            }
-            if feeder_tx.send((seq as u64, item)).is_err() {
-                break;
-            }
-        }
+        push_items(items, &feeder_tx, cancel.as_ref());
         return Feeder::Inline;
     }
     let slot: FeederPanicSlot = Arc::new(std::sync::Mutex::new(None));
     let job_slot = Arc::clone(&slot);
     let push_loop = move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            for (seq, item) in items.into_iter().enumerate() {
-                if cancel_active(cancel.as_ref()) {
-                    break;
-                }
-                if feeder_tx.send((seq as u64, item)).is_err() {
-                    break;
-                }
-            }
+            push_items(items, &feeder_tx, cancel.as_ref());
         }));
         if let Err(payload) = result {
             *job_slot
@@ -346,7 +416,7 @@ fn feed_items<I: Send + 'static>(
 const SPIN_ROUNDS_PER_US: u32 = 64;
 
 /// Backoff ceiling inside the pre-anchor spin: 64 pauses ≈ 1 µs between
-/// polls at the tail of a long window (see `AnchorSpin::spin_for`).
+/// polls at the tail of a long window (see `AnchorSpin::spin_claim`).
 const MAX_POLL_PAUSES: u32 = 64;
 
 /// Adaptive pre-anchor spin budget for one worker's recv loop.
@@ -387,16 +457,21 @@ impl AnchorSpin {
         (max_us / 16).max(1)
     }
 
-    /// Spin `try_recv` for up to the current budget.
-    /// `Ok(Some(_))`: an item was caught mid-spin — the park is avoided.
-    /// `Ok(None)`: budget exhausted — run the blocking anchor, then fold its
-    /// latency back via [`AnchorSpin::note_park`].
-    /// `Err(Closed)`: channel disconnected mid-spin (trusted like the burst
+    /// Spin non-blocking claims for up to the current budget.
+    /// `Claim::Ready(n)`: a run was caught mid-spin — the park is avoided.
+    /// `Claim::Empty`: budget exhausted — run the blocking anchor, then fold
+    /// its latency back via [`AnchorSpin::note_park`].
+    /// `Claim::Closed`: channel disconnected mid-spin (trusted like the burst
     /// phase's `Closed`; the crossfire >= 3.1.20 pin carries the
     /// spurious-`Closed` race fix).
-    fn spin_for<T: Send + 'static>(&mut self, rx: &Receiver<T>) -> Result<Option<T>, TryRecvError> {
+    fn spin_claim<T: Send + 'static>(
+        &mut self,
+        rx: &Receiver<T>,
+        scratch: &mut Vec<T>,
+        batch_cap: usize,
+    ) -> Claim {
         if self.budget_us == 0 {
-            return Ok(None);
+            return Claim::Empty;
         }
         // Backoff polling: the first polls are tight (fast suppliers are
         // caught almost immediately), then the pause count doubles up to
@@ -412,18 +487,18 @@ impl AnchorSpin {
         let window = Duration::from_micros(u64::from(self.budget_us));
         let start = Instant::now();
         loop {
-            match rx.try_recv() {
-                Ok(item) => return Ok(Some(item)),
+            match claim_poll(rx, scratch, batch_cap) {
+                Claim::Ready(n) => return Claim::Ready(n),
                 // A `Closed` seen mid-spin must not be second-guessed here:
                 // the anchor's blocking recv would only repeat it.
-                Err(TryRecvError::Closed) => return Err(TryRecvError::Closed),
-                Err(TryRecvError::Empty) => {},
+                Claim::Closed => return Claim::Closed,
+                Claim::Empty => {},
             }
             // Wall-clock deadline (checked every 8 polls) keeps the window
             // honest under contention; the poll backstop bounds the loop when
             // the clock does not advance (miri).
             if polls >= max_polls || (polls & 7 == 7 && start.elapsed() >= window) {
-                return Ok(None);
+                return Claim::Empty;
             }
             for _ in 0..pauses {
                 std::hint::spin_loop();
@@ -457,29 +532,46 @@ impl AnchorSpin {
     }
 }
 
-/// Anchor item acquisition for the worker recv loops: optional adaptive
-/// pre-spin ([`AnchorSpin`]) then the blocking `recv` that parks correctly
-/// on an empty channel and exits on disconnect. With the knob off this is
-/// the plain `rx.recv()` plus two predictable branches; the park latency is
-/// measured only when the knob is on.
-fn anchor_recv<T: Send + 'static>(
+/// Anchor head for the worker recv loops, unifying the two streaming fixes:
+/// 1. one non-blocking [`claim_poll`] — a whole ready run with the batch knob on, exactly one
+///    `try_recv` with it off (the historical burst-drain rhythm: back-to-back items never re-enter
+///    the blocking preamble);
+/// 2. the activity-gated [`AnchorSpin`] window for the empty micro-gap (todo #4) — inert with the
+///    knob off;
+/// 3. the blocking `recv` that parks correctly on an empty channel and exits on disconnect, folding
+///    its park latency back into the spin budget only when the knob is on.
+///
+/// Returns the number of items now sitting in `scratch` (`0` = channel
+/// closed — the caller exits its loop).
+fn anchor_claim<T: Send + 'static>(
     spin: &mut AnchorSpin,
     rx: &Receiver<T>,
-) -> Result<T, ChannelError> {
-    match spin.spin_for(rx) {
-        Ok(Some(item)) => Ok(item),
-        Ok(None) => {
-            if spin.max_us == 0 {
-                return rx.recv();
-            }
-            let start = Instant::now();
-            let got = rx.recv();
-            spin.note_park(start.elapsed());
-            got
+    scratch: &mut Vec<T>,
+    batch_cap: usize,
+) -> usize {
+    match claim_poll(rx, scratch, batch_cap) {
+        Claim::Ready(n) => n,
+        Claim::Closed => 0,
+        // Nothing ready: ride out the micro-gap before parking (knob-gated).
+        Claim::Empty => match spin.spin_claim(rx, scratch, batch_cap) {
+            Claim::Ready(n) => n,
+            Claim::Closed => 0,
+            Claim::Empty => {
+                let timed = spin.max_us > 0;
+                let start = Instant::now();
+                match rx.recv() {
+                    Ok(item) => {
+                        if timed {
+                            spin.note_park(start.elapsed());
+                        }
+                        scratch.clear();
+                        scratch.push(item);
+                        1
+                    },
+                    Err(_) => 0,
+                }
+            },
         },
-        Err(TryRecvError::Closed) => Err(ChannelError::Closed),
-        // spin_for converts every channel outcome; Empty never escapes it.
-        Err(TryRecvError::Empty) => unreachable!("spin_for never reports Empty"),
     }
 }
 
@@ -600,34 +692,27 @@ fn spawn_stage_fanout<I, O, Tx, R>(
             move || {
                 // Adaptive pre-anchor spin state (todo #4); plain locals.
                 let mut spin = AnchorSpin::new(spin_anchor_us());
+                // Batch claim scratch (YOUPIPE_BATCH_RECV, todo #1 residual
+                // (d)); cap 0 keeps the per-item anchor + burst rhythm.
+                let batch_cap = crate::handoff::batch_recv_cap();
+                let mut scratch: Vec<(u64, I)> = Vec::with_capacity(batch_cap.max(1));
                 'outer: loop {
-                    // Anchor: one blocking recv parks the worker when the
-                    // channel is empty; Err means all senders are gone.
-                    // (`anchor_recv` pre-spins when the knob is on and the
-                    // channel was recently active.)
-                    let Ok((seq, item)) = anchor_recv(&mut spin, &rx) else {
-                        break
-                    };
-                    if cancel_active(worker_cancel.as_ref()) {
-                        break;
-                    }
-                    let output = stage(item);
-                    if tx.send((seq, output)).is_err() {
-                        break;
-                    }
-                    // Burst-drain: absorb already-queued items while the
-                    // channel's cache lines are hot, without re-entering the
-                    // blocking-recv preamble per item. With several workers
-                    // contending on the same MPMC ring, the workers that lag
-                    // behind park on the anchor while the burst winners drain
-                    // the backlog — the contending population thins itself
+                    // Anchor + burst-drain via `anchor_claim`: absorb
+                    // already-queued items while the channel's cache lines are
+                    // hot, without re-entering the blocking-recv preamble per
+                    // item. With several workers contending on the same MPMC
+                    // ring, the workers that lag behind park on the anchor
+                    // while the burst winners drain the backlog — the
+                    // contending population thins itself
                     // instead of every worker hammering the ring per item.
-                    loop {
-                        let (seq, item) = match rx.try_recv() {
-                            Ok(v) => v,
-                            Err(TryRecvError::Empty) => continue 'outer,
-                            Err(TryRecvError::Closed) => break 'outer,
-                        };
+                    // With batching on, the burst claims whole ready runs with
+                    // one head CAS per run; with the spin knob on, the anchor
+                    // rides out empty micro-gaps before parking.
+                    let claimed = anchor_claim(&mut spin, &rx, &mut scratch, batch_cap);
+                    if claimed == 0 {
+                        break;
+                    }
+                    for (seq, item) in scratch.drain(..) {
                         if cancel_active(worker_cancel.as_ref()) {
                             break 'outer;
                         }
@@ -720,27 +805,23 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
                     }
                     open
                 };
+                // Batch claim scratch (see `spawn_stage`).
+                let batch_cap = crate::handoff::batch_recv_cap();
+                let mut scratch: Vec<(u64, I)> = Vec::with_capacity(batch_cap.max(1));
                 'outer: loop {
-                    // Anchor + burst-drain, same shape as `spawn_stage`.
-                    let Ok((seq, item)) = anchor_recv(&mut spin, &rx) else {
-                        break
-                    };
-                    if cancel_active(worker_cancel.as_ref()) {
+                    // Anchor + burst-drain, same shape as `spawn_stage`
+                    // (batched + spin-gated via `anchor_claim` there too).
+                    let claimed = anchor_claim(&mut spin, &rx, &mut scratch, batch_cap);
+                    if claimed == 0 {
                         break;
                     }
-                    // Downstream closed mid-group: fall through to the
-                    // burst loop, whose `Closed` / send-failure handling
-                    // terminates the worker (same shape as `spawn_stage`).
-                    let _ = forward(seq, item);
-                    loop {
-                        let (seq, item) = match rx.try_recv() {
-                            Ok(v) => v,
-                            Err(TryRecvError::Empty) => continue 'outer,
-                            Err(TryRecvError::Closed) => break 'outer,
-                        };
+                    for (seq, item) in scratch.drain(..) {
                         if cancel_active(worker_cancel.as_ref()) {
                             break 'outer;
                         }
+                        // Downstream closed mid-group: the group's
+                        // unforwarded outputs are dropped by the next
+                        // `clear` — the worker is on its abort path anyway.
                         if !forward(seq, item) {
                             break 'outer;
                         }
@@ -816,25 +897,20 @@ fn forward_fenced<M, Tx>(
     // Adaptive pre-anchor spin state (todo #4); see `spawn_stage_fanout`.
     let mut spin = AnchorSpin::new(spin_anchor_us());
     let batched = fwd_batch_enabled();
-    'outer: loop {
+    // Batch claim scratch (see `spawn_stage`).
+    let batch_cap = crate::handoff::batch_recv_cap();
+    let mut scratch: Vec<(u64, M)> = Vec::with_capacity(batch_cap.max(1));
+    loop {
         // Anchor + burst-drain (same shape as the stage workers): the
         // forwarder is the sole consumer, but draining the mid channel while
-        // its cache lines are hot also releases upstream backpressure sooner.
-        let Ok(item) = anchor_recv(&mut spin, &mid_rx) else {
-            break
-        };
-        if cancel_active(cancel) {
-            return;
+        // its cache lines are hot also releases upstream backpressure
+        // sooner. `anchor_claim` batches ready runs and rides out empty
+        // micro-gaps before parking.
+        let claimed = anchor_claim(&mut spin, &mid_rx, &mut scratch, batch_cap);
+        if claimed == 0 {
+            break;
         }
-        if !fwd(&mut fence, &fenced_tx, item, batched) {
-            return;
-        }
-        loop {
-            let item = match mid_rx.try_recv() {
-                Ok(v) => v,
-                Err(TryRecvError::Empty) => continue 'outer,
-                Err(TryRecvError::Closed) => break 'outer,
-            };
+        for item in scratch.drain(..) {
             if cancel_active(cancel) {
                 return;
             }
@@ -3128,9 +3204,14 @@ impl<T: Send + Unpin + 'static> Terminal<T> for VecCollector {
     ) -> Vec<T> {
         let mut results = Vec::with_capacity(n);
         if ordered {
-            drain_ordered_async_sharded(&mut rx, n, OrderedAccounting::Validate { cancel }, |item| {
-                results.push(item);
-            })
+            drain_ordered_async_sharded(
+                &mut rx,
+                n,
+                OrderedAccounting::Validate { cancel },
+                |item| {
+                    results.push(item);
+                },
+            )
             .await;
         } else {
             drain_unordered_async_sharded(&mut rx, |item| results.push(item)).await;
@@ -4010,22 +4091,26 @@ mod tests {
         assert_eq!(off.budget_us, 0);
     }
 
-    /// `spin_for`: a zero budget never spins; with a budget it catches a
-    /// queued item without parking, exhausts to `None` on an empty channel
-    /// (bounded rounds — miri-safe, no wall clock), and propagates `Closed`.
+    /// `spin_claim`: a zero budget never spins; with a budget it catches a
+    /// queued run without parking (batched when `batch_cap > 0`), exhausts to
+    /// `Empty` on an empty channel (bounded rounds — miri-safe, no wall
+    /// clock), and propagates `Closed`.
     #[test]
-    fn anchor_spin_spin_for_phases() {
+    fn anchor_spin_spin_claim_phases() {
         let (tx, rx) = channel::<u32>(4);
         let mut s = AnchorSpin::new(100);
-        assert!(matches!(s.spin_for(&rx), Ok(None))); // budget 0: no spin
+        let mut scratch: Vec<u32> = Vec::with_capacity(2);
+        assert_eq!(s.spin_claim(&rx, &mut scratch, 0), Claim::Empty); // budget 0: no spin
         tx.send(7).unwrap();
         s.budget_us = 100;
-        assert_eq!(s.spin_for(&rx).unwrap(), Some(7));
+        assert_eq!(s.spin_claim(&rx, &mut scratch, 0), Claim::Ready(1));
+        assert_eq!(scratch, vec![7]);
+        scratch.clear();
         s.budget_us = 1; // 64-poll backstop: exhausts immediately on empty
-        assert!(matches!(s.spin_for(&rx), Ok(None)));
+        assert_eq!(s.spin_claim(&rx, &mut scratch, 0), Claim::Empty);
         drop(tx);
         s.budget_us = 100;
-        assert!(matches!(s.spin_for(&rx), Err(TryRecvError::Closed)));
+        assert_eq!(s.spin_claim(&rx, &mut scratch, 0), Claim::Closed);
     }
 
     /// `fence_batch_send` on both paths: delivers the whole batch, parks

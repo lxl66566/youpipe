@@ -61,22 +61,65 @@ fn verify_ordered_accounting<T>(
 /// absorbs the burst without per-item blocking-recv overhead (condvar/park
 /// bookkeeping inside the channel on the empty path); only the first item of
 /// each burst goes through the blocking `recv()`.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) fn drain_unordered<R, O>(rx: &R, mut sink: impl FnMut(O))
+pub(crate) fn drain_unordered<R, O>(rx: &R, sink: impl FnMut(O))
 where
     R: RecvItem<(u64, O)>,
     O: Send + 'static,
 {
+    drain_unordered_with(rx, crate::handoff::batch_recv_cap(), sink);
+}
+
+/// [`drain_unordered`] with an explicit batch cap (0 = per-item, the
+/// historical loop byte-for-byte) so tests can drive the batch path
+/// without env-var gymnastics.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn drain_unordered_with<R, O>(rx: &R, batch_cap: usize, mut sink: impl FnMut(O))
+where
+    R: RecvItem<(u64, O)>,
+    O: Send + 'static,
+{
+    // Batch scratch, reused across bursts for the whole drain (one
+    // allocation per run; capacity 0 = no alloc).
+    let mut scratch: Vec<(u64, O)> = Vec::with_capacity(batch_cap);
     loop {
-        // Burst-drain: pop everything already queued without blocking.
-        loop {
-            match rx.try_recv() {
-                Ok((_, item)) => sink(item),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Closed) => return,
+        if batch_cap > 0 {
+            // Batch burst-drain: claim ready runs with one cursor update
+            // per run (YOUPIPE_BATCH_RECV, todo #1 residual (d)). A 0-claim
+            // is inconclusive (empty / first slot in-flight), so the single
+            // `try_recv` below resolves Empty vs Closed before anchoring.
+            loop {
+                let n = rx.try_recv_batch(scratch.spare_capacity_mut());
+                if n == 0 {
+                    break;
+                }
+                // SAFETY: try_recv_batch initialized exactly scratch[..n].
+                unsafe { scratch.set_len(n) };
+                for (_, item) in scratch.drain(..) {
+                    sink(item);
+                }
+            }
+        } else {
+            // Burst-drain: pop everything already queued without blocking.
+            loop {
+                match rx.try_recv() {
+                    Ok((_, item)) => sink(item),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Closed) => return,
+                }
             }
         }
         // Queue drained but channel may still be open — block for one.
+        // (Batch path: this is also the Empty/Closed probe.)
+        if batch_cap > 0 {
+            match rx.try_recv() {
+                Ok((_, item)) => {
+                    sink(item);
+                    continue;
+                },
+                Err(TryRecvError::Empty) => (),
+                Err(TryRecvError::Closed) => return,
+            }
+        }
         match rx.recv() {
             Ok((_, item)) => sink(item),
             Err(_) => return,
@@ -93,11 +136,34 @@ where
 ///
 /// Burst-drains like [`drain_unordered`]; ordering is unaffected — the
 /// [`ReorderBuffer`] re-sequences by `seq` regardless of arrival order.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn drain_ordered<R, O>(
     rx: &R,
     expected_items: usize,
     accounting: OrderedAccounting<'_>,
+    sink: impl FnMut(O),
+) where
+    R: RecvItem<(u64, O)>,
+    O: Send + 'static,
+{
+    drain_ordered_with(
+        rx,
+        expected_items,
+        accounting,
+        crate::handoff::batch_recv_cap(),
+        sink,
+    );
+}
+
+/// [`drain_ordered`] with an explicit batch cap (0 = per-item, the
+/// historical loop byte-for-byte) — same rationale as
+/// [`drain_unordered_with`]. Ordering never depends on the claim size:
+/// the [`ReorderBuffer`] re-sequences by `seq`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn drain_ordered_with<R, O>(
+    rx: &R,
+    expected_items: usize,
+    accounting: OrderedAccounting<'_>,
+    batch_cap: usize,
     mut sink: impl FnMut(O),
 ) where
     R: RecvItem<(u64, O)>,
@@ -117,12 +183,48 @@ pub(crate) fn drain_ordered<R, O>(
         emitted += 1;
         sink(item);
     };
+    // Batch scratch (see `drain_unordered_with`).
+    let mut scratch: Vec<(u64, O)> = Vec::with_capacity(batch_cap);
     loop {
-        // Burst-drain: pop everything already queued without blocking.
-        loop {
+        if batch_cap > 0 {
+            loop {
+                let n = rx.try_recv_batch(scratch.spare_capacity_mut());
+                if n == 0 {
+                    break;
+                }
+                // SAFETY: try_recv_batch initialized exactly scratch[..n].
+                unsafe { scratch.set_len(n) };
+                for (seq, item) in scratch.drain(..) {
+                    buffer.insert_into(seq, item, &mut sink);
+                }
+            }
+        } else {
+            // Burst-drain: pop everything already queued without blocking.
+            loop {
+                match rx.try_recv() {
+                    Ok((seq, item)) => buffer.insert_into(seq, item, &mut sink),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Closed) => {
+                        for item in buffer.flush_remaining() {
+                            sink(item);
+                        }
+                        if let OrderedAccounting::Validate { cancel } = accounting {
+                            verify_ordered_accounting(&buffer, emitted, expected_items, cancel);
+                        }
+                        return;
+                    },
+                }
+            }
+        }
+        // Queue drained but channel may still be open — block for one.
+        // (Batch path: this is also the Empty/Closed probe.)
+        if batch_cap > 0 {
             match rx.try_recv() {
-                Ok((seq, item)) => buffer.insert_into(seq, item, &mut sink),
-                Err(TryRecvError::Empty) => break,
+                Ok((seq, item)) => {
+                    buffer.insert_into(seq, item, &mut sink);
+                    continue;
+                },
+                Err(TryRecvError::Empty) => (),
                 Err(TryRecvError::Closed) => {
                     for item in buffer.flush_remaining() {
                         sink(item);
@@ -134,7 +236,6 @@ pub(crate) fn drain_ordered<R, O>(
                 },
             }
         }
-        // Queue drained but channel may still be open — block for one.
         if let Ok((seq, item)) = rx.recv() {
             buffer.insert_into(seq, item, &mut sink);
         } else {
@@ -441,6 +542,81 @@ mod tests {
         sorted.sort_unstable();
         let expected_items: Vec<u64> = (0..=SPAN).filter(|&s| s != 1 && s != (1 << 20)).collect();
         assert_eq!(sorted, expected_items);
+    }
+
+    /// Batch-cap equivalence of the unordered drain: cap 0 (the historical
+    /// per-item loop) and cap N (the batch path) must deliver the identical
+    /// multiset under concurrent producers — a lost or duplicated item
+    /// inside a batch claim would show up here.
+    #[test]
+    fn drain_unordered_batch_cap_equivalence() {
+        const P: usize = 4;
+        const N: u64 = 2_000;
+        for cap in [0usize, 3] {
+            let (tx, rx) = channel::<(u64, u64)>(16);
+            let mut hs = Vec::new();
+            for p in 0..P {
+                let tx = tx.clone();
+                let base = p as u64 * N;
+                hs.push(std::thread::spawn(move || {
+                    for i in 0..N {
+                        tx.send((0, base + i)).unwrap();
+                    }
+                }));
+            }
+            drop(tx);
+            let mut got = Vec::new();
+            drain_unordered_with(&rx, cap, |v| got.push(v));
+            for h in hs {
+                h.join().unwrap();
+            }
+            got.sort_unstable();
+            assert_eq!(got, (0..P as u64 * N).collect::<Vec<_>>(), "cap {cap}");
+        }
+    }
+
+    /// Ordered drain over out-of-order arrivals with the batch path on: the
+    /// `ReorderBuffer` must re-sequence batched arrival runs exactly as it
+    /// does per-item arrivals.
+    #[test]
+    fn drain_ordered_batch_resequences_out_of_order() {
+        const N: u64 = 1_000;
+        let (tx, rx) = channel::<(u64, u64)>(64);
+        // feed in a stride pattern so every batch claim (cap 8) mixes
+        // non-consecutive seqs
+        let feeder = std::thread::spawn(move || {
+            for k in 0..8 {
+                for seq in (k..N).step_by(8) {
+                    tx.send((seq, seq)).unwrap();
+                }
+            }
+            drop(tx);
+        });
+        let mut out = Vec::new();
+        drain_ordered_with(
+            &rx,
+            usize::try_from(N).unwrap(),
+            OrderedAccounting::Validate { cancel: None },
+            8,
+            |v| out.push(v),
+        );
+        feeder.join().unwrap();
+        assert_eq!(out, (0..N).collect::<Vec<_>>());
+    }
+
+    /// EOF with the batch path on: a channel whose senders dropped with
+    /// items queued must deliver every item and then return (the 0-claim →
+    /// try_recv probe hand-off).
+    #[test]
+    fn drain_unordered_batch_eof_after_close() {
+        let (tx, rx) = channel::<(u64, u64)>(32);
+        for i in 0..32u64 {
+            tx.send((i, i)).unwrap();
+        }
+        drop(tx);
+        let mut got = Vec::new();
+        drain_unordered_with(&rx, 8, |v| got.push(v));
+        assert_eq!(got, (0..32).collect::<Vec<_>>());
     }
 
     /// A fired cancel token exempts the equality form: the run fed fewer

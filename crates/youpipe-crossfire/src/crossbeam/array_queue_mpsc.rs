@@ -5,6 +5,10 @@
 //!   - Add token interface according to crossbeam-channel
 //!   - Modified push() to push_with_ptr();
 //!   - Add try_push_oneshot();
+//!   - youpipe fork extension (2026-09): pop_batch() — claim a run of ready
+//!     items with ONE `recv` SeqCst store, amortizing the per-item cursor
+//!     update over the batch (see docs/src/dev/streaming.md "Batched ring
+//!     operations" in the youpipe repo).
 //!
 //! Fork from crossbeam-queue crate commit 5a154def002304814d50f3c7658bd30eb46b2fad
 //!
@@ -224,6 +228,77 @@ impl<T> ArrayQueueMpsc<T> {
         }
     }
 
+    /// youpipe fork extension (batch recv): claim up to `out.len()`
+    /// consecutively ready items, publishing the new head with ONE `recv`
+    /// SeqCst store for the whole batch.
+    ///
+    /// Non-blocking: returns the ready prefix (0 = nothing ready right now;
+    /// NOT an emptiness/closedness verdict — the caller distinguishes via
+    /// `pop`). Per item this pays one stamp Acquire load plus the value
+    /// move; per batch one `recv` load and, only when the cached tail says
+    /// empty, one `sender` load. The stamp walk needs no tail bound: a slot
+    /// beyond the producers' tail simply carries a stamp from an older lap
+    /// and terminates the run. A slot whose producer has claimed (tail
+    /// advanced) but not yet stored the value/stamp also terminates the run
+    /// — `pop`'s `_read` spin keeps the bounded-wait contract for the
+    /// blocking paths.
+    #[inline]
+    pub fn pop_batch(&self, out: &mut [MaybeUninit<T>]) -> usize {
+        let recv_val = self.recv.load(Ordering::Relaxed);
+        let mut head = recv_val as u32;
+        let mut tail_cached = (recv_val >> 32) as u32;
+        if tail_cached == head {
+            // Cached tail is stale: take a fresh snapshot before declaring
+            // nothing ready (SeqCst would only matter for the park-path
+            // final check, which batch callers never perform).
+            tail_cached = self.sender.load(Ordering::Acquire) as u32;
+            if tail_cached == head {
+                return 0;
+            }
+        }
+        let mut n = 0;
+        while n < out.len() {
+            let index = (head & (self.one_lap - 1)) as usize;
+            debug_assert!(index < self.buffer.len());
+            let slot = unsafe { self.buffer.get_unchecked(index) };
+            if slot.stamp.load(Ordering::Acquire) != (head as usize).wrapping_add(1) {
+                break;
+            }
+            unsafe {
+                out[n].write(slot.value.get().read().assume_init());
+            }
+            n += 1;
+            head = if index + 1 < self.buffer.len() {
+                head + 1
+            } else {
+                (head & !(self.one_lap - 1)).wrapping_add(self.one_lap)
+            };
+        }
+        if n > 0 {
+            // Hint invariant (`_start_read` relies on it): head <=
+            // tail_cached <= real tail. The per-item path advances head one
+            // slot per call, so it can never step PAST the hint (each step
+            // re-runs the == emptiness check and refreshes on exact hit);
+            // a batch JUMP can: the walk is stamp-bounded, not
+            // tail-bounded, and may legitimately consume past a stale-low
+            // hint. Storing that stale hint verbatim leaves
+            // `tail_cached < head`, which `_start_read` misreads as "an
+            // item exists" and `_read` then spins on a stamp from a dead
+            // lap forever (reproduced 2026-09: 4 producers / batch drain,
+            // recv={head=40000, tail_cached=16}, collector spinning at
+            // 200% CPU). Clamp the stored hint up to the new head: hint ==
+            // head reads as "maybe empty, refresh from sender" — exactly
+            // the truth when the walk outran the hint — and the hint can
+            // never exceed the real tail because the walk only covered
+            // published slots.
+            let hint = tail_cached.max(head);
+            // Single cursor publication frees `n` slots for the producers
+            // at once. SeqCst to match `pop` (the Miri-observed ordering).
+            self.recv.store(((hint as u64) << 32) | (head as u64), Ordering::SeqCst);
+        }
+        n
+    }
+
     #[inline]
     pub fn pop_cached(&self) -> Option<T> {
         if let Some((head, tail_cached)) = self._start_read::<false>(false) {
@@ -380,5 +455,116 @@ impl<T> Drop for ArrayQueueMpsc<T> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    /// Drain via batches of at most `max`; returns when no batch makes
+    /// progress. Mirrors the intended production pattern: a typed Vec plus
+    /// `spare_capacity_mut()` as the uninit batch buffer.
+    fn collect_batch(q: &ArrayQueueMpsc<u32>, max: usize) -> Vec<u32> {
+        let mut got = Vec::new();
+        let mut buf: Vec<u32> = Vec::with_capacity(max);
+        loop {
+            let n = q.pop_batch(buf.spare_capacity_mut());
+            if n == 0 {
+                return got;
+            }
+            // SAFETY: pop_batch initialized exactly buf[..n].
+            unsafe { buf.set_len(n) };
+            got.append(&mut buf);
+        }
+    }
+
+    #[test]
+    fn batch_claims_fifo_prefix_across_laps() {
+        let q = ArrayQueueMpsc::new(3); // lap wrap exercised over 21 items
+        let mut pushed = 0u32;
+        for _chunk in 0..7 {
+            for _ in 0..3 {
+                let v = MaybeUninit::new(pushed);
+                assert!(unsafe { q.push_with_ptr(v.as_ptr()) });
+                pushed += 1;
+            }
+            // single-batch contract: a claim never exceeds the buffer
+            let mut buf: Vec<u32> = Vec::with_capacity(2);
+            let n = q.pop_batch(buf.spare_capacity_mut());
+            assert_eq!(n, 2, "claim is capped by the buffer, not the run");
+            // SAFETY: initialized by the claim above.
+            unsafe { buf.set_len(n) };
+            assert_eq!(&buf[..], &[pushed - 3, pushed - 2]);
+            buf.clear();
+            // rest of the run, then a 0-claim on the drained ring
+            assert_eq!(collect_batch(&q, 8), vec![pushed - 1]);
+        }
+        assert_eq!(collect_batch(&q, 4), vec![]);
+        // still usable after empty batches
+        let v = MaybeUninit::new(99u32);
+        assert!(unsafe { q.push_with_ptr(v.as_ptr()) });
+        assert_eq!(collect_batch(&q, 8), vec![99]);
+    }
+
+    #[test]
+    fn batch_partial_when_buffer_smaller_than_ready_run() {
+        let q = ArrayQueueMpsc::new(8);
+        for i in 0..8u32 {
+            let v = MaybeUninit::new(i);
+            assert!(unsafe { q.push_with_ptr(v.as_ptr()) });
+        }
+        // one claim with a 4-slot buffer stops at 4 even though 8 are ready
+        let mut buf: Vec<u32> = Vec::with_capacity(4);
+        let n = q.pop_batch(buf.spare_capacity_mut());
+        assert_eq!(n, 4);
+        // SAFETY: initialized by the claim above.
+        unsafe { buf.set_len(n) };
+        assert_eq!(&buf[..], (0..4).collect::<Vec<_>>().as_slice());
+        buf.clear();
+        assert_eq!(collect_batch(&q, 8), (4..8).collect::<Vec<_>>());
+        assert_eq!(collect_batch(&q, 8), vec![]);
+    }
+
+    #[test]
+    fn batch_multi_producer_no_loss_no_dup() {
+        const P: usize = 4;
+        // Miri runs ~100x slower; the interleaving surface (multi-producer
+        // vs batch claim) is size-independent.
+        const N: u32 = if cfg!(miri) { 100 } else { 2000 };
+        let q = std::sync::Arc::new(ArrayQueueMpsc::<u32>::new(7));
+        let mut hs = Vec::new();
+        for p in 0..P {
+            let q = std::sync::Arc::clone(&q);
+            let base = u32::try_from(p).unwrap() * N;
+            hs.push(std::thread::spawn(move || {
+                for i in 0..N {
+                    let v = MaybeUninit::new(base + i);
+                    while !unsafe { q.push_with_ptr(v.as_ptr()) } {
+                        std::hint::spin_loop();
+                    }
+                }
+            }));
+        }
+        let mut got: Vec<u32> = Vec::new();
+        let mut buf: Vec<u32> = Vec::with_capacity(5);
+        let mut idle = 0usize;
+        while got.len() < P * N as usize {
+            let n = q.pop_batch(buf.spare_capacity_mut());
+            if n == 0 {
+                idle += 1;
+                assert!(idle < 1_000_000, "consumer stalled");
+                continue;
+            }
+            idle = 0;
+            // SAFETY: pop_batch initialized exactly buf[..n].
+            unsafe { buf.set_len(n) };
+            got.append(&mut buf);
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        got.sort_unstable();
+        assert_eq!(got, (0..u32::try_from(P).unwrap() * N).collect::<Vec<_>>());
     }
 }

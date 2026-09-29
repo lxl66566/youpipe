@@ -91,6 +91,43 @@ pub(crate) trait FlavorImpl: Queue {
 
     fn try_recv_final(&self) -> Option<Self::Item>;
 
+    /// youpipe fork extension (batch recv): claim a run of ready items with
+    /// amortized cursor updates, writing them into `out` and returning the
+    /// count (0 = nothing ready right now; NOT an emptiness/closedness
+    /// verdict). Default: per-item `try_recv` fallback for flavors without
+    /// a native batch op.
+    #[inline]
+    fn try_recv_batch(&self, out: &mut [MaybeUninit<Self::Item>]) -> usize {
+        let mut n = 0;
+        while n < out.len() {
+            match self.try_recv() {
+                Some(item) => {
+                    out[n].write(item);
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        n
+    }
+
+    /// youpipe fork extension (batch send): claim free slots for the
+    /// longest ready prefix of `values` without blocking; returns the count
+    /// sent. `values` must be fully initialized and the returned prefix is
+    /// moved out. Default: per-item `try_send` fallback.
+    #[inline]
+    unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<Self::Item>]) -> usize {
+        let mut n = 0;
+        while n < values.len() {
+            if self.try_send(&values[n]) {
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        n
+    }
+
     fn backoff_limit(&self) -> u16;
 }
 
@@ -169,6 +206,16 @@ macro_rules! flavor_dispatch {
         #[inline(always)]
         fn backoff_limit(&self) -> u16 {
             $wrap_method!(self, backoff_limit)
+        }
+
+        #[inline]
+        fn try_recv_batch(&self, out: &mut [MaybeUninit<Self::Item>]) -> usize {
+            $wrap_method!(self, try_recv_batch out)
+        }
+
+        #[inline]
+        unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<Self::Item>]) -> usize {
+            $wrap_method!(self, try_send_batch values)
         }
     };
 }

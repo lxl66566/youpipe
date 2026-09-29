@@ -211,6 +211,85 @@ makes the asymmetry bite. The flavour stays opt-in under the same knob;
 (c) closed as falsified — readings and the mixed-pipeline warning in
 benchmarks.md "Async sharded-terminal A/B".
 
+#### Batched ring operations (`YOUPIPE_BATCH_RECV`)
+
+Sharding removes the send-side fan-in but every ring op is still per item:
+the collector's `try_recv` pays one `recv` SeqCst store per item on lines the
+senders keep invalidating (hotpath: p50 551 ns/item, 31-sender ping-pong),
+and the single feeder pays one tail CAS per item into the 31-consumer input
+ring (901 ns/item avg, 94 % of feeder wall — see benchmarks.md
+"true-streaming"). `YOUPIPE_BATCH_RECV` (unset = off) amortizes the cursor
+updates over runs of consecutive slots (fork extension, same opt-in family
+as `YOUPIPE_SHARDED_TERM`; A/B through the runtime knob, same binary):
+
+- **MPSC `pop_batch`** (`array_queue_mpsc`, the terminal rings): one `recv`
+  load + one `recv` SeqCst store per claimed *run*; per item only the stamp
+  Acquire load and the value move. The stamp walk needs no tail bound — a
+  slot beyond the producers' tail carries an older lap's stamp and stops the
+  run; a slot whose producer has claimed-but-not-yet-stored also stops it
+  (the blocking `pop`'s spin keeps the bounded-wait contract). Consumers
+  are single by construction, no CAS.
+- **MPMC `pop_batch`** (`array_queue`, the mid/worker rings): a read-only
+  stamp walk over positions `head, head+1, …` (the per-item readiness rule
+  `stamp == pos + 1`), then ONE head CAS claims the whole run — any
+  interfering consumer moves the head and fails the CAS, and a producer
+  cannot touch a slot whose stamp equals `pos + 1`, so the checked values
+  are stable until popped. Bounded retries keep it non-blocking; the
+  per-item `pop` path keeps the unbounded loop.
+- **MPMC `try_push_batch`** (feeder side): symmetric — one tail CAS claims a
+  run of free slots, then value writes + Release stamps. Prefix semantics:
+  sends the longest free prefix, returns the count; the caller pushes the
+  remainder with per-item blocking `send`. **Backpressure semantics are
+  unchanged**: park granularity stays per item (only when full), item order
+  and capacity are identical. MPSC send-side batching is deliberately absent
+  — producers would have to buffer outputs to batch them, which changes
+  streaming latency (not semantically equal).
+
+Integration points (all behind the one knob, cap clamped 2..=4096, default
+64): the collector's burst phase (`drain_unordered/ordered[_sharded]`,
+batch claim then a single per-item `try_recv` probe to resolve the
+inconclusive 0-claim into Empty/Closed), the worker/fence-forwarder burst
+phase (`claim_burst` in `handoff/channel.rs` — batch first, anchor on miss),
+and the feeder push loop (`push_items`: stage a batch, send the free
+prefix, per-item send the tail). Cap 0 = the historical per-item loops
+byte-for-byte. Async terminals keep per-item `try_recv` (p50 ≈ 20 ns,
+nothing to amortize).
+
+Correctness notes: the batch claims exactly-once runs (stamp-walk + single
+CAS protocol, fork unit tests + `tests/batch_recv.rs` exactly-once suites
+under multi-producer/multi-consumer interleaving, miri tree-borrows
+included); `on_recv`/`on_send` fire once per *item* so parked-producer wake
+counts are unchanged; cancel checks stay per item (staged-but-unsent feeder
+items get their destructors run explicitly on abort — a
+`Vec<MaybeUninit<_>>` drop would skip them, leaking every `I: Drop`; same
+contract as in-flight items).
+
+**MPSC hint invariant** (hard-won, 2026-09): `_start_read` treats any
+`tail_cached != head` as "an item exists" and `_read` then *spins* for the
+matching stamp (bounded-wait assumption). The per-item path advances `head`
+one slot per call, so it can never step past the cached tail hint — each
+step re-runs the `==` emptiness check and refreshes on exact hit. A batch
+JUMP can: the walk is stamp-bounded, not tail-bounded, and legitimately
+consumes past a stale-low hint, leaving `tail_cached < head` in `recv` —
+which the next per-item `try_recv` misreads as "an item exists" and spins on
+a stamp from a dead lap forever (reproduced: 4 producers / batch drain,
+`recv={head=40000, tail_cached=16}`, collector burning a core at 100 %).
+`pop_batch` therefore clamps the stored hint up to the new head
+(`tail_cached.max(head)`) — hint == head reads as "maybe empty, refresh
+from sender", and the hint still never exceeds the real tail because the
+walk only covered published slots. The MPMC ring is immune (no tail hints:
+its `_start_read` checks the stamp and returns, never spins).
+
+Testing note (`tests/batch_recv.rs`): a liveness bug in this family can sit
+INSIDE the fork's uninterruptible stamp spin, so budgets on our own loops
+cannot bound it — every potentially-hanging scenario (concurrent
+exactly-once suites, each e2e `run()`, the send/recv interplay test) runs
+its whole body on a worker thread behind a `recv_timeout` watchdog that
+fails the test in seconds; the stalled worker leaks until process exit
+(which is why a hung test thread must never be the one running the body —
+libtest joins test threads, so an inline hang holds the process and the
+shared cargo lock hostage).
+
 ## Worker recv loops: anchor + burst-drain
 
 Every sync consumer loop (`spawn_stage` / `spawn_expand_stage` workers, the

@@ -249,6 +249,16 @@ impl<F: Flavor> Tx<F> {
         }
     }
 
+    /// youpipe fork extension: non-blocking batch send of the longest free
+    /// prefix of `values`; returns the count sent (0 = nothing sendable
+    /// right now). `values` must be fully initialized; the sent prefix is
+    /// moved out. Backpressure granularity is unchanged — callers fall
+    /// back to per-item blocking `send` for the remainder.
+    #[inline]
+    pub unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<F::Item>]) -> usize {
+        self.shared.try_send_batch(values)
+    }
+
     /// Sends a message with a timeout.
     /// Will block when channel is full.
     ///

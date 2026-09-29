@@ -16,6 +16,7 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker / per-task-group SPSC shards | streaming | multi-worker (sync) or high-fanout (async) terminal stage is the bottleneck (see [dev/streaming](../dev/streaming.md)) |
 | `YOUPIPE_SPIN_ANCHOR` | adaptive pre-anchor `try_recv` spin window (µs) in sync worker recv loops | streaming | convoy collapse: serial supplier (feeder/fence) feeding ≥ ~10 workers, run times ~items × 2 µs (see [dev/streaming](../dev/streaming.md)) |
 | `YOUPIPE_FWD_BATCH` | fence forwarder pushes released batches via `try_send` | streaming | rarely useful alone; pairs with `YOUPIPE_SPIN_ANCHOR` on fence-heavy chains |
+| `YOUPIPE_BATCH_RECV` | batched ring claims on the streaming data plane | streaming | channel handoff dominates and bursts arrive in runs (see [dev/streaming](../dev/streaming.md)) |
 
 `Workload` and `buffer_size`/`async_workers`/`io_concurrency` are disjoint: a
 fused `pipe()` ignores the streaming knobs (it has no channels and no async
@@ -91,6 +92,23 @@ the send side and the collector, not the recv anchor).
 back-to-back `try_send`, parking at most once per full ring. Measured no
 independent win while downstream workers still park per item on recv; keep
 for chains that already run `YOUPIPE_SPIN_ANCHOR`.
+
+`YOUPIPE_BATCH_RECV`: unset/`"0"` = off (default), `"1"` = on with the
+default cap 64, `"N"` (2..=4096) = on with cap N. Batches the streaming
+data plane's cursor updates: the collector's terminal drain, the stage /
+expand / fence-forwarder burst phase and the feeder push loop claim runs
+of consecutive ring slots with one atomic cursor update per run instead
+of one per item (fork extension — mechanism and the four-combo
+`sharded_term` × `batch_recv` verdict in [dev/streaming](../dev/streaming.md)
+and [dev/benchmarks](../dev/benchmarks.md)). Backpressure granularity,
+item order, capacity and cancellation semantics are unchanged; async
+terminals keep per-item recv. Default off: on a shared terminal ring
+batching alone is bimodal at 100K (convoy mode, todo #4) and regresses
+short 1K runs; the recommended pairing is with
+`YOUPIPE_SHARDED_TERM=1`, where it takes dominant fan-in wins
+(`workers2` −69 %, `single_unordered_cpu` −34 %, `multi2` −15 %) and
+removes the sharded terminal's round-to-round bimodality (readings:
+[dev/benchmarks](../dev/benchmarks.md) "Batched ring ops four-combo").
 
 Why auto is safe for consumers that read the output right after collect
 (the feared DRAM round-trip): measured on the reference machine

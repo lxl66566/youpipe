@@ -25,8 +25,8 @@
 //! residual (c)).
 
 use super::channel::{
-    ChannelError, MpscAsyncReceiver, MpscAsyncSender, MpscReceiver, MpscSender, TryRecvError,
-    TryRecvItem, mpsc_async_channel, mpsc_channel,
+    ChannelError, MpscAsyncReceiver, MpscAsyncSender, MpscReceiver, MpscSender, RecvItem,
+    TryRecvError, TryRecvItem, mpsc_async_channel, mpsc_channel,
 };
 
 /// Minimum per-shard capacity. Below this the ring degenerates into a
@@ -54,17 +54,18 @@ pub fn sharded_mpsc_channel<T: Send + 'static>(
         txs.push(tx);
         rxs.push(rx);
     }
-    (
-        txs,
-        ShardedReceiver {
-            inner: ShardSet {
-                rxs,
-                closed: vec![false; shards],
-                cursor: 0,
-                open: shards,
-            },
+    // Batch scratch for `drain_pass` (YOUPIPE_BATCH_RECV; capacity 0 =
+    // per-item draining, the historical shape).
+    let scratch = Vec::with_capacity(super::batch_recv_cap());
+    (txs, ShardedReceiver {
+        inner: ShardSet {
+            rxs,
+            closed: vec![false; shards],
+            cursor: 0,
+            open: shards,
         },
-    )
+        scratch,
+    })
 }
 
 /// Create `shards` independent bounded async MPSC channels presenting one
@@ -91,17 +92,14 @@ pub fn sharded_mpsc_async_channel<T: Send + Unpin + 'static>(
         txs.push(tx);
         rxs.push(rx);
     }
-    (
-        txs,
-        ShardedAsyncReceiver {
-            inner: ShardSet {
-                rxs,
-                closed: vec![false; shards],
-                cursor: 0,
-                open: shards,
-            },
+    (txs, ShardedAsyncReceiver {
+        inner: ShardSet {
+            rxs,
+            closed: vec![false; shards],
+            cursor: 0,
+            open: shards,
         },
-    )
+    })
 }
 
 /// Receiver-side core shared by both flavours: the shard receivers, the
@@ -166,6 +164,56 @@ impl<R> ShardSet<R> {
         self.cursor = (self.cursor + 1) % n;
         self.open > 0
     }
+
+    /// Batched variant of [`ShardSet::drain_pass`] for the sync flavour
+    /// under `YOUPIPE_BATCH_RECV`: each shard's ready run is claimed with
+    /// one `recv`-cursor store per run (todo #1 residual (d)); a
+    /// 0-capacity `scratch` keeps the per-item rhythm above
+    /// byte-for-byte.
+    fn drain_pass_batched<T, S: FnMut(T)>(&mut self, scratch: &mut Vec<T>, sink: &mut S) -> bool
+    where
+        R: RecvItem<T>,
+    {
+        let n = self.rxs.len();
+        // 0-capacity scratch = batching off: skip the claim entirely so the
+        // per-item drain below is byte-for-byte the historical loop.
+        let can_batch = scratch.capacity() > 0;
+        for k in 0..n {
+            let i = (self.cursor + k) % n;
+            if self.closed[i] {
+                continue;
+            }
+            loop {
+                // Batch claim first (one cursor store per run).
+                if can_batch {
+                    let claimed =
+                        RecvItem::try_recv_batch(&self.rxs[i], scratch.spare_capacity_mut());
+                    if claimed > 0 {
+                        // SAFETY: try_recv_batch initialized exactly the
+                        // prefix.
+                        unsafe { scratch.set_len(claimed) };
+                        for item in scratch.drain(..) {
+                            sink(item);
+                        }
+                        continue;
+                    }
+                }
+                // No batchable run: one per-item try_recv resolves the
+                // 0-claim (empty / in-flight / closed).
+                match RecvItem::try_recv(&self.rxs[i]) {
+                    Ok(item) => sink(item),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Closed) => {
+                        self.closed[i] = true;
+                        self.open -= 1;
+                        break;
+                    },
+                }
+            }
+        }
+        self.cursor = (self.cursor + 1) % n;
+        self.open > 0
+    }
 }
 
 /// Sole consumer of a [`sharded_mpsc_channel`]: owns all shard receivers and
@@ -173,13 +221,16 @@ impl<R> ShardSet<R> {
 /// consumer, same contract as [`MpscReceiver`].
 pub struct ShardedReceiver<T: Send + 'static> {
     inner: ShardSet<MpscReceiver<T>>,
+    /// Per-pass batch scratch for `drain_pass_batched`
+    /// (YOUPIPE_BATCH_RECV; capacity 0 = per-item draining).
+    scratch: Vec<T>,
 }
 
 impl<T: Send + 'static> ShardedReceiver<T> {
-    /// One full burst pass (see [`ShardSet::drain_pass`]). Returns `false`
-    /// once every shard has closed (EOF).
+    /// One full burst pass (see [`ShardSet::drain_pass_batched`]). Returns
+    /// `false` once every shard has closed (EOF).
     pub(crate) fn drain_pass<S: FnMut(T)>(&mut self, sink: &mut S) -> bool {
-        self.inner.drain_pass(sink)
+        self.inner.drain_pass_batched(&mut self.scratch, sink)
     }
 
     /// Anchor: every shard is empty but at least one is still open — block
@@ -276,8 +327,9 @@ impl<T: Send + Unpin + 'static> ShardedAsyncReceiver<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use futures::executor::block_on;
+
+    use super::*;
 
     /// EOF aggregation: shards close independently (their senders drop at
     /// different times) and the receiver keeps delivering from the open ones
