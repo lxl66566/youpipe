@@ -1,4 +1,4 @@
-use std::future::Future;
+use std::{future::Future, mem::MaybeUninit};
 
 use crossfire::{mpmc, mpsc};
 
@@ -61,6 +61,20 @@ impl<T: Send + 'static> SyncSender<T> {
             crossfire::TrySendError::Disconnected(v) => TrySendError::Closed(v),
         })
     }
+
+    /// Non-blocking batch send of the longest free prefix of `buf`; returns
+    /// the count sent. `buf` must be fully initialized; the sent prefix is
+    /// moved out (do not read it again), the remainder stays owned by the
+    /// caller. Backpressure granularity is unchanged: callers fall back to
+    /// per-item blocking [`Self::send`] for the remainder, parking per item
+    /// exactly as the per-item path would.
+    ///
+    /// Probe caliber: one hotpath guard per *batch* (see
+    /// [`SyncReceiver::try_recv_batch`]).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SyncSender"))]
+    pub fn try_send_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        unsafe { self.tx.try_send_batch(buf) }
+    }
 }
 
 impl<T: Send + 'static> Clone for SyncSender<T> {
@@ -85,6 +99,20 @@ impl<T: Send + 'static> SyncReceiver<T> {
             crossfire::TryRecvError::Empty => TryRecvError::Empty,
             crossfire::TryRecvError::Disconnected => TryRecvError::Closed,
         })
+    }
+
+    /// Non-blocking batch claim of the ready run into `buf` (a typed Vec's
+    /// `spare_capacity_mut()`); returns the count claimed. 0 means nothing
+    /// is ready right now — NOT an Empty/Closed verdict (`try_recv`
+    /// distinguishes). Amortizes the ring's per-item cursor CAS over the
+    /// batch ([`Self::try_recv`] stays the single-item contract).
+    ///
+    /// Probe caliber: one hotpath guard per *batch*, not per item —
+    /// per-item attribution lives in the p50 divided by the mean batch
+    /// size; do not compare its per-call p50 against `try_recv`'s directly.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SyncReceiver"))]
+    pub fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        self.rx.try_recv_batch(buf)
     }
 }
 
@@ -250,6 +278,20 @@ impl<T: Send + 'static> MpscReceiver<T> {
             crossfire::TryRecvError::Disconnected => TryRecvError::Closed,
         })
     }
+
+    /// Non-blocking batch claim of the ready run into `buf` (a typed Vec's
+    /// `spare_capacity_mut()`); returns the count claimed. 0 means nothing
+    /// is ready right now — NOT an Empty/Closed verdict (`try_recv`
+    /// distinguishes). One `recv` cursor store per batch replaces the
+    /// per-item store — the collector-side amortization this type exists
+    /// for (todo #1 residual (d)).
+    ///
+    /// Probe caliber: one hotpath guard per *batch* (see
+    /// [`SyncReceiver::try_recv_batch`]).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscReceiver"))]
+    pub fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        self.rx.try_recv_batch(buf)
+    }
 }
 
 impl<T: Send + 'static> RecvItem<T> for MpscReceiver<T> {
@@ -261,6 +303,11 @@ impl<T: Send + 'static> RecvItem<T> for MpscReceiver<T> {
     #[inline]
     fn try_recv(&self) -> Result<T, TryRecvError> {
         MpscReceiver::try_recv(self)
+    }
+
+    #[inline]
+    fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        MpscReceiver::try_recv_batch(self, buf)
     }
 }
 
@@ -329,6 +376,52 @@ impl<T: Send + Unpin + 'static> MpscAsyncReceiver<T> {
     }
 }
 
+/// Claim the next ready run for a worker-style burst loop: batch-claim
+/// into `scratch` (its spare capacity), falling back to one blocking
+/// `recv()` anchor when nothing is ready. Returns the number of items now
+/// sitting in `scratch` (its prefix); `0` means the channel closed (EOF
+/// after draining). `batch_cap` is the knob-resolved batch limit — pass 0
+/// to disable batching, which degrades to exactly the historical
+/// anchor + per-item-burst rhythm.
+///
+/// This is the recv side of the worker burst phase shared by the stage,
+/// expand and fence-forwarder loops (todo #1 residual (d)).
+pub(crate) fn claim_burst<R, T>(rx: &R, scratch: &mut Vec<T>, batch_cap: usize) -> usize
+where
+    R: RecvItem<T>,
+{
+    // Contract: scratch must be empty on entry (call sites drain it fully —
+    // `drain(..)` also on their abort paths) and have capacity for at least
+    // one item; the batch claim writes at offset 0 via the spare capacity.
+    debug_assert!(scratch.is_empty());
+    if batch_cap > 0 {
+        let n = rx.try_recv_batch(scratch.spare_capacity_mut());
+        if n > 0 {
+            // SAFETY: try_recv_batch initialized exactly scratch[..n].
+            unsafe { scratch.set_len(n) };
+            return n;
+        }
+    }
+    // Nothing batchable: one item via try_recv (also resolves the
+    // Empty/Closed distinction a 0-batch cannot), then the blocking anchor.
+    match rx.try_recv() {
+        Ok(item) => {
+            scratch.clear();
+            scratch.push(item);
+            1
+        },
+        Err(TryRecvError::Empty) => match rx.recv() {
+            Ok(item) => {
+                scratch.clear();
+                scratch.push(item);
+                1
+            },
+            Err(_) => 0,
+        },
+        Err(TryRecvError::Closed) => 0,
+    }
+}
+
 /// Channel is closed (all senders/receivers dropped).
 #[derive(Debug, PartialEq, Eq)]
 pub enum ChannelError {
@@ -362,6 +455,23 @@ impl<T: Send + 'static> SendItem<T> for SyncSender<T> {
 pub trait RecvItem<T> {
     fn recv(&self) -> Result<T, ChannelError>;
     fn try_recv(&self) -> Result<T, TryRecvError>;
+    /// Non-blocking batch claim of the ready prefix into `buf`; returns the
+    /// count. 0 = nothing ready right now — NOT an Empty/Closed verdict
+    /// (call [`Self::try_recv`] to distinguish). Default: per-item fallback
+    /// for backings without a native batch op.
+    fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        let mut n = 0;
+        while n < buf.len() {
+            match self.try_recv() {
+                Ok(v) => {
+                    buf[n].write(v);
+                    n += 1;
+                },
+                Err(_) => break,
+            }
+        }
+        n
+    }
 }
 
 impl<T: Send + 'static> RecvItem<T> for SyncReceiver<T> {
@@ -373,6 +483,11 @@ impl<T: Send + 'static> RecvItem<T> for SyncReceiver<T> {
     #[inline]
     fn try_recv(&self) -> Result<T, TryRecvError> {
         SyncReceiver::try_recv(self)
+    }
+
+    #[inline]
+    fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        SyncReceiver::try_recv_batch(self, buf)
     }
 }
 
