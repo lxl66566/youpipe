@@ -14,6 +14,7 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `StageOptions` | per-stage workers / io_concurrency / buffer | streaming | stages have unequal costs |
 | `ComputePool::new_pinned(n)` | workers pinned 1:1 to allowed CPUs | pools | tight loops of large saturated fused batches (**not** streaming — see [pools](pools.md)) |
 | `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker SPSC shards | streaming | multi-worker terminal stage is the bottleneck (see [dev/streaming](../dev/streaming.md)) |
+| `YOUPIPE_BATCH_RECV` | batched ring claims on the streaming data plane | streaming | channel handoff dominates and bursts arrive in runs (see [dev/streaming](../dev/streaming.md)) |
 
 `Workload` and `buffer_size`/`async_workers`/`io_concurrency` are disjoint: a
 fused `pipe()` ignores the streaming knobs (it has no channels and no async
@@ -80,6 +81,17 @@ are unchanged.
 `YOUPIPE_NT_STORE`: unset = auto, `"0"` = force off, `"1"` = force on
 (any other value panics — an early A/B passed `=off` and silently
 enabled NT on both sides).
+
+`YOUPIPE_BATCH_RECV`: unset/`"0"` = off (default), `"1"` = on with the
+default cap 64, `"N"` (2..=4096) = on with cap N. Batches the streaming
+data plane's cursor updates: the collector's terminal drain, the stage /
+expand / fence-forwarder burst phase and the feeder push loop claim runs
+of consecutive ring slots with one atomic cursor update per run instead
+of one per item (fork extension — mechanism and the four-combo
+`sharded_term` × `batch_recv` verdict in [dev/streaming](../dev/streaming.md)
+and [dev/benchmarks](../dev/benchmarks.md)). Backpressure granularity,
+item order, capacity and cancellation semantics are unchanged; async
+terminals keep per-item recv.
 
 Why auto is safe for consumers that read the output right after collect
 (the feared DRAM round-trip): measured on the reference machine
