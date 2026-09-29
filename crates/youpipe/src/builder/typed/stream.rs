@@ -5,6 +5,7 @@ use std::{
     marker::PhantomData,
     num::NonZeroUsize,
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use super::{
@@ -22,8 +23,9 @@ use crate::{
     builder::config::{PipelineConfig, Workload},
     executor::compute::ComputePool,
     handoff::{
-        MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, ShardedReceiver, SyncSender,
-        TryRecvError, channel::channel, mpsc_channel, sharded_mpsc_channel,
+        ChannelError, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, ShardedReceiver,
+        SyncSender, TryRecvError, TrySendError, channel::channel, mpsc_channel,
+        sharded_mpsc_channel,
     },
     pool::Registry,
     runtime::{AsyncRuntime, DefaultRuntime},
@@ -102,6 +104,48 @@ fn sharded_term_enabled() -> bool {
         Ok(v) if v == "0" || v.is_empty() => false,
         Ok(other) => {
             panic!("YOUPIPE_SHARDED_TERM: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
+        },
+        Err(_) => false,
+    })
+}
+
+// ── Convoy fix knobs (todo #4; attribution in docs/src/dev/streaming.md
+// "Convoy collapse forensics") ──
+//
+// `YOUPIPE_SPIN_ANCHOR=<µs>` (unset/"0" = off): adaptive pre-anchor spin in
+// the sync worker recv loops (`spawn_stage` / `spawn_expand_stage` /
+// `forward_fenced`) — see [`AnchorSpin`]. `YOUPIPE_FWD_BATCH=1` (default
+// off): the fence forwarder pushes each released batch with `try_send`,
+// parking at most once per FULL item instead of paying a blocking send per
+// item. Runtime knobs rather than config fields so A/B benches compare the
+// same binary (recompiles swing tight benchmarks by tens of percent through
+// pure code layout).
+
+static SPIN_ANCHOR_US: OnceLock<u32> = OnceLock::new();
+
+/// Max pre-anchor spin window in µs; 0 = the anchor is a plain blocking
+/// recv (knob off, every [`AnchorSpin`] inert).
+fn spin_anchor_us() -> u32 {
+    *SPIN_ANCHOR_US.get_or_init(|| match std::env::var("YOUPIPE_SPIN_ANCHOR") {
+        Ok(v) if v == "0" || v.is_empty() => 0,
+        Ok(other) => other.parse().unwrap_or_else(|_| {
+            panic!(
+                "YOUPIPE_SPIN_ANCHOR: invalid value {other:?} (leave unset or use \"0\" or a spin \
+                 window in µs, e.g. \"10\")"
+            )
+        }),
+        Err(_) => 0,
+    })
+}
+
+static FWD_BATCH: OnceLock<bool> = OnceLock::new();
+
+fn fwd_batch_enabled() -> bool {
+    *FWD_BATCH.get_or_init(|| match std::env::var("YOUPIPE_FWD_BATCH") {
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" || v.is_empty() => false,
+        Ok(other) => {
+            panic!("YOUPIPE_FWD_BATCH: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
         },
         Err(_) => false,
     })
@@ -292,6 +336,196 @@ fn feed_items<I: Send + 'static>(
     }
 }
 
+// ── Adaptive pre-anchor spin (todo #4 fix, `YOUPIPE_SPIN_ANCHOR`) ──
+
+/// Calibration: one `pause` + one empty `try_recv` ≈ 15 ns on the reference
+/// machine, so 1 µs of window ≈ 64 polls. Doubles as the miri backstop (the
+/// wall-clock deadline may never fire there — time can freeze in a busy
+/// loop); on real hardware the clock check dominates.
+const SPIN_ROUNDS_PER_US: u32 = 64;
+
+/// Backoff ceiling inside the pre-anchor spin: 64 pauses ≈ 1 µs between
+/// polls at the tail of a long window (see `AnchorSpin::spin_for`).
+const MAX_POLL_PAUSES: u32 = 64;
+
+/// Adaptive pre-anchor spin budget for one worker's recv loop.
+///
+/// The convoy pathology (streaming.md "Convoy collapse forensics") lives at
+/// channels whose supply side is a single rate-limited entity (feeder job /
+/// fence forwarder) and whose demand side is a crowd: the channel hovers
+/// empty, every arrival pays a futex wake RTT (~1–2 µs), and the pipeline
+/// clocks at items × RTT. Spinning `try_recv` before parking lets consumers
+/// ride out those micro-gaps — bursts re-form and the wake RTT leaves the
+/// critical path.
+///
+/// The budget must be **activity-gated** (constant spin-window widening is
+/// falsified, dead-ends.md): it only stays above zero while items keep
+/// arriving within the knob's window after a failed spin, measured as the
+/// blocking recv's latency right after the spin gave up. All state is
+/// per-worker locals touched once per anchor — no atomics, no clock reads
+/// while the channel has a backlog.
+struct AnchorSpin {
+    /// Current spin window in µs; 0 = park immediately (baseline behavior).
+    budget_us: u32,
+    /// Knob value: the largest window worth spinning through.
+    max_us: u32,
+}
+
+impl AnchorSpin {
+    fn new(max_us: u32) -> Self {
+        Self {
+            budget_us: 0,
+            max_us,
+        }
+    }
+
+    /// First growth step (first "live" park): max/16 clamped to ≥1 µs, so
+    /// geometric doubling reaches a covering window in ~4 anchors without
+    /// ever spinning near the full knob on the first try.
+    fn initial(max_us: u32) -> u32 {
+        (max_us / 16).max(1)
+    }
+
+    /// Spin `try_recv` for up to the current budget.
+    /// `Ok(Some(_))`: an item was caught mid-spin — the park is avoided.
+    /// `Ok(None)`: budget exhausted — run the blocking anchor, then fold its
+    /// latency back via [`AnchorSpin::note_park`].
+    /// `Err(Closed)`: channel disconnected mid-spin (trusted like the burst
+    /// phase's `Closed`; the crossfire >= 3.1.20 pin carries the
+    /// spurious-`Closed` race fix).
+    fn spin_for<T: Send + 'static>(&mut self, rx: &Receiver<T>) -> Result<Option<T>, TryRecvError> {
+        if self.budget_us == 0 {
+            return Ok(None);
+        }
+        // Backoff polling: the first polls are tight (fast suppliers are
+        // caught almost immediately), then the pause count doubles up to
+        // MAX_POLL_PAUSES — a crowd of spinning workers on one shared ring
+        // must not poll at full rate or the ring's stamp cache lines bounce
+        // between cores faster than items arrive (measured: tight spinning
+        // at 14 workers REGRESSES the collapsed cell 3x vs parking, 2026-09
+        // convoy matrix; ~1 poll/µs/worker at the backoff tail rides out
+        // micro-gaps without the futex round-trip).
+        let mut pauses = 1u32;
+        let mut polls = 0u64;
+        let max_polls = u64::from(self.budget_us) * u64::from(SPIN_ROUNDS_PER_US);
+        let window = Duration::from_micros(u64::from(self.budget_us));
+        let start = Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok(item) => return Ok(Some(item)),
+                // A `Closed` seen mid-spin must not be second-guessed here:
+                // the anchor's blocking recv would only repeat it.
+                Err(TryRecvError::Closed) => return Err(TryRecvError::Closed),
+                Err(TryRecvError::Empty) => {},
+            }
+            // Wall-clock deadline (checked every 8 polls) keeps the window
+            // honest under contention; the poll backstop bounds the loop when
+            // the clock does not advance (miri).
+            if polls >= max_polls || (polls & 7 == 7 && start.elapsed() >= window) {
+                return Ok(None);
+            }
+            for _ in 0..pauses {
+                std::hint::spin_loop();
+            }
+            pauses = pauses.saturating_mul(2).min(MAX_POLL_PAUSES);
+            polls += 1;
+        }
+    }
+
+    /// Fold the blocking anchor's latency into the budget:
+    /// - item arrived within `4x` the knob's window: the channel is live — a longer spin might have
+    ///   caught an earlier item, double the budget. The 4x slack is load-bearing: with a crowd of
+    ///   `k` parked consumers and wake-one delivery, a given worker wins an item only every ~k
+    ///   gaps, so a strict `parked <= window` rule decays every loser to a pure park (measured:
+    ///   parks stayed at ~190 K/run — the spin never engaged at all; with the slack the crowd ramps
+    ///   collectively);
+    /// - item took longer than 4x the window: quiet relative to what this worker is prepared to
+    ///   spin — quarter it (an idle stage decays to pure parking within log₄(window) anchors, ≤
+    ///   ~1.33x the window of wasted spin per idle episode).
+    fn note_park(&mut self, parked: Duration) {
+        let live_below = Duration::from_micros(u64::from(self.max_us) * 4);
+        if parked <= live_below {
+            self.budget_us = self
+                .budget_us
+                .saturating_mul(2)
+                .max(Self::initial(self.max_us))
+                .min(self.max_us);
+        } else {
+            self.budget_us /= 4;
+        }
+    }
+}
+
+/// Anchor item acquisition for the worker recv loops: optional adaptive
+/// pre-spin ([`AnchorSpin`]) then the blocking `recv` that parks correctly
+/// on an empty channel and exits on disconnect. With the knob off this is
+/// the plain `rx.recv()` plus two predictable branches; the park latency is
+/// measured only when the knob is on.
+fn anchor_recv<T: Send + 'static>(
+    spin: &mut AnchorSpin,
+    rx: &Receiver<T>,
+) -> Result<T, ChannelError> {
+    match spin.spin_for(rx) {
+        Ok(Some(item)) => Ok(item),
+        Ok(None) => {
+            if spin.max_us == 0 {
+                return rx.recv();
+            }
+            let start = Instant::now();
+            let got = rx.recv();
+            spin.note_park(start.elapsed());
+            got
+        },
+        Err(TryRecvError::Closed) => Err(ChannelError::Closed),
+        // spin_for converts every channel outcome; Empty never escapes it.
+        Err(TryRecvError::Empty) => unreachable!("spin_for never reports Empty"),
+    }
+}
+
+/// Push a released fence batch into the downstream channel (`todo #4` fix,
+/// `YOUPIPE_FWD_BATCH`).
+///
+/// `batched == false`: one blocking `send` per item (baseline).
+/// `batched == true`: `try_send` back-to-back and park only on the rare
+/// `Full` — once per full ring, not per item. The fence-output channel is
+/// the serial-supplier→crowd interface where a per-item blocking send
+/// serializes a wake RTT into every item under a crowd of downstream
+/// workers.
+///
+/// The batched path pops from the tail: `pop` is O(1) and keeps the
+/// allocation intact for the caller's [`FenceBarrier::reuse`] (a
+/// mid-vector `remove` would shift the remainder; `drain` consumes the
+/// whole batch before a `Full` can park). Arrival order within a batch was
+/// never a contract — unordered output interleaves workers anyway, ordered
+/// runs re-sequence by `seq` in the collector's `ReorderBuffer`.
+fn fence_batch_send<T: Send + 'static, Tx: SendItem<T>>(
+    tx: &Tx,
+    batch: &mut Vec<T>,
+    batched: bool,
+) -> bool {
+    if !batched {
+        for it in batch.drain(..) {
+            if tx.send(it).is_err() {
+                return false;
+            }
+        }
+        return true;
+    }
+    while let Some(it) = batch.pop() {
+        match tx.try_send(it) {
+            Ok(()) => {},
+            // Full: park once for this item, then resume the batch.
+            Err(TrySendError::Full(it)) => {
+                if tx.send(it).is_err() {
+                    return false;
+                }
+            },
+            Err(TrySendError::Closed(_)) => return false,
+        }
+    }
+    true
+}
+
 /// Spawn `parallelism` workers that pull from `rx`, apply `stage`, and
 /// forward to `tx` — as pool jobs in pool mode, or as dedicated OS threads
 /// when [`StreamCtx::dedicated_threads`] is set. Each worker loops until its
@@ -363,10 +597,16 @@ fn spawn_stage_fanout<I, O, Tx, R>(
             let rx = rx.clone();
             let worker_cancel = ctx.cancel.clone();
             move || {
+                // Adaptive pre-anchor spin state (todo #4); plain locals.
+                let mut spin = AnchorSpin::new(spin_anchor_us());
                 'outer: loop {
                     // Anchor: one blocking recv parks the worker when the
                     // channel is empty; Err means all senders are gone.
-                    let Ok((seq, item)) = rx.recv() else { break };
+                    // (`anchor_recv` pre-spins when the knob is on and the
+                    // channel was recently active.)
+                    let Ok((seq, item)) = anchor_recv(&mut spin, &rx) else {
+                        break
+                    };
                     if cancel_active(worker_cancel.as_ref()) {
                         break;
                     }
@@ -460,6 +700,9 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
                 // per item): expand-heavy loads pay zero steady-state
                 // allocation instead of one `Vec` per input.
                 let mut buf: Vec<N> = Vec::new();
+                // Adaptive pre-anchor spin state (todo #4); see
+                // `spawn_stage_fanout`.
+                let mut spin = AnchorSpin::new(spin_anchor_us());
                 // Expand `item` into the scratch buffer and forward the
                 // outputs. Returns false when the downstream channel closed
                 // mid-group (unforwarded outputs are dropped by the next
@@ -478,7 +721,9 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
                 };
                 'outer: loop {
                     // Anchor + burst-drain, same shape as `spawn_stage`.
-                    let Ok((seq, item)) = rx.recv() else { break };
+                    let Ok((seq, item)) = anchor_recv(&mut spin, &rx) else {
+                        break
+                    };
                     if cancel_active(worker_cancel.as_ref()) {
                         break;
                     }
@@ -542,19 +787,22 @@ fn forward_fenced<M, Tx>(
 {
     // Push one item through the fence, forwarding any released batch.
     // Returns false when the downstream channel is closed.
-    fn fwd<M2, Tx2>(fence: &mut FenceBarrier<(u64, M2)>, fenced_tx: &Tx2, item: (u64, M2)) -> bool
+    fn fwd<M2, Tx2>(
+        fence: &mut FenceBarrier<(u64, M2)>,
+        fenced_tx: &Tx2,
+        item: (u64, M2),
+        batched: bool,
+    ) -> bool
     where
         M2: Send + Unpin + 'static,
         Tx2: SendItem<(u64, M2)>,
     {
         if let Some(mut batch) = fence.push(item) {
-            // Drain in place so the allocation survives and can be recycled
+            // Send in place so the allocation survives and can be recycled
             // by the barrier — steady state is zero allocator traffic per
             // batch (see `FenceBarrier::reuse`).
-            for it in batch.drain(..) {
-                if fenced_tx.send(it).is_err() {
-                    return false;
-                }
+            if !fence_batch_send(fenced_tx, &mut batch, batched) {
+                return false;
             }
             fence.reuse(batch);
         }
@@ -564,15 +812,20 @@ fn forward_fenced<M, Tx>(
         FenceMode::Barrier => FenceBarrier::with_capacity(mode, expected),
         FenceMode::Chunked(_) => FenceBarrier::new(mode),
     };
+    // Adaptive pre-anchor spin state (todo #4); see `spawn_stage_fanout`.
+    let mut spin = AnchorSpin::new(spin_anchor_us());
+    let batched = fwd_batch_enabled();
     'outer: loop {
         // Anchor + burst-drain (same shape as the stage workers): the
         // forwarder is the sole consumer, but draining the mid channel while
         // its cache lines are hot also releases upstream backpressure sooner.
-        let Ok(item) = mid_rx.recv() else { break };
+        let Ok(item) = anchor_recv(&mut spin, &mid_rx) else {
+            break
+        };
         if cancel_active(cancel) {
             return;
         }
-        if !fwd(&mut fence, &fenced_tx, item) {
+        if !fwd(&mut fence, &fenced_tx, item, batched) {
             return;
         }
         loop {
@@ -584,7 +837,7 @@ fn forward_fenced<M, Tx>(
             if cancel_active(cancel) {
                 return;
             }
-            if !fwd(&mut fence, &fenced_tx, item) {
+            if !fwd(&mut fence, &fenced_tx, item, batched) {
                 return;
             }
         }
@@ -592,12 +845,8 @@ fn forward_fenced<M, Tx>(
     // Normal drain (mid_rx closed): flush remaining buffered items. This path
     // is only reached on completion — the cancel path returns early above
     // without flushing, dropping in-progress items as expected on abort.
-    if let Some(remaining) = fence.flush() {
-        for it in remaining {
-            if fenced_tx.send(it).is_err() {
-                return;
-            }
-        }
+    if let Some(mut remaining) = fence.flush() {
+        fence_batch_send(&fenced_tx, &mut remaining, batched);
     }
 }
 
@@ -3607,6 +3856,98 @@ mod tests {
         assert_eq!(budget.fences, 2);
         assert_eq!(budget.explicit_stages, 0);
         assert_eq!(budget.explicit_workers, 0);
+    }
+
+    /// `note_park` growth/decay: live parks double the budget up to the
+    /// knob, quiet parks quarter it to zero, a zero knob is inert.
+    #[test]
+    fn anchor_spin_budget_adapts() {
+        let mut s = AnchorSpin::new(10);
+        assert_eq!(s.budget_us, 0);
+        // First live park: initial window (10/16 → 1).
+        s.note_park(Duration::from_micros(2));
+        assert_eq!(s.budget_us, 1);
+        // Doubling, capped at the knob.
+        for expected in [2, 4, 8, 10, 10] {
+            s.note_park(Duration::from_nanos(500));
+            assert_eq!(s.budget_us, expected);
+        }
+        // Quiet channel: quarters down to pure parking.
+        for _ in 0..4 {
+            s.note_park(Duration::from_millis(1));
+        }
+        assert_eq!(s.budget_us, 0);
+        // Knob off: stays inert regardless of park latency.
+        let mut off = AnchorSpin::new(0);
+        off.note_park(Duration::from_nanos(1));
+        assert_eq!(off.budget_us, 0);
+    }
+
+    /// `spin_for`: a zero budget never spins; with a budget it catches a
+    /// queued item without parking, exhausts to `None` on an empty channel
+    /// (bounded rounds — miri-safe, no wall clock), and propagates `Closed`.
+    #[test]
+    fn anchor_spin_spin_for_phases() {
+        let (tx, rx) = channel::<u32>(4);
+        let mut s = AnchorSpin::new(100);
+        assert!(matches!(s.spin_for(&rx), Ok(None))); // budget 0: no spin
+        tx.send(7).unwrap();
+        s.budget_us = 100;
+        assert_eq!(s.spin_for(&rx).unwrap(), Some(7));
+        s.budget_us = 1; // 64-poll backstop: exhausts immediately on empty
+        assert!(matches!(s.spin_for(&rx), Ok(None)));
+        drop(tx);
+        s.budget_us = 100;
+        assert!(matches!(s.spin_for(&rx), Err(TryRecvError::Closed)));
+    }
+
+    /// `fence_batch_send` on both paths: delivers the whole batch, parks
+    /// through a `Full` ring (batched path), and reports a closed
+    /// downstream. Delivery set is checked unordered — the batched path
+    /// intentionally reverses within-batch order.
+    #[test]
+    fn fence_batch_send_delivers_parks_and_closes() {
+        // Baseline path: batch larger than the ring, drained concurrently.
+        let (tx, rx) = channel::<u32>(2);
+        let drainer = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            while got.len() < 5 {
+                if let Ok(v) = rx.recv() {
+                    got.push(v);
+                }
+            }
+            got
+        });
+        let mut batch = vec![1, 2, 3, 4, 5];
+        assert!(fence_batch_send(&tx, &mut batch, false));
+        assert_eq!(batch.len(), 0);
+        let mut got = drainer.join().unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3, 4, 5]);
+
+        // Batched path: try_send back-to-back, one park per Full.
+        let (tx, rx) = channel::<u32>(2);
+        let drainer = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            while got.len() < 5 {
+                if let Ok(v) = rx.recv() {
+                    got.push(v);
+                }
+            }
+            got
+        });
+        let mut batch = vec![6, 7, 8, 9, 10];
+        assert!(fence_batch_send(&tx, &mut batch, true));
+        assert_eq!(batch.len(), 0);
+        let mut got = drainer.join().unwrap();
+        got.sort_unstable();
+        assert_eq!(got, vec![6, 7, 8, 9, 10]);
+
+        // Closed downstream (batched path): false, remainder dropped.
+        let (tx, rx) = channel::<u32>(2);
+        drop(rx);
+        let mut batch = vec![1u32, 2, 3];
+        assert!(!fence_batch_send(&tx, &mut batch, true));
     }
 
     #[test]
