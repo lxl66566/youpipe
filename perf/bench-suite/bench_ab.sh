@@ -26,7 +26,7 @@
 # Afterwards `compare.py <outdir>` aggregates per-id medians across rounds.
 #
 # Usage:
-#   perf/bench-suite/bench_ab.sh -a <rev> -b <rev> [-c <rev>] [options] [filter...]
+#   perf/bench-suite/bench_ab.sh -a <rev> -b <rev> [-c <rev>] [-d <rev>] [options] [filter...]
 #
 #   rev       git rev-ish, or `wt` for a snapshot of the current working
 #             tree (uncommitted changes allowed — snapshotted up front),
@@ -80,7 +80,7 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//' | head -n -1; exit
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -a|-b|-c) SIDE_REVS+=("$2"); shift 2 ;;
+        -a|-b|-c|-d) SIDE_REVS+=("$2"); shift 2 ;;
         -r|--rounds) ROUNDS="$2"; shift 2 ;;
         -t|--taskset) TASKSET_CPUS="$2"; shift 2 ;;
         -o|--outdir) OUTDIR="$2"; shift 2 ;;
@@ -181,7 +181,10 @@ declare -A SIDE_BINS=()
 for i in "${!LABELS[@]}"; do
     label=${LABELS[$i]}; dir="$WTROOT/$label"
     echo "==> side $label: cargo bench --no-run"
-    bins=$(cd "$dir" && cargo bench --no-run --message-format=json 2>/dev/null \
+    # Build phase under the shared cargo lock (co-workers' protocol): the
+    # interleaved ROUNDS below run the binaries directly (no cargo) and must
+    # NOT hold the lock for the whole session.
+    bins=$(flock -w 3600 -o /tmp/youpipe-locks/cargo.lock -c "cd '$dir' && cargo bench --no-run --message-format=json" 2>/dev/null \
         | python3 -c '
 import json, sys
 # `${BENCH_TARGETS[*]}` arrives space-separated (bash array join), so split on
