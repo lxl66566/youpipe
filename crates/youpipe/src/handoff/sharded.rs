@@ -45,11 +45,15 @@ pub fn sharded_mpsc_channel<T: Send + 'static>(
         txs.push(tx);
         rxs.push(rx);
     }
+    // Batch scratch for `drain_pass` (YOUPIPE_BATCH_RECV; capacity 0 =
+    // per-item draining, the historical shape).
+    let scratch = Vec::with_capacity(super::batch_recv_cap());
     (txs, ShardedReceiver {
         rxs,
         closed: vec![false; shards],
         cursor: 0,
         open: shards,
+        scratch,
     })
 }
 
@@ -67,6 +71,8 @@ pub struct ShardedReceiver<T: Send + 'static> {
     cursor: usize,
     /// Open (not yet `Closed`) shard count — the EOF signal is `open == 0`.
     open: usize,
+    /// Per-pass batch scratch (capacity = batch cap; 0 disables batching).
+    scratch: Vec<T>,
 }
 
 impl<T: Send + 'static> ShardedReceiver<T> {
@@ -83,12 +89,31 @@ impl<T: Send + 'static> ShardedReceiver<T> {
     /// to one pass.
     pub(crate) fn drain_pass<S: FnMut(T)>(&mut self, sink: &mut S) -> bool {
         let n = self.rxs.len();
+        // 0-capacity scratch = batching off: skip the claim entirely so the
+        // per-item drain below is byte-for-byte the historical loop.
+        let can_batch = self.scratch.capacity() > 0;
         for k in 0..n {
             let i = (self.cursor + k) % n;
             if self.closed[i] {
                 continue;
             }
             loop {
+                // Batch claim first (one cursor store per run, todo #1
+                // residual (d)).
+                if can_batch {
+                    let claimed = self.rxs[i].try_recv_batch(self.scratch.spare_capacity_mut());
+                    if claimed > 0 {
+                        // SAFETY: try_recv_batch initialized exactly the
+                        // prefix.
+                        unsafe { self.scratch.set_len(claimed) };
+                        for item in self.scratch.drain(..) {
+                            sink(item);
+                        }
+                        continue;
+                    }
+                }
+                // No batchable run: one per-item try_recv resolves the
+                // 0-claim (empty / in-flight / closed).
                 match self.rxs[i].try_recv() {
                     Ok(item) => sink(item),
                     Err(TryRecvError::Empty) => break,

@@ -23,7 +23,7 @@ use crate::{
     executor::compute::ComputePool,
     handoff::{
         MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, ShardedReceiver, SyncSender,
-        TryRecvError, channel::channel, mpsc_channel, sharded_mpsc_channel,
+        channel::channel, mpsc_channel, sharded_mpsc_channel,
     },
     pool::Registry,
     runtime::{AsyncRuntime, DefaultRuntime},
@@ -199,6 +199,91 @@ impl Feeder {
     }
 }
 
+/// The feeder push loop: seq-tag every item and push it downstream.
+///
+/// With `YOUPIPE_BATCH_RECV` on, items are staged in batches and the free
+/// prefix is claimed with one tail CAS per run (`try_send_batch`); the
+/// remainder goes through per-item blocking `send` — parking granularity
+/// (per item, only when full) and item order are exactly the per-item
+/// path's, so backpressure semantics are unchanged. The inline path
+/// (`items.len() <= buffer`, never blocks) shares this loop: batches of
+/// `cap` items are strictly fewer channel operations.
+///
+/// Abort parity with the per-item loop: staged-but-unsent items get their
+/// destructors run explicitly — a `Vec<MaybeUninit<_>>` drop would skip
+/// them, silently leaking every `I: Drop` on the cancel/closed paths.
+fn push_items<I: Send + 'static>(
+    items: Vec<I>,
+    feeder_tx: &SyncSender<(u64, I)>,
+    cancel: Option<&CancellationToken>,
+) {
+    let cap = crate::handoff::batch_recv_cap();
+    if cap == 0 {
+        for (seq, item) in items.into_iter().enumerate() {
+            if cancel_active(cancel) {
+                break;
+            }
+            if feeder_tx.send((seq as u64, item)).is_err() {
+                break;
+            }
+        }
+        return;
+    }
+    let mut staged: Vec<std::mem::MaybeUninit<(u64, I)>> = Vec::with_capacity(cap);
+    let mut iter = items.into_iter().enumerate();
+    'push: loop {
+        staged.clear();
+        for (seq, item) in iter.by_ref() {
+            if cancel_active(cancel) {
+                // SAFETY: every staged slot so far was initialized by the
+                // line below; Drop parity with the per-item path (see the
+                // doc comment) before abandoning the rest with `iter`.
+                for slot in &mut staged {
+                    unsafe { slot.assume_init_drop() };
+                }
+                return; // remaining items dropped: the run is aborting
+            }
+            staged.push(std::mem::MaybeUninit::new((seq as u64, item)));
+            if staged.len() == cap {
+                break;
+            }
+        }
+        if staged.is_empty() {
+            return;
+        }
+        // Contract (see `SyncSender::try_send_batch`): every staged slot
+        // was initialized just above; the returned prefix is moved out.
+        let sent = feeder_tx.try_send_batch(&mut staged);
+        let mut i = sent;
+        while i < staged.len() {
+            // Cancel parity with the historical per-item loop: check before
+            // every blocking send, not once per batch (a full channel with a
+            // stalled receiver must not park the feeder mid-batch after
+            // cancel fired).
+            if cancel_active(cancel) {
+                // SAFETY: slots from `i` on are still initialized (only
+                // staged[..i] were moved out); Drop parity, see above.
+                for slot in &mut staged[i..] {
+                    unsafe { slot.assume_init_drop() };
+                }
+                break 'push;
+            }
+            // SAFETY: the unsent tail was initialized above and stays
+            // owned by us (the moved-out prefix is skipped).
+            let (seq, item) = unsafe { staged[i].assume_init_read() };
+            i += 1;
+            if feeder_tx.send((seq, item)).is_err() {
+                // SAFETY: slots from `i` on are still initialized (only
+                // staged[..i] were moved out); Drop parity, see above.
+                for slot in &mut staged[i..] {
+                    unsafe { slot.assume_init_drop() };
+                }
+                break 'push;
+            }
+        }
+    }
+}
+
 /// Push `items` into the feeder channel.
 ///
 /// When all items fit in the channel buffer (`items.len() ≤ buffer`), push
@@ -251,28 +336,14 @@ fn feed_items<I: Send + 'static>(
     lease: Option<&ParkingLease>,
 ) -> Feeder {
     if items.len() <= buffer {
-        for (seq, item) in items.into_iter().enumerate() {
-            if cancel_active(cancel.as_ref()) {
-                break;
-            }
-            if feeder_tx.send((seq as u64, item)).is_err() {
-                break;
-            }
-        }
+        push_items(items, &feeder_tx, cancel.as_ref());
         return Feeder::Inline;
     }
     let slot: FeederPanicSlot = Arc::new(std::sync::Mutex::new(None));
     let job_slot = Arc::clone(&slot);
     let push_loop = move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            for (seq, item) in items.into_iter().enumerate() {
-                if cancel_active(cancel.as_ref()) {
-                    break;
-                }
-                if feeder_tx.send((seq as u64, item)).is_err() {
-                    break;
-                }
-            }
+            push_items(items, &feeder_tx, cancel.as_ref());
         }));
         if let Err(payload) = result {
             *job_slot
@@ -363,30 +434,28 @@ fn spawn_stage_fanout<I, O, Tx, R>(
             let rx = rx.clone();
             let worker_cancel = ctx.cancel.clone();
             move || {
+                // Batch claim scratch (YOUPIPE_BATCH_RECV, todo #1 residual
+                // (d)); cap 0 keeps the per-item anchor + burst rhythm.
+                let batch_cap = crate::handoff::batch_recv_cap();
+                let mut scratch: Vec<(u64, I)> = Vec::with_capacity(batch_cap.max(1));
                 'outer: loop {
-                    // Anchor: one blocking recv parks the worker when the
-                    // channel is empty; Err means all senders are gone.
-                    let Ok((seq, item)) = rx.recv() else { break };
-                    if cancel_active(worker_cancel.as_ref()) {
-                        break;
-                    }
-                    let output = stage(item);
-                    if tx.send((seq, output)).is_err() {
-                        break;
-                    }
-                    // Burst-drain: absorb already-queued items while the
-                    // channel's cache lines are hot, without re-entering the
-                    // blocking-recv preamble per item. With several workers
-                    // contending on the same MPMC ring, the workers that lag
-                    // behind park on the anchor while the burst winners drain
-                    // the backlog — the contending population thins itself
+                    // Anchor + burst-drain: one blocking recv parks the
+                    // worker when the channel is empty (Err means all
+                    // senders are gone); the burst phase then absorbs
+                    // already-queued items while the channel's cache lines
+                    // are hot, without re-entering the blocking-recv
+                    // preamble per item. With several workers contending on
+                    // the same MPMC ring, the workers that lag behind park
+                    // on the anchor while the burst winners drain the
+                    // backlog — the contending population thins itself
                     // instead of every worker hammering the ring per item.
-                    loop {
-                        let (seq, item) = match rx.try_recv() {
-                            Ok(v) => v,
-                            Err(TryRecvError::Empty) => continue 'outer,
-                            Err(TryRecvError::Closed) => break 'outer,
-                        };
+                    // With batching on, the burst claims whole ready runs
+                    // with one head CAS per run (`claim_burst`).
+                    let claimed = crate::handoff::claim_burst(&rx, &mut scratch, batch_cap);
+                    if claimed == 0 {
+                        break;
+                    }
+                    for (seq, item) in scratch.drain(..) {
                         if cancel_active(worker_cancel.as_ref()) {
                             break 'outer;
                         }
@@ -476,25 +545,23 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
                     }
                     open
                 };
+                // Batch claim scratch (see `spawn_stage`).
+                let batch_cap = crate::handoff::batch_recv_cap();
+                let mut scratch: Vec<(u64, I)> = Vec::with_capacity(batch_cap.max(1));
                 'outer: loop {
-                    // Anchor + burst-drain, same shape as `spawn_stage`.
-                    let Ok((seq, item)) = rx.recv() else { break };
-                    if cancel_active(worker_cancel.as_ref()) {
+                    // Anchor + burst-drain, same shape as `spawn_stage`
+                    // (batched there via `claim_burst` too).
+                    let claimed = crate::handoff::claim_burst(&rx, &mut scratch, batch_cap);
+                    if claimed == 0 {
                         break;
                     }
-                    // Downstream closed mid-group: fall through to the
-                    // burst loop, whose `Closed` / send-failure handling
-                    // terminates the worker (same shape as `spawn_stage`).
-                    let _ = forward(seq, item);
-                    loop {
-                        let (seq, item) = match rx.try_recv() {
-                            Ok(v) => v,
-                            Err(TryRecvError::Empty) => continue 'outer,
-                            Err(TryRecvError::Closed) => break 'outer,
-                        };
+                    for (seq, item) in scratch.drain(..) {
                         if cancel_active(worker_cancel.as_ref()) {
                             break 'outer;
                         }
+                        // Downstream closed mid-group: the group's
+                        // unforwarded outputs are dropped by the next
+                        // `clear` — the worker is on its abort path anyway.
                         if !forward(seq, item) {
                             break 'outer;
                         }
@@ -564,23 +631,19 @@ fn forward_fenced<M, Tx>(
         FenceMode::Barrier => FenceBarrier::with_capacity(mode, expected),
         FenceMode::Chunked(_) => FenceBarrier::new(mode),
     };
-    'outer: loop {
-        // Anchor + burst-drain (same shape as the stage workers): the
-        // forwarder is the sole consumer, but draining the mid channel while
-        // its cache lines are hot also releases upstream backpressure sooner.
-        let Ok(item) = mid_rx.recv() else { break };
-        if cancel_active(cancel) {
-            return;
+    // Batch claim scratch (see `spawn_stage`).
+    let batch_cap = crate::handoff::batch_recv_cap();
+    let mut scratch: Vec<(u64, M)> = Vec::with_capacity(batch_cap.max(1));
+    loop {
+        // Anchor + burst-drain (same shape as the stage workers, batched
+        // via `claim_burst`): the forwarder is the sole consumer, but
+        // draining the mid channel while its cache lines are hot also
+        // releases upstream backpressure sooner.
+        let claimed = crate::handoff::claim_burst(&mid_rx, &mut scratch, batch_cap);
+        if claimed == 0 {
+            break;
         }
-        if !fwd(&mut fence, &fenced_tx, item) {
-            return;
-        }
-        loop {
-            let item = match mid_rx.try_recv() {
-                Ok(v) => v,
-                Err(TryRecvError::Empty) => continue 'outer,
-                Err(TryRecvError::Closed) => break 'outer,
-            };
+        for item in scratch.drain(..) {
             if cancel_active(cancel) {
                 return;
             }
