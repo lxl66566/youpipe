@@ -328,6 +328,75 @@ collector-side parks/item in slow async runs are exactly the
 (~16 `sched_yield` per item in slow runs) and is worth keeping in mind for
 the #14 hang forensics.
 
+### Fix (a)+(b) landed: adaptive pre-anchor spin, fence batch send (2026-09-30)
+
+Both fix candidates above are implemented as **default-off runtime
+knobs** (`builder/typed/stream.rs`, `AnchorSpin` / `fence_batch_send`):
+
+- `YOUPIPE_SPIN_ANCHOR=<µs>` — per-worker spin budget in the three sync
+  recv loops (`spawn_stage` / `spawn_expand_stage` / `forward_fenced`).
+  Before the blocking anchor, spin `try_recv` for the current budget with
+  **backoff polling** (pause count doubles per poll up to 64 ≈ 1 µs between
+  polls at the tail); the budget is gated on the measured anchor latency —
+  a park that returned within 4× the knob window doubles the budget (the
+  4× slack is load-bearing: with wake-one delivery a worker wins an item
+  only every ~k gaps, so a strict `parked ≤ window` rule decays the whole
+  crowd back to parking), a quiet park quarters it to zero. Constant spin
+  windows stay falsified (dead-ends.md) — the gate is per-worker state, and
+  an idle stage reaches pure parking within log₄(window) anchors.
+- `YOUPIPE_FWD_BATCH=1` — the fence forwarder pushes a released batch with
+  `try_send` back-to-back, parking at most once per full ring instead of
+  per item (needs `MpscSender::try_send`, also added).
+
+Readings (`convoy-probe`, same binary, fresh process per cell, 3
+interleaved off/on rounds; the off side collapses in ~1/3 of processes,
+medians in ms):
+
+| cell | off | spin30 | verdict |
+| --- | --- | --- | --- |
+| fence auto 14/14 | 120–254 (bimodal) | 27–57 | catastrophic ≥180 ms mode eliminated |
+| fence 9/9 | 12–107 (drifting) | 23–28 | stabilized at ~25 |
+| fence 1/15 | 90–127 (bimodal, lucky 5.5) | 24–33 | fixed |
+| fence 20/1 (pipelined ref) | 24–27 | 24–28 | untouched, no leak |
+| async2/15-1 | 25–188 (bimodal) | 29–309 (bimodal) | **not fixed — different face** |
+| soak 100K×10 ×3 procs | mode wanders, 646 ms outlier | 26–107, no ≥180 run | parks 90–197K/run → 0.3–2.6K |
+
+The spin's cost side is real but bounded: in the rare lucky fast seed
+(fence 1/15 r3: 5.5 ms) spin-on costs ~4× (25 ms) because consumers
+poll-contend the single forwarder's stamp writes; `nv` ctx-switches rise
+to 40–80K/run while voluntary parks collapse. In the sparse 20/1 shape both
+`v` and `nv` *drop* under the knob (budget decays between gaps) — idle
+stages do not burn CPU.
+
+**Poll-ceiling sweep** (temporary env override, same binary): tight
+polling regresses the fence family (pause cap 1 → 219 ms med, 8 → 193,
+16 → 181 vs 64 → 33–67, 128 → 43–102): a crowd spinning at full rate
+bounces the ring stamps faster than items arrive. `MAX_POLL_PAUSES = 64`
+is kept. The async family is unmoved at every ceiling — see below.
+
+**The async family is out of this knob's reach.** `async1` with 15 sync
+workers (single prefix, mixed channel into 128 io tasks) reproduces the
+collapse (236 ms off, 226 ms spin-on) while `w1=1` is fast both ways — the
+slow face is the 15-worker crowd **sending into** the mixed-mode channel
+plus the terminal drain: per-run ctx-switches in slow runs are 2.3
+voluntary parks/item on the collector (`main`) and 1.2/item on `yp-pool`
+(send-side `Full` parks) — not recv-anchor parks. Fixing it needs the
+crossfire `RegistryMulti` wake policy (candidate (c)) and/or the async
+terminal fan-in (todo #1 (c) closed as falsified, so the async terminal
+stays a single MPSC). `async2/15-1` therefore remains open under #4.
+
+`YOUPIPE_FWD_BATCH` standalone shows no independent rescue (fence auto med
+205/165 with only the knob on): removing the forwarder's per-item send
+parks does not help while the downstream crowd still parks per item on
+recv. Combined with the spin it is within noise (occasionally slightly
+better: fence-auto r3 min 15.6 vs 28.7 ms). Default stays off; the knob is
+retained since it is free when the ring is not full.
+
+Default policy: **both knobs stay off** (opt-in). The spin is a large win
+exactly when the convoy pathology is present (serial supplier → worker
+crowd ≥ ~10) and a measurable cost in the lucky fast regime; user guidance
+lives in tuning.md.
+
 ## Pool-wide parking lease (deadlock freedom across concurrent runs)
 
 A channel-parking job — a non-inline feeder, a sync/expand stage worker, a

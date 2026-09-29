@@ -86,17 +86,21 @@
   疑似 anchor+burst recv 的 convoy 双稳（recv-loop 注释记录过 8-worker
   形态）。async-only 链 83 ms 另受 feeder 单线程推送率限制（15–32 个
   sync 生产者并发推送时无此限制）。
-- 方向：**已归因**（2026-09-29，`convoy-probe` harness，数据与结论见
-  dev/streaming.md "Convoy collapse forensics"）：根因是假设 3 的修正
-  形态——burst-drain 失效，串行供应者（feeder job / fence forwarder）→
-  ≥10–12 消费者人群的通道接口逐 item park+wake（~2 µs/item，80% 内核
-  调度器周期）；假设 1（mixed 通道背压）与假设 2（fence 批量节奏）证伪
-  （async 侧 `RegistryMulti` 异步 waker 扇出为放大器，与 todo #1 的
-  collector 侧逐 item park 同根）。修复候选（未实施）：worker recv 环
-  anchor 前自适应自旋（活动门控）/ forwarder 按 chunk 批量 send /
-  crossfire `SPIN_LIMIT`·`fire()` 扇出策略（fork 内，须活动门控）。
-  实施任一修复后用 `sync_fuse` 家族 + `convoy-probe` 边界矩阵复测，
-  再评估 2+ sync 前缀的 async 链是否还需形态侧缓解。
+- 方向：**修复已落地**（2026-09-30，候选 (a)+(b)，`AnchorSpin`/
+  `fence_batch_send`，旋钮 `YOUPIPE_SPIN_ANCHOR`/`YOUPIPE_FWD_BATCH` 默认
+  off）：fence 家族場缩已消（14/14 auto 180–254 ms → 27–57 ms、1/15
+  90–127 → 24–33、9/9 收敛 ~25；soak 100K×10 无 ≥180 ms run、parks
+  90–197K/run → 0.3–2.6K；轮询退避尾部 `MAX_POLL_PAUSES=64` 低于此会在
+  人群场景回归）。读数与机制见 dev/streaming.md 「Fix (a)+(b) landed」。
+  **async 家族不在此旋钮射程内**：async1/15 单前缀复现慢 mode（off 236 /
+  spin 226 ms），慢 run 的停车在 collector（2.3/item，todo #1 面）与
+  send 侧 `Full`（1.2/item）而非 recv anchor——需 crossfire
+  `RegistryMulti` 唤醒策略（候选 (c)）或 async 终端扇入（#1 (c) 已证伪
+  关闭，async 终端仍是单 MPSC）。两旋钮默认 off（快 mode 有 2–4× 自旋
+  开销 + 活跃稀疏期烧 CPU），opt-in 指南见 advanced/tuning.md。
+- 遗余：async 形状（async2/15-1 等）場缩未修，归因已明确（上段），
+  待候选 (c)；快 mode 下自旋开销的进一步收窄（预算上限/退避曲线）
+  未探索。
 - 验证：`sync_fuse` 家族（canary `fence_infra` + async/fence/cancel 形状）。
 
 ### 5. [P1] `ordered()` + `expand()`：批量 payload 方案
