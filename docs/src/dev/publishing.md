@@ -74,7 +74,12 @@ Checklist per release:
 1. Bump `[workspace.package] version` (one place; all inheriting crates move
    together). The vendored forks pin their versions in their own manifests —
    bump those in the same commit.
-2. `cargo test --workspace && cargo clippy --workspace --all-targets`.
+2. `cargo test --workspace && cargo clippy --workspace --all-targets`, plus
+   a `cargo test -p youpipe --no-default-features` pass: nothing exercises
+   that feature combination in regular development (gungraun's bench build
+   is what surfaced the 0.6.0 gating gaps — dead async paths, an ungated
+   test binary, a doctest calling `stage_async_with`), so it needs an
+   explicit check or it silently rots.
 3. `cargo package -p <crate> --list` for each crate: no stray files. The
    `youpipe` package directory is self-contained (`src/`, `benches/`,
    `tests/`, `examples/`, README symlink), so docs/tooling can't leak into
