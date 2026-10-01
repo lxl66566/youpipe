@@ -1219,68 +1219,72 @@ bar's absolute value is ratio × that number.
   (`taskset -c 1-31`, core 0 left to OS/IRQ housekeeping), 5 rounds ×
   700 ms measurement, ~2-8 % cross-round spread on most cells.
 
-### Results (median ms per iteration, 5 interleaved rounds; 2026-09-07 rerun, cpu_balanced extended to 2 M/4 M)
+### Results (median ms per iteration, 5 interleaved rounds; 2026-10-01 rerun for the 0.6.0 release)
 
 | Scenario | n | Best | Runner-up | Rest |
 | --- | --- | --- | --- | --- |
-| cpu_balanced | 1K | youpipe 0.009 | rayon 0.037 | std threads 0.556 |
-| cpu_balanced | 10K | youpipe 0.012 | rayon 0.063 | std threads 0.583 |
-| cpu_balanced | 100K | youpipe 0.053 | rayon 0.123 | std threads 0.764 |
-| cpu_balanced | 1M | rayon 0.469 | youpipe 0.475 | std threads 2.719 |
-| cpu_balanced | 2M | rayon 0.832 | youpipe 0.949 | std threads 6.210 |
-| cpu_balanced | 4M | rayon 1.707 | youpipe 1.907 | std threads 11.739 |
-| cpu_unbalanced | 10K | youpipe (Unbalanced) 0.029 | youpipe (default) 0.037 | rayon 0.079, std threads 0.587 |
-| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.204 | youpipe (default) 0.238 | rayon 0.263, std threads 0.815 |
-| io_async | 500 | futures 9.123 | youpipe 9.458 | tokio 9.471 |
-| io_async | 2K | futures 17.516 | youpipe 18.213 | tokio 18.462 |
-| io_async | 5K | futures 34.082 | youpipe 34.766 | tokio 35.739 |
-| io_blocking | 500 | youpipe (512 thr) 8.569 | tokio 8.871 | std threads 16.988, youpipe (31 thr) 34.725 |
-| io_blocking | 2K | youpipe (512 thr) 12.555 | tokio 12.716 | std threads 47.889, youpipe (31 thr) 122.419 |
-| mixed_cpu_io | 500 | futures 9.155 | youpipe 9.502 | tokio 10.728 |
-| mixed_cpu_io | 2K | futures 9.340 | youpipe 10.636 | tokio 13.393 |
-| real_doc | 1K | youpipe 10.753 | tokio 10.884 | rayon 37.918 |
-| real_doc | 4K | youpipe 14.199 | tokio 17.385 | rayon 137.073 |
-| real_web | 500 | youpipe 11.866 | tokio 12.888 | futures 13.155 |
-| real_web | 2K | youpipe 22.681 | tokio 27.610 | futures 28.840 |
+| cpu_balanced | 1K | youpipe 0.011 | rayon 0.036 | std threads 0.547 |
+| cpu_balanced | 10K | youpipe 0.013 | rayon 0.062 | std threads 0.572 |
+| cpu_balanced | 100K | youpipe 0.052 | rayon 0.122 | std threads 0.781 |
+| cpu_balanced | 1M | rayon 0.463 | youpipe 0.483 | std threads 2.830 |
+| cpu_balanced | 2M | youpipe 0.801 | rayon 0.823 | std threads 6.618 |
+| cpu_balanced | 4M | youpipe 1.565 | rayon 1.672 | std threads 12.817 |
+| cpu_unbalanced | 10K | youpipe (default) 0.038 | youpipe (Unbalanced) 0.038 | rayon 0.080, std threads 0.569 |
+| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.193 | youpipe (default) 0.242 | rayon 0.259, std threads 0.865 |
+| io_async | 500 | futures 9.135 | tokio 9.427 | youpipe 9.565 |
+| io_async | 2K | futures 17.565 | youpipe 18.422 | tokio 18.572 |
+| io_async | 5K | futures 34.473 | youpipe 35.135 | tokio 35.863 |
+| io_blocking | 500 | tokio 9.024 | youpipe (512 thr) 9.384 | std threads 19.482, youpipe (31 thr) 55.796 |
+| io_blocking | 2K | tokio 12.900 | youpipe (512 thr) 14.834 | std threads 52.699, youpipe (31 thr) 226.953 |
+| mixed_cpu_io | 500 | futures 9.148 | youpipe 9.639 | tokio 11.040 |
+| mixed_cpu_io | 2K | futures 9.359 | youpipe 11.089 | tokio 14.357 |
+| real_doc | 1K | tokio 10.965 | youpipe 11.044 | rayon 37.993 |
+| real_doc | 4K | youpipe 15.611 | tokio 17.677 | rayon 137.540 |
+| real_web | 500 | youpipe 12.931 | futures 14.139 | tokio 14.200 |
+| real_web | 2K | youpipe 22.397 | tokio 27.123 | futures 29.247 |
 
 ### Reading the results
 
 - **Balanced CPU** (`pipe_ref` vs `par_iter`, both borrowing warm data):
-  youpipe leads 1K–100K (−76 % @ 1K, −81 % @ 10K, −57 % @ 100K), ties at
-  1 M (+1 %), then rayon pulls ahead at 2 M (+14 %) and 4 M (+12 %) —
-  above ~1 M the batches (≥ 32 MB of R+W buffer traffic) leave the
-  cache-resident regime and rayon's collect path sustains ~38 GB/s where
-  youpipe's holds ~34 GB/s. Resolved 2026-09-25 by two same-day
-  attributions (see "NT-store attribution" and "Attributing the 2M/4M
-  fused-collect gap" below): the dominant term is the plain output
-  stores' read-for-ownership + L3 pollution — non-temporal leaf stores
-  (`YOUPIPE_NT_STORE`) close and reverse the gap (2 M 0.82 vs rayon
-  0.83 ms, 4 M 1.57 vs 1.68 ms); a secondary worker park/wake
-  occupancy loss (~1-4 pt, causal via the spin-rounds knob) remains.
-  Before the `num_cpus` cache (2026-09-05), rayon won 1K and 1M — the 1K
-  loss was ~50 µs of cgroup-reading `available_parallelism` syscalls per
-  run, not scheduling overhead. Equal-chunk hand-threading is 10–60×
-  behind everywhere: 31 spawns per call, no stealing.
-- **Skewed CPU**: `Workload::Unbalanced` + work stealing now beats rayon at
-  both sizes (0.03 vs 0.081 @ 10K; 0.213 vs 0.267 @ 100K) — at 10K the fixed
-  syscall cost previously masked the win — and static chunking is ~3-19×
-  behind, stranding the 10 % heavy items in whichever chunks they landed in.
+  youpipe leads 1K–100K (−69 % @ 1K, −79 % @ 10K, −57 % @ 100K), rayon
+  edges 1 M (+4 %), and youpipe is back ahead at 2 M (−3 %) and 4 M (−6 %).
+  The ≥2 M regime is memory-bound (≥ 32 MB of R+W buffer traffic, outside
+  the cache-resident range); the 2026-09-25 attributions (see "NT-store
+  attribution" and "Attributing the 2M/4M fused-collect gap" below) pinned
+  the then-gap on plain output stores' read-for-ownership + L3 pollution
+  (non-temporal leaf stores, `YOUPIPE_NT_STORE`, closed and reversed it:
+  2 M 0.82 vs rayon 0.83 ms, 4 M 1.57 vs 1.68 ms) plus a secondary worker
+  park/wake occupancy loss (~1-4 pt, causal via the spin-rounds knob). In
+  this rerun the default configuration already holds 2 M/4 M ahead; wall
+  clocks are not comparable across sessions, but the ordering matches what
+  the NT-store attribution predicted. Before the `num_cpus` cache
+  (2026-09-05), rayon won 1K and 1M — the 1K loss was ~50 µs of
+  cgroup-reading `available_parallelism` syscalls per run, not scheduling
+  overhead. Equal-chunk hand-threading is 6–50× behind everywhere:
+  31 spawns per call, no stealing.
+- **Skewed CPU**: `Workload::Unbalanced` + work stealing beats rayon at
+  both sizes (0.038 vs 0.080 @ 10K, dead even with the default workload
+  there; 0.193 vs 0.259 @ 100K) and static chunking is ~4–15× behind,
+  stranding the 10 % heavy items in whichever chunks they landed in.
 - **Async IO is a near-tie** — the spreads overlap. youpipe
-  multiplexes over the same tokio runtime: ±1 % vs tokio (ahead at ≥2K items
-  as channel throughput stops mattering), 2–5 % behind `futures::stream`,
-  the lightest async *combinator* stack. futures' mixed_cpu_io lead has the
-  same cause: it runs the CPU stage inline on runtime workers. That is fine
-  at 100 ns/item CPU, and the reason youpipe exists is everything it can't
-  do there: fences, cancellation, ordered output, dedicated CPU-pool
-  isolation, backpressure across *stages* rather than futures.
-- **Blocking IO is a configuration story**: correctly oversubscribed, youpipe
-  ≈ tokio `spawn_blocking` (same 512 threads); at the default 31 threads the
-  waits serialize (122 ms @ 2K). The chart keeps that failure visible on
-  purpose — blocking stages must size the pool, not the framework.
+  multiplexes over the same tokio runtime: within ~1–2 % of tokio (ahead
+  at ≥2K items as channel throughput stops mattering), 2–5 % behind
+  `futures::stream`, the lightest async *combinator* stack. futures'
+  mixed_cpu_io lead has the same cause: it runs the CPU stage inline on
+  runtime workers. That is fine at 100 ns/item CPU, and the reason youpipe
+  exists is everything it can't do there: fences, cancellation, ordered
+  output, dedicated CPU-pool isolation, backpressure across *stages*
+  rather than futures.
+- **Blocking IO is a configuration story**: correctly oversubscribed,
+  youpipe (512 thr) tracks tokio `spawn_blocking` within 4–15 % (same
+  512-thread shape); at the default 31 threads the waits serialize
+  (227 ms @ 2K). The chart keeps that failure visible on purpose —
+  blocking stages must size the pool, not the framework.
 - **Realistic pipelines** are where the streaming engine pays off: 3-stage
-  sync+async chains beat hand-written tokio channel plumbing by up to 23 %
-  at the larger batches (fewer tasks, pooled scheduling, mixed-mode
-  channels) and beat rayon by ~10× once IO blocks its workers.
+  sync+async chains are a near-tie with hand-written tokio channel plumbing
+  at the small batch (real_doc 1K, ±1 %) and pull ahead up to ~17 % at the
+  larger batches (fewer tasks, pooled scheduling, mixed-mode channels);
+  rayon loses ~9× once IO blocks its workers.
 
 ### NT-store attribution (2026-09-25): the ≥2 M gap was output RFO
 
