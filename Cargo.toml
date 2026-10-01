@@ -20,7 +20,7 @@ default-members = ["crates/youpipe", "crates/youpipe-sys"]
 # manifests (they are synced from their own fork repos and must stay
 # diffable against them).
 [workspace.package]
-version      = "0.5.0"
+version      = "0.6.0"
 edition      = "2024"
 rust-version = "1.85"
 repository   = "https://github.com/lxl66566/youpipe"

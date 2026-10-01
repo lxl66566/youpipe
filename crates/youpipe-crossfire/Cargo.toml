@@ -24,7 +24,7 @@
 # in youpipe's Cargo.toml (lib name stays `crossfire`).
 [package]
 name         = "youpipe-crossfire"
-version      = "0.5.0"
+version      = "0.6.0"
 authors      = ["plan <frostyplanet@gmail.com>"]
 edition      = "2021"
 # Aligned with the youpipe workspace MSRV (upstream: 1.79) — see the note

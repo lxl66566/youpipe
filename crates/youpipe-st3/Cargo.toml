@@ -12,7 +12,7 @@
 # release; the lib target keeps the name `st3` so call sites don't churn.
 [package]
 name         = "youpipe-st3"
-version      = "0.5.0"
+version      = "0.6.0"
 authors      = ["Serge Barral <serge.barral@asynchronics.com>"]
 edition      = "2021"
 # Aligned with the youpipe workspace MSRV (upstream: 1.60); youpipe requires

@@ -25,8 +25,8 @@ Workspace-internal dependencies are declared with **both** a `path` and a
 `version`:
 
 ```toml
-youpipe-sys = { path = "../youpipe-sys", version = "0.5" }
-st3         = { package = "youpipe-st3", path = "../youpipe-st3", version = "0.5" }
+youpipe-sys = { path = "../youpipe-sys", version = "0.6" }
+st3         = { package = "youpipe-st3", path = "../youpipe-st3", version = "0.6" }
 ```
 
 * **In this repo** cargo always builds against the `path` — no registry
@@ -43,7 +43,7 @@ no `[patch]` or feature tricks involved.
 
 A crate's manifest must resolve from the registry alone, so dependencies go
 first. All crates share the workspace version train (`[workspace.package]`,
-currently `0.5`):
+currently `0.6`):
 
 ```sh
 cargo publish -p youpipe-concurrent-queue
