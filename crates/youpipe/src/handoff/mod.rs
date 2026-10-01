@@ -45,6 +45,6 @@ pub use channel::{
     mpsc_channel, sync_async_channel,
 };
 pub(crate) use channel::{Claim, claim_poll};
-pub use sharded::{
-    ShardedAsyncReceiver, ShardedReceiver, sharded_mpsc_async_channel, sharded_mpsc_channel,
-};
+#[cfg(feature = "tokio-runtime")]
+pub use sharded::{ShardedAsyncReceiver, sharded_mpsc_async_channel};
+pub use sharded::{ShardedReceiver, sharded_mpsc_channel};

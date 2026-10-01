@@ -7,6 +7,7 @@
 //! read through a process-wide `OnceLock`, so the env var must be set before
 //! the first `run()` in this process — one `#[test]` fn with sequential
 //! scenario blocks, same discipline as the sync suite.
+#![cfg(feature = "tokio-runtime")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

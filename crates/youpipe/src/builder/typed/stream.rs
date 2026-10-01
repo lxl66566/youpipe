@@ -19,6 +19,10 @@ use crate::handoff::{
     AsyncReceiver, AsyncRecvItem, MpscAsyncReceiver, MpscAsyncSender, ShardedAsyncReceiver,
     async_channel, mpsc_async_channel, sharded_mpsc_async_channel, sync_async_channel,
 };
+#[cfg(feature = "tokio-runtime")]
+use crate::state::{
+    drain_ordered_async, drain_ordered_async_sharded, drain_unordered_async_sharded,
+};
 use crate::{
     builder::config::{PipelineConfig, Workload},
     executor::compute::ComputePool,
@@ -29,8 +33,7 @@ use crate::{
     pool::Registry,
     runtime::{AsyncRuntime, DefaultRuntime},
     state::{
-        FenceBarrier, FenceMode, OrderedAccounting, drain_ordered, drain_ordered_async,
-        drain_ordered_async_sharded, drain_ordered_sharded, drain_unordered_async_sharded,
+        FenceBarrier, FenceMode, OrderedAccounting, drain_ordered, drain_ordered_sharded,
         drain_unordered_sharded,
     },
     sync::CancellationToken,
@@ -965,7 +968,8 @@ fn spawn_forwarder<M, Tx, R>(
 /// via [`StreamPipe::stage_with`] / [`StreamPipe::stage_async_with`] /
 /// [`StreamPipe::expand_with`].
 ///
-/// ```rust
+/// ```
+/// # #[cfg(feature = "tokio-runtime")] fn main() {
 /// use youpipe::prelude::*;
 ///
 /// // Heavy CPU stage gets 8 workers, light one divides the rest; the async
@@ -981,6 +985,8 @@ fn spawn_forwarder<M, Tx, R>(
 ///     .run();
 /// # fn crunch(x: u64) -> u64 { x }
 /// # async fn fetch(x: u64) -> u64 { x }
+/// # }
+/// # #[cfg(not(feature = "tokio-runtime"))] fn main() {}
 /// ```
 ///
 /// # Worker budget semantics (`workers`)
@@ -1655,6 +1661,7 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     /// contention and only add collector pass cost and per-run channel
     /// construction (a small-`n` run would otherwise build
     /// `io_concurrency` rings up front — up to 512).
+    #[cfg(feature = "tokio-runtime")]
     fn sharded_async_terminal(&self, concurrency: usize) -> usize {
         if !self.sharded_terminal || concurrency <= 1 {
             return 0;

@@ -25,9 +25,10 @@
 //! residual (c)).
 
 use super::channel::{
-    ChannelError, MpscAsyncReceiver, MpscAsyncSender, MpscReceiver, MpscSender, RecvItem,
-    TryRecvError, TryRecvItem, mpsc_async_channel, mpsc_channel,
+    ChannelError, MpscReceiver, MpscSender, RecvItem, TryRecvError, mpsc_channel,
 };
+#[cfg(feature = "tokio-runtime")]
+use super::channel::{MpscAsyncReceiver, MpscAsyncSender, TryRecvItem, mpsc_async_channel};
 
 /// Minimum per-shard capacity. Below this the ring degenerates into a
 /// producer/consumer ping-pong (park on every `Full`), which the
@@ -79,6 +80,7 @@ pub fn sharded_mpsc_channel<T: Send + 'static>(
 /// each shard shared by `io_concurrency / shards` tasks — per-ring
 /// contention drops from `io_concurrency`-way to that quotient while the
 /// collector's pass cost stays bounded by `shards`.
+#[cfg(feature = "tokio-runtime")]
 #[must_use]
 pub fn sharded_mpsc_async_channel<T: Send + Unpin + 'static>(
     shards: usize,
@@ -137,6 +139,8 @@ impl<R> ShardSet<R> {
     /// `T` sits on the method (not the impl) so `ShardSet<R>` needs no
     /// unconstrained parameter — the item type is fully determined by
     /// `R: TryRecvItem<T>` at the call site.
+    // Async-collector only: the sync receiver drains via `drain_pass_batched`.
+    #[cfg(feature = "tokio-runtime")]
     fn drain_pass<T, S: FnMut(T)>(&mut self, sink: &mut S) -> bool
     where
         R: TryRecvItem<T>,
@@ -273,10 +277,12 @@ impl<T: Send + 'static> ShardedReceiver<T> {
 /// **Not `Clone`** (single consumer); also `!Sync` like the underlying
 /// [`MpscAsyncReceiver`] — it lives on the one thread driving the
 /// collector's `block_on`.
+#[cfg(feature = "tokio-runtime")]
 pub struct ShardedAsyncReceiver<T: Send + Unpin + 'static> {
     inner: ShardSet<MpscAsyncReceiver<T>>,
 }
 
+#[cfg(feature = "tokio-runtime")]
 impl<T: Send + Unpin + 'static> ShardedAsyncReceiver<T> {
     /// One full burst pass (see [`ShardSet::drain_pass`]). Returns `false`
     /// once every shard has closed (EOF).
@@ -327,8 +333,6 @@ impl<T: Send + Unpin + 'static> ShardedAsyncReceiver<T> {
 
 #[cfg(test)]
 mod tests {
-    use futures::executor::block_on;
-
     use super::*;
 
     /// EOF aggregation: shards close independently (their senders drop at
@@ -414,8 +418,11 @@ mod tests {
     /// shards and the stream ends only when the last shard closes. Producers
     /// use `try_send` from the test thread — the sender side needs no
     /// runtime, only the collector's anchor is driven by `block_on`.
+    #[cfg(feature = "tokio-runtime")]
     #[test]
     fn async_eof_aggregates_across_shards() {
+        use futures::executor::block_on;
+
         let (txs, mut rx) = sharded_mpsc_async_channel::<usize>(3, 33);
         let mut it = txs.into_iter();
         let tx0 = it.next().unwrap();
@@ -451,8 +458,11 @@ mod tests {
     /// Async anchor parks on the live shard (skipping the closed one) and is
     /// woken by a send from another OS thread — the waker round-trip through
     /// `block_on`'s park-based executor must deliver the item exactly once.
+    #[cfg(feature = "tokio-runtime")]
     #[test]
     fn async_anchor_parks_until_send() {
+        use futures::executor::block_on;
+
         let (txs, mut rx) = sharded_mpsc_async_channel::<usize>(2, 16);
         let mut it = txs.into_iter();
         let tx0 = it.next().unwrap();

@@ -1,5 +1,7 @@
+#[cfg(feature = "tokio-runtime")]
+use crate::handoff::{AsyncRecvItem, ShardedAsyncReceiver};
 use crate::{
-    handoff::{AsyncRecvItem, RecvItem, ShardedAsyncReceiver, ShardedReceiver, TryRecvError},
+    handoff::{RecvItem, ShardedReceiver, TryRecvError},
     state::ReorderBuffer,
     sync::CancellationToken,
 };
@@ -259,6 +261,7 @@ pub(crate) fn drain_ordered_with<R, O>(
 /// already queued, and a plain `while let Ok(..) = rx.recv().await` would pay
 /// one waker-register/wake round-trip per item. The two-phase loop converts
 /// that per-item `await` cost into per-burst cost.
+#[cfg(feature = "tokio-runtime")]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) async fn drain_unordered_async<R, O>(rx: &R, mut sink: impl FnMut(O))
 where
@@ -286,6 +289,7 @@ where
 
 /// Async counterpart of [`drain_ordered`]: re-sequences through a
 /// [`ReorderBuffer`] while burst-draining like [`drain_unordered_async`].
+#[cfg(feature = "tokio-runtime")]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) async fn drain_ordered_async<R, O>(
     rx: &R,
@@ -407,6 +411,7 @@ pub(crate) fn drain_ordered_sharded<O, S: FnMut(O)>(
 /// [`ShardedAsyncReceiver::recv_anchor`](crate::handoff::ShardedAsyncReceiver::recv_anchor)
 /// for the one-shard waker rationale). EOF is the aggregation of all shards
 /// closing.
+#[cfg(feature = "tokio-runtime")]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) async fn drain_unordered_async_sharded<O, S: FnMut(O)>(
     rx: &mut ShardedAsyncReceiver<(u64, O)>,
@@ -432,6 +437,7 @@ pub(crate) async fn drain_unordered_async_sharded<O, S: FnMut(O)>(
 /// re-sequences by `seq`), so sharding is transparent to the ordered
 /// contract. Accounting and the window-overflow semantics are shared
 /// verbatim.
+#[cfg(feature = "tokio-runtime")]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) async fn drain_ordered_async_sharded<O, S: FnMut(O)>(
     rx: &mut ShardedAsyncReceiver<(u64, O)>,
