@@ -14,6 +14,10 @@ members         = [
 # the vendored forks and the bench crates are opt-in via `-p` / `--workspace`
 # (they pull heavyweight deps: aes-gcm, zstd, perfcnt, valgrind runner, ...).
 default-members = ["crates/youpipe", "crates/youpipe-sys"]
+# cargo-fuzz crate: built by `cargo fuzz ...` from its own directory on a
+# nightly toolchain with sanitizer flags that would break plain workspace
+# builds, so it cannot be a member.
+exclude = ["crates/youpipe-fuzz"]
 
 # Shared metadata for the youpipe-* crates developed in-tree (everything
 # lives under crates/). The vendored forks keep fully self-contained

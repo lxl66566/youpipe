@@ -1,0 +1,47 @@
+[package]
+name    = "youpipe-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# cargo-fuzz marker: `cargo fuzz build|run` must be invoked from this
+# directory (it compiles the bins below on a nightly toolchain with
+# `-Zsanitizer=fuzzer[,address]`). Excluded from the root workspace on
+# purpose: those flags would break plain `cargo build --workspace`.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+youpipe       = { path = "../youpipe" }
+
+[[bin]]
+name = "pipeline"
+path = "fuzz_targets/pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream"
+path = "fuzz_targets/stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "channel"
+path = "fuzz_targets/channel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reorder"
+path = "fuzz_targets/reorder.rs"
+test = false
+doc = false
+bench = false
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

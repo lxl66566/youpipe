@@ -1,3 +1,9 @@
 /target
 session-*.md
 /docs/book
+# cargo-fuzz products — the fuzz crate is excluded from the workspace, so its
+# target dir is not covered by the root /target rule
+/crates/youpipe-fuzz/target
+/crates/youpipe-fuzz/corpus
+/crates/youpipe-fuzz/artifacts
+/crates/youpipe-fuzz/coverage
