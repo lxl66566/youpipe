@@ -22,7 +22,7 @@
 - [Core types and execution paths](dev/core-types.md)
 - [Work-stealing scheduler](dev/scheduler.md)
 - [Streaming data plane](dev/streaming.md)
-- [Verification: miri and loom](dev/testing.md)
+- [Verification: miri, loom and fuzzing](dev/testing.md)
 - [Vendored crossfire: blocking-waker designs](dev/crossfire-waker-designs.md)
 - [Vendored crossfire: waker-cache archaeology](dev/crossfire-waker-cache.md)
 - [Falsified directions](dev/dead-ends.md)

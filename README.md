@@ -67,6 +67,21 @@ Full manual at **[lxl66566.github.io/youpipe](https://lxl66566.github.io/youpipe
 
 Sources live under `docs/` (`mdbook build docs` to build locally).
 
+## Fuzzing
+
+Coverage-guided fuzzing lives in `crates/youpipe-fuzz` (cargo-fuzz, excluded
+from the workspace):
+
+```sh
+cargo fuzz run --fuzz-dir crates/youpipe-fuzz pipeline -- -max_total_time=60
+```
+
+Targets: `pipeline` (fused chains), `stream` (streaming topology),
+`channel` (handoff data plane), `reorder` (ReorderBuffer) — each asserts
+against a serial reference model. See
+[the verification guide](https://lxl66566.github.io/youpipe/dev/testing.html)
+for details, Windows specifics, and known findings.
+
 ## Performance
 
 youpipe is the only library at or near the top in every

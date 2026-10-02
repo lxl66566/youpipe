@@ -116,3 +116,74 @@ youpipe ships a `.cargo/config.toml` override (`opt-level=3`, `panic=unwind`) th
 
 - `panic = "abort"` — disables `catch_unwind`, so the `LeafGuard` / `ForEachGuard` panic-safety paths never run; any panic inside a pool worker aborts the process instead of propagating. Detected in `lib.rs` via `#[cfg(panic = "abort")]` (the deprecated-const warning trick) — this is accurate inside the library compilation, unlike cargo's build-script `CARGO_CFG_PANIC` env var which mirrors the build-script's own panic strategy (always `unwind`), not the target crate's.
 - `opt-level = "s"` / `"z"` — disables the leaf-loop auto-vectorizer (~2× regression on the lightweight warm path). No longer detected at compile time: the rationale and the `[build] rustflags = ["-C", "opt-level=3"]` override recipe live in youpipe's own `.cargo/config.toml` comment for downstream users to copy.
+
+# Fuzzing (cargo-fuzz)
+
+Coverage-guided fuzzing lives in `crates/youpipe-fuzz` — a cargo-fuzz crate
+excluded from the workspace (its nightly sanitizer flags would break plain
+`cargo build --workspace`). Four targets, all structured-input harnesses:
+each decodes a random program (item values, stage chain, knobs) from the
+fuzzer byte stream and asserts the concurrent result against a serial
+reference model.
+
+| Target   | Covers |
+| -------- | ------ |
+| `pipeline` | fused `pipe`/`pipe_ref` chains (`map`/`filter`/`try_map`/`map_err`), knob combinations (`with_compute_workers`, `with_oversubscribe`, `with_workload`), `collect`/`for_each`/`try_collect` terminals |
+| `stream`  | streaming topology and the fused pass-through (via the worker-pin flag), `expand_emit`, `fence`, ordered/unordered collection, tiny buffers for backpressure |
+| `channel` | handoff channel: strict FIFO and exact capacity accounting in a single-threaded interleave, close propagation across sender/receiver clones, MPMC count/multiset conservation under real threads |
+| `reorder` | `ReorderBuffer` re-sequencing against a `BTreeMap` model, interleaved with `flush_remaining`/`reset` |
+
+Run from the repo root (nightly toolchain required):
+
+```sh
+cargo fuzz run --fuzz-dir crates/youpipe-fuzz <target> -- -max_total_time=60
+```
+
+Design notes:
+
+- The builders are type-state, so stage kinds cannot be spliced at runtime.
+  Each harness picks from a fixed set of chain templates with data-driven
+  parameters — the fused core composes a chain into one closure per worker,
+  so what coverage needs is every builder method and terminal exercised, not
+  every chain shape.
+- `stream` shares one process-global 2-worker `TokioPool` across iterations;
+  `run()` would otherwise build and tear down a multi-thread runtime per
+  iteration, dominating fuzzing throughput.
+- Caller contracts the harness never violates: `.ordered()` + `.expand()`
+  (documented panic), and `ReorderBuffer`'s outstanding-window `< capacity`
+  precondition.
+- `for_each` terminals assert multisets — rayon `par_iter().for_each` order
+  semantics; `collect` and ordered `run` assert exact order.
+
+Windows specifics:
+
+- The MSVC ASan runtime is a DLL the loader must find next to the fuzz
+  executables (or on `PATH`), otherwise the target exits with
+  `STATUS_DLL_NOT_FOUND` before running a single input. Copy it once per
+  `cargo fuzz build`:
+  ```sh
+  cp "/c/Program Files/Microsoft Visual Studio/2022/<edition>/VC/Tools/MSVC/<ver>/bin/Hostx64/x64/clang_rt.asan_dynamic-x86_64.dll" \
+     crates/youpipe-fuzz/target/x86_64-pc-windows-msvc/release/
+  ```
+- Harness assertion panics abort via fast-fail before libFuzzer's death
+  callback can write a `crash-*` artifact; the panic message on stderr is
+  the evidence. Corpus replay usually does not reproduce low-probability
+  races — re-fuzzing does.
+
+## Known finding: `.ordered()` output order violation
+
+The `stream` target found a real ordering bug (two independent reproductions
+in short runs; roughly once per 30–50k executions, on short inputs). The
+multiset is intact but the sequence is wrong:
+
+```text
+want: [x+2, x+1, x,   y+2, y+1, y]
+got:  [x+2, x,   x+1, y+2, y+1, y]     # adjacent items swapped
+
+want: [A, B, C, A, B, C, A, B, C]
+got:  [A, B, C, A, B, A, B, C, C]      # 4-item displacement
+```
+
+`.ordered()` promises input-order output, so both are contract violations.
+The intermittency points at a race between sequence tagging and the ordered
+drain/collector. Unfixed — re-fuzz `stream` to reproduce.

@@ -61,6 +61,20 @@ let r: Vec<u64> = (0..1000).stream()
 
 源码位于 `docs/`（`mdbook build docs` 本地构建）。
 
+## Fuzz
+
+覆盖引导的模糊测试位于 `crates/youpipe-fuzz`（cargo-fuzz，已从 workspace
+排除）：
+
+```sh
+cargo fuzz run --fuzz-dir crates/youpipe-fuzz pipeline -- -max_total_time=60
+```
+
+Targets：`pipeline`（fused 链）、`stream`（streaming 拓扑）、`channel`
+（handoff 数据面）、`reorder`（ReorderBuffer）——每个 target 都与串行参考
+模型对比断言。详见[验证指南](https://lxl66566.github.io/youpipe/dev/testing.html)（含
+Windows 注意事项与已知发现）。
+
 ## 性能
 
 youpipe 在所有负载类别下都稳居第一梯队——CPU
