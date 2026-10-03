@@ -130,7 +130,7 @@ reference model.
 | -------- | ------ |
 | `pipeline` | fused `pipe`/`pipe_ref` chains (`map`/`filter`/`try_map`/`map_err`), knob combinations (`with_compute_workers`, `with_oversubscribe`, `with_workload`), `collect`/`for_each`/`try_collect` terminals |
 | `stream`  | streaming topology and the fused pass-through (via the worker-pin flag), `expand_emit`, `fence`, ordered/unordered collection, tiny buffers for backpressure |
-| `channel` | handoff channel: strict FIFO and exact capacity accounting in a single-threaded interleave, close propagation across sender/receiver clones, MPMC count/multiset conservation under real threads |
+| `channel` | handoff channel: strict FIFO and exact capacity accounting in a single-threaded interleave, close propagation across sender/receiver clones, batch send/claim exact-count + EOF-transition semantics, MPMC and MPSC count/multiset/per-producer-FIFO conservation under real threads |
 | `reorder` | `ReorderBuffer` re-sequencing against a `BTreeMap` model, interleaved with `flush_remaining`/`reset` |
 
 Run from the repo root (nightly toolchain required):
@@ -149,6 +149,13 @@ Design notes:
 - `stream` shares one process-global 2-worker `TokioPool` across iterations;
   `run()` would otherwise build and tear down a multi-thread runtime per
   iteration, dominating fuzzing throughput.
+- The `channel` batch cases mirror the engine's call patterns, so they fuzz
+  the `MaybeUninit` staging/`set_len` unsafe paths as production uses them:
+  fresh values staged in a `MaybeUninit` slice for `try_send_batch` (the
+  feeder), claims into a typed Vec's `spare_capacity_mut()` for
+  `try_recv_batch` (`claim_poll`, the sharded terminal), and the MPSC case
+  drives the same batch-first / blocking-`recv`-fallback drain rhythm the
+  sharded receiver uses.
 - Caller contracts the harness never violates: `.ordered()` + `.expand()`
   (documented panic), and `ReorderBuffer`'s outstanding-window `< capacity`
   precondition.
@@ -172,9 +179,10 @@ Windows specifics:
 
 ## Known finding: `.ordered()` output order violation
 
-The `stream` target found a real ordering bug (two independent reproductions
-in short runs; roughly once per 30–50k executions, on short inputs). The
-multiset is intact but the sequence is wrong:
+The `stream` target found a real ordering bug (multiple independent
+reproductions in short runs — sporadic, observed anywhere from ~6k to ~50k
+executions in, always on short inputs). The multiset is intact but the
+sequence is wrong:
 
 ```text
 want: [x+2, x+1, x,   y+2, y+1, y]
