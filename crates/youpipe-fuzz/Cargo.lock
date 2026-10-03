@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "youpipe"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "loom",
  "tokio",
@@ -439,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "youpipe-concurrent-queue"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crossbeam-utils",
  "loom",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "youpipe-crossfire"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crossbeam-utils",
  "futures-core",
@@ -466,14 +466,14 @@ dependencies = [
 
 [[package]]
 name = "youpipe-st3"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "crossbeam-utils",
 ]
 
 [[package]]
 name = "youpipe-sys"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "libc",
  "loom",

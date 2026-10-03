@@ -43,5 +43,14 @@ test = false
 doc = false
 bench = false
 
+# Mirror of the root workspace's lint set (this crate is excluded from the
+# workspace, so it inherits nothing).
 [lints.clippy]
-all = { level = "warn", priority = -1 }
+all                     = { level = "warn", priority = -1 }
+cargo                   = { level = "warn", priority = -1 }
+doc_markdown            = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+multiple_crate_versions = "allow"
+pedantic                = { level = "warn", priority = -1 }
+wildcard_imports        = "allow"
