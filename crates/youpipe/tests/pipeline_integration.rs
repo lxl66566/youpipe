@@ -520,6 +520,94 @@ fn test_stream_multi_stage() {
     assert_eq!(result, expected);
 }
 
+/// `.ordered()` must re-sequence to exact input order under every racy
+/// combination the streaming topology allows: several stage workers, tiny
+/// buffers (backpressure), fence links (barrier and chunked), both
+/// terminals. Regression guard for the former "ordered output order
+/// violation" fuzz finding — that finding turned out to be a harness
+/// template-selection bug (an exact-order assertion on an unordered
+/// pipeline), so this test pins the contract the library actually promises.
+#[test]
+fn test_stream_ordered_exact_order_stress() {
+    fn xorshift(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+    // Miri: same dispatch/drain paths per item, fewer rounds (see
+    // `cpu_heavy` for the ~1000× interpreter rationale).
+    let rounds: u64 = if cfg!(miri) {
+        20
+    } else {
+        2000
+    };
+    let mut rng = 0x243f_6a88_85a3_08d3_u64;
+    for round in 0..rounds {
+        let n = 1 + xorshift(&mut rng) % 64;
+        let items: Vec<u64> = (0..n).map(|_| xorshift(&mut rng)).collect();
+        let (workers, buffer) = (
+            usize::try_from(1 + xorshift(&mut rng) % 4).unwrap(),
+            usize::try_from(1 + xorshift(&mut rng) % 8).unwrap(),
+        );
+        let (mul, add) = (xorshift(&mut rng) | 1, xorshift(&mut rng));
+        let expect: Vec<u64> = items
+            .iter()
+            .map(|&x| x.wrapping_mul(mul).wrapping_add(add))
+            .collect();
+        let ctx = format!("round {round}: n={n} workers={workers} buffer={buffer}");
+        let stage = move |x: u64| x.wrapping_mul(mul).wrapping_add(add);
+        match round % 3 {
+            // stage × 2 on the real topology (worker pin opts out of the
+            // fused pass-through) + Vec terminal
+            0 => {
+                let got = stream(items)
+                    .with_compute_workers(workers)
+                    .with_buffer_size(buffer)
+                    .stage(stage)
+                    .stage(|x: u64| x)
+                    .ordered()
+                    .run();
+                assert_eq!(got, expect, "{ctx}");
+            },
+            // same shape, for_each terminal (same ordered drain, sink
+            // instead of Vec)
+            1 => {
+                let mut got = Vec::with_capacity(expect.len());
+                stream(items)
+                    .with_compute_workers(workers)
+                    .with_buffer_size(buffer)
+                    .stage(stage)
+                    .stage(|x: u64| x)
+                    .ordered()
+                    .for_each(|x| got.push(x));
+                assert_eq!(got, expect, "{ctx}");
+            },
+            // fence mid-chain: both fence modes release order differently,
+            // the collector must not care
+            _ => {
+                let mode = if xorshift(&mut rng) & 1 == 0 {
+                    FenceMode::Barrier
+                } else {
+                    FenceMode::Chunked(
+                        NonZeroUsize::new(usize::try_from(1 + xorshift(&mut rng) % 4).unwrap())
+                            .unwrap(),
+                    )
+                };
+                let got = stream(items)
+                    .with_compute_workers(workers)
+                    .with_buffer_size(buffer)
+                    .stage(stage)
+                    .fence(mode)
+                    .stage(|x: u64| x)
+                    .ordered()
+                    .run();
+                assert_eq!(got, expect, "{ctx}");
+            },
+        }
+    }
+}
+
 // ── Fused pass-through: pure SyncStage chains run on the fused core ──
 
 /// A pure sync chain's pass-through output must equal both the sequential
