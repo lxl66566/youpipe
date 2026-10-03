@@ -2,12 +2,15 @@
 # vendored into youpipe.
 #
 # Provenance: local fork repo at /root/programs/fork/crossfire-rs,
-# branch `waker-tl` @ e8e21f1 ("waker: loom model checking for the waker
-# registry", on top of 665095b "waker: u64 registration stamps and unified
-# QueueEntry stale check", on top of 541e0fc "waker: Per-thread immortal
-# blocking waker with seq-tagged queue entries"). `src/` is byte-identical
-# to that commit (git archive waker-tl, verified with diff -r) — the
-# fork's uncommitted working-tree changes are deliberately NOT included.
+# branch `waker-tl` @ 2894038 ("blocking: re-verify the waker Closed stamp
+# against the peer counter", on top of e8e21f1 "waker: loom model checking
+# for the waker registry", 665095b "waker: u64 registration stamps and
+# unified QueueEntry stale check", 541e0fc "waker: Per-thread immortal
+# blocking waker with seq-tagged queue entries"). On top of that commit
+# this copy carries youpipe-local extensions: the try_send_batch /
+# try_recv_batch fast paths, the RegistrySingle retry-on-Skip +
+# node-state get_waker_state fixes (2026-09 intermittent-hang forensics),
+# and their tests.
 #
 # Design C: the blocking wake target is thread::current(), which never
 # changes, so the waker node lives in a thread_local and is only re-armed

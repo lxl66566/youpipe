@@ -185,7 +185,17 @@ impl<F: Flavor> Tx<F> {
                 return_ok!();
             } else {
                 debug_assert_eq!(state, WakerState::Closed as u8);
-                return Err(SendTimeoutError::Disconnected(unsafe { item.assume_init_read() }));
+                // The stamp is a hint, not a verdict: this thread's waker
+                // node is shared across every channel it blocks on, and a
+                // foreign registry's close() can stamp it Closed
+                // mid-episode (commit_waiting then fails Init->Waiting with
+                // Closed). Only the rx counter is authoritative — close_rx()
+                // decrements it before closing the registry, so count > 0
+                // proves the stamp is foreign. Re-arm and retry.
+                if shared.is_rx_closed() {
+                    return Err(SendTimeoutError::Disconnected(unsafe { item.assume_init_read() }));
+                }
+                continue;
             }
         }
     }
@@ -724,5 +734,52 @@ impl<T, F: Flavor<Item = T> + FlavorMP> SenderType for MTx<F> {
     #[inline(always)]
     fn new(shared: Arc<ChannelShared<F>>) -> Self {
         MTx::new(shared)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::waker::tl_blocking_waker;
+    use std::sync::mpsc;
+
+    // Regression (found by youpipe's cargo-fuzz stream target, 2026-10): the
+    // per-thread blocking waker node is shared across every channel a thread
+    // blocks on, and a foreign registry's close() can stamp it Closed
+    // mid-episode — commit_waiting then fails Init->Waiting with Closed.
+    // The stamp is a hint, not a verdict: only the rx counter is
+    // authoritative (close_rx decrements it before closing the registry).
+    // Stamping the node Closed from outside while the episode is armed on a
+    // live channel is the deterministic core of that race. Assertions live
+    // after join(): in-thread asserts would kill the worker first and hang
+    // the main thread on recv().
+    #[test]
+    fn send_treats_foreign_closed_stamp_as_spurious() {
+        let (tx, rx) = crate::mpmc::bounded_blocking::<usize>(1);
+        tx.try_send(0).expect("fill to force parking");
+        let (node_tx, node_rx) = mpsc::channel();
+        let worker = {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let node = tl_blocking_waker();
+                node_tx.send(node.clone_node()).expect("publish node");
+                let item = MaybeUninit::new(7_usize);
+                tx._send_bounded(&item, None)
+            })
+        };
+        // Wait for the parked episode (its registry entry), then stamp.
+        for _ in 0..5000 {
+            if tx.get_wakers_count().0 > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        let node = node_rx.recv().expect("node handle");
+        node.close_wake();
+        // The sender must re-verify, re-arm and complete the send.
+        rx.recv().expect("drain filler");
+        let r = worker.join().expect("join worker");
+        assert!(r.is_ok(), "spurious Disconnected while rx alive: {r:?}");
+        assert_eq!(rx.recv().expect("the sent item"), 7);
     }
 }

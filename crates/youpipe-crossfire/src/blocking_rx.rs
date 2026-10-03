@@ -155,7 +155,16 @@ impl<F: Flavor> Rx<F> {
                 trace_log!("rx: after park state={}", state);
             }
             if state == WakerState::Closed as u8 {
-                break 'MAIN;
+                // The stamp is a hint, not a verdict — same rationale as
+                // `_send_bounded`'s Closed branch: a foreign registry's
+                // close() can stamp this thread's shared waker node Closed
+                // while the senders are alive. Only the tx counter is
+                // authoritative (close_tx decrements it before closing the
+                // registry); re-arm and wait again otherwise.
+                if shared.is_tx_closed() {
+                    break 'MAIN;
+                }
+                continue 'MAIN;
             }
             backoff.reset();
             loop {
@@ -666,5 +675,44 @@ where
     #[inline(always)]
     fn new(shared: Arc<ChannelShared<F>>) -> Self {
         MRx::new(shared)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::waker::tl_blocking_waker;
+    use std::sync::mpsc;
+
+    // Same regression as the send side: a foreign Closed stamp on the shared
+    // per-thread waker node must not turn into Disconnected while the
+    // senders are alive — the tx counter is the only authority. Assertions
+    // live after join() so a regression fails fast instead of hanging.
+    #[test]
+    fn recv_treats_foreign_closed_stamp_as_spurious() {
+        let (tx, rx) = crate::mpmc::bounded_blocking::<usize>(1);
+        let (node_tx, node_rx) = mpsc::channel();
+        let worker = {
+            let rx = rx.clone();
+            std::thread::spawn(move || {
+                let node = tl_blocking_waker();
+                node_tx.send(node.clone_node()).expect("publish node");
+                rx._recv_blocking(None)
+            })
+        };
+        for _ in 0..5000 {
+            if rx.get_wakers_count().1 > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        let node = node_rx.recv().expect("node handle");
+        node.close_wake();
+        // Keep the channel empty while the waker observes the stamp: the
+        // post-loop try_recv() must not mask the verdict with a later item.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        tx.send(7).expect("feed the receiver");
+        let r = worker.join().expect("join worker");
+        assert_eq!(r.expect("recv must not report Disconnected while tx alive"), 7);
     }
 }
