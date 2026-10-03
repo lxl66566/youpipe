@@ -494,6 +494,10 @@ C 的 40B 档在稳态**结构性归零**（总量 104 次/run，对 73,728 个 
 
 **已知残留的定性**：重臂与 fire 的 seq Relaxed 传播窄窗口（两把锁间无 hb 边，fire 可能读到重臂前旧戳、陈旧项偷走一次 fire）经 `loom_fire_vs_rearm_race_recovers_within_one_event` 枚举确认**真实可达且良性**：有界恢复（下一事件唤醒）、绝不 Closed；不可用内存序修复（两步操作无法原子化），也无需修复。§11.5 的一次未复现挂起无对应 miri/loom 反例，维持"高负载饥饿"归因。
 
+### 11.7 残留定性修正：close 变体会盖 Closed（2026-10，已修）
+
+§11.6 的"绝不 Closed"只对 fire 成立。close 变体（锁内 pop 陈旧 entry → `upgrade_live` 读 seq → `close_wake` CAS）与重臂同样无 hb 边：读到旧戳时 Closed 盖到现役 episode 上，`commit_waiting` 以 Closed 失败，blocking send/recv 直接返回虚假 `Disconnected`（youpipe fuzz 实锤：无序 expand 链整组丢失；artifact/corpus 重放不可复现，种子驱动 fuzz ~33 万次执行时复现）。registry 层不可根治（seq 校验与 CAS 之间固有 TOCTOU），修复在判定点：fork `waker-tl` @ `2894038`（vendored 已同步）——Closed stamp 仅作提示，blocking 判定点以对端计数器复核（`close_rx`/`close_tx` **先减计数后关 registry**，计数 > 0 即证 stamp 外来），虚假则重臂重试。判定发生在重新注册之后 + close 协议先减计数，两重保证重试不会睡穿真实 close。async 轨节点按 future 独立创建、无跨 registry 复用，不受影响。回归测试为确定性构造：从外部对现役 episode 的共享节点直接 `close_wake()`，send/recv 双向断言不得虚假断连（fork + vendored 各一份）。
+
 **youpipe 层不新增 loom 模型的理由**：`handoff/channel.rs` 包装层（~400 行）是无同步状态机的薄封装（错误枚举映射 + 类型包装 + clone 转发），没有可交错的原语；协议交错的模型检查由 vendored crate 内 5 模型承担，youpipe 侧可观察行为由 `handoff_channel.rs` 在真实线程 + miri 下覆盖；`handoff/notify.rs` 等真正含同步原语的文件已有各自模型（testing.md）。
 
 **Windows 可移植性接缝**（详见 testing.md）：vendored 的 `reg_lock` 接缝在 `cfg(miri)` 下切 `std::sync::Mutex`（parking_lot 的 Windows futex 路径 miri 不可解释，同 youpipe-sys 的 shim 理由）；`captains-log` dev-dep（unix libc 假设）已从 fork 与 vendored 双侧移除——fork 由此恢复 Windows 本机全量可测。

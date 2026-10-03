@@ -177,21 +177,44 @@ Windows specifics:
   the evidence. Corpus replay usually does not reproduce low-probability
   races — re-fuzzing does.
 
-## Known finding: `.ordered()` output order violation
+## Fuzz findings, resolved
 
-The `stream` target found a real ordering bug (multiple independent
-reproductions in short runs — sporadic, observed anywhere from ~6k to ~50k
-executions in, always on short inputs). The multiset is intact but the
-sequence is wrong:
+### `.ordered()` output order violation — harness template-folding bug
 
-```text
-want: [x+2, x+1, x,   y+2, y+1, y]
-got:  [x+2, x,   x+1, y+2, y+1, y]     # adjacent items swapped
+The `stream` target's ordered assertion fired on inputs decoding as
+`ordered=true` with the expand template. That template's body never calls
+`.ordered()` (expand + ordered is a documented panic), but the fold
+`r.pick(5) % 2` mapped the ordered set onto `{0, 1}`, keeping the expand
+template under `finish`'s exact-order assertion — legitimate
+completion-order interleavings of an *unordered* pipeline were flagged as
+divergences (adjacent swaps, 4-item displacements; the multiset was always
+intact — the tell that this was not a library ordering race). The harness
+now folds via an explicit ordered-compatible template-ID array, and the
+library's ordered contract is pinned by `test_stream_ordered_exact_order_stress`
+(`tests/pipeline_integration.rs`): randomized rounds over
+workers/buffer/fence-mode/terminal shapes with exact input-order
+assertions.
 
-want: [A, B, C, A, B, C, A, B, C]
-got:  [A, B, C, A, B, A, B, C, C]      # 4-item displacement
-```
+### Blocking channel spurious `Disconnected` — vendored crossfire
 
-`.ordered()` promises input-order output, so both are contract violations.
-The intermittency points at a race between sequence tagging and the ordered
-drain/collector. Unfixed — re-fuzz `stream` to reproduce.
+Re-fuzzing with the corrected harness found a real library bug: an
+unordered expand chain sporadically lost an entire expand group. Root
+cause: the per-thread blocking waker node is shared across every channel
+a thread blocks on, and a foreign registry's `close()` racing the node's
+re-arm validates a stale queue entry (no hb edge between two registry
+mutexes) and stamps `Closed` onto the live episode — `commit_waiting`
+then fails Init→Waiting with `Closed`, and `_send_bounded` /
+`_recv_blocking` translated it into `Disconnected` while the peer was
+alive. Artifact/corpus replay does not reproduce it; seed-driven fuzzing
+does (~1 in 300k executions).
+
+Fix (fork `waker-tl` @ `2894038`, vendored sync): the Closed stamp is a
+hint, not a verdict — the blocking decision points re-verify against the
+peer counter (`close_rx`/`close_tx` decrement it *before* closing the
+registry, so count > 0 proves the stamp foreign) and re-arm on mismatch.
+Checking after re-registration plus the decrement-before-close protocol
+closes the lost-notification window, so the retry cannot park through a
+real close. Async paths were never exposed: their waker nodes are
+per-future, not per-thread. Deterministic regression tests (fork and
+vendored) stamp the shared node Closed from outside mid-episode, on both
+the send and recv sides.
