@@ -21,7 +21,7 @@
 use std::{mem::MaybeUninit, sync::Arc, time::Duration};
 
 use youpipe::{
-    FenceMode, StageOptions,
+    FenceMode, SyncStageOptions,
     handoff::{RecvItem, TryRecvError, channel, mpsc_channel},
     stream,
     sync::CancellationToken,
@@ -351,7 +351,9 @@ fn knob_e2e_streaming_topology_with_batch() {
         move || {
             stream(0..n_aux() as u64)
                 .with_cancel(cancel)
-                .stage_with(StageOptions::new().workers(2), |x: u64| x.wrapping_add(5))
+                .stage_with(SyncStageOptions::new().workers(2), |x: u64| {
+                    x.wrapping_add(5)
+                })
                 .ordered()
                 .run()
         }

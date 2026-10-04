@@ -3500,9 +3500,17 @@ impl<S, I, O> Pipe<S, I, O> {
     ///     let _ = f;
     /// });
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `factor == 0` — a zero oversubscription factor is never
+    /// meaningful (see `PipelineConfig::require_nonzero`).
     #[must_use]
     pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = NonZeroUsize::new(factor.max(1));
+        self.oversubscribe = Some(PipelineConfig::require_nonzero(
+            factor,
+            "with_oversubscribe",
+        ));
         self
     }
 
@@ -4008,9 +4016,16 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
     /// Oversubscribe the compute pool — see [`Pipe::with_oversubscribe`] for
     /// the full guidance. Same semantics: creates a transient
     /// `factor × num_cpus` thread pool at `.try_collect()` time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `factor == 0` (see [`Pipe::with_oversubscribe`]).
     #[must_use]
     pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = NonZeroUsize::new(factor.max(1));
+        self.oversubscribe = Some(PipelineConfig::require_nonzero(
+            factor,
+            "with_oversubscribe",
+        ));
         self
     }
 
@@ -4327,9 +4342,16 @@ impl<S, O> RangePipe<S, O> {
     }
 
     /// Oversubscribe the compute pool — see [`Pipe::with_oversubscribe`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `factor == 0` (see [`Pipe::with_oversubscribe`]).
     #[must_use]
     pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = NonZeroUsize::new(factor.max(1));
+        self.oversubscribe = Some(PipelineConfig::require_nonzero(
+            factor,
+            "with_oversubscribe",
+        ));
         self
     }
 }

@@ -678,19 +678,19 @@ fn test_stream_pass_through_cancel_excluded() {
     assert!(r.len() < 10_000, "cancelled run must abort early");
 }
 
-/// A `StageOptions::workers` pin disables the pass-through: the pinned
+/// A `SyncStageOptions::workers` pin disables the pass-through: the pinned
 /// budget must cap stage concurrency (the fused core would use the whole
 /// pool). Mirrors `test_compute_workers_pin_survives_compute_pool`.
 #[test]
 #[cfg_attr(miri, ignore)] // wall-clock-based concurrency probing
 fn test_stream_pass_through_stage_pin_excluded() {
-    use youpipe::StageOptions;
+    use youpipe::SyncStageOptions;
 
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let (a, p) = (active.clone(), peak.clone());
     let r = stream(0..200u64)
-        .stage_with(StageOptions::new().workers(2), move |x| {
+        .stage_with(SyncStageOptions::new().workers(2), move |x| {
             let now = a.fetch_add(1, Ordering::SeqCst) + 1;
             p.fetch_max(now, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -720,11 +720,11 @@ fn test_stream_with_fence_chunked() {
 }
 
 /// `fence_with` reads the fence's output-channel capacity from
-/// `StageOptions` (previously hardcoded to `ctx.buffer_size(parallelism)`);
+/// `FenceOptions` (previously hardcoded to `ctx.buffer_size(parallelism)`);
 /// a tight buffer must still deliver every item in both modes.
 #[test]
 fn test_stream_fence_with_options_buffer() {
-    use youpipe::StageOptions;
+    use youpipe::FenceOptions;
 
     for mode in [
         FenceMode::Barrier,
@@ -732,7 +732,7 @@ fn test_stream_fence_with_options_buffer() {
     ] {
         let r: Vec<u64> = stream(0..500u64)
             .stage(|x| x + 1)
-            .fence_with(StageOptions::new().buffer(2), mode)
+            .fence_with(FenceOptions::new().buffer(2), mode)
             .stage(|x| x * 2)
             .run();
         let mut expected: Vec<u64> = (0..500u64).map(|x| (x + 1) * 2).collect();
@@ -1664,7 +1664,7 @@ fn test_workload_custom_try_collect() {
     assert_eq!(r.unwrap(), (1..=1_000).collect::<Vec<_>>());
 }
 
-// ── per-stage StageOptions (streaming) ──
+// ── per-stage stage options (streaming) ──
 
 #[test]
 // Wall-clock concurrency observation relies on sleep overlap; miri's
@@ -1677,7 +1677,7 @@ fn test_workload_custom_try_collect() {
 fn test_stage_options_workers_pins_parallelism() {
     use std::time::Duration;
 
-    use youpipe::StageOptions;
+    use youpipe::SyncStageOptions;
 
     // The pinned stage must never exceed 2 concurrent executions, whatever
     // the default equal-division would have granted it.
@@ -1687,7 +1687,7 @@ fn test_stage_options_workers_pins_parallelism() {
     let m = max_active.clone();
     let n = 40usize;
     stream(0..n)
-        .stage_with(StageOptions::new().workers(2), move |x: usize| {
+        .stage_with(SyncStageOptions::new().workers(2), move |x: usize| {
             let cur = a.fetch_add(1, Ordering::SeqCst) + 1;
             m.fetch_max(cur, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(5));
@@ -1713,7 +1713,7 @@ fn test_stage_options_workers_pins_parallelism() {
 fn test_stage_options_io_concurrency_pins_fanout() {
     use std::time::Duration;
 
-    use youpipe::StageOptions;
+    use youpipe::AsyncStageOptions;
 
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
@@ -1723,7 +1723,7 @@ fn test_stage_options_io_concurrency_pins_fanout() {
     let r: Vec<usize> = stream(0..n)
         // Global default is 128; the per-stage pin must win.
         .with_io_concurrency(128)
-        .stage_async_with(StageOptions::new().io_concurrency(3), move |x: usize| {
+        .stage_async_with(AsyncStageOptions::new().io_concurrency(3), move |x: usize| {
             let a = a.clone();
             let m = m.clone();
             async move {
@@ -1748,7 +1748,7 @@ fn test_stage_options_io_concurrency_pins_fanout() {
 fn test_stage_options_buffer_override_runs() {
     // A tiny explicit buffer tightens backpressure but must not affect
     // correctness (items flow through, none dropped).
-    use youpipe::StageOptions;
+    use youpipe::SyncStageOptions;
 
     // Miri: single emulated pool worker. An `n > buffer` run no longer
     // deadlocks there (the runner falls back to dedicated OS threads when the
@@ -1761,8 +1761,10 @@ fn test_stage_options_buffer_override_runs() {
         (500, 2, 4)
     };
     let r: Vec<usize> = stream(0..n)
-        .stage_with(StageOptions::new().buffer(b1), |x: usize| x + 1)
-        .stage_with(StageOptions::new().buffer(b2).workers(3), |x: usize| x * 2)
+        .stage_with(SyncStageOptions::new().buffer(b1), |x: usize| x + 1)
+        .stage_with(SyncStageOptions::new().buffer(b2).workers(3), |x: usize| {
+            x * 2
+        })
         .run();
     let expected: Vec<usize> = (0..n).map(|x| (x + 1) * 2).collect();
     let mut sorted = r;
@@ -1796,14 +1798,17 @@ fn test_stream_expand_emit() {
 
 #[test]
 fn test_stream_expand_emit_with_workers() {
-    use youpipe::StageOptions;
+    use youpipe::SyncStageOptions;
 
     let r: Vec<u32> = stream(0..50u32)
-        .expand_emit_with(StageOptions::new().workers(2), |x, out: &mut Vec<u32>| {
-            for i in 0..=x {
-                out.push(i);
-            }
-        })
+        .expand_emit_with(
+            SyncStageOptions::new().workers(2),
+            |x, out: &mut Vec<u32>| {
+                for i in 0..=x {
+                    out.push(i);
+                }
+            },
+        )
         .run();
     assert_eq!(
         r.len(),
@@ -1814,10 +1819,12 @@ fn test_stream_expand_emit_with_workers() {
 
 #[test]
 fn test_stage_options_expand_with_workers() {
-    use youpipe::StageOptions;
+    use youpipe::SyncStageOptions;
 
     let r: Vec<u32> = stream(0..50u32)
-        .expand_with(StageOptions::new().workers(2), |x| vec![x; x as usize + 1])
+        .expand_with(SyncStageOptions::new().workers(2), |x| {
+            vec![x; x as usize + 1]
+        })
         .run();
     assert_eq!(
         r.len(),
@@ -1831,12 +1838,12 @@ fn test_stage_budget_explicit_deduction() {
     // 2 explicit stages (4+4 workers) on an 8-worker budget: the unspecified
     // third stage must still run (≥1 worker), not deadlock — the budget
     // deduction must not zero it out.
-    use youpipe::StageOptions;
+    use youpipe::SyncStageOptions;
 
     let r: Vec<usize> = stream(0..100)
         .with_compute_workers(8)
-        .stage_with(StageOptions::new().workers(4), |x: usize| x + 1)
-        .stage_with(StageOptions::new().workers(4), |x: usize| x + 1)
+        .stage_with(SyncStageOptions::new().workers(4), |x: usize| x + 1)
+        .stage_with(SyncStageOptions::new().workers(4), |x: usize| x + 1)
         .stage(|x: usize| x * 10)
         .run();
     assert_eq!(r.len(), 100);
@@ -1931,7 +1938,7 @@ fn test_concurrent_full_budget_runs_share_pool_no_deadlock() {
 #[test]
 #[cfg_attr(miri, ignore)] // thread-count stress the interpreter cannot pace
 fn test_concurrent_pinned_runs_mixed_admission_no_deadlock() {
-    use youpipe::StageOptions;
+    use youpipe::SyncStageOptions;
 
     let r: Vec<usize> = run_with_deadlock_watchdog(|| {
         const RUNS: usize = 12;
@@ -1949,8 +1956,8 @@ fn test_concurrent_pinned_runs_mixed_admission_no_deadlock() {
                         barrier.wait();
                         let r: Vec<u64> = stream(0..1000u64)
                             .with_compute_pool(pool)
-                            .stage_with(StageOptions::new().workers(2), |x| x + 1)
-                            .stage_with(StageOptions::new().workers(2), |x| x * 2)
+                            .stage_with(SyncStageOptions::new().workers(2), |x| x + 1)
+                            .stage_with(SyncStageOptions::new().workers(2), |x| x * 2)
                             .run();
                         r.len()
                     })
@@ -1977,16 +1984,16 @@ fn test_concurrent_pinned_runs_mixed_admission_no_deadlock() {
 #[test]
 #[cfg_attr(miri, ignore)] // thread-count stress the interpreter cannot pace
 fn test_fence_forwarder_counts_in_parking_lease_no_deadlock() {
-    use youpipe::StageOptions;
+    use youpipe::SyncStageOptions;
 
     let r: Vec<u64> = run_with_deadlock_watchdog(|| {
         stream(0..2000u64)
             .with_compute_pool(youpipe::ComputePool::new(8))
-            .stage_with(StageOptions::new().workers(6), |x| {
+            .stage_with(SyncStageOptions::new().workers(6), |x| {
                 x.wrapping_mul(3).wrapping_add(1)
             })
             .fence(FenceMode::Chunked(NonZeroUsize::new(64).unwrap()))
-            .stage_with(StageOptions::new().workers(1), |x| x ^ 0x5a5a)
+            .stage_with(SyncStageOptions::new().workers(1), |x| x ^ 0x5a5a)
             .run()
     });
     assert_eq!(r.len(), 2000);
@@ -2068,20 +2075,20 @@ fn test_stream_stages_at_pool_size_no_deadlock() {
     assert!(r.iter().all(|&x| x >= 8));
 }
 
-/// Regression: explicit `StageOptions::workers` pins whose sum (plus the
+/// Regression: explicit `SyncStageOptions::workers` pins whose sum (plus the
 /// feeder) exceeds the pool must be clamped to the liveness budget, not
 /// oversubscribe the pool into a deadlock. `workers(3) + workers(3)` on a
 /// 4-thread pool previously hung for n ≫ buffer.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn test_stream_explicit_pins_exceeding_pool_no_deadlock() {
-    use youpipe::StageOptions;
+    use youpipe::SyncStageOptions;
 
     let r: Vec<u64> = run_with_deadlock_watchdog(|| {
         stream(0..2000u64)
             .with_compute_pool(youpipe::ComputePool::new(4))
-            .stage_with(StageOptions::new().workers(3), |x| x + 1)
-            .stage_with(StageOptions::new().workers(3), |x| x * 2)
+            .stage_with(SyncStageOptions::new().workers(3), |x| x + 1)
+            .stage_with(SyncStageOptions::new().workers(3), |x| x * 2)
             .stage(|x| x + 10)
             .run()
     });

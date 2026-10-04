@@ -38,7 +38,7 @@ The streaming path (`stream(..)`) ignores it: streaming already load-balances
 per-item skew through its MPMC channel + per-stage workers (a stalled worker
 simply stops draining while peers keep consuming), and there is no fork/join
 oversplit decision to tune. To control streaming tail latency, raise
-`compute_workers` or pin a stage's `StageOptions::workers`.
+`compute_workers` or pin a stage's `SyncStageOptions::workers`.
 
 ### `Slots<T>` — Index-Based Zero-Copy Buffers
 
@@ -391,11 +391,11 @@ stream(items)                       // StreamPipe<StreamStart, I, I>
 | Builder method        | Runtime topology                                                          |
 | --------------------- | ------------------------------------------------------------------------- |
 | `.stage(f)`           | `parallelism` compute-pool workers pull, apply `f`, forward               |
-| `.stage_with(opts,f)` | same, with `opts.workers` / `opts.buffer` pinning that stage              |
+| `.stage_with(opts,f)` | same, with `opts.workers` / `opts.buffer` pinning that stage (`SyncStageOptions`) |
 | `.expand(f)`          | like `.stage` but each input → `Vec<N>` outputs (inherits parent's `seq`) |
 | `.fence(mode)`        | dedicated forwarder thread batching between adjacent stages               |
 | `.stage_async(f)`     | `io_concurrency` tokio tasks on the async runtime (M:N)                   |
-| `.stage_async_with(o,f)` | same, with `opts.io_concurrency` / `opts.buffer` pinning that stage    |
+| `.stage_async_with(o,f)` | same, with `o.io_concurrency` / `o.buffer` pinning that stage (`AsyncStageOptions`) |
 | `.ordered()`          | feeder tags each item with `seq`; collector reorders via `ReorderBuffer`  |
 | `.with_cancel(token)` | feeder/workers/bridges check `is_cancelled()` per iteration               |
 | `.for_each(f)`        | side-effect terminal: drains item-by-item, no output `Vec` materialised   |
@@ -403,7 +403,8 @@ stream(items)                       // StreamPipe<StreamStart, I, I>
 The stage chain is a typestate (`SyncStage<FenceLink<SyncStage<StreamStart,…>>>`)
 walked by the `StageSpawn` trait — `spawn` recurses inside-out (older stages
 first) so the data-flow direction matches. `stage_budget()` reports the number
-of compute-pool stages plus any `StageOptions::workers` pins. `.run()` then
+of compute-pool stages plus any `SyncStageOptions::workers` pins. `.run()`
+then
 enforces the liveness invariant `feeder(≤1) + Σ stage workers ≤ pool_threads`:
 the feeder reserves its slot first, explicit pins are granted upstream-first
 (clamped to what remains, one slot held back per not-yet-spawned sync stage),
@@ -416,6 +417,22 @@ dedicated-thread mode: stage workers and the feeder are plain OS threads and
 the pool is left untouched. Per-stage `buffer` / `io_concurrency` pins
 replace the global `buffer_size` (and its `downstream_workers × 4` floor) /
 `io_concurrency` for that stage only.
+
+#### Options types split by stage kind (2026-10, ex-todo #6)
+
+The former unified `StageOptions { workers, io_concurrency, buffer }` silently
+ignored knobs that do not apply to a stage's kind (`workers` on async stages,
+`io_concurrency` on sync ones, everything but `buffer` on fences). It is now
+three types — `SyncStageOptions { workers, buffer }` (`.stage_with` /
+`.expand_with` / `.expand_emit_with`), `AsyncStageOptions { io_concurrency,
+buffer }` (`.stage_async_with`), `FenceOptions { buffer }` (`.fence_with`) —
+so a cross-kind knob no longer compiles. The same change unified zero-value
+semantics: every count/capacity setter (`StageOptions`-family, pipeline-level
+`with_compute_workers` / `with_async_workers` / `buffer_size` /
+`io_concurrency`, and all seven `with_oversubscribe` copies) previously
+treated `0` as either silent-unpin or silent `max(1)`; they now panic at
+build time via `PipelineConfig::require_nonzero` (`with_compute_workers`'
+upper clamp to `MAX_COMPUTE_WORKERS` stays — that one is deliberate).
 
 #### Async IO stages
 

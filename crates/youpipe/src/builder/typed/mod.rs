@@ -11,7 +11,7 @@ pub(crate) use self::fused::{
 pub use self::{
     borrowed::{PipeRef, TryPipeRef, pipe_ref},
     fused::{Pipe, RangePipe, TryPipe, pipe, pipe_range},
-    stream::{StageOptions, StreamPipe, StreamStart, stream},
+    stream::{AsyncStageOptions, FenceOptions, StreamPipe, StreamStart, SyncStageOptions, stream},
     traits::{
         Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, StageMarker, SyncMap,
         TryMap,

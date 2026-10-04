@@ -32,7 +32,7 @@ Runtime guards (things the type cannot see):
   concurrency on a larger pool, and the fused core has no notion of "use
   only N threads of a pool" (`test_compute_workers_pin_survives_compute_pool`
   fails otherwise). Also avoids ~ms transient-pool construction per run.
-- Per-stage `StageOptions::workers`/`buffer` pins ⇒ no pass-through — same
+- Per-stage `SyncStageOptions::workers`/`buffer` pins ⇒ no pass-through — same
   policy, the pins express per-stage topology with no fused equivalent.
 - `.ordered()` stays **eligible**: pass-through output IS input order.
 
@@ -631,8 +631,8 @@ stage — this removed the per-run `thread::spawn` + join (measured −3.8 %
 on `stream_pipeline/with_fence/1K`, 61 µs/run, 25/25 dominant; 100 K noise
 — see benchmarks.md) that the feeder side shed earlier. When the lease cannot host the
 run, or `run()` executes on a worker of the same pool, the forwarder keeps
-a dedicated OS thread. `fence_with(StageOptions, mode)` reads the fence's
-output-channel capacity from `StageOptions::buffer` (only meaningful knob —
+a dedicated OS thread. `fence_with(FenceOptions, mode)` reads the fence's
+output-channel capacity from `FenceOptions::buffer` (only meaningful knob —
 the forwarder is single-threaded); `fence(mode)` keeps the default
 (`buffer_size` with the `parallelism * 4` floor).
 

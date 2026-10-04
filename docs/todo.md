@@ -155,20 +155,6 @@
 顺带收益：与 crossfire per-thread waker（设计 C，dev/crossfire-waker-designs.md
 §11）叠加后每组的 channel hop 数减少。
 
-### 6. [P1] StageOptions 类型分裂与零值语义统一
-
-- **无效旋钮静默忽略**：`workers` 对 async stage 无意义（async 扇出只读
-  `io_concurrency`/`buffer`）、`io_concurrency` 对 sync stage 无意义——
-  `.stage_async_with(StageOptions::new().workers(64), f)` 编译运行皆通过但
-  什么都不做。拆 `SyncStageOptions { workers, buffer }` /
-  `AsyncStageOptions { io_concurrency, buffer }`，类型系统已在区分 stage
-  种族，编译期拦下比 debug_assert 强。
-- **零值语义两套并存**：`StageOptions::workers(0)`/`buffer(0)`/
-  `io_concurrency(0)` 经 `NonZeroUsize::new` 静默变 `None`=回退默认，而
-  pipeline 级 setter 全是 `max(1)` 截断；`with_oversubscribe(0)` 同病
-  （六处 `.max(1)`），与 `Workload::Custom(NonZeroUsize)` 的纪律不一致。
-  统一为 assert! 或 NonZero 入参，一次 breaking 收敛。
-
 ### 7. [P1] 取消的部分输出语义
 
 取消时 feeder/worker break，collector 排干通道即返回——中途取消产出静默

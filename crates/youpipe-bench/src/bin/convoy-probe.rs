@@ -27,7 +27,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use youpipe::{CancellationToken, FenceMode, PipelineConfig, StageOptions, TokioPool, stream};
+use youpipe::{
+    AsyncStageOptions, CancellationToken, FenceMode, FenceOptions, PipelineConfig,
+    SyncStageOptions, TokioPool, stream,
+};
 
 fn bump(x: u64) -> u64 {
     bb(x.wrapping_add(1))
@@ -114,10 +117,10 @@ struct Cfg {
     shape: String,
     n: usize,
     runs: usize,
-    workers: usize,     // per-stage StageOptions::workers pin (0 = default split)
+    workers: usize,     // per-stage SyncStageOptions::workers pin (0 = default split)
     w1: usize,          // stage-1-only workers pin (0 = fall back to `workers`)
     w2: usize,          // stage-2-only workers pin (0 = fall back to `workers`)
-    pinbuf: usize,      // per-stage StageOptions::buffer pin (0 = default floor)
+    pinbuf: usize,      // per-stage SyncStageOptions::buffer pin (0 = default floor)
     buffer: usize,      // config buffer_size
     chunk: usize,       // fence chunk (0 = Barrier)
     io: usize,          // async io_concurrency
@@ -128,14 +131,14 @@ struct Cfg {
     csv: bool,
 }
 
-fn stage_opts(c: &Cfg) -> StageOptions {
+fn stage_opts(c: &Cfg) -> SyncStageOptions {
     stage_opts_n(c, c.workers)
 }
 
-/// StageOptions with an explicit worker count (`n` = the resolved per-stage
+/// SyncStageOptions with an explicit worker count (`n` = the resolved per-stage
 /// pin: `--w1`/`--w2` fall back to `--workers`).
-fn stage_opts_n(c: &Cfg, n: usize) -> StageOptions {
-    let mut o = StageOptions::new();
+fn stage_opts_n(c: &Cfg, n: usize) -> SyncStageOptions {
+    let mut o = SyncStageOptions::new();
     if n > 0 {
         o = o.workers(n);
     }
@@ -183,9 +186,9 @@ fn run_shape(c: &Cfg, data: &[u64], tokio_handle: Option<&tokio::runtime::Handle
     };
     let opts = stage_opts(c);
     let fence_opts = if c.pinbuf > 0 {
-        StageOptions::new().buffer(c.pinbuf)
+        FenceOptions::new().buffer(c.pinbuf)
     } else {
-        StageOptions::new()
+        FenceOptions::new()
     };
     let never = CancellationToken::new();
     let config = PipelineConfig::default()
@@ -234,7 +237,7 @@ fn run_shape(c: &Cfg, data: &[u64], tokio_handle: Option<&tokio::runtime::Handle
                 .stage_with(stage_opts_n(c, c.w1), f)
                 .stage_with(stage_opts_n(c, c.w2_or()), f)
                 .stage_async_with(
-                    StageOptions::new().io_concurrency(c.io),
+                    AsyncStageOptions::new().io_concurrency(c.io),
                     |x: u64| async move { bb(x.wrapping_add(1)) },
                 )
                 .run()
@@ -246,7 +249,7 @@ fn run_shape(c: &Cfg, data: &[u64], tokio_handle: Option<&tokio::runtime::Handle
             pipe.with_async_pool(TokioPool::new(h.clone()))
                 .stage_with(opts, f)
                 .stage_async_with(
-                    StageOptions::new().io_concurrency(c.io),
+                    AsyncStageOptions::new().io_concurrency(c.io),
                     |x: u64| async move { bb(x.wrapping_add(1)) },
                 )
                 .run()
@@ -257,7 +260,7 @@ fn run_shape(c: &Cfg, data: &[u64], tokio_handle: Option<&tokio::runtime::Handle
             let h = tokio_handle.expect("async shapes need the runtime handle");
             pipe.with_async_pool(TokioPool::new(h.clone()))
                 .stage_async_with(
-                    StageOptions::new().io_concurrency(c.io),
+                    AsyncStageOptions::new().io_concurrency(c.io),
                     |x: u64| async move { bb(x.wrapping_add(1)) },
                 )
                 .run()

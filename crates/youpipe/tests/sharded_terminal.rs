@@ -12,7 +12,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use youpipe::{FenceMode, StageOptions, stream, sync::CancellationToken};
+use youpipe::{FenceMode, SyncStageOptions, stream, sync::CancellationToken};
 
 /// Miri runs ~100x slower than native: shrink the item counts (the topology
 /// under test — shard count, EOF aggregation, ordering — is size-independent).
@@ -118,7 +118,7 @@ fn sharded_terminal_semantics() {
     // ── Small-worker shape (2 workers): drains to EOF without hang ──
     let got = stream(0..n_aux() as u64)
         .with_cancel(inert_cancel())
-        .stage_with(StageOptions::new().workers(2), |x: u64| x + 3)
+        .stage_with(SyncStageOptions::new().workers(2), |x: u64| x + 3)
         .ordered()
         .run();
     assert_eq!(got, (0..n_aux() as u64).map(|x| x + 3).collect::<Vec<_>>());

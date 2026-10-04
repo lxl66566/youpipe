@@ -70,9 +70,10 @@ pub mod state;
 pub mod sync;
 
 pub use builder::{
-    Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, Pipe, PipeRef,
-    PipelineConfig, RangePipe, StageMarker, StageOptions, StreamPipe, StreamStart, SyncMap, TryMap,
-    TryPipe, TryPipeRef, Workload, pipe, pipe_range, pipe_ref, stream,
+    AsyncStageOptions, FenceOptions, Filter, FusedStage, FusedTryStage, Identity, InfallibleChain,
+    MapErr, Pipe, PipeRef, PipelineConfig, RangePipe, StageMarker, StreamPipe, StreamStart,
+    SyncMap, SyncStageOptions, TryMap, TryPipe, TryPipeRef, Workload, pipe, pipe_range, pipe_ref,
+    stream,
 };
 pub use executor::{ComputePool, compute::MAX_COMPUTE_WORKERS};
 pub use handoff::{AsyncReceiver, AsyncSender, Receiver, Sender, async_channel, channel};

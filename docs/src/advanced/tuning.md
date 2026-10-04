@@ -10,8 +10,8 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `with_buffer_size(n)` | channel capacity between stages | streaming | bursty producers, memory bounds |
 | `with_io_concurrency(n)` | in-flight async tasks per async stage | streaming | IO waits are cheap and plentiful |
 | `.ordered()` | reorder pass restoring input order | streaming | output must match input order |
-| `.fence(mode)` / `.fence_with(StageOptions, mode)` | isolation at one stage boundary (`buffer` pin) | streaming | downstream must not see partial upstream |
-| `StageOptions` | per-stage workers / io_concurrency / buffer | streaming | stages have unequal costs |
+| `.fence(mode)` / `.fence_with(FenceOptions, mode)` | isolation at one stage boundary (`buffer` pin) | streaming | downstream must not see partial upstream |
+| `SyncStageOptions` / `AsyncStageOptions` | per-stage workers (sync) / io_concurrency (async) / buffer (both) | streaming | stages have unequal costs |
 | `ComputePool::new_pinned(n)` | workers pinned 1:1 to allowed CPUs | pools | tight loops of large saturated fused batches (**not** streaming — see [pools](pools.md)) |
 | `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker / per-task-group SPSC shards | streaming | multi-worker (sync) or high-fanout (async) terminal stage is the bottleneck (see [dev/streaming](../dev/streaming.md)) |
 | `YOUPIPE_SPIN_ANCHOR` | adaptive pre-anchor `try_recv` spin window (µs) in sync worker recv loops | streaming | convoy collapse: serial supplier (feeder/fence) feeding ≥ ~10 workers, run times ~items × 2 µs (see [dev/streaming](../dev/streaming.md)) |
@@ -142,7 +142,8 @@ post-convoy-fix soak.
 
 `compute_workers` is a **budget**, not a thread count. The runner first
 reserves one pool slot for the feeder (a pool job whenever `n > buffer`),
-then grants `StageOptions::workers` pins in pipeline order — each clamped to
+then grants `SyncStageOptions::workers` pins in pipeline order — each clamped
+  to
 what remains, with one slot held back per not-yet-spawned sync stage — and
 divides the rest equally across unpinned stages. Every sync stage keeps at
 least 1 resident worker, so total blocking pool jobs never exceed the pool:
@@ -157,10 +158,10 @@ use youpipe::prelude::*;
 // The async stage gets its own io_concurrency and buffer, overriding the
 // pipeline-level values.
 let r: Vec<u64> = items.stream()
-    .stage_with(StageOptions::new().workers(8), |x: u64| crunch(x))
+    .stage_with(SyncStageOptions::new().workers(8), |x: u64| crunch(x))
     .stage(|x: u64| light(x))
     .stage_async_with(
-        StageOptions::new().io_concurrency(512).buffer(1024),
+        AsyncStageOptions::new().io_concurrency(512).buffer(1024),
         |x: u64| async move { io(x).await },
     )
     .run();
@@ -193,13 +194,14 @@ saturated with cheap waits; it doubles as the memory bound — each in-flight
 task holds its item and buffers.
 
 Override per stage when stages differ: a network stage wants ~512, a local
-disk stage ~16 — via `stage_async_with(StageOptions::new().io_concurrency(n), ..)`.
+disk stage ~16 — via
+`stage_async_with(AsyncStageOptions::new().io_concurrency(n), ..)`.
 
 ## `buffer_size`: backpressure depth (streaming)
 
 Per-channel capacity between stages, default 256. The effective capacity is
 `max(buffer_size, downstream_workers * 4)` — a floor so every downstream
-worker can hold items in flight; an explicit `StageOptions::buffer(n)`
+worker can hold items in flight; an explicit `SyncStageOptions::buffer(n)`
 replaces that logic for that stage's output channel. Small buffers tighten
 backpressure (less peak memory); large ones absorb bursts.
 
@@ -222,5 +224,5 @@ overlaps — the right default for mixed CPU/IO.
 | Skewed CPU (10 % of items cost 1000×) | `with_workload(Workload::Unbalanced)`; extreme skew: `Custom(16..=32)`; cheap ns-scale items: `YOUPIPE_CHUNK_SLACK=0` |
 | Blocking IO inside a sync `.stage()` | oversized compute pool via `with_compute_pool` — see [pools](pools.md); `Workload` will not help |
 | Many small async IO ops | raise `io_concurrency` (512+) globally or per stage; widen `buffer_size` for bursty sources |
-| Heavy CPU stage + light IO stage | pin the heavy stage's `StageOptions::workers`; give the async stage its own `io_concurrency`/`buffer` |
+| Heavy CPU stage + light IO stage | pin the heavy stage's `SyncStageOptions::workers`; give the async stage its own `AsyncStageOptions::io_concurrency`/`buffer` |
 | Consumer needs input order | `.ordered()`; drop it if completion order is acceptable |

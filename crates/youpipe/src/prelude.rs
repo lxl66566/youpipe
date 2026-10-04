@@ -19,7 +19,8 @@
 #[cfg(feature = "tokio-runtime")]
 pub use crate::runtime::TokioPool;
 pub use crate::{
-    Identity, Pipe, PipelineConfig, StageOptions, StreamPipe, StreamStart, Workload,
+    AsyncStageOptions, FenceOptions, Identity, Pipe, PipelineConfig, StreamPipe, StreamStart,
+    SyncStageOptions, Workload,
     executor::{ComputePool, compute::MAX_COMPUTE_WORKERS},
     handoff::{Receiver, Sender, async_channel, channel},
     pipe, pipe_range, pipe_ref,

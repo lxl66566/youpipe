@@ -11,7 +11,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use youpipe::{PipelineConfig, StageOptions, stream, sync::CancellationToken};
+use youpipe::{AsyncStageOptions, PipelineConfig, stream, sync::CancellationToken};
 
 /// Miri runs ~100x slower than native: shrink the item counts (the topology
 /// under test — shard count, EOF aggregation, ordering — is size-independent).
@@ -117,9 +117,10 @@ fn sharded_async_terminal_semantics() {
     //    guard against per-shard fixed cost breaking tiny terminals ──
     let got = stream(0..n_aux() as u64)
         .with_cancel(inert_cancel())
-        .stage_async_with(StageOptions::new().io_concurrency(2), |x: u64| async move {
-            x + 3
-        })
+        .stage_async_with(
+            AsyncStageOptions::new().io_concurrency(2),
+            |x: u64| async move { x + 3 },
+        )
         .ordered()
         .run();
     assert_eq!(got, (0..n_aux() as u64).map(|x| x + 3).collect::<Vec<_>>());
@@ -127,9 +128,10 @@ fn sharded_async_terminal_semantics() {
     // ── io_concurrency 1: never shards (single task IS one SPSC ring) ──
     let mut got = stream(0..n_aux() as u64)
         .with_cancel(inert_cancel())
-        .stage_async_with(StageOptions::new().io_concurrency(1), |x: u64| async move {
-            x + 4
-        })
+        .stage_async_with(
+            AsyncStageOptions::new().io_concurrency(1),
+            |x: u64| async move { x + 4 },
+        )
         .run();
     got.sort_unstable();
     assert_eq!(got, (0..n_aux() as u64).map(|x| x + 4).collect::<Vec<_>>());

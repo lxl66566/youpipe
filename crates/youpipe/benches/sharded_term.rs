@@ -19,8 +19,8 @@
 //! * `single_*` — one stage, the direct todo #1 shape (hotpath: engine paced at ~365 ns/item by the
 //!   collector-side data plane);
 //! * `multi2_*` — two stages (terminal fan-in behind one mid channel);
-//! * `workers2_*` — `StageOptions::workers(2)` small-terminal shape, the guard against per-shard
-//!   fixed cost regressing low-worker pipelines;
+//! * `workers2_*` — `SyncStageOptions::workers(2)` small-terminal shape, the guard against
+//!   per-shard fixed cost regressing low-worker pipelines;
 //! * `expand_*` — expand terminal (per-shard multi-output).
 //!
 //! `cheap` (x+1) is the primary read: with near-zero per-item CPU the
@@ -32,7 +32,7 @@ mod common;
 use std::hint::black_box as bb;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use youpipe::{CancellationToken, StageOptions, stream};
+use youpipe::{CancellationToken, SyncStageOptions, stream};
 
 /// Per-item CPU cost aligned with `mixed_load`'s `youpipe_stream_cpu` anchor
 /// (50 mul-add rounds ≈ tens of ns).
@@ -143,7 +143,7 @@ fn bench_sharded_term(c: &mut Criterion) {
                 |v| {
                     let r = stream(v)
                         .with_cancel(cancel.clone())
-                        .stage_with(StageOptions::new().workers(2), |x: u64| bb(cpu_work(x)))
+                        .stage_with(SyncStageOptions::new().workers(2), |x: u64| bb(cpu_work(x)))
                         .run();
                     bb(r)
                 },

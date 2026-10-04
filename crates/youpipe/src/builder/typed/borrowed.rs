@@ -138,9 +138,16 @@ impl<'a, S, T, O> PipeRef<'a, S, T, O> {
 
     /// Oversubscribe the compute pool — see
     /// [`Pipe::with_oversubscribe`](crate::Pipe::with_oversubscribe).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `factor == 0` (see [`Pipe::with_oversubscribe`]).
     #[must_use]
     pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = NonZeroUsize::new(factor.max(1));
+        self.oversubscribe = Some(PipelineConfig::require_nonzero(
+            factor,
+            "with_oversubscribe",
+        ));
         self
     }
 
@@ -467,9 +474,16 @@ impl<'a, S, T, O, E> TryPipeRef<'a, S, T, O, E> {
 
     /// Oversubscribe the compute pool — see
     /// [`Pipe::with_oversubscribe`](crate::Pipe::with_oversubscribe).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `factor == 0` (see [`Pipe::with_oversubscribe`]).
     #[must_use]
     pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = NonZeroUsize::new(factor.max(1));
+        self.oversubscribe = Some(PipelineConfig::require_nonzero(
+            factor,
+            "with_oversubscribe",
+        ));
         self
     }
 

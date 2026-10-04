@@ -960,13 +960,19 @@ fn spawn_forwarder<M, Tx, R>(
 
 // ── StreamPipe (data-first chainable streaming pipeline) ──
 
-/// Per-stage tuning overrides, chainable like the pipeline itself.
+/// Per-stage tuning for **sync and expand** stages, chainable like the
+/// pipeline itself. Attach via [`StreamPipe::stage_with`] /
+/// [`StreamPipe::expand_with`] / [`StreamPipe::expand_emit_with`].
 ///
 /// Every field is optional: unset fields fall back to the pipeline-level
 /// [`PipelineConfig`] value (or the runner's equal division of
-/// `compute_workers` across sync stages, for `workers`). Attach to a stage
-/// via [`StreamPipe::stage_with`] / [`StreamPipe::stage_async_with`] /
-/// [`StreamPipe::expand_with`].
+/// `compute_workers` across sync stages, for `workers`).
+///
+/// The options types are split by stage kind so cross-kind knobs are
+/// unrepresentable at compile time: `workers` does not exist on
+/// [`AsyncStageOptions`] (an async stage has no compute-pool workers), and
+/// neither kind's knobs exist on [`FenceOptions`] (the fence forwarder is
+/// single-threaded).
 ///
 /// ```
 /// # #[cfg(feature = "tokio-runtime")] fn main() {
@@ -976,10 +982,10 @@ fn spawn_forwarder<M, Tx, R>(
 /// // stage runs 512 concurrent IO tasks with a deep buffer.
 /// let r: Vec<u64> = (0..1000)
 ///     .stream()
-///     .stage_with(StageOptions::new().workers(8), |x: u64| crunch(x))
+///     .stage_with(SyncStageOptions::new().workers(8), |x: u64| crunch(x))
 ///     .stage(|x: u64| x + 1)
 ///     .stage_async_with(
-///         StageOptions::new().io_concurrency(512).buffer(1024),
+///         AsyncStageOptions::new().io_concurrency(512).buffer(1024),
 ///         |x: u64| async move { fetch(x).await },
 ///     )
 ///     .run();
@@ -1006,13 +1012,12 @@ fn spawn_forwarder<M, Tx, R>(
 /// alone and spawns dedicated OS threads instead — the request is then
 /// honored as-is, since threads are not pool-bounded.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct StageOptions {
+pub struct SyncStageOptions {
     pub(crate) workers: Option<NonZeroUsize>,
-    pub(crate) io_concurrency: Option<NonZeroUsize>,
     pub(crate) buffer: Option<NonZeroUsize>,
 }
 
-impl StageOptions {
+impl SyncStageOptions {
     /// A fresh options set — everything unset, everything falls back to the
     /// pipeline-level [`PipelineConfig`].
     #[must_use]
@@ -1032,19 +1037,17 @@ impl StageOptions {
     ///
     /// Pinning `workers` or `buffer` also opts a pure-sync chain out of the
     /// fused pass-through — see [`StreamPipe::run`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` — a zero-worker pin is always a caller bug, so it
+    /// fails at build time instead of silently un-pinning the stage.
     #[must_use]
     pub fn workers(mut self, n: usize) -> Self {
-        self.workers = NonZeroUsize::new(n);
-        self
-    }
-
-    /// Pin this async stage's concurrent-task fan-out, bypassing the global
-    /// `io_concurrency`. The right knob when one async stage talks to a
-    /// high-latency network (wants 512 in flight) while another hits a local
-    /// disk (wants 16).
-    #[must_use]
-    pub fn io_concurrency(mut self, n: usize) -> Self {
-        self.io_concurrency = NonZeroUsize::new(n);
+        self.workers = Some(PipelineConfig::require_nonzero(
+            n,
+            "SyncStageOptions::workers",
+        ));
         self
     }
 
@@ -1052,9 +1055,101 @@ impl StageOptions {
     /// `buffer_size` (and its `downstream_workers * 4` floor). Small buffers
     /// tighten backpressure (less peak memory); large ones absorb bursts.
     /// Correctness is unaffected — only throughput/memory trade off.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` (see [`SyncStageOptions::workers`]).
     #[must_use]
     pub fn buffer(mut self, n: usize) -> Self {
-        self.buffer = NonZeroUsize::new(n);
+        self.buffer = Some(PipelineConfig::require_nonzero(
+            n,
+            "SyncStageOptions::buffer",
+        ));
+        self
+    }
+}
+
+/// Per-stage tuning for **async** stages — attach via
+/// [`StreamPipe::stage_async_with`]. Unset fields fall back to the
+/// pipeline-level [`PipelineConfig`]. There is no `workers` knob here: an
+/// async stage has no compute-pool workers, its fan-out is
+/// [`AsyncStageOptions::io_concurrency`] (the runtime multiplexes those
+/// tasks over `async_workers` OS threads).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AsyncStageOptions {
+    pub(crate) io_concurrency: Option<NonZeroUsize>,
+    pub(crate) buffer: Option<NonZeroUsize>,
+}
+
+impl AsyncStageOptions {
+    /// A fresh options set — everything unset, everything falls back to the
+    /// pipeline-level [`PipelineConfig`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pin this async stage's concurrent-task fan-out, bypassing the global
+    /// `io_concurrency`. The right knob when one async stage talks to a
+    /// high-latency network (wants 512 in flight) while another hits a local
+    /// disk (wants 16).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` — a zero fan-out cannot make progress, so it
+    /// fails at build time instead of silently un-pinning the stage.
+    #[must_use]
+    pub fn io_concurrency(mut self, n: usize) -> Self {
+        self.io_concurrency = Some(PipelineConfig::require_nonzero(
+            n,
+            "AsyncStageOptions::io_concurrency",
+        ));
+        self
+    }
+
+    /// Pin this stage's **output** channel capacity — same semantics as
+    /// [`SyncStageOptions::buffer`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` (see [`SyncStageOptions::workers`]).
+    #[must_use]
+    pub fn buffer(mut self, n: usize) -> Self {
+        self.buffer = Some(PipelineConfig::require_nonzero(
+            n,
+            "AsyncStageOptions::buffer",
+        ));
+        self
+    }
+}
+
+/// Per-link tuning for a fence — attach via [`StreamPipe::fence_with`].
+/// The fence forwarder is single-threaded, so the output-channel capacity
+/// is the only knob: a tight buffer increases backpressure onto the
+/// upstream stage; the default (`buffer_size` with the `parallelism * 4`
+/// floor) favours throughput.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FenceOptions {
+    pub(crate) buffer: Option<NonZeroUsize>,
+}
+
+impl FenceOptions {
+    /// A fresh options set — everything unset, everything falls back to the
+    /// pipeline-level [`PipelineConfig`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pin the fence's **output** channel capacity, bypassing `buffer_size`
+    /// (and its `parallelism * 4` floor).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` (see [`SyncStageOptions::workers`]).
+    #[must_use]
+    pub fn buffer(mut self, n: usize) -> Self {
+        self.buffer = Some(PipelineConfig::require_nonzero(n, "FenceOptions::buffer"));
         self
     }
 }
@@ -1073,7 +1168,7 @@ pub struct StageBudget {
     /// stage-worker division (see `try_exec`).
     pub fences: usize,
     /// Number of those stages that pinned their worker count via
-    /// `StageOptions::workers`.
+    /// `SyncStageOptions::workers`.
     pub explicit_stages: usize,
     /// Sum of the pinned worker counts.
     pub explicit_workers: usize,
@@ -1160,7 +1255,7 @@ where
 pub struct SyncStage<Prev, F> {
     pub(super) prev: Prev,
     pub(super) f: F,
-    pub(super) opts: StageOptions,
+    pub(super) opts: SyncStageOptions,
 }
 
 /// 1-to-N expansion stage: `Fn(O, &mut Vec<N>)` (push-style — appends zero
@@ -1176,7 +1271,7 @@ pub struct SyncStage<Prev, F> {
 pub struct ExpandStage<Prev, F, N> {
     pub(super) prev: Prev,
     pub(super) f: F,
-    pub(super) opts: StageOptions,
+    pub(super) opts: SyncStageOptions,
     _marker: PhantomData<fn() -> N>,
 }
 
@@ -1188,7 +1283,7 @@ pub struct ExpandStage<Prev, F, N> {
 pub struct AsyncStage<Prev, F> {
     pub(super) prev: Prev,
     pub(super) f: F,
-    pub(super) opts: StageOptions,
+    pub(super) opts: AsyncStageOptions,
 }
 
 /// Fence link: inserts a [`FenceBarrier`] between two stages. The type is
@@ -1198,10 +1293,9 @@ pub struct AsyncStage<Prev, F> {
 pub struct FenceLink<Prev> {
     pub(super) prev: Prev,
     pub(super) mode: FenceMode,
-    /// Only `buffer` is meaningful here (the forwarder is single-threaded —
-    /// `workers` / `io_concurrency` are ignored, the same convention as
-    /// `io_concurrency` on sync stages).
-    pub(super) opts: StageOptions,
+    /// Only the output-buffer pin applies (the forwarder is single-threaded
+    /// — that is the whole `FenceOptions` type).
+    pub(super) opts: FenceOptions,
 }
 
 /// Marker trait for a streaming stage chain that knows how to spawn itself
@@ -1251,7 +1345,8 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     }
 
     /// Worker-budget summary of this chain — number of pool-consuming stages
-    /// plus any per-stage worker counts pinned via `StageOptions::workers`.
+    /// plus any per-stage worker counts pinned via
+    /// `SyncStageOptions::workers`.
     /// Used by `StreamPipe::run` to divide the pool across stages.
     fn stage_budget(&self) -> StageBudget;
 
@@ -1306,7 +1401,8 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     /// Eligibility is compile-time by impl set: only `StreamStart` and
     /// `SyncStage` override this; an `ExpandStage` / `FenceLink` /
     /// `AsyncStage` anywhere in the chain keeps the default (`Err`) and the
-    /// run takes the streaming path. A `SyncStage` whose `StageOptions` pin
+    /// run takes the streaming path. A `SyncStage` whose
+    /// `SyncStageOptions` pin
     /// `workers` / `buffer` also declines — those pins express per-stage
     /// topology with no fused equivalent.
     ///
@@ -1572,14 +1668,14 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     pub cancel: Option<CancellationToken>,
     pub n: usize,
     /// Default per-stage compute-pool parallelism, set by `StreamPipe::run`
-    /// from the worker budget: explicit `StageOptions::workers` pins are
+    /// from the worker budget: explicit `SyncStageOptions::workers` pins are
     /// deducted from `compute_workers` first, then the remainder is divided
     /// equally across the unpinned sync stages (clamped to ≥ 1). A stage's
     /// actual worker count is resolved in `StreamCtx::stage_workers`, which
-    /// consults the stage's own `StageOptions` before falling back here.
+    /// consults the stage's own `SyncStageOptions` before falling back here.
     /// Bridges (which have no options of their own) use this value directly;
-    /// fences use it only as the fallback for their `StageOptions::buffer`
-    /// pin, via `stage_buffer`.
+    /// fences use it only as the fallback for their
+    /// `FenceOptions::buffer` pin, via `stage_buffer`.
     pub per_stage_parallelism: usize,
     /// When `true`, sync/expand stage workers, fence forwarders (and a
     /// non-inline feeder) run as dedicated OS threads instead of pool jobs. Chosen by
@@ -1669,9 +1765,10 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
         concurrency.min(self.config.async_workers.max(1))
     }
 
-    /// Resolve a stage's worker count: the stage's explicit
-    /// `StageOptions::workers` pin, or the runner-computed default division.
-    /// Clamped to `[1, n]` (a stage never gets more workers than items).
+    /// Resolve a sync/expand stage's worker count: the stage's explicit
+    /// [`SyncStageOptions::workers`] pin, or the runner-computed default
+    /// division. Clamped to `[1, n]` (a stage never gets more workers than
+    /// items).
     ///
     /// Pool mode additionally clamps the grant to the remaining liveness
     /// budget (`worker_slots_left`), reserving one slot per not-yet-spawned
@@ -1680,7 +1777,7 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     /// (upstream first) only until the budget runs out; what remains is
     /// spread over later stages at 1 worker each. In dedicated-thread mode
     /// the pool is untouched and the request is honored as-is.
-    pub fn stage_workers(&self, opts: &StageOptions) -> usize {
+    pub fn stage_workers(&self, opts: &SyncStageOptions) -> usize {
         let requested = opts
             .workers
             .map_or(self.per_stage_parallelism, NonZeroUsize::get);
@@ -1735,18 +1832,19 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     }
 
     /// Resolve a stage's output-channel capacity: the stage's explicit
-    /// `StageOptions::buffer` pin (used verbatim — the caller opted into this
-    /// exact backpressure), or the config value with the
-    /// `downstream_workers * 4` floor.
-    pub fn stage_buffer(&self, opts: &StageOptions, parallelism: usize) -> usize {
-        opts.buffer
-            .map_or_else(|| self.buffer_size(parallelism), NonZeroUsize::get)
+    /// buffer pin (used verbatim — the caller opted into this exact
+    /// backpressure), or the config value with the
+    /// `downstream_workers * 4` floor. Takes the buffer field because every
+    /// options kind ([`SyncStageOptions`] / [`AsyncStageOptions`] /
+    /// [`FenceOptions`]) carries it.
+    pub fn stage_buffer(&self, buffer: Option<NonZeroUsize>, parallelism: usize) -> usize {
+        buffer.map_or_else(|| self.buffer_size(parallelism), NonZeroUsize::get)
     }
 
     /// Resolve an async stage's task fan-out: the stage's explicit
-    /// `StageOptions::io_concurrency` pin, or the global config value.
-    /// Clamped to `[1, n]`.
-    pub fn stage_io_concurrency(&self, opts: &StageOptions) -> usize {
+    /// [`AsyncStageOptions::io_concurrency`] pin, or the global config
+    /// value. Clamped to `[1, n]`.
+    pub fn stage_io_concurrency(&self, opts: &AsyncStageOptions) -> usize {
         let resolved = opts
             .io_concurrency
             .map_or(self.config.io_concurrency, NonZeroUsize::get);
@@ -1894,7 +1992,7 @@ where
     fn spawn<R: AsyncRuntime>(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx<'_, R>) -> FinalRx<M> {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
-        let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, parallelism);
         let (out_tx, out_rx) = channel::<(u64, M)>(buffer);
         spawn_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::Sync(out_rx)
@@ -1914,7 +2012,7 @@ where
         // their output feeds multiple workers in this stage.
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
-        let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, parallelism);
         if ctx.sharded_terminal(parallelism) {
             // YOUPIPE_SHARDED_TERM=1: one SPSC ring per worker instead of one
             // shared ring — removes both the send-side producer CAS
@@ -1942,7 +2040,7 @@ where
         // mixed-mode producers).
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
-        let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, parallelism);
         let (out_tx, out_rx) = sync_async_channel::<(u64, M)>(buffer);
         spawn_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         out_rx
@@ -1964,7 +2062,7 @@ where
         // landings per item (measured on `.stage_async(a).stage(s)`).
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
-        let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, parallelism);
         let (out_tx, out_rx) = channel::<(u64, M)>(buffer);
         spawn_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::Sync(out_rx)
@@ -1980,7 +2078,7 @@ where
         // MPSC — mirrors `spawn_single` vs `spawn`.
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
-        let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, parallelism);
         if ctx.sharded_terminal(parallelism) {
             // See `SyncStage::spawn_single` — the feeder being async changes
             // nothing about the terminal fan-in shape.
@@ -2088,7 +2186,7 @@ where
     fn spawn<R: AsyncRuntime>(self, rx: Receiver<(u64, In)>, ctx: &StreamCtx<'_, R>) -> FinalRx<N> {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
-        let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, parallelism);
         let (out_tx, out_rx) = channel::<(u64, N)>(buffer);
         spawn_expand_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::Sync(out_rx)
@@ -2104,7 +2202,7 @@ where
     {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
-        let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, parallelism);
         if ctx.sharded_terminal(parallelism) {
             // See `SyncStage::spawn_single`; expand workers benefit from the
             // same send-side de-contention as plain sync workers.
@@ -2127,7 +2225,7 @@ where
         // expansion workers write the mixed-mode sender directly.
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
-        let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, parallelism);
         let (out_tx, out_rx) = sync_async_channel::<(u64, N)>(buffer);
         spawn_expand_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         out_rx
@@ -2143,7 +2241,7 @@ where
         // through prev, converted once at our input.
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
-        let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, parallelism);
         let (out_tx, out_rx) = channel::<(u64, N)>(buffer);
         spawn_expand_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::Sync(out_rx)
@@ -2157,7 +2255,7 @@ where
     ) -> FinalRx<N> {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
-        let buffer = ctx.stage_buffer(&self.opts, parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, parallelism);
         let (out_tx, out_rx) = mpsc_channel::<(u64, N)>(buffer);
         spawn_expand_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::SyncSingle(out_rx)
@@ -2200,7 +2298,7 @@ where
         ctx: &StreamCtx<'_, R>,
     ) -> FinalRx<Prev::Out> {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
-        let buffer = ctx.stage_buffer(&self.opts, ctx.per_stage_parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = channel::<(u64, Prev::Out)>(buffer);
         spawn_forwarder(ctx, mid_rx, fenced_tx, self.mode, ctx.n);
         FinalRx::Sync(fenced_rx)
@@ -2215,7 +2313,7 @@ where
         Self: Sized,
     {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
-        let buffer = ctx.stage_buffer(&self.opts, ctx.per_stage_parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = mpsc_channel::<(u64, Prev::Out)>(buffer);
         spawn_forwarder(ctx, mid_rx, fenced_tx, self.mode, ctx.n);
         FinalRx::SyncSingle(fenced_rx)
@@ -2233,7 +2331,7 @@ where
         // behaviour — no extra bridge needed between the fence and a
         // downstream async stage.
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
-        let buffer = ctx.stage_buffer(&self.opts, ctx.per_stage_parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = sync_async_channel::<(u64, Prev::Out)>(buffer);
         spawn_forwarder(ctx, mid_rx, fenced_tx, self.mode, ctx.n);
         fenced_rx
@@ -2249,7 +2347,7 @@ where
         // converted to sync exactly once (at the fence's own input) instead of
         // up front plus per level.
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
-        let buffer = ctx.stage_buffer(&self.opts, ctx.per_stage_parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = channel::<(u64, Prev::Out)>(buffer);
         spawn_forwarder(ctx, mid_rx, fenced_tx, self.mode, ctx.n);
         FinalRx::Sync(fenced_rx)
@@ -2262,7 +2360,7 @@ where
         ctx: &StreamCtx<'_, R>,
     ) -> FinalRx<Prev::Out> {
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
-        let buffer = ctx.stage_buffer(&self.opts, ctx.per_stage_parallelism);
+        let buffer = ctx.stage_buffer(self.opts.buffer, ctx.per_stage_parallelism);
         let (fenced_tx, fenced_rx) = mpsc_channel::<(u64, Prev::Out)>(buffer);
         spawn_forwarder(ctx, mid_rx, fenced_tx, self.mode, ctx.n);
         FinalRx::SyncSingle(fenced_rx)
@@ -2386,7 +2484,7 @@ where
         // shared MPSC ring, or per-task-group shards under
         // `YOUPIPE_SHARDED_TERM=1`), mirroring `spawn_single` vs `spawn`.
         let prev_rx = self.prev.spawn_async_feeder::<R>(rx, ctx);
-        let buffer = ctx.stage_buffer(&self.opts, ctx.stage_io_concurrency(&self.opts));
+        let buffer = ctx.stage_buffer(self.opts.buffer, ctx.stage_io_concurrency(&self.opts));
         let a_in_rx = bridge_final_rx_to_async::<Prev::Out, R>(prev_rx, buffer, ctx);
         spawn_async_consumers_body_single::<F, Prev::Out, M, Fut, R>(
             self.f, a_in_rx, &self.opts, ctx,
@@ -2423,7 +2521,7 @@ where
 fn spawn_async_consumers_body<F, In, M, Fut, R>(
     f: F,
     a_in_rx: AsyncReceiver<(u64, In)>,
-    opts: &StageOptions,
+    opts: &AsyncStageOptions,
     ctx: &StreamCtx<'_, R>,
 ) -> AsyncReceiver<(u64, M)>
 where
@@ -2434,7 +2532,7 @@ where
     R: AsyncRuntime,
 {
     let concurrency = ctx.stage_io_concurrency(opts);
-    let buffer = ctx.stage_buffer(opts, concurrency);
+    let buffer = ctx.stage_buffer(opts.buffer, concurrency);
     let (a_out_tx, a_out_rx) = async_channel::<(u64, M)>(buffer);
     let pool = ctx.acquire_async().expect("failed to build async runtime");
     let f = Arc::new(f);
@@ -2532,7 +2630,7 @@ fn spawn_async_terminal_tasks<F, In, M, Fut, R, I>(
 fn spawn_async_consumers_body_single<F, In, M, Fut, R>(
     f: F,
     a_in_rx: AsyncReceiver<(u64, In)>,
-    opts: &StageOptions,
+    opts: &AsyncStageOptions,
     ctx: &StreamCtx<'_, R>,
 ) -> FinalRx<M>
 where
@@ -2543,7 +2641,7 @@ where
     R: AsyncRuntime,
 {
     let concurrency = ctx.stage_io_concurrency(opts);
-    let buffer = ctx.stage_buffer(opts, concurrency);
+    let buffer = ctx.stage_buffer(opts.buffer, concurrency);
     let shards = ctx.sharded_async_terminal(concurrency);
     if shards > 0 {
         let (txs, out_rx) = sharded_mpsc_async_channel::<(u64, M)>(shards, buffer);
@@ -2671,7 +2769,7 @@ where
 fn spawn_async_consumers<Prev, F, In, M, Fut, R>(
     f: F,
     prev_rx: FinalRx<Prev::Out>,
-    opts: &StageOptions,
+    opts: &AsyncStageOptions,
     ctx: &StreamCtx<'_, R>,
 ) -> FinalRx<M>
 where
@@ -2683,7 +2781,7 @@ where
     M: Send + Unpin + 'static,
     R: AsyncRuntime,
 {
-    let buffer = ctx.stage_buffer(opts, ctx.stage_io_concurrency(opts));
+    let buffer = ctx.stage_buffer(opts.buffer, ctx.stage_io_concurrency(opts));
     let a_in_rx = bridge_final_rx_to_async::<Prev::Out, R>(prev_rx, buffer, ctx);
     FinalRx::Async(spawn_async_consumers_body::<F, Prev::Out, M, Fut, R>(
         f, a_in_rx, opts, ctx,
@@ -2794,8 +2892,8 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
 
     /// Set the compute-pool worker budget that gets divided across sync
     /// stages (streaming counterpart of the fused path's thread count).
-    /// Unset fields in a [`StageOptions`] attached to a stage fall back to a
-    /// share of this budget.
+    /// Unset fields in a [`SyncStageOptions`] attached to a stage fall back
+    /// to a share of this budget.
     ///
     /// The budget is **pinned** by this call: it applies regardless of
     /// [`with_compute_pool`](Self::with_compute_pool) and regardless of the
@@ -2810,27 +2908,39 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
 
     /// Set the async runtime's OS-thread count (streaming-only; async stages
     /// multiplex [`PipelineConfig::io_concurrency`] tasks over these threads).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` — see [`PipelineConfig::with_async_workers`].
     #[must_use]
     pub fn with_async_workers(mut self, n: usize) -> Self {
-        self.config.async_workers = n.max(1);
+        self.config = self.config.with_async_workers(n);
         self
     }
 
     /// Set the per-channel buffer capacity between stages (streaming-only).
     /// See [`PipelineConfig::with_buffer_size`] for the
     /// `max(downstream_workers * 4)` floor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` — see [`PipelineConfig::with_buffer_size`].
     #[must_use]
     pub fn with_buffer_size(mut self, n: usize) -> Self {
-        self.config.buffer_size = n.max(1);
+        self.config = self.config.with_buffer_size(n);
         self
     }
 
     /// Set the default concurrent-task fan-out for async stages
     /// (streaming-only). Overridable per stage via
-    /// [`StageOptions::io_concurrency`] on [`Self::stage_async_with`].
+    /// [`AsyncStageOptions::io_concurrency`] on [`Self::stage_async_with`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` — see [`PipelineConfig::with_io_concurrency`].
     #[must_use]
     pub fn with_io_concurrency(mut self, n: usize) -> Self {
-        self.config.io_concurrency = n.max(1);
+        self.config = self.config.with_io_concurrency(n);
         self
     }
 
@@ -2843,24 +2953,24 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     where
         N: Send + Unpin + 'static,
     {
-        self.stage_with(StageOptions::new(), f)
+        self.stage_with(SyncStageOptions::new(), f)
     }
 
-    /// [`Self::stage`] with per-stage tuning — see [`StageOptions`].
+    /// [`Self::stage`] with per-stage tuning — see [`SyncStageOptions`].
     ///
     /// ```rust
-    /// use youpipe::{StageOptions, stream};
+    /// use youpipe::{SyncStageOptions, stream};
     ///
     /// // Heavy parse stage pinned to 4 workers; later stages divide the rest.
     /// let result: Vec<i32> = stream(0..100)
-    ///     .stage_with(StageOptions::new().workers(4), |x: i32| x + 1)
+    ///     .stage_with(SyncStageOptions::new().workers(4), |x: i32| x + 1)
     ///     .stage(|x: i32| x * 2)
     ///     .run();
     /// # assert_eq!(result.len(), 100);
     /// ```
     pub fn stage_with<N>(
         self,
-        opts: StageOptions,
+        opts: SyncStageOptions,
         f: impl Fn(O) -> N + Send + Sync + 'static,
     ) -> StreamPipe<SyncStage<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N, R>
     where
@@ -2901,18 +3011,18 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     where
         N: Send + Unpin + 'static,
     {
-        self.expand_emit_with(StageOptions::new(), move |item, out| {
+        self.expand_emit_with(SyncStageOptions::new(), move |item, out| {
             out.append(&mut f(item));
         })
     }
 
-    /// [`Self::expand`] with per-stage tuning — see [`StageOptions`].
+    /// [`Self::expand`] with per-stage tuning — see [`SyncStageOptions`].
     #[allow(clippy::type_complexity)] // typestate builder return type; the
     // `impl Fn` + nested `ExpandStage` + `R` param are inherent to the design
     // and not helpfully decomposable.
     pub fn expand_with<N>(
         self,
-        opts: StageOptions,
+        opts: SyncStageOptions,
         f: impl Fn(O) -> Vec<N> + Send + Sync + 'static,
     ) -> StreamPipe<ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>, I, N, R>
     where
@@ -2958,16 +3068,17 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     where
         N: Send + Unpin + 'static,
     {
-        self.expand_emit_with(StageOptions::new(), f)
+        self.expand_emit_with(SyncStageOptions::new(), f)
     }
 
-    /// [`Self::expand_emit`] with per-stage tuning — see [`StageOptions`].
+    /// [`Self::expand_emit`] with per-stage tuning — see
+    /// [`SyncStageOptions`].
     #[allow(clippy::type_complexity)] // typestate builder return type; the
     // `impl Fn` + nested `ExpandStage` + `R` param are inherent to the design
     // and not helpfully decomposable.
     pub fn expand_emit_with<N>(
         self,
-        opts: StageOptions,
+        opts: SyncStageOptions,
         f: impl Fn(O, &mut Vec<N>) + Send + Sync + 'static,
     ) -> StreamPipe<ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>, I, N, R>
     where
@@ -3018,18 +3129,17 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// - [`FenceMode::Chunked`] releases batches as soon as they form so the two sides overlap —
     ///   the right default for mixed CPU/IO loads.
     pub fn fence(self, mode: FenceMode) -> StreamPipe<FenceLink<S>, I, O, R> {
-        self.fence_with(StageOptions::new(), mode)
+        self.fence_with(FenceOptions::new(), mode)
     }
 
-    /// [`Self::fence`] with per-link tuning — see [`StageOptions`]. The only
-    /// meaningful knob is [`StageOptions::buffer`]: the fence's **output**
-    /// channel capacity (the fence is single-threaded, so `workers` /
-    /// `io_concurrency` are ignored). A tight buffer increases backpressure
-    /// onto the upstream stage; the default (`buffer_size` with the
-    /// `parallelism * 4` floor) favours throughput.
+    /// [`Self::fence`] with per-link tuning — see [`FenceOptions`]: the
+    /// fence's **output** channel capacity (the only knob — the fence is
+    /// single-threaded). A tight buffer increases backpressure onto the
+    /// upstream stage; the default (`buffer_size` with the `parallelism * 4`
+    /// floor) favours throughput.
     pub fn fence_with(
         self,
-        opts: StageOptions,
+        opts: FenceOptions,
         mode: FenceMode,
     ) -> StreamPipe<FenceLink<S>, I, O, R> {
         StreamPipe {
@@ -3066,20 +3176,21 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
         N: Send + Unpin + 'static,
         Fut: Future<Output = N> + Send + 'static,
     {
-        self.stage_async_with(StageOptions::new(), f)
+        self.stage_async_with(AsyncStageOptions::new(), f)
     }
 
-    /// [`Self::stage_async`] with per-stage tuning — see [`StageOptions`].
-    /// The interesting knob here is [`StageOptions::io_concurrency`]: pin a
-    /// high fan-out for network-bound stages, a low one for disk-bound
-    /// stages, instead of one global `io_concurrency` for the whole chain.
+    /// [`Self::stage_async`] with per-stage tuning — see
+    /// [`AsyncStageOptions`]. The interesting knob here is
+    /// [`AsyncStageOptions::io_concurrency`]: pin a high fan-out for
+    /// network-bound stages, a low one for disk-bound stages, instead of one
+    /// global `io_concurrency` for the whole chain.
     ///
     /// ```rust
-    /// # use youpipe::{stream, StageOptions};
+    /// # use youpipe::{stream, AsyncStageOptions};
     /// # async fn fetch(u: u64) -> u64 { u }
     /// let result: Vec<u64> = stream(0..64)
     ///     .stage_async_with(
-    ///         StageOptions::new().io_concurrency(32),
+    ///         AsyncStageOptions::new().io_concurrency(32),
     ///         |u: u64| async move { fetch(u).await },
     ///     )
     ///     .run();
@@ -3088,7 +3199,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     #[cfg(feature = "tokio-runtime")]
     pub fn stage_async_with<N, Fut>(
         self,
-        opts: StageOptions,
+        opts: AsyncStageOptions,
         f: impl Fn(O) -> Fut + Send + Sync + 'static,
     ) -> StreamPipe<AsyncStage<S, impl Fn(O) -> Fut + Send + Sync + 'static>, I, N, R>
     where
@@ -3386,7 +3497,8 @@ where
     /// When the chain is exclusively `.stage()`s — no `expand` / `fence` /
     /// `stage_async`, no [`with_cancel`](Self::with_cancel), no
     /// [`with_compute_workers`](Self::with_compute_workers) pin, no per-stage
-    /// [`workers`](StageOptions::workers) / [`buffer`](StageOptions::buffer)
+    /// [`workers`](SyncStageOptions::workers) /
+    /// [`buffer`](SyncStageOptions::buffer)
     /// pin — `run()` composes the stages into one `g ∘ f` pass and executes
     /// it on the fused index core (hybrid dispatch, zero-copy slots), the
     /// same core `pipe(..).map().collect()` uses. Behavioural differences vs
@@ -3678,7 +3790,8 @@ where
         // no notion of "cap stage concurrency on a larger pool" — the
         // streaming path is the only one that honours the cap without paying
         // ~ms transient-pool construction per `run()`. Same "explicit pin ⇒
-        // no pass-through" policy as per-stage `StageOptions::workers` pins.
+        // no pass-through" policy as per-stage `SyncStageOptions::workers`
+        // pins.
         if self.cancel.is_none() && !self.config.compute_workers_pinned {
             let pool = self
                 .compute_pool

@@ -30,7 +30,8 @@
 /// per-item skew through its MPMC channel + per-stage workers (a stalled
 /// worker simply stops draining while peers keep consuming), and there is no
 /// fork/join oversplit decision to tune. To control streaming tail latency,
-/// raise `compute_workers` or the stage's `StageOptions::workers`.
+/// raise `compute_workers` or the stage's
+/// `SyncStageOptions::workers`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Workload {
     /// Adaptive oversplit (see above). Right choice for most workloads.
@@ -73,7 +74,7 @@ pub struct PipelineConfig {
     /// run onward is spawn-free. An explicit `with_compute_pool` always
     /// takes precedence. Streaming
     /// path: the worker budget divided across sync stages (see
-    /// `StageOptions::workers` for per-stage overrides).
+    /// `SyncStageOptions::workers` for per-stage overrides).
     ///
     /// Clamped to `[1, MAX_COMPUTE_WORKERS]` — the scheduler's sleep bitmask
     /// packs thread indices into 9 bits (511 threads), so larger values are
@@ -97,7 +98,8 @@ pub struct PipelineConfig {
     /// `max(buffer_size, downstream_workers * 4)` — a floor that keeps every
     /// downstream worker able to hold a few items in flight even when the
     /// configured capacity is smaller than the fan-out. An explicit
-    /// [`StageOptions::buffer`](crate::StageOptions::buffer) override replaces
+    /// [`SyncStageOptions::buffer`](crate::SyncStageOptions::buffer) override
+    /// replaces
     /// this logic for that stage's output channel.
     pub(crate) buffer_size: usize,
     /// Number of concurrently in-flight async I/O tasks per async stage.
@@ -109,7 +111,7 @@ pub struct PipelineConfig {
     /// runtime with yielded waits, bounded to cap memory.
     ///
     /// Streaming-only, and applies to *every* async stage in the chain; use
-    /// [`StageOptions::io_concurrency`](crate::StageOptions::io_concurrency)
+    /// [`AsyncStageOptions::io_concurrency`](crate::AsyncStageOptions::io_concurrency)
     /// to size stages individually.
     pub(crate) io_concurrency: usize,
     /// Expected workload distribution pattern. Fused-only (see [`Workload`]).
@@ -134,11 +136,26 @@ impl Default for PipelineConfig {
 }
 
 impl PipelineConfig {
+    /// Shared zero-value rejection for every public count/capacity setter:
+    /// `0` is never a meaningful pin or size, so it fails loudly at build
+    /// time instead of silently truncating to `1` or un-pinning (the two
+    /// legacy behaviours this unified; record in docs core-types.md
+    /// "Options types split by stage kind").
+    pub(crate) fn require_nonzero(n: usize, knob: &'static str) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(n).unwrap_or_else(|| panic!("{knob} expects a non-zero value"))
+    }
+
     /// Clamp-and-record a compute-worker budget set through any builder.
     /// Shared by every `with_compute_workers` so the clamp and the pin flag
     /// (see [`Self::compute_workers_pinned`]) cannot drift apart.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` (see [`Self::require_nonzero`]).
     pub(crate) fn set_compute_workers(&mut self, n: usize) {
-        self.compute_workers = n.clamp(1, crate::MAX_COMPUTE_WORKERS);
+        // `require_nonzero` already floors at 1; the min is the 9-bit cap.
+        let pinned = Self::require_nonzero(n, "with_compute_workers");
+        self.compute_workers = pinned.get().min(crate::MAX_COMPUTE_WORKERS);
         self.compute_workers_pinned = true;
     }
 
@@ -150,10 +167,15 @@ impl PipelineConfig {
     /// [`ComputePool::clear_cached_pools`](crate::ComputePool::clear_cached_pools)
     /// to reclaim their threads.
     ///
-    /// Silently clamped to `[1, MAX_COMPUTE_WORKERS]` (511 on 64-bit): the
+    /// Clamped to `[1, MAX_COMPUTE_WORKERS]` (511 on 64-bit): the
     /// scheduler's sleep bitmask packs thread indices into 9 bits, so a pool
     /// beyond that cannot exist. Values above the cap truncate rather than
-    /// panic so exploratory configs (`num_cpus * 16`, …) keep running.
+    /// panic so exploratory configs (`num_cpus * 16`, …) keep running;
+    /// `0` is never exploratory-useful and panics instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` (see [`Self::set_compute_workers`]).
     #[must_use]
     pub fn with_compute_workers(mut self, n: usize) -> Self {
         self.set_compute_workers(n);
@@ -161,27 +183,39 @@ impl PipelineConfig {
     }
 
     /// Sets the number of async I/O worker threads. Streaming-only.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` (see [`PipelineConfig::require_nonzero`]).
     #[must_use]
     pub fn with_async_workers(mut self, n: usize) -> Self {
-        self.async_workers = n.max(1);
+        self.async_workers = Self::require_nonzero(n, "with_async_workers").get();
         self
     }
 
     /// Sets the per-channel buffer capacity. Streaming-only; see the
     /// [`PipelineConfig`] field docs for the `max(downstream_workers * 4)`
     /// floor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` (see [`PipelineConfig::require_nonzero`]).
     #[must_use]
     pub fn with_buffer_size(mut self, n: usize) -> Self {
-        self.buffer_size = n.max(1);
+        self.buffer_size = Self::require_nonzero(n, "with_buffer_size").get();
         self
     }
 
     /// Sets the number of concurrently in-flight async I/O tasks per async
     /// stage. Higher values trade memory for IO concurrency (see
     /// [`PipelineConfig::io_concurrency`]). Streaming-only.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n == 0` (see [`PipelineConfig::require_nonzero`]).
     #[must_use]
     pub fn with_io_concurrency(mut self, n: usize) -> Self {
-        self.io_concurrency = n.max(1);
+        self.io_concurrency = Self::require_nonzero(n, "with_io_concurrency").get();
         self
     }
 
@@ -201,7 +235,7 @@ mod tests {
     fn test_compute_workers_clamp_and_pin() {
         let mut cfg = PipelineConfig::default();
         assert!(!cfg.compute_workers_pinned, "default is unpinned");
-        cfg.set_compute_workers(0);
+        cfg.set_compute_workers(1);
         assert_eq!(cfg.compute_workers, 1);
         cfg.set_compute_workers(10_000);
         assert_eq!(cfg.compute_workers, crate::MAX_COMPUTE_WORKERS);
@@ -210,5 +244,29 @@ mod tests {
         let public = PipelineConfig::default().with_compute_workers(8);
         assert_eq!(public.compute_workers, 8);
         assert!(public.compute_workers_pinned, "public builder pins too");
+    }
+
+    #[test]
+    #[should_panic(expected = "with_compute_workers expects a non-zero value")]
+    fn test_compute_workers_zero_panics() {
+        let _ = PipelineConfig::default().with_compute_workers(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "with_buffer_size expects a non-zero value")]
+    fn test_buffer_size_zero_panics() {
+        let _ = PipelineConfig::default().with_buffer_size(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "with_io_concurrency expects a non-zero value")]
+    fn test_io_concurrency_zero_panics() {
+        let _ = PipelineConfig::default().with_io_concurrency(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "with_async_workers expects a non-zero value")]
+    fn test_async_workers_zero_panics() {
+        let _ = PipelineConfig::default().with_async_workers(0);
     }
 }

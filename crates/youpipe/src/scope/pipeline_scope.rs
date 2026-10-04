@@ -180,9 +180,16 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
     ///         .for_each(|_| { /* blocking IO */ });
     /// });
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `factor == 0` (see [`crate::Pipe::with_oversubscribe`]).
     #[must_use]
     pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = std::num::NonZeroUsize::new(factor.max(1));
+        self.oversubscribe = Some(PipelineConfig::require_nonzero(
+            factor,
+            "with_oversubscribe",
+        ));
         self
     }
 
@@ -342,9 +349,16 @@ impl<'env, S, I, O, E> ScopedTryPipe<'env, S, I, O, E> {
 
     /// Oversubscribe the compute pool — see
     /// [`crate::Pipe::with_oversubscribe`] for the full guidance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `factor == 0` (see [`crate::Pipe::with_oversubscribe`]).
     #[must_use]
     pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = std::num::NonZeroUsize::new(factor.max(1));
+        self.oversubscribe = Some(PipelineConfig::require_nonzero(
+            factor,
+            "with_oversubscribe",
+        ));
         self
     }
 
