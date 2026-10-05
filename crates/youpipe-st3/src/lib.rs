@@ -106,6 +106,20 @@ fn unpack(value: UnsignedLong) -> (UnsignedShort, UnsignedShort) {
     )
 }
 
+#[cfg(st3_loom)]
+fn allocate_buffer<T>(len: usize) -> Box<[UnsafeCell<MaybeUninit<T>>]> {
+    // Unlike the real `UnsafeCell`, loom's is not plain data: every cell
+    // carries a model location that must be registered by `new`. Exposing
+    // uninitialized slots (the fast path below) would make the first write
+    // resolve a garbage location handle — observed as an index-out-of-bounds
+    // panic in `loom::rt::cell::Cell::start_write` and a cascade abort while
+    // unwinding (2026-10 loom re-enablement).
+    let mut buffer = Vec::with_capacity(len);
+    buffer.extend((0..len).map(|_| UnsafeCell::new(MaybeUninit::uninit())));
+    buffer.into_boxed_slice()
+}
+
+#[cfg(not(st3_loom))]
 fn allocate_buffer<T>(len: usize) -> Box<[UnsafeCell<MaybeUninit<T>>]> {
     let mut buffer = Vec::with_capacity(len);
 

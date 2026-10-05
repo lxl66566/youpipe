@@ -6,7 +6,7 @@ timeouts and the required flag combinations):
 
 ```sh
 perf/verify/miri.sh            # lib + integration binaries + vendored crossfire lib
-perf/verify/loom.sh            # youpipe + vendored queue + vendored crossfire models
+perf/verify/loom.sh            # youpipe + vendored queue + crossfire + st3 models
 ```
 
 The `youpipe-sys` crate (workspace member `crates/youpipe-sys`) provides a
@@ -66,6 +66,29 @@ crate gates explicitly and `loom.sh` runs it without RUSTFLAGS:
 
 ```sh
 LOOM_MAX_PREEMPTIONS=2 cargo test -p youpipe-crossfire --features loom --lib -- loom_
+```
+
+The vendored `youpipe-st3` is a second deliberate exception, in two ways:
+it keeps upstream's own `st3_loom` cfg name (so its rustflag cannot leak
+into dependencies carrying `cfg(loom)` shims), and loom is a **regular
+target-gated dependency of the lib** (`[target."cfg(st3_loom)".dependencies]`),
+not a dev-dependency. The lib itself swaps its atomics and buffer cells for
+loom simulations under that cfg, so the integration models (`tests/loom.rs`)
+link a genuinely loom-backed rlib. Upstream PR #10 demoted loom to a
+dev-dep and gated the shims on `all(test, st3_loom)` — but integration
+tests link the lib *without* `cfg(test)`, so under that form every model
+degenerates to one real-atomic schedule and passes vacuously in ~0.00s
+(caught by the 2026-10 review; the fork's 12 models had never actually
+explored). Re-enabling them also required constructing buffer slots via
+`UnsafeCell::new` under loom: loom cells carry model state that the
+fork's `set_len`-over-uninitialized-memory allocation cannot provide
+(symptom: index-out-of-bounds in `loom::rt::cell::Cell::start_write`).
+
+```sh
+# Upstream CI's preemption budget; models take 0.3s-2min each under real
+# exploration (before the fix: 0.00s each).
+LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg st3_loom" \
+    cargo test -p youpipe-st3 --release --test integration
 ```
 
 What the models cover:

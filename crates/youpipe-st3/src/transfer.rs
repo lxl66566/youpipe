@@ -5,15 +5,15 @@ use core::mem::MaybeUninit;
 use crate::config::UnsignedShort;
 use crate::loom_exports::cell::UnsafeCell;
 
-#[cfg(not(all(test, st3_loom)))]
+#[cfg(not(st3_loom))]
 use core::ptr;
 
-#[cfg(not(all(test, st3_loom)))]
+#[cfg(not(st3_loom))]
 use crate::loom_exports::debug_or_loom_assert;
 
 /// Maximum number of items moved by the inline scalar path of
 /// [`transfer_items`] before falling back to a bulk copy.
-#[cfg(not(all(test, st3_loom)))]
+#[cfg(not(st3_loom))]
 const SMALL_CHUNK: usize = 8;
 
 /// Bitwise-move `count` items from position `src_pos` of a ring buffer to
@@ -38,7 +38,7 @@ const SMALL_CHUNK: usize = 8;
 ///   are disjoint.
 /// - The moved items must not be read or dropped again from the source
 ///   queue.
-#[cfg(not(all(test, st3_loom)))]
+#[cfg(not(st3_loom))]
 pub(crate) unsafe fn transfer_items<T>(
     src_buffer: &[UnsafeCell<MaybeUninit<T>>],
     src_mask: UnsignedShort,
@@ -118,7 +118,7 @@ pub(crate) unsafe fn transfer_items<T>(
 
 /// Loom fallback: loom's `UnsafeCell` exposes no raw pointers, so the
 /// transfer degenerates to the tracked per-element loop.
-#[cfg(all(test, st3_loom))]
+#[cfg(st3_loom)]
 pub(crate) unsafe fn transfer_items<T>(
     src_buffer: &[UnsafeCell<MaybeUninit<T>>],
     src_mask: UnsignedShort,

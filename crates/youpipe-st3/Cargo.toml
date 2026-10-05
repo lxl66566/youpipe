@@ -52,14 +52,21 @@ path    = "benches/micro.rs"
 [dependencies]
 crossbeam-utils = { version = "0.8.14", default-features = false }
 
+# Loom must be a REGULAR (target-gated) dependency, not a dev-dependency:
+# the lib itself switches to loom primitives under `cfg(st3_loom)` (see
+# src/loom_exports.rs), so it must be able to link loom when the cfg is set.
+# Upstream PR #10 demoted loom to a dev-dep and gated the lib on
+# `all(test, st3_loom)`, which silently vacuums the integration loom tests
+# (they link the lib without cfg(test), so real atomics are used and every
+# model degenerates to one schedule). This restores the pre-PR#10 form.
+[target."cfg(st3_loom)".dependencies]
+loom = "0.7"
+
 [dev-dependencies]
 criterion       = "0.5"
 crossbeam-deque = "0.8"
 num_cpus        = "1.13"
 oorandom        = "11.1"
-
-[target."cfg(st3_loom)".dev-dependencies]
-loom = "0.7"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(st3_loom)"] }

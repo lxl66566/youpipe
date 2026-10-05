@@ -66,7 +66,7 @@ Review 中提出的 P1/P2/P4/P5/P6/P7 共 6 项优化全部落地（P1 额外做
 - 预订不变量（`count ≤ min(源存活数, dest 空闲)`）保证两侧物理区间不相交，含 self-steal（同一 buffer）；debug/loom 断言逐对检查 3×3 段不相交。
 - `copy_nonoverlapping` 对非 `Copy` 类型合法：这是**搬迁**而非复制——源槽位搬走后逻辑回到 `MaybeUninit`，位于新 head 之前，`Drop for Queue` 只遍历 `[head, tail)` 存活区间，不会重复 drop。
 - 别名模式（`&[UnsafeCell<MaybeUninit<T>>]` → 裸指针 → 写入）与 std `UnsafeCell::get` 内部做法一致，Miri/strict-provenance 兼容。
-- `cfg(all(test, st3_loom))` 下退化为逐元素 `with`/`with_mut` 循环（loom 的 `UnsafeCell` 不暴露裸指针，且需被模型追踪）；原子协议两条路径完全一致。
+- `cfg(st3_loom)` 下退化为逐元素 `with`/`with_mut` 循环（loom 的 `UnsafeCell` 不暴露裸指针，且需被模型追踪）；原子协议两条路径完全一致。（更正：本文撰写时门控误为 `all(test, st3_loom)`，12 项 loom 测试实际空转——本轮修复还原为纯 `cfg(st3_loom)` 并重跑真实验证，见 Cargo.toml 注释与 docs/src/dev/testing.md。）
 
 **新增测试**：`fifo/lifo_bulk_steal`（src/dst 独立旋转 × dest 预载 × 偷窃数量 × 混合容量组合 (8,8)/(16,8)/(8,16)，约 1.8 万种对齐，含跨 src/dst 断点情形）与 `fifo/lifo_bulk_self_steal`（批量自窃的每种切分位置）。debug 断言全程开启，验证分段数学与不相交性。
 

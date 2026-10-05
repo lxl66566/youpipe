@@ -1,4 +1,14 @@
-#[cfg(all(test, st3_loom))]
+//! Loom primitive shims.
+//!
+//! NOTE: the gating below must stay a plain `cfg(st3_loom)` — do NOT add a
+//! `test` conjunct. The integration loom tests link this lib as an rlib
+//! compiled *without* cfg(test), so `all(test, st3_loom)` would select the
+//! real atomics for exactly those tests: loom::model then tracks none of the
+//! queue's operations, explores a single schedule, and every model passes
+//! vacuously in ~0.00s (upstream PR #10 "loom-as-dev-dep" introduced this
+//! form; measured on the 2026-10 fix). The plain cfg in turn requires loom
+//! to be a regular target dependency — see Cargo.toml.
+#[cfg(st3_loom)]
 #[allow(unused_imports)]
 pub(crate) mod sync {
     pub(crate) mod atomic {
@@ -9,7 +19,7 @@ pub(crate) mod sync {
         pub(crate) use loom::sync::atomic::AtomicU64;
     }
 }
-#[cfg(not(all(test, st3_loom)))]
+#[cfg(not(st3_loom))]
 #[allow(unused_imports)]
 pub(crate) mod sync {
     pub(crate) mod atomic {
@@ -21,11 +31,11 @@ pub(crate) mod sync {
     }
 }
 
-#[cfg(all(test, st3_loom))]
+#[cfg(st3_loom)]
 pub(crate) mod cell {
     pub(crate) use loom::cell::UnsafeCell;
 }
-#[cfg(not(all(test, st3_loom)))]
+#[cfg(not(st3_loom))]
 pub(crate) mod cell {
     #[derive(Debug)]
     pub(crate) struct UnsafeCell<T>(core::cell::UnsafeCell<T>);
@@ -46,11 +56,11 @@ pub(crate) mod cell {
 
 #[allow(unused_macros)]
 macro_rules! debug_or_loom_assert {
-    ($($arg:tt)*) => (if cfg!(any(debug_assertions, all(test, st3_loom))) { assert!($($arg)*); })
+    ($($arg:tt)*) => (if cfg!(any(debug_assertions, st3_loom)) { assert!($($arg)*); })
 }
 #[allow(unused_macros)]
 macro_rules! debug_or_loom_assert_eq {
-    ($($arg:tt)*) => (if cfg!(any(debug_assertions, all(test, st3_loom))) { assert_eq!($($arg)*); })
+    ($($arg:tt)*) => (if cfg!(any(debug_assertions, st3_loom)) { assert_eq!($($arg)*); })
 }
 #[allow(unused_imports)]
 pub(crate) use debug_or_loom_assert;
