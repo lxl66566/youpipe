@@ -207,9 +207,14 @@ impl<T> ConcurrentQueue<T> {
     /// On the unbounded queue this reserves the tail range with one CAS per
     /// block segment instead of one CAS per item (see
     /// [`Unbounded::push_n`](crate::ConcurrentQueue::push_n)); the other
-    /// variants fall back to per-item `push`. Fewer than all items are written
-    /// only if the queue was closed mid-batch (the unwritten values are
-    /// dropped — use `push` for item-granular error handling).
+    /// variants fall back to per-item `push`.
+    ///
+    /// The batch stops early — and the remaining values are dropped — when
+    /// the queue fills up mid-batch (bounded and single-slot variants,
+    /// which cannot hand the rejected value back through this API), when
+    /// the queue is closed, or when the iterator is exhausted before its
+    /// reported length (`ExactSizeIterator::len()` is a hint, not a
+    /// contract). Use per-item `push` for item-granular error handling.
     ///
     /// # Examples
     ///
