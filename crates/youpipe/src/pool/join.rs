@@ -137,18 +137,14 @@ where
             if job_b_id == job.id() {
                 // Found B — run it inline. Two shapes by A's outcome:
                 //
-                // * A ok (the hot case): run B directly. A panicking B is
-                //   then the ONE panic that escapes `join_on_captured` as a
-                //   live unwind — safe because the caller (the fused tree
-                //   recursion) parks a sibling-cleanup guard at the join
-                //   call that knows A completed. Wrapping this call in
-                //   `catch_unwind` instead (even isolated in a cold
-                //   helper) regressed sync_cpu_heavy/100K by +33 % in
-                //   same-session A/B vs a rayon control — this branch is
-                //   that layout-sensitive.
-                // * A failed (cold, batch already doomed): capture B's
-                //   panic as a value so the caller's match sees both
-                //   failures instead of losing A's result to the unwind.
+                // * A ok (the hot case): run B directly. A panicking B is then the ONE panic that
+                //   escapes `join_on_captured` as a live unwind — safe because the caller (the
+                //   fused tree recursion) parks a sibling-cleanup guard at the join call that knows
+                //   A completed. Wrapping this call in `catch_unwind` instead (even isolated in a
+                //   cold helper) regressed sync_cpu_heavy/100K by +33 % in same-session A/B vs a
+                //   rayon control — this branch is that layout-sensitive.
+                // * A failed (cold, batch already doomed): capture B's panic as a value so the
+                //   caller's match sees both failures instead of losing A's result to the unwind.
                 break if result_a.is_ok() {
                     Ok(unsafe { job_b.run_inline(false) })
                 } else {

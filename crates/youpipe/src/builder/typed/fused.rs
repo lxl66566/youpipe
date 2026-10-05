@@ -1287,9 +1287,9 @@ where
 /// - `Err(e)` chunk — the fallible tree's leaf/internal-node cleanup has already dropped every live
 ///   output slot and consumed every input slot in the chunk's range, so nothing remains to clean
 ///   (mirrors the panicked chunk of the infallible strategies).
-/// - Panicking chunk — comes back as `TryFailure::Panic` through the recursion's
-///   per-level halt (leaf guard cleans its own partial range; completed sibling
-///   ranges are dropped at each internal node), so nothing leaks either.
+/// - Panicking chunk — comes back as `TryFailure::Panic` through the recursion's per-level halt
+///   (leaf guard cleans its own partial range; completed sibling ranges are dropped at each
+///   internal node), so nothing leaks either.
 struct TryStrategy<'a, R, E, OP> {
     output: &'a Slots<R>,
     op: &'a OP,
@@ -5175,6 +5175,12 @@ where
 //   * two fork/join waves instead of one;
 //   * flat in selectivity: the merge tree's cost scales with survivors (O(depth) `extend` moves
 //     each), this path's with the input.
+//   Panic safety mirrors the index cores: pass 2's tree runs on
+//   `join_captured` + `SiblingGuard` and drops each completed sibling's leaf
+//   range (a contiguous output image via the prefix-sum `bounds` with a
+//   `total` sentinel) before letting a panic ride on; pass 1 owns no shared
+//   buffer (survivor temporaries drop in the leaf loop), so its plain `join`
+//   needs no cleanup.
 // Same-binary knob A/B (5 interleaved rounds, 32-core, 100K borrowed):
 // keep90 −50.5 %, keep50 −37.1 %, keep33 −31.1 % (all 25/25 stable); keep10
 // +41.3 %, every 10K shape +28…+75 % (all 0/25) — crossover ≈ 25 %
@@ -5287,11 +5293,13 @@ where
 }
 
 /// Pass 2: write leaf `leaf_base`'s survivors into the leaf's slice of the
-/// shared output buffer (`offsets`/`counts` from the scan). On unwind the
-/// leaf guard drops the written prefix; fully completed siblings' outputs
-/// leak when the root frees the buffer — a known, accepted panic-path leak
-/// (the index cores fixed theirs via `join_captured` + sibling cleanup; this
-/// merge-based filter path still resumes panics straight through its joins).
+/// shared output buffer (`bounds`/`counts` from the scan). Panic safety (same
+/// shape as [`par_tree_rec`]): a panicking leaf drops its own written prefix
+/// via the guard, the internal-node match below drops every completed
+/// sibling's leaf range before letting the panic ride on, and the unwind-only
+/// [`SiblingGuard`] covers the one self-run-B escape — so by the time a panic
+/// leaves this recursion, the subtree's output slots are all uninit again and
+/// the driver's `Slots` drop (a memory free) leaks nothing.
 struct FilterPlaceCtx<'i, 'a, S, E>
 where
     S: FusedStage<&'i E>,
@@ -5299,10 +5307,18 @@ where
     input: &'i [E],
     stages: &'a S,
     output: &'a Slots<S::Output>,
-    offsets: &'a [usize],
+    /// `bounds[i]` = leaf i's output start, `bounds[leaves]` = `total` — the
+    /// sentinel closes the last leaf, so any leaf range `[lo, hi)` maps to the
+    /// contiguous output range `[bounds[lo], bounds[hi])` (prefix-sum
+    /// geometry). That contiguous image is what the panic cleanup drops.
+    bounds: &'a [usize],
     counts: &'a [usize],
 }
 
+/// Recursive invariant: if a panic escapes [`place_filter_rec`] for the leaf
+/// range `[leaf_base, leaf_base + leaves)`, every output slot that subtree
+/// ever wrote has been dropped (leaf guard for the partial one, the join match
+/// for completed siblings) — the buffer is left as if the subtree never ran.
 fn place_filter_rec<'i, S, E>(
     pool: &ComputePool,
     ctx: &FilterPlaceCtx<'i, '_, S, E>,
@@ -5315,16 +5331,21 @@ fn place_filter_rec<'i, S, E>(
     E: Sync,
     S::Output: Send,
 {
-    let (input, stages, output, offsets, counts) =
-        (ctx.input, ctx.stages, ctx.output, ctx.offsets, ctx.counts);
+    let (input, stages, output, bounds, counts) =
+        (ctx.input, ctx.stages, ctx.output, ctx.bounds, ctx.counts);
     if splits_left == 0 || end - start <= 1 {
-        let off = offsets[leaf_base];
+        let off = bounds[leaf_base];
         let cnt = counts[leaf_base];
         // SAFETY: this leaf owns the disjoint output range
         // `[off, off + cnt)` exclusively; the slots are uninit.
-        let out_slice = unsafe { output.as_mut_slice(off, off + cnt) };
+        // Raw pointer only (no `out_slice[...]` accesses): the guard's
+        // `out_ptr` derives from the `&mut [R]`, and any write through the
+        // slice itself is a FOREIGN write that disables that derived tag
+        // under Tree Borrows — the unwind cleanup would then reborrow-UB
+        // (found by miri on the panic-accounting test; same reason the
+        // other leaves stick to raw pointers).
+        let out_ptr = unsafe { output.as_mut_slice(off, off + cnt) }.as_mut_ptr();
         let in_ptr = input[start..end].as_ptr();
-        let out_ptr = out_slice.as_mut_ptr();
         // Unwind cleanup — output half only, same shape as the borrowed
         // collect leaf (`LeafCleanup`, see `par_index_leaf_by_ref`).
         let mut g = LeafCleanup::<E, S::Output, true, false> {
@@ -5337,10 +5358,21 @@ fn place_filter_rec<'i, S, E>(
             // SAFETY: shared read of input slot i (borrowed input, no moves).
             let item = unsafe { &*in_ptr.add(i) };
             if let Some(o) = stages.apply(item) {
-                // Bounds-checked store (NOT a raw write): a non-deterministic
-                // predicate that keeps more items in pass 2 than pass 1
-                // counted must panic here, not write past the leaf's slice.
-                out_slice[g.written] = o;
+                // Bounds-checked RAW write (NOT `=`): slice assignment drops
+                // the old value first, but these slots are uninit — a Drop
+                // output type would run drop glue over garbage bits (SIGSEGV,
+                // found by the panic-accounting test). The bounds check
+                // makes a non-deterministic predicate that keeps more items
+                // in pass 2 than pass 1 counted panic here, not write past
+                // the leaf's slice.
+                assert!(
+                    g.written < cnt,
+                    "non-deterministic filter predicate: pass 2 kept more items than pass 1 \
+                     counted"
+                );
+                // SAFETY: slot `written` is inside the leaf's `[0, cnt)`
+                // slice (asserted above) and still uninit.
+                unsafe { ptr::write(out_ptr.add(g.written), o) };
                 g.written += 1;
             }
         }
@@ -5351,7 +5383,30 @@ fn place_filter_rec<'i, S, E>(
     }
     let mid = start + (end - start) / 2;
     let left_leaves = split_leaf_count(mid - start, splits_left - 1);
-    pool.join(
+    let leaves = left_leaves + split_leaf_count(end - mid, splits_left - 1);
+    // Drop the completed subtree's slice of the shared buffer. Shared by the
+    // unwind backstop and the match below (the `par_tree_rec` sibling-cleanup
+    // contract, mapped from index ranges to leaf ranges).
+    let drop_leaf_range = |lo: usize, hi: usize| {
+        // SAFETY (leaf geometry): `bounds` is a prefix sum with a `total`
+        // sentinel, so `[bounds[lo], bounds[hi])` is exactly leaf range
+        // `[lo, hi)`'s contiguous slice; a subtree that returned Ok filled
+        // every slot in it (deterministic predicate contract — pass 1 and
+        // pass 2 observe the same survivors).
+        unsafe { output.drop_range(bounds[lo], bounds[hi]) };
+    };
+    // Unwind backstop for the one panic `join_captured` lets escape: a
+    // self-run B (see `join_on_captured`'s self-pop branch). Any panic that
+    // unwinds past the join call below therefore implies A completed
+    // successfully; the guard drops exactly the left leaf range, then lets
+    // the unwind continue (B's own recursion already zeroed its side — the
+    // invariant on `place_filter_rec`).
+    let g = SiblingGuard {
+        start: leaf_base,
+        mid: leaf_base + left_leaves,
+        drop_success_range: &drop_leaf_range,
+    };
+    let (l, r) = pool.join_captured(
         || place_filter_rec(pool, ctx, start, mid, splits_left - 1, leaf_base),
         || {
             place_filter_rec(
@@ -5364,6 +5419,22 @@ fn place_filter_rec<'i, S, E>(
             );
         },
     );
+    std::mem::forget(g);
+    match (l, r) {
+        (Ok(()), Ok(())) => {},
+        // Panicking sides zeroed themselves (invariant); a completed sibling
+        // is dropped here before the panic rides on. Among two panics the
+        // left (first) payload wins — join's own both-panic ordering.
+        (Err(p), Err(_)) => unwind::resume_unwinding(p),
+        (Err(p), Ok(())) => {
+            drop_leaf_range(leaf_base + left_leaves, leaf_base + leaves);
+            unwind::resume_unwinding(p);
+        },
+        (Ok(()), Err(p)) => {
+            drop_leaf_range(leaf_base, leaf_base + left_leaves);
+            unwind::resume_unwinding(p);
+        },
+    }
 }
 
 /// Drive the two-pass count-then-place filter collect (see the section
@@ -5384,17 +5455,18 @@ where
     let counts: Vec<AtomicUsize> = (0..leaves).map(|_| AtomicUsize::new(0)).collect();
     count_filter_rec(pool, input, stages, 0, n, depth, &counts, 0);
 
-    // Sequential scan over ≤ a few hundred leaf counts: offsets[i] is leaf
-    // i's start in the shared output buffer, total its exact length.
+    // Sequential scan over ≤ a few hundred leaf counts: bounds[i] is leaf
+    // i's start in the shared output buffer, `total` its exact length. The
+    // trailing `total` sentinel closes the last leaf (see
+    // `FilterPlaceCtx::bounds`) so the panic cleanup can drop any leaf range
+    // as one contiguous `drop_range` call.
     let mut total = 0;
-    let offsets: Vec<usize> = counts
-        .iter()
-        .map(|c| {
-            let o = total;
-            total += c.load(Ordering::Relaxed);
-            o
-        })
-        .collect();
+    let mut bounds: Vec<usize> = Vec::with_capacity(leaves + 1);
+    for c in &counts {
+        bounds.push(total);
+        total += c.load(Ordering::Relaxed);
+    }
+    bounds.push(total);
     let counts: Vec<usize> = counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
 
     let output = Slots::uninit(total);
@@ -5402,7 +5474,7 @@ where
         input,
         stages,
         output: &output,
-        offsets: &offsets,
+        bounds: &bounds,
         counts: &counts,
     };
     place_filter_rec(pool, &ctx, 0, n, depth, 0);

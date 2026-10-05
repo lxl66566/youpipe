@@ -89,6 +89,17 @@ regressed `sync_cpu_heavy/100K` by +33 % through codegen layout shifts — is
 caught one level up by the recursion's unwind-only `SiblingGuard`, which
 knows the inline side already completed and drops exactly that range.
 
+The count-then-place filter collect (`YOUPIPE_FILTER_COLLECT=ctp`) reuses
+the same pattern in its pass-2 place tree, with the cleanup unit mapped
+from index ranges to *leaf* ranges: the count scan threads a prefix-sum
+`bounds` array (trailing `total` sentinel) down the tree, so any leaf range
+is one contiguous `Slots::drop_range` call. Its pass-1 count tree keeps
+plain `join` — it owns no shared buffer (survivor temporaries drop inside
+the leaf loop). The place leaf must also write through the guard's raw
+pointer only: a slice-index write both drops the uninit slot's garbage bits
+(SIGSEGV for `Drop` outputs) and is a foreign write that disables the
+guard's derived tag under Tree Borrows, breaking the unwind cleanup.
+
 ### `Pipe<S, I, O>` — Data-First Fused Pipeline
 
 `Pipe` is the data-first fused pipeline. Built by `pipe(items)`, it carries the

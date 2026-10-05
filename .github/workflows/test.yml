@@ -43,7 +43,7 @@ jobs:
       # repetitions), so lib + all integration binaries stay within budget.
       # The `.cargo/config.toml` MIRIFLAGS (-Zmiri-ignore-leaks) is applied
       # automatically for the global pool's intentionally-leaked threads.
-      - run: cargo miri test --lib --test compute_pool --test pipeline_integration --test scope_integration
+      - run: cargo miri test --lib --test compute_pool --test pipeline_integration --test filter_collect_panic --test scope_integration
 
   loom:
     name: loom model tests
