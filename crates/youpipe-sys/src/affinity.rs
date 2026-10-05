@@ -31,9 +31,17 @@ mod imp {
     }
 
     /// Pin the calling thread to exactly `cpu`. Returns `false` on failure
-    /// (invalid CPU, permissions) — callers proceed unpinned.
+    /// (invalid CPU — including ids at or beyond `CPU_SETSIZE` (1024) — or
+    /// permissions) — callers proceed unpinned.
     #[must_use]
     pub fn pin_current_thread_to(cpu: u32) -> bool {
+        // `libc::CPU_SET` is a Rust impl indexing the fixed-size word array
+        // inside `cpu_set_t`; an id at or beyond `CPU_SETSIZE` panics on the
+        // bounds check there — observed as a non-unwinding abort that even
+        // `catch_unwind` cannot intercept, not the documented `false`.
+        if cpu >= libc::CPU_SETSIZE as u32 {
+            return false;
+        }
         // SAFETY: same as `allowed_cpus`; the set holds exactly one bit.
         unsafe {
             let mut set = std::mem::zeroed::<cpu_set_t>();
