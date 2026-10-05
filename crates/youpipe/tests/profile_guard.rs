@@ -7,6 +7,10 @@
 //! layer is compiled out again.
 
 #[test]
+// `cfg!` is a constant, but the check must stay a *runtime* failure: a
+// compile-time assert would break `cargo test --release`, where
+// debug-assertions are legitimately off.
+#[allow(clippy::assertions_on_constants)]
 fn debug_assertions_are_active() {
     assert!(cfg!(debug_assertions));
 }
