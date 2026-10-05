@@ -3154,7 +3154,11 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
 
     /// Append a 1-to-N expansion stage: `Fn(O) -> Vec<N>`. Each input item
     /// produces zero or more outputs (like `flat_map`); expanded items inherit
-    /// the parent's sequence tag for ordered collection.
+    /// the parent's sequence tag so the collector can attribute them to their
+    /// input. Note that `.ordered()` is *not* available here: one sequence tag
+    /// fans out to N items, which violates the reorder buffer's
+    /// single-item-per-seq contract — see the `# Panics` section of
+    /// [`run`](Self::run).
     ///
     /// This owned-`Vec` signature pays one `malloc` + `free` per input item.
     /// For expand-heavy loads prefer the push-style [`Self::expand_emit`],
