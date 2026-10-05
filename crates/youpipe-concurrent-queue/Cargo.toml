@@ -13,24 +13,24 @@
 # release; call sites keep importing `concurrent_queue` via the dependency
 # alias in youpipe's Cargo.toml.
 [package]
-name         = "youpipe-concurrent-queue"
-version      = "0.6.0"
-authors      = [
+name                   = "youpipe-concurrent-queue"
+version.workspace      = true
+authors                = [
   "Stjepan Glavina <stjepang@gmail.com>",
   "Taiki Endo <te316e89@gmail.com>",
   "John Nunley <dev@notgull.net>"
 ]
-edition      = "2021"
-# Aligned with the youpipe workspace MSRV (upstream: 1.60) — youpipe requires
-# 1.85 anyway, and a lower declared MSRV makes clippy's workspace-wide
-# clippy.toml warn on every `cargo clippy --workspace`.
-rust-version = "1.85"
-description  = "Concurrent multi-producer multi-consumer queue (youpipe fork)"
-license      = "Apache-2.0 OR MIT"
-repository   = "https://github.com/smol-rs/concurrent-queue"
-keywords     = ["channel", "mpmc", "mpsc", "spmc", "spsc"]
-categories   = ["concurrency"]
-exclude      = ["/.*"]
+edition                = "2021"
+# Upstream MSRV: 1.60 — youpipe requires 1.85 anyway, and a lower declared
+# MSRV makes clippy's workspace-wide clippy.toml warn on every
+# `cargo clippy --workspace`.
+rust-version.workspace = true
+description            = "Concurrent multi-producer multi-consumer queue (youpipe fork)"
+license                = "Apache-2.0 OR MIT"
+repository.workspace   = true
+keywords               = ["channel", "mpmc", "mpsc", "spmc", "spsc"]
+categories             = ["concurrency"]
+exclude                = ["/.*"]
 
 [lib]
 bench = false

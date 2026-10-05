@@ -1,6 +1,7 @@
 # Fork of criterion-perf-events v0.4.0
 # (https://github.com/criterion-rs/criterion-perf-events), maintained
-# independently and intended for crates.io. Changes on top of upstream:
+# independently as a youpipe lab-bench tool (not on crates.io). Changes on
+# top of upstream:
 #
 #   * criterion ^0.8 (upstream is unmaintained since 2023-05 and pinned to
 #     criterion ^0.4, which Cargo cannot unify with the 0.8 line; the
@@ -20,22 +21,23 @@
 # youpipe/st3 already have it); the lib target keeps the name
 # `criterion_perf_counters` so call sites don't churn.
 [package]
-name         = "youpipe-criterion-perf-counters"
-version      = "0.5.0"
-edition      = "2021"
-rust-version = "1.85"
-authors      = ["Jens Breitbart <jbreitbart@gmail.com>"]
-description  = "Criterion.rs measurement plugin for Linux perf events: process-wide per-thread hardware counters (instructions, cycles, cache misses, ...) as a drop-in alternative to wall-clock time"
-license      = "MIT OR Apache-2.0"
-repository   = "https://github.com/lxl66566/youpipe"
-keywords     = ["benchmark", "criterion", "linux", "perf", "profiling"]
-categories   = ["development-tools::profiling", "os::linux-apis"]
+name                   = "youpipe-criterion-perf-counters"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors                = ["Jens Breitbart <jbreitbart@gmail.com>"]
+description            = "Criterion.rs measurement plugin for Linux perf events: process-wide per-thread hardware counters (instructions, cycles, cache misses, ...) as a drop-in alternative to wall-clock time"
+repository.workspace   = true
+license.workspace      = true
+keywords               = ["benchmark", "criterion", "linux", "perf", "profiling"]
+categories             = ["development-tools::profiling", "os::linux-apis"]
+publish                = false
 
 [lib]
 name = "criterion_perf_counters"
 
 [dependencies]
-criterion = "0.8"
+criterion = { workspace = true }
 perfcnt   = "0.8"
 
 # Fork: sources stay diffable with upstream (no inline allow-churn), so the

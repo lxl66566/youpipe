@@ -8,14 +8,12 @@ on relative paths while published builds resolve registry versions.
 
 | Crate | Directory | Published |
 | ----- | --------- | --------- |
-| Crate | Directory | Published |
-| ----- | --------- | --------- |
 | `youpipe` | `crates/youpipe` | yes |
 | `youpipe-sys` | `crates/youpipe-sys` | yes |
 | `youpipe-st3` | `crates/youpipe-st3` | yes (fork of upstream st3) |
 | `youpipe-concurrent-queue` | `crates/youpipe-concurrent-queue` | yes (fork of upstream concurrent-queue) |
 | `youpipe-crossfire` | `crates/youpipe-crossfire` | yes (fork of upstream crossfire, per-thread blocking waker) |
-| `youpipe-criterion-perf-counters` | `crates/youpipe-criterion-perf-counters` | no (bench-only tool dep) |
+| `youpipe-criterion-perf-counters` | `crates/youpipe-criterion-perf-counters` | no (`publish = false`; criterion-perf-events fork for the lab benches) |
 | `youpipe-bench` | `crates/youpipe-bench` | no (`publish = false`; opt-in lab benches) |
 | `youpipe-gungraun` | `crates/youpipe-gungraun` | no (`publish = false`; deterministic Ir benches) |
 
@@ -42,10 +40,14 @@ no `[patch]` or feature tricks involved.
 ## Publish order
 
 A crate's manifest must resolve from the registry alone, so dependencies go
-first. All crates share the workspace version train (`[workspace.package]`,
-currently `0.6`):
+first. All publishing crates share the workspace version train
+(`[workspace.package]`, currently `0.6`); every non-publishing crate carries
+`publish = false`, so `cargo publish --workspace` selects exactly the five
+below:
 
 ```sh
+cargo publish --workspace --keep-going   # one-shot; retry stragglers
+# or, explicitly ordered:
 cargo publish -p youpipe-concurrent-queue
 cargo publish -p youpipe-crossfire
 cargo publish -p youpipe-st3
@@ -71,9 +73,9 @@ cargo package -p youpipe-sys
 
 Checklist per release:
 
-1. Bump `[workspace.package] version` (one place; all inheriting crates move
-   together). The vendored forks pin their versions in their own manifests —
-   bump those in the same commit.
+1. Bump `[workspace.package] version` (one place; every publishing crate
+   moves together — the forks inherit it too) and the internal requirement
+   strings in `[workspace.dependencies]` in the same commit.
 2. `cargo test --workspace && cargo clippy --workspace --all-targets`, plus
    a `cargo test -p youpipe --no-default-features` pass: nothing exercises
    that feature combination in regular development (gungraun's bench build

@@ -87,11 +87,7 @@ name              = "horizontal"
 required-features = ["tokio-runtime"]
 
 [dependencies]
-# Workspace-internal path deps carry a `version` too: cargo builds against the
-# path in this repo, while the manifest published to crates.io drops the path
-# and resolves the registry crate at that requirement instead (must be
-# published first; `cargo publish` refuses to ship a mismatched pair).
-concurrent-queue = { package = "youpipe-concurrent-queue", path = "../youpipe-concurrent-queue", version = "0.6" }
+concurrent-queue = { workspace = true }
 # Vendored fork (crates/youpipe-crossfire) of crossfire 3.1.20 with a
 # per-thread immortal blocking waker (design C): without it every contended
 # park allocates a 40-byte ArcWaker — the dominant allocation class in the
@@ -99,32 +95,24 @@ concurrent-queue = { package = "youpipe-concurrent-queue", path = "../youpipe-co
 # issue #70 fix (spurious try_recv Disconnected under load).
 # See docs/src/dev/crossfire-waker-designs.md (design C) and
 # docs/src/dev/crossfire-waker-cache.md (archaeology; superseded design A).
-crossfire        = { package = "youpipe-crossfire", path = "../youpipe-crossfire", version = "0.6" }
+crossfire        = { workspace = true }
+hotpath          = { workspace = true, optional = true }
 # Only pulled in by the `crossfire-trace` forensics feature (see [features]).
-log              = { version = "0.4", optional = true }
-hotpath          = { version = "0.24", optional = true }
-st3              = { package = "youpipe-st3", path = "../youpipe-st3", version = "0.6" }
-tokio            = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"], optional = true }
-youpipe-sys      = { path = "../youpipe-sys", version = "0.6" }
+log              = { workspace = true, optional = true }
+st3              = { workspace = true }
+tokio            = { workspace = true, optional = true }
+youpipe-sys      = { workspace = true }
 
 [dev-dependencies]
-criterion         = "0.8"
-crossbeam-channel = "0.5"
+criterion         = { workspace = true }
+crossbeam-channel = { workspace = true }
 # Direct access for tests/handoff_channel.rs: the timeout park variants
 # (send_timeout/recv_timeout) of the vendored waker protocol are not
 # re-exported by the handoff wrapper.
-crossfire         = { package = "youpipe-crossfire", path = "../youpipe-crossfire", version = "0.6" }
+crossfire         = { workspace = true }
 futures           = "0.3"
-rayon             = "1"
-tokio             = { version = "1", features = [
-  "io-util",
-  "macros",
-  "net",
-  "rt-multi-thread",
-  "sync",
-  "test-util",
-  "time"
-] }
+rayon             = { workspace = true }
+tokio             = { workspace = true, features = ["io-util", "net", "test-util"] }
 
 # ── Concurrency-model testing of the pool's synchronization cores ──
 # Loom is activated by the `--cfg loom` rustflag (the ecosystem-standard
@@ -151,10 +139,16 @@ tokio             = { version = "1", features = [
 # directly with `loom::thread`. Regular (real-thread) unit tests cannot run
 # on simulated primitives, hence the `-- loom_tests` filter.
 [target."cfg(loom)".dependencies]
-loom = "0.7"
+loom = { workspace = true }
 
 [features]
-default       = ["tokio-runtime"]
+default         = ["tokio-runtime"]
+# ── Crossfire waker-layer trace (deadlock forensics) ──
+# Forwards to the vendored crossfire's `trace_log` (log::debug! per
+# send/recv/wake episode). Off by default: the log volume is huge and the
+# feature exists purely to instrument reproduction runs of intermittent
+# lost-wakeup hangs (todo P1 #14).
+crossfire-trace = ["crossfire/trace_log", "dep:log"]
 # (No `loom` feature: loom model-checking is driven by the `--cfg loom`
 # rustflag instead — see `[target.'cfg(loom)'.dependencies]` below.)
 # ── Optional permanent instrumentation (zero-cost when off) ──
@@ -166,15 +160,9 @@ default       = ["tokio-runtime"]
 #
 # NOTE: youpipe's `hotpath` feature must forward to `hotpath/hotpath`, otherwise
 # the hotpath crate stays in its `lib_off` mode where every macro is a no-op.
-hotpath       = ["dep:hotpath", "hotpath/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-hotpath-cpu   = ["hotpath", "hotpath/hotpath-cpu"]
-# ── Crossfire waker-layer trace (deadlock forensics) ──
-# Forwards to the vendored crossfire's `trace_log` (log::debug! per
-# send/recv/wake episode). Off by default: the log volume is huge and the
-# feature exists purely to instrument reproduction runs of intermittent
-# lost-wakeup hangs (todo P1 #14).
-crossfire-trace = ["crossfire/trace_log", "dep:log"]
+hotpath         = ["dep:hotpath", "hotpath/hotpath"]
+hotpath-alloc   = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu     = ["hotpath", "hotpath/hotpath-cpu"]
 # ── Async runtime backend for streaming `.stage_async(..)` stages ──
 # The fused CPU path (`pipe` / `scope`) is fully sync and needs no backend.
 #
@@ -182,7 +170,7 @@ crossfire-trace = ["crossfire/trace_log", "dep:log"]
 # is the only concrete backend today, but the trait + `StreamPipe<.., R:
 # AsyncRuntime>` plumbing is kept generic so a future backend (a thread-per-core
 # runtime, monoio, …) slots in without touching the streaming code.
-tokio-runtime = ["dep:tokio"]
+tokio-runtime   = ["dep:tokio"]
 
 [lints]
 workspace = true

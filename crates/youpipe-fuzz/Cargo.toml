@@ -1,8 +1,8 @@
 [package]
 name    = "youpipe-fuzz"
 version = "0.0.0"
-publish = false
 edition = "2024"
+publish = false
 
 # cargo-fuzz marker: `cargo fuzz build|run` must be invoked from this
 # directory (it compiles the bins below on a nightly toolchain with
@@ -11,37 +11,37 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+[[bin]]
+bench = false
+doc   = false
+name  = "pipeline"
+path  = "fuzz_targets/pipeline.rs"
+test  = false
+
+[[bin]]
+bench = false
+doc   = false
+name  = "stream"
+path  = "fuzz_targets/stream.rs"
+test  = false
+
+[[bin]]
+bench = false
+doc   = false
+name  = "channel"
+path  = "fuzz_targets/channel.rs"
+test  = false
+
+[[bin]]
+bench = false
+doc   = false
+name  = "reorder"
+path  = "fuzz_targets/reorder.rs"
+test  = false
+
 [dependencies]
 libfuzzer-sys = "0.4"
 youpipe       = { path = "../youpipe" }
-
-[[bin]]
-name = "pipeline"
-path = "fuzz_targets/pipeline.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "stream"
-path = "fuzz_targets/stream.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "channel"
-path = "fuzz_targets/channel.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "reorder"
-path = "fuzz_targets/reorder.rs"
-test = false
-doc = false
-bench = false
 
 # Mirror of the root workspace's lint set (this crate is excluded from the
 # workspace, so it inherits nothing).

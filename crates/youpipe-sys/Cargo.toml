@@ -13,10 +13,10 @@ categories             = ["concurrency"]
 parking_lot = "0.12"
 
 [target."cfg(all(target_os = \"linux\", not(miri)))".dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [target."cfg(loom)".dependencies]
-loom = "0.7"
+loom = { workspace = true }
 
 [lints]
 workspace = true

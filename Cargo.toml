@@ -4,31 +4,62 @@ members         = [
   "crates/youpipe",
   "crates/youpipe-bench",
   "crates/youpipe-concurrent-queue",
-  "crates/youpipe-crossfire",
   "crates/youpipe-criterion-perf-counters",
+  "crates/youpipe-crossfire",
   "crates/youpipe-gungraun",
   "crates/youpipe-st3",
   "crates/youpipe-sys",
 ]
+# cargo-fuzz crate: built by `cargo fuzz ...` from its own directory on a
+# nightly toolchain with sanitizer flags that would break plain workspace
+# builds, so it cannot be a member.
+exclude         = ["crates/youpipe-fuzz"]
 # Plain `cargo build/test/clippy` at the root covers only the library crates;
 # the vendored forks and the bench crates are opt-in via `-p` / `--workspace`
 # (they pull heavyweight deps: aes-gcm, zstd, perfcnt, valgrind runner, ...).
 default-members = ["crates/youpipe", "crates/youpipe-sys"]
-# cargo-fuzz crate: built by `cargo fuzz ...` from its own directory on a
-# nightly toolchain with sanitizer flags that would break plain workspace
-# builds, so it cannot be a member.
-exclude = ["crates/youpipe-fuzz"]
 
-# Shared metadata for the youpipe-* crates developed in-tree (everything
-# lives under crates/). The vendored forks keep fully self-contained
-# manifests (they are synced from their own fork repos and must stay
-# diffable against them).
+# Shared metadata for the crates on the publish train. The vendored source
+# forks (youpipe-st3, youpipe-concurrent-queue, youpipe-crossfire) inherit
+# these too: manifest inheritance doesn't affect their sources, which stay
+# diffable against their upstream repos. Fork-specific provenance fields
+# (edition, authors, license, description) stay per-crate. Crates off the
+# train (youpipe-bench, youpipe-gungraun, youpipe-criterion-perf-counters,
+# youpipe-fuzz) carry `publish = false`, so `cargo publish --workspace`
+# skips them.
 [workspace.package]
 version      = "0.6.0"
 edition      = "2024"
 rust-version = "1.85"
 repository   = "https://github.com/lxl66566/youpipe"
 license      = "Apache-2.0"
+
+# Single-sourced dependency requirements: members inherit with
+# `{ workspace = true }` and may append `features`/`optional`. The vendored
+# forks keep self-contained requirement specs (diffability) and youpipe-fuzz
+# cannot inherit at all (excluded from the workspace).
+[workspace.dependencies]
+criterion         = "0.8"
+crossbeam-channel = "0.5"
+# youpipe's probes and the bench profile binary's `HotpathGuard` share a
+# process-global state: the two crates must resolve ONE hotpath instance, so
+# the requirement is single-sourced here.
+hotpath           = "0.24"
+libc              = "0.2"
+log               = "0.4"
+loom              = "0.7"
+rayon             = "1"
+tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# Internal path+version dual declaration: local builds resolve the path,
+# published manifests resolve the registry requirement
+# (docs/src/dev/publishing.md). Bump these requirement strings in the same
+# commit as `[workspace.package] version`. `youpipe` itself stays local: its
+# lab-bench consumers need divergent `default-features` settings.
+concurrent-queue = { package = "youpipe-concurrent-queue", path = "crates/youpipe-concurrent-queue", version = "0.6" }
+crossfire        = { package = "youpipe-crossfire", path = "crates/youpipe-crossfire", version = "0.6" }
+st3              = { package = "youpipe-st3", path = "crates/youpipe-st3", version = "0.6" }
+youpipe-sys      = { path = "crates/youpipe-sys", version = "0.6" }
 
 [workspace.lints.clippy]
 all                     = { level = "warn", priority = -1 }
@@ -51,9 +82,9 @@ unused_qualifications = "warn"
 # must ship them (strip must stay off explicitly in case `[profile
 # release]` ever gains `strip`).
 [profile.bench]
+debug         = true
+strip         = false
 codegen-units = 1
-debug       = true
-strip       = false
 
 # Single codegen unit for release builds. A project whose value proposition is
 # per-item throughput cannot tolerate the code-layout lottery that

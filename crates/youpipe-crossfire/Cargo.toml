@@ -26,22 +26,20 @@
 # release; call sites keep importing `crossfire` via the dependency alias
 # in youpipe's Cargo.toml (lib name stays `crossfire`).
 [package]
-name         = "youpipe-crossfire"
-version      = "0.6.0"
-authors      = ["plan <frostyplanet@gmail.com>"]
-edition      = "2021"
-# Aligned with the youpipe workspace MSRV (upstream: 1.79) — see the note
-# in youpipe-concurrent-queue's manifest.
-rust-version = "1.85"
-description  = "channels for async and threads (youpipe fork)"
-license      = "Apache-2.0"
-homepage     = "https://github.com/frostyplanet/crossfire-rs"
-repository   = "https://github.com/frostyplanet/crossfire-rs"
-documentation = "https://docs.rs/crossfire"
-keywords     = ["async", "non-blocking", "lock-free", "channel"]
-categories   = ["concurrency", "data-structures"]
-exclude      = ["/ci/*", "/bors.toml"]
-readme       = "README.md"
+name                   = "youpipe-crossfire"
+version.workspace      = true
+authors                = ["plan <frostyplanet@gmail.com>"]
+edition                = "2021"
+# Upstream MSRV: 1.79 — see the note in youpipe-concurrent-queue's manifest.
+rust-version.workspace = true
+description            = "channels for async and threads (youpipe fork)"
+license                = "Apache-2.0"
+homepage               = "https://github.com/frostyplanet/crossfire-rs"
+repository.workspace   = true
+keywords               = ["async", "non-blocking", "lock-free", "channel"]
+categories             = ["concurrency", "data-structures"]
+exclude                = ["/ci/*", "/bors.toml"]
+readme                 = "README.md"
 
 [lib]
 bench = false

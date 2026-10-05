@@ -14,49 +14,12 @@
 #
 # Methodology and recorded results: docs/src/dev/benchmarks.md.
 [package]
-name         = "youpipe-bench"
-version      = "0.1.0"
-edition      = "2024"
-rust-version = "1.85"
-description  = "Opt-in lab benches: perf-event counters, real-disk file-encrypt, hotpath profiling"
-publish      = false
-
-[features]
-# Turns youpipe's permanent `#[hotpath::measure]` probes into real recorders
-# for the `hotpath-profile` binary. Feature-gated so the other targets in
-# this crate never run instrumented: the perf-event and file-encrypt benches
-# would otherwise count the probe bookkeeping as framework cost.
-hotpath = ["youpipe/hotpath", "dep:hotpath"]
-# Forwards youpipe's crossfire-trace (log::debug! per send/recv/wake episode)
-# into convoy-probe's raw-file logger (CONVOY_TRACE_PATH). Huge volume; only
-# for small-n forensics runs.
-crossfire-trace = ["youpipe/crossfire-trace", "dep:log"]
-
-[dependencies]
-aes-gcm   = "0.10"
-# Version-pinned to youpipe's own `hotpath` dep: the probes and the
-# `HotpathGuard` in the profile binary must share one global state.
-hotpath   = { version = "0.24", optional = true }
-getrandom = "0.2"
-# Only for the `crossfire-trace` forensics feature (convoy-probe logger).
-log       = { version = "0.4", optional = true, features = ["std"] }
-rayon     = "1"
-tokio     = { version = "1", features = ["fs", "rt-multi-thread"] }
-youpipe   = { path = "../youpipe", default-features = true }
-zstd      = "0.13"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-
-[dev-dependencies]
-criterion               = "0.8"
-criterion-perf-counters = { package = "youpipe-criterion-perf-counters", path = "../youpipe-criterion-perf-counters" }
-perfcnt                 = "0.8"
-
-# ── perf-event counter bench (criterion driven by hardware counters) ──
-[[bench]]
-harness = false
-name    = "perf_events"
+name                   = "youpipe-bench"
+version                = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+description            = "Opt-in lab benches: perf-event counters, real-disk file-encrypt, hotpath profiling"
+publish                = false
 
 # ── one-shot application benches (not criterion; run with `cargo run`) ──
 [[bin]]
@@ -75,6 +38,44 @@ name = "horizontal-counters"
 # per-run wall + per-thread ctxt-switch deltas by thread group.
 [[bin]]
 name = "convoy-probe"
+
+# ── perf-event counter bench (criterion driven by hardware counters) ──
+[[bench]]
+harness = false
+name    = "perf_events"
+
+[dependencies]
+aes-gcm   = "0.10"
+getrandom = "0.2"
+# Single-sourced with youpipe's requirement in [workspace.dependencies]: the
+# probes and the `HotpathGuard` in the profile binary must share one global
+# state.
+hotpath   = { workspace = true, optional = true }
+# Only for the `crossfire-trace` forensics feature (convoy-probe logger).
+log       = { workspace = true, features = ["std"], optional = true }
+rayon     = { workspace = true }
+tokio     = { workspace = true, features = ["fs"] }
+youpipe   = { path = "../youpipe" }
+zstd      = "0.13"
+
+[dev-dependencies]
+criterion               = { workspace = true }
+criterion-perf-counters = { package = "youpipe-criterion-perf-counters", path = "../youpipe-criterion-perf-counters" }
+perfcnt                 = "0.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[features]
+# Forwards youpipe's crossfire-trace (log::debug! per send/recv/wake episode)
+# into convoy-probe's raw-file logger (CONVOY_TRACE_PATH). Huge volume; only
+# for small-n forensics runs.
+crossfire-trace = ["dep:log", "youpipe/crossfire-trace"]
+# Turns youpipe's permanent `#[hotpath::measure]` probes into real recorders
+# for the `hotpath-profile` binary. Feature-gated so the other targets in
+# this crate never run instrumented: the perf-event and file-encrypt benches
+# would otherwise count the probe bookkeeping as framework cost.
+hotpath         = ["dep:hotpath", "youpipe/hotpath"]
 
 # Lab bench (publish = false): intentionally not inheriting the workspace lint set.
 [lints]

@@ -11,22 +11,22 @@
 # The package is renamed so it can never be confused with the crates.io
 # release; the lib target keeps the name `st3` so call sites don't churn.
 [package]
-name         = "youpipe-st3"
-version      = "0.6.0"
-authors      = ["Serge Barral <serge.barral@asynchronics.com>"]
-edition      = "2021"
-# Aligned with the youpipe workspace MSRV (upstream: 1.60); youpipe requires
-# 1.85 anyway — see youpipe-concurrent-queue's comment.
-rust-version = "1.85"
-license      = "MIT OR Apache-2.0"
-repository   = "https://github.com/asynchronics/st3"
-description  = """
+name                   = "youpipe-st3"
+version.workspace      = true
+authors                = ["Serge Barral <serge.barral@asynchronics.com>"]
+edition                = "2021"
+# Upstream MSRV: 1.60; youpipe requires 1.85 anyway — see
+# youpipe-concurrent-queue's comment.
+rust-version.workspace = true
+license                = "MIT OR Apache-2.0"
+repository.workspace   = true
+description            = """
 A very fast lock-free, bounded, work-stealing LIFO queue (youpipe fork).
 """
-categories   = ["concurrency", "data-structures"]
-keywords     = ["bounded", "lock-free", "queue", "stack", "work-stealing"]
-autotests    = false
-autobenches  = false
+categories             = ["concurrency", "data-structures"]
+keywords               = ["bounded", "lock-free", "queue", "stack", "work-stealing"]
+autotests              = false
+autobenches            = false
 
 [lib]
 name = "st3"

@@ -1,6 +1,14 @@
 [files]
 include              = ["**/*.toml"]
-exclude              = ["target/*", "node_modules/*"]
+# Vendored forks must stay diffable against their upstream repos: never
+# reformat their manifests / rustfmt.toml.
+exclude              = [
+  "target/*",
+  "node_modules/*",
+  "crates/youpipe-concurrent-queue/*",
+  "crates/youpipe-crossfire/*",
+  "crates/youpipe-st3/*",
+]
 respect-ignore-files = true
 
 [format.rules]

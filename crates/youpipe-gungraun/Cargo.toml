@@ -14,12 +14,12 @@
 #
 # See Readme.md for methodology and what is deliberately NOT measured here.
 [package]
-name         = "youpipe-gungraun"
-version      = "0.1.0"
-edition      = "2024"
-rust-version = "1.85"
-description  = "Deterministic valgrind-instruction-count benches for youpipe (pinned-size pools, youpipe vs rayon vs sequential)"
-publish      = false
+name                   = "youpipe-gungraun"
+version                = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+description            = "Deterministic valgrind-instruction-count benches for youpipe (pinned-size pools, youpipe vs rayon vs sequential)"
+publish                = false
 
 [lib]
 # Keep cargo bench from running the lib's (empty) unittest target, which
@@ -44,11 +44,11 @@ name    = "stream"
 test    = false
 
 [dependencies]
-rayon = "1"
+rayon   = { workspace = true }
 youpipe = { path = "../youpipe", default-features = false }
 
 [dev-dependencies]
-crossbeam-channel = "0.5"
+crossbeam-channel = { workspace = true }
 gungraun          = "0.19.4"
 
 # Lab bench (publish = false): intentionally not inheriting the workspace lint set.
