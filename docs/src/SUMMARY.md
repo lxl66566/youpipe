@@ -26,5 +26,6 @@
 - [Vendored crossfire: blocking-waker designs](dev/crossfire-waker-designs.md)
 - [Vendored crossfire: waker-cache archaeology](dev/crossfire-waker-cache.md)
 - [Falsified directions](dev/dead-ends.md)
+- [Review fixes 2026-10](dev/review-2026-10.md)
 - [Benchmarks and methodology](dev/benchmarks.md)
 - [Publishing](dev/publishing.md)
