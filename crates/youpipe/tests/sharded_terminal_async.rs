@@ -147,26 +147,38 @@ fn sharded_async_terminal_semantics() {
     let expected: Vec<u64> = (0..n_main() as u64).map(|x| (x + 1) * 2).collect();
     assert_eq!(got, expected);
 
-    // ── Producer task dies mid-run (panic → runtime drops its sender): the
-    //    shard closes, the run must drain the remaining shards and return
-    //    (fewer items) instead of hanging. Same contract as the shared
-    //    ring's one-sender-of-many drop. ──
+    // ── Producer task panic mid-run: the payload must reach the `run()`
+    //    caller (the fused path's propagate-to-caller contract) — the
+    //    runtime used to swallow it at the task boundary and the run
+    //    silently returned n−1 items. The dead task's shard still closes
+    //    (dropped sender), so the remaining tasks drain and the collector
+    //    returns instead of hanging; `run()` then re-raises the recorded
+    //    payload. Same no-hang contract as the shared ring's
+    //    one-sender-of-many drop. ──
     let n_panic: u64 = if cfg!(miri) {
         200
     } else {
         10_000
     };
-    let got = stream(0..n_panic)
-        .with_cancel(inert_cancel())
-        .stage_async(move |x: u64| async move {
-            assert!(x != n_panic / 2, "async consumer task exits mid-run");
-            x
-        })
-        .run();
-    // Exactly one item is lost: the panicking task dies holding the item it
-    // was processing; the remaining tasks drain the input channel and their
-    // shards, and the dead task"s shard closes on its dropped sender.
-    assert_eq!(got.len(), usize::try_from(n_panic - 1).unwrap());
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stream(0..n_panic)
+            .with_cancel(inert_cancel())
+            .stage_async(move |x: u64| async move {
+                assert!(x != n_panic / 2, "async consumer task exits mid-run");
+                x
+            })
+            .run()
+    }))
+    .expect_err("async producer panic must propagate to the run() caller");
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .expect("panic payload was a string");
+    assert!(
+        msg.contains("async consumer task exits mid-run"),
+        "re-raised payload must be the user panic, got {msg:?}"
+    );
 
     // ── Cancellation: a fired token mid-run must return (fewer items), not
     //    hang on the shard aggregation ──

@@ -42,6 +42,30 @@ becomes input order (within the any-order contract), stage panics propagate
 to the caller after partial-state cleanup instead of aborting the process.
 `for_each` never passes through (its drain is a caller-thread `FnMut`).
 
+#### Panic semantics
+
+Three execution planes, one contract: a stage closure's panic must reach the
+`run()` caller — never a silent truncation.
+
+- Fused pass-through: caught per chunk, resumed on the caller after
+  partial-state cleanup (`ErasedFailure` slot).
+- Streaming sync/expand workers and fence forwarders: pool jobs and
+  dedicated threads abort the process on panic (channel-parking jobs cannot
+  unwind past a pool worker; see `spawn_stage_jobs`).
+- Streaming feeder: caught, payload stored, resumed by `Feeder::finish`
+  after the collect.
+- Streaming async stages: the runtime isolates panics at the task boundary
+  and drops the payload with the unobserved JoinHandle, so each task is
+  wrapped in `CatchTaskPanic` — the payload is recorded in a per-run
+  first-wins `PanicSlot` and re-raised by `try_exec` after the collector
+  returns (which the panicking task itself releases by ending and dropping
+  its channel ends). The same mechanism surfaces nested `run()` misuse:
+  `block_on` inside a runtime task re-raises with the actionable
+  `spawn_blocking` hint instead of silently killing every consumer task.
+  The ordered drain runs under `catch_unwind` so a recorded payload wins
+  over the `emitted + dropped == n` accounting assertion (a panicked task
+  legitimately drops its in-flight item).
+
 ---
 
 ### MPMC Channels (`channel.rs`)
@@ -189,11 +213,12 @@ next burst pass), the same trade the sync side measured as a win. Liveness
 transfers verbatim: a shard's producers are live tasks that either send
 (firing that shard's recv waker), await upstream (progress elsewhere
 eventually feeds them), or drop their senders (closing the shard); a task
-that panics mid-run (tokio catches it, the runtime drops its sender)
-closes its shard while the others keep flowing — verified by
-`tests/sharded_terminal_async.rs` (unordered/ordered/expand/for_each,
-`io_concurrency` 1 / 2 / above `async_workers` sharing, producer panic,
-cancel, single-item input).
+that panics mid-run closes its shard while the others keep flowing — its
+payload is recorded (`CatchTaskPanic`, see [Panic
+semantics](#panic-semantics)) and re-raised on the `run()` caller after the
+collector returns — verified by `tests/sharded_terminal_async.rs`
+(unordered/ordered/expand/for_each, `io_concurrency` 1 / 2 / above
+`async_workers` sharing, producer panic, cancel, single-item input).
 
 Measured verdict (2026-09-29, `sharded_term_async` bench, 10 interleaved
 same-binary knob rounds): the async flavour **regresses the shapes it was

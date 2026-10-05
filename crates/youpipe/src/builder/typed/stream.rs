@@ -1,11 +1,15 @@
-#[cfg(feature = "tokio-runtime")]
-use std::future::Future;
 use std::{
     cell::Cell,
     marker::PhantomData,
     num::NonZeroUsize,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
+};
+#[cfg(feature = "tokio-runtime")]
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
 };
 
 use super::{
@@ -154,10 +158,14 @@ fn fwd_batch_enabled() -> bool {
     })
 }
 
-/// Caught panic payload from a pool-submitted feeder job, re-raised on the
-/// calling thread by [`Feeder::finish`] (preserving the panic-propagation
-/// semantics of the old feeder thread's `join`).
-type FeederPanicSlot = Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
+/// First panic payload caught inside one run's detached execution contexts
+/// (feeder job/thread, async stage tasks), re-raised on the calling thread
+/// after the collector returns — the panic-propagation contract of the
+/// fused path, where a stage panic reaches the `run()` caller. First
+/// writer wins (same policy as the fused path's `ErasedFailure::record`):
+/// when every task dies (nested `run()` re-raise) the original panic is the
+/// meaningful one.
+type PanicSlot = Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
 
 /// Pool-capacity lease covering one streaming run's channel-parking jobs
 /// (non-inline feeder + sync/expand stage workers).
@@ -224,8 +232,8 @@ impl Drop for ParkingLease {
 /// nothing to reap) or a detached feeder (pool job or dedicated thread)
 /// whose panic payload is re-raised by [`Feeder::finish`].
 enum Feeder {
-    Pool(FeederPanicSlot),
-    Thread(FeederPanicSlot),
+    Pool(PanicSlot),
+    Thread(PanicSlot),
     Inline,
 }
 
@@ -235,14 +243,31 @@ impl Feeder {
             Self::Pool(slot) | Self::Thread(slot) => slot,
             Self::Inline => return,
         };
-        // Same poison-recovery pattern as the hybrid dispatcher's fail slot.
-        if let Some(payload) = slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            std::panic::resume_unwind(payload);
-        }
+        resume_stored_panic(&slot);
+    }
+}
+
+/// Record `payload` in `slot` unless an earlier panic is already stored
+/// (first-wins, see [`PanicSlot`]). Poison recovery: a panic stored under
+/// this mutex poisons it, but the payload is still valid to record/read.
+fn record_panic(slot: &PanicSlot, payload: Box<dyn std::any::Any + Send>) {
+    let mut guard = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.is_none() {
+        *guard = Some(payload);
+    }
+}
+
+/// Re-raise the stored panic payload (if any) on the calling thread. Same
+/// poison-recovery pattern as the hybrid dispatcher's fail slot.
+fn resume_stored_panic(slot: &PanicSlot) {
+    if let Some(payload) = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -386,16 +411,14 @@ fn feed_items<I: Send + 'static>(
         push_items(items, &feeder_tx, cancel.as_ref());
         return Feeder::Inline;
     }
-    let slot: FeederPanicSlot = Arc::new(std::sync::Mutex::new(None));
+    let slot: PanicSlot = Arc::new(std::sync::Mutex::new(None));
     let job_slot = Arc::clone(&slot);
     let push_loop = move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             push_items(items, &feeder_tx, cancel.as_ref());
         }));
         if let Err(payload) = result {
-            *job_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload);
+            record_panic(&job_slot, payload);
         }
     };
     if dedicated {
@@ -1730,6 +1753,12 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// be the natural fit but is still unstable as of 1.85.)
     #[cfg(feature = "tokio-runtime")]
     pub(crate) cached_pool: OnceLock<std::io::Result<R>>,
+    /// First panic recorded by this run's async stage tasks
+    /// ([`CatchTaskPanic`]); re-raised on the caller by `try_exec` after the
+    /// collector returns. `OnceLock`: sync-only runs never touch it and pay
+    /// no allocation.
+    #[cfg(feature = "tokio-runtime")]
+    pub(crate) async_panic: OnceLock<PanicSlot>,
     /// Carries the backend type `R` even when no backend feature is enabled
     /// (then the `async_pool` / `cached_pool` fields don't exist, so `R`
     /// would otherwise be an unused type parameter). Zero-sized at runtime.
@@ -1885,6 +1914,16 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
             // the lock (`io::Error` is not `Clone`).
             Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
         }
+    }
+
+    /// This run's async-task panic slot, created on first use (see
+    /// [`Self::async_panic`]).
+    #[cfg(feature = "tokio-runtime")]
+    pub(crate) fn async_panic_slot(&self) -> PanicSlot {
+        Arc::clone(
+            self.async_panic
+                .get_or_init(|| Arc::new(std::sync::Mutex::new(None))),
+        )
     }
 }
 
@@ -2492,6 +2531,50 @@ where
     }
 }
 
+/// Future wrapper converting a panic inside the wrapped task into a normal
+/// completion with the payload recorded in a [`PanicSlot`].
+///
+/// The runtime isolates panics at the task boundary and discards the payload
+/// with the unobserved JoinHandle — a panicking async stage closure
+/// therefore closed its channel normally and the collector returned
+/// truncated output with no error signal. Recording here and re-raising
+/// from `try_exec` after the drain restores the fused path's contract: the
+/// panic reaches the `run()` caller. The same mechanism surfaces nested
+/// `run()` misuse — `block_on` inside a runtime task re-raises with the
+/// actionable `spawn_blocking` hint instead of silently killing every
+/// consumer task (0-item output).
+///
+/// Wrapping the whole task (not just the `f(item)` await) keeps the
+/// payload's ordering edge to the collector simply "task ended" (payload is
+/// recorded before the task's channel ends drop, so the channel-close that
+/// releases the collector happens after the store), and `catch_unwind`
+/// around a poll is a no-op on the happy path (table-based unwinding).
+#[cfg(feature = "tokio-runtime")]
+struct CatchTaskPanic<F> {
+    fut: F,
+    slot: PanicSlot,
+}
+
+#[cfg(feature = "tokio-runtime")]
+impl<F: Future<Output = ()>> Future for CatchTaskPanic<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: `fut` is structurally pinned — it is never moved out of
+        // this wrapper; `slot` has no pinned-field sensitivity.
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: pinned projection of `fut` per its structural pinning.
+        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fut.poll(cx))) {
+            Ok(poll) => poll,
+            Err(payload) => {
+                record_panic(&this.slot, payload);
+                Poll::Ready(())
+            },
+        }
+    }
+}
+
 /// Spawn `io_concurrency` async consumer tasks that read `a_in_rx`, apply `f`,
 /// and forward to a fresh async output channel; returns that output channel.
 ///
@@ -2537,28 +2620,33 @@ where
     let pool = ctx.acquire_async().expect("failed to build async runtime");
     let f = Arc::new(f);
     let cancel = ctx.cancel.clone();
+    let fail = ctx.async_panic_slot();
     for _ in 0..concurrency {
         let f = f.clone();
         let rx = a_in_rx.clone();
         let tx = a_out_tx.clone();
         let c = cancel.clone();
+        let slot = fail.clone();
         // Spawn via the runtime-agnostic backend. `pool.spawn` is the explicit
         // spawn — it does not depend on a TLS current-runtime context, so no
         // `enter()` guard is needed (a future non-tokio backend's scoped-tls
         // `enter` would have no RAII guard anyway).
-        pool.spawn(async move {
-            loop {
-                let Ok((seq, item)) = rx.recv().await else {
-                    break;
-                };
-                if cancel_active(c.as_ref()) {
-                    break;
+        pool.spawn(CatchTaskPanic {
+            fut: async move {
+                loop {
+                    let Ok((seq, item)) = rx.recv().await else {
+                        break;
+                    };
+                    if cancel_active(c.as_ref()) {
+                        break;
+                    }
+                    let out = f(item).await;
+                    if tx.send((seq, out)).await.is_err() {
+                        break;
+                    }
                 }
-                let out = f(item).await;
-                if tx.send((seq, out)).await.is_err() {
-                    break;
-                }
-            }
+            },
+            slot,
         });
     }
     drop(a_out_tx);
@@ -2592,23 +2680,28 @@ fn spawn_async_terminal_tasks<F, In, M, Fut, R, I>(
     let pool = ctx.acquire_async().expect("failed to build async runtime");
     let f = Arc::new(f);
     let cancel = ctx.cancel.clone();
+    let fail = ctx.async_panic_slot();
     for tx in senders {
         let f = f.clone();
         let rx = a_in_rx.clone();
         let c = cancel.clone();
-        pool.spawn(async move {
-            loop {
-                let Ok((seq, item)) = rx.recv().await else {
-                    break;
-                };
-                if cancel_active(c.as_ref()) {
-                    break;
+        let slot = fail.clone();
+        pool.spawn(CatchTaskPanic {
+            fut: async move {
+                loop {
+                    let Ok((seq, item)) = rx.recv().await else {
+                        break;
+                    };
+                    if cancel_active(c.as_ref()) {
+                        break;
+                    }
+                    let out = f(item).await;
+                    if tx.send((seq, out)).await.is_err() {
+                        break;
+                    }
                 }
-                let out = f(item).await;
-                if tx.send((seq, out)).await.is_err() {
-                    break;
-                }
-            }
+            },
+            slot,
         });
     }
     drop(a_in_rx);
@@ -3954,6 +4047,8 @@ where
             async_pool,
             #[cfg(feature = "tokio-runtime")]
             cached_pool: OnceLock::new(),
+            #[cfg(feature = "tokio-runtime")]
+            async_panic: OnceLock::new(),
             _marker: PhantomData,
         };
 
@@ -4079,28 +4174,51 @@ where
         // token legitimately shortens the stream, exempting the equality
         // form (see `OrderedAccounting`).
         let cancel = ctx.cancel.as_ref();
-        let results = match final_rx {
-            FinalRx::Sync(rx) => terminal.drain_sync(rx, ordered, n, cancel),
-            FinalRx::SyncSingle(rx) => terminal.drain_sync(rx, ordered, n, cancel),
-            FinalRx::SyncSharded(rx) => terminal.drain_sync_sharded(rx, ordered, n, cancel),
-            #[cfg(feature = "tokio-runtime")]
-            FinalRx::Async(rx) => {
-                let pool = ctx.acquire_async()?;
-                pool.block_on(terminal.drain_async(rx, ordered, n, cancel))
-            },
-            #[cfg(feature = "tokio-runtime")]
-            FinalRx::AsyncSingle(rx) => {
-                let pool = ctx.acquire_async()?;
-                pool.block_on(terminal.drain_async(rx, ordered, n, cancel))
-            },
-            #[cfg(feature = "tokio-runtime")]
-            FinalRx::AsyncSharded(rx) => {
-                let pool = ctx.acquire_async()?;
-                pool.block_on(terminal.drain_async_sharded(rx, ordered, n, cancel))
-            },
-        };
+        // The drain runs under catch_unwind so a recorded async-stage panic
+        // (see `CatchTaskPanic`) wins over the ordered drain's accounting
+        // assertion: a panicked task drops its in-flight item, which would
+        // trip `emitted + dropped == n` with a misleading invariant message
+        // before the real payload could be re-raised. Any other drain panic
+        // (e.g. a user `for_each` closure on this thread) resumes unchanged.
+        let results =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match final_rx {
+                FinalRx::Sync(rx) => Ok(terminal.drain_sync(rx, ordered, n, cancel)),
+                FinalRx::SyncSingle(rx) => Ok(terminal.drain_sync(rx, ordered, n, cancel)),
+                FinalRx::SyncSharded(rx) => Ok(terminal.drain_sync_sharded(rx, ordered, n, cancel)),
+                #[cfg(feature = "tokio-runtime")]
+                FinalRx::Async(rx) => {
+                    let pool = ctx.acquire_async()?;
+                    Ok(pool.block_on(terminal.drain_async(rx, ordered, n, cancel)))
+                },
+                #[cfg(feature = "tokio-runtime")]
+                FinalRx::AsyncSingle(rx) => {
+                    let pool = ctx.acquire_async()?;
+                    Ok(pool.block_on(terminal.drain_async(rx, ordered, n, cancel)))
+                },
+                #[cfg(feature = "tokio-runtime")]
+                FinalRx::AsyncSharded(rx) => {
+                    let pool = ctx.acquire_async()?;
+                    Ok(pool.block_on(terminal.drain_async_sharded(rx, ordered, n, cancel)))
+                },
+            })) {
+                Ok(Ok(results)) => results,
+                // Runtime acquisition failure inside the closure: report it as
+                // the run's `Err`, exactly as the bare `?` did.
+                Ok(Err(e)) => return Err(e),
+                Err(drain_panic) => {
+                    #[cfg(feature = "tokio-runtime")]
+                    if let Some(slot) = ctx.async_panic.get() {
+                        resume_stored_panic(slot);
+                    }
+                    std::panic::resume_unwind(drain_panic)
+                },
+            };
 
         feeder.finish();
+        #[cfg(feature = "tokio-runtime")]
+        if let Some(slot) = ctx.async_panic.get() {
+            resume_stored_panic(slot);
+        }
         Ok(results)
     }
 }
@@ -4284,7 +4402,7 @@ mod tests {
 
     #[test]
     fn test_feeder_finish_resumes_payload() {
-        let slot: FeederPanicSlot = Arc::new(std::sync::Mutex::new(Some(
+        let slot: PanicSlot = Arc::new(std::sync::Mutex::new(Some(
             Box::new("feeder boom") as Box<dyn std::any::Any + Send>
         )));
         let result = std::panic::catch_unwind(move || Feeder::Pool(slot).finish());

@@ -1013,6 +1013,82 @@ async fn test_run_in_spawn_blocking_works() {
     assert_eq!(sorted, (1..=8u64).collect::<Vec<_>>());
 }
 
+// ── Async stage panic propagation ──
+
+/// A panicking async stage closure must propagate to the `run()` caller —
+/// the runtime isolates panics at the task boundary and drops the payload
+/// with the unobserved JoinHandle, so the run used to close its channel
+/// normally and silently return truncated output (review B2).
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_stage_async_panic_propagates_to_caller() {
+    catch_panic_asserting(
+        || {
+            let _ = stream(0..1000u64)
+                .stage_async(|x: u64| async move {
+                    assert!(x != 500, "async boom at {x}");
+                    x + 1
+                })
+                .run();
+        },
+        &["async boom at 500"],
+    );
+}
+
+/// Ordered flavour: the recorded payload must win over the ordered drain's
+/// accounting assertion (a panicked task drops its in-flight item, which
+/// would otherwise trip `emitted + dropped == n` with a misleading
+/// invariant message before the real panic could be re-raised).
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_stage_async_panic_propagates_ordered() {
+    catch_panic_asserting(
+        || {
+            let _ = stream(0..1000u64)
+                .stage_async(|x: u64| async move {
+                    assert!(x != 500, "async boom at {x}");
+                    x + 1
+                })
+                .ordered()
+                .run();
+        },
+        &["async boom at 500"],
+    );
+}
+
+/// Nested `run()` inside an async stage closure: the inner run's async
+/// terminal calls `block_on` from a runtime task, which re-raises with the
+/// actionable `spawn_blocking` hint. That panic used to be swallowed with
+/// the task (every consumer died, the run silently returned 0 items);
+/// it must now reach the outer `run()` caller. The inner runs share one
+/// pre-built pool so the failure path does not construct a runtime per
+/// task.
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_nested_run_inside_stage_async_propagates() {
+    use youpipe::TokioPool;
+
+    let shared = TokioPool::build(2).expect("build shared runtime");
+    let inner_pool = shared.clone();
+    catch_panic_asserting(
+        move || {
+            let _ = stream(0..8u64)
+                .stage_async(move |x: u64| {
+                    let pool = inner_pool.clone();
+                    async move {
+                        let _inner: Vec<u64> = stream(0..4u64)
+                            .with_async_pool(pool)
+                            .stage_async(|y: u64| async move { y + 1 })
+                            .run();
+                        x
+                    }
+                })
+                .run();
+        },
+        &["youpipe", "spawn_blocking"],
+    );
+}
+
 #[cfg(feature = "tokio-runtime")]
 #[test]
 // Wall-clock assertion (heartbeat gap < 40 ms) — meaningless under miri's
