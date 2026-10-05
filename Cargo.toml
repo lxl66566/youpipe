@@ -101,3 +101,18 @@ codegen-units = 1
 # (rayon, crossbeam, etc. all do the same).
 [profile.release]
 codegen-units = 1
+
+# The workspace `.cargo/config.toml` sets profile-blind `[build] rustflags`.
+# While `-C opt-level=3` lived there, it applied to dev/test builds too, and
+# rustc silently inferred `debug-assertions = off` / `overflow-checks = off`
+# (its defaults for opt-level > 0): every debug-side invariant in this
+# workspace (reorder accounting, fused geometry asserts, push_n length
+# guards, overflow checks) was compiled out of `cargo test` runs. opt-level
+# belongs in the profile table so cargo sees it when computing the implied
+# debug-assertions default and emits the explicit override. Assertions stay
+# on for the CPU-heavy stress tests, which need opt-level = 3 to finish
+# quickly.
+[profile.dev]
+opt-level = 3
+debug-assertions = true
+overflow-checks = true

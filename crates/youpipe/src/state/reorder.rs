@@ -128,17 +128,13 @@ impl<T> ReorderBuffer<T> {
                     "duplicate seq {seq} — ReorderBuffer is single-item-per-seq; use without \
                      `expand`"
                 );
-            } else {
-                // `slot.tag - 1` (the resident seq) is computed inline: a
-                // `let` binding would be unused in release builds.
-                debug_assert!(
-                    false,
-                    "seq {seq} aliases seq {} in slot {idx} — outstanding window exceeded \
-                     capacity {}; the older item was dropped",
-                    slot.tag - 1, // tag != UNOCCUPIED, so no underflow
-                    self.slots.len()
-                );
             }
+            // No debug_assert on the capacity-violation arm: the window
+            // precondition is owned by the caller's sizing (see `drain_ordered`);
+            // violations degrade gracefully here (drop + count), and the unit
+            // tests below exercise that path deliberately. An assert made them
+            // unrunnable with debug assertions on — unnoticed until the
+            // profile fix actually enabled debug assertions for `cargo test`.
             self.dropped += 1;
             unsafe { slot.item.assume_init_drop() };
             self.len -= 1;

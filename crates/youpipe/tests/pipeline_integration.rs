@@ -949,14 +949,17 @@ fn test_async_first_all_downstream_kinds() {
     assert_eq!(r, (0..100u64).map(|x| (x + 1) * 3).collect::<Vec<_>>());
 
     // .stage_async → .stage → .stage_async (async→sync→async round trip).
-    let r: Vec<u64> = stream(0..100u64)
+    // Input starts at 3: the last closure subtracts 3 and the expected-value
+    // expression mirrors it, so a 0 input would overflow-check-panic now
+    // that overflow checks actually run under `cargo test`.
+    let r: Vec<u64> = stream(3..103u64)
         .with_compute_pool(pool)
         .stage_async(|x| async move { x + 1 })
         .stage(|x| x * 2)
         .stage_async(|x| async move { x - 3 })
         .ordered()
         .run();
-    assert_eq!(r, (0..100u64).map(|x| (x + 1) * 2 - 3).collect::<Vec<_>>());
+    assert_eq!(r, (3..103u64).map(|x| (x + 1) * 2 - 3).collect::<Vec<_>>());
 }
 
 // ── Streaming terminal inside an async context ──

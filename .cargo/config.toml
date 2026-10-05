@@ -1,24 +1,20 @@
 # ── Performance overrides ──
 #
-# The host's `~/.cargo/config.toml` sets `[profile.release] panic = "abort"
-# opt-level = "s"`. That combination is catastrophic for youpipe:
+# The host's `~/.cargo/config.toml` may set `[profile]` tables that take
+# precedence over the `[profile]` tables in Cargo.toml. A host
+# `panic = "abort"` would neuter every `catch_unwind` in the pool/join
+# machinery, so `-C panic=unwind` is forced here for ALL profiles — the
+# library requires unwind semantics everywhere (tests included).
 #
-#   * `panic = "abort"` makes every `catch_unwind` in the pool/join machinery
-#     a no-op (panics tear the process down instead of unwinding), so the
-#     `LeafGuard` panic-safety path in `par_index_leaf` is never exercised and
-#     the index-spill it works around still happens.
-#   * `opt-level = "s"` (size) disables the loop unrolling/vectorization
-#     heuristics that the leaf auto-vectorizer depends on — measured: ~2×
-#     regression on the lightweight 1 M warm path vs `opt-level = 3`.
-#
-# `~/.cargo/config.toml`'s `[profile]` table takes precedence over the
-# `[profile]` table in `Cargo.toml`, so a local override there does nothing.
-# `[build] rustflags` *is* applied after profile flags, and rustc takes the
-# last `-C` flag for each setting, so we use this to force the perf-friendly
-# configuration regardless of the host's defaults. Override or disable by
-# setting `RUSTFLAGS` in the environment (Cargo appends those after these).
+# `-C opt-level=3` deliberately does NOT live here: `[build] rustflags` is
+# profile-blind, and an opt-level > 0 from this path made rustc infer
+# `debug-assertions = off` for dev/test, silently compiling out the whole
+# debug-side invariant layer of `cargo test` runs. dev/test opt-level is
+# pinned in Cargo.toml's `[profile.dev]` instead, where cargo can emit the
+# matching `-C debug-assertions=on`. Override or disable by setting
+# `RUSTFLAGS` in the environment (Cargo appends those after these).
 [build]
-rustflags = ["-C", "opt-level=3", "-C", "panic=unwind"]
+rustflags = ["-C", "panic=unwind"]
 
 # Miri configuration.
 #
