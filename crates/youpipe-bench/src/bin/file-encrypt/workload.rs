@@ -46,7 +46,7 @@ fn hash01(i: usize) -> f64 {
 /// sorted by name (deterministic) plus the total bytes written.
 ///
 /// Each file's content is generated on the fly by a per-file LCG over an
-/// 8-symbol alphabet (compressible, non-periodic). See the module docs for why.
+/// 16-symbol alphabet (compressible, non-periodic). See the module docs for why.
 pub fn generate(
     dir: &Path,
     count: usize,
