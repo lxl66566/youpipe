@@ -234,8 +234,11 @@ impl<T> ConcurrentQueue<T> {
                 // No segment-reservation structure to exploit; fall back to
                 // per-item push and count successes until the first error.
                 for _ in 0..iter.len() {
-                    // SAFETY: the loop runs exactly `iter.len()` times.
-                    let value = unsafe { iter.next().unwrap_unchecked() };
+                    // `ExactSizeIterator::len()` is a hint, not a contract
+                    // (only `TrustedLen` is): an over-reporting iterator
+                    // returns `None` before the count runs out — stop
+                    // instead of unwrapping.
+                    let Some(value) = iter.next() else { break };
                     match q.push(value) {
                         Ok(()) => written += 1,
                         // Cannot hand the value back through this API; drop
@@ -250,8 +253,11 @@ impl<T> ConcurrentQueue<T> {
             }
             Inner::Bounded(q) => {
                 for _ in 0..iter.len() {
-                    // SAFETY: the loop runs exactly `iter.len()` times.
-                    let value = unsafe { iter.next().unwrap_unchecked() };
+                    // `ExactSizeIterator::len()` is a hint, not a contract
+                    // (only `TrustedLen` is): an over-reporting iterator
+                    // returns `None` before the count runs out — stop
+                    // instead of unwrapping.
+                    let Some(value) = iter.next() else { break };
                     match q.push(value) {
                         Ok(()) => written += 1,
                         Err(crate::PushError::Full(v)) | Err(crate::PushError::Closed(v)) => {

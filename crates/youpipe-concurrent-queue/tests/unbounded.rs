@@ -295,3 +295,61 @@ fn push_n_mpmc_drops() {
         assert_eq!(DROPS.load(Ordering::SeqCst), total);
     }
 }
+/// `ExactSizeIterator::len()` is a safe hint, not a contract: an
+/// over-reporting iterator must not cause UB in `push_n` (it used to
+/// `unwrap_unchecked` the `next()` results). The batch ends at actual
+/// exhaustion and the queue stays consistent.
+#[test]
+fn push_n_lying_len_over_report() {
+    struct LyingIter {
+        i: i32,
+    }
+    impl Iterator for LyingIter {
+        type Item = i32;
+        fn next(&mut self) -> Option<i32> {
+            self.i += 1;
+            (self.i <= 40).then_some(self.i)
+        }
+    }
+    impl ExactSizeIterator for LyingIter {
+        fn len(&self) -> usize {
+            100 // over-reports; 40 > BLOCK_CAP so the batch spans blocks
+        }
+    }
+
+    let q = ConcurrentQueue::unbounded();
+    assert_eq!(q.push_n(LyingIter { i: 0 }), 40);
+    assert_eq!(q.len(), 40);
+    for i in 1..=40 {
+        assert_eq!(q.pop(), Ok(i));
+    }
+    assert_eq!(q.pop(), Err(PopError::Empty));
+}
+
+/// Same lie, but with items large enough to take the per-item `push`
+/// fallback inside `push_n` (no stack-staged segment).
+#[test]
+fn push_n_lying_len_over_report_large_items() {
+    struct LyingBigIter {
+        i: usize,
+    }
+    impl Iterator for LyingBigIter {
+        type Item = [u8; 512];
+        fn next(&mut self) -> Option<[u8; 512]> {
+            self.i += 1;
+            (self.i <= 2).then_some([self.i as u8; 512])
+        }
+    }
+    impl ExactSizeIterator for LyingBigIter {
+        fn len(&self) -> usize {
+            5
+        }
+    }
+
+    let q = ConcurrentQueue::unbounded();
+    assert_eq!(q.push_n(LyingBigIter { i: 0 }), 2);
+    assert_eq!(q.len(), 2);
+    assert_eq!(q.pop(), Ok([1; 512]));
+    assert_eq!(q.pop(), Ok([2; 512]));
+    assert_eq!(q.pop(), Err(PopError::Empty));
+}

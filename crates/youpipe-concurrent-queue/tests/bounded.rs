@@ -369,3 +369,41 @@ fn mpmc_ring_buffer() {
         assert_eq!(c.load(Ordering::SeqCst), THREADS);
     }
 }
+/// `ExactSizeIterator::len()` is a safe hint, not a contract: an
+/// over-reporting iterator must not cause UB in the per-item `push_n`
+/// fallback; the batch ends at actual exhaustion.
+#[test]
+fn push_n_lying_len_over_report() {
+    struct LyingIter {
+        i: i32,
+    }
+    impl Iterator for LyingIter {
+        type Item = i32;
+        fn next(&mut self) -> Option<i32> {
+            self.i += 1;
+            (self.i <= 2).then_some(self.i)
+        }
+    }
+    impl ExactSizeIterator for LyingIter {
+        fn len(&self) -> usize {
+            5
+        }
+    }
+
+    let q = ConcurrentQueue::bounded(8);
+    assert_eq!(q.push_n(LyingIter { i: 0 }), 2);
+    assert_eq!(q.pop(), Ok(1));
+    assert_eq!(q.pop(), Ok(2));
+    assert_eq!(q.pop(), Err(PopError::Empty));
+}
+
+/// A batch that hits `Full` stops early and drops the rest — the batch
+/// analogue of `push` returning `Full`.
+#[test]
+fn push_n_stops_at_full() {
+    let q = ConcurrentQueue::bounded(2);
+    assert_eq!(q.push_n([1, 2, 3, 4, 5]), 2);
+    assert_eq!(q.pop(), Ok(1));
+    assert_eq!(q.pop(), Ok(2));
+    assert_eq!(q.pop(), Err(PopError::Empty));
+}

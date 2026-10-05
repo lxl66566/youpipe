@@ -1,7 +1,7 @@
 use alloc::alloc::{alloc_zeroed, handle_alloc_error};
 use alloc::boxed::Box;
 use core::alloc::Layout;
-use core::mem::MaybeUninit;
+use core::mem::{MaybeUninit, size_of};
 use core::ptr;
 
 use crossbeam_utils::CachePadded;
@@ -275,6 +275,11 @@ impl<T> Unbounded<T> {
         }
     }
 
+    // Items wider than this skip the stack-staged segment in `push_n` and
+    // take the per-item `push` fallback instead: staging is `BLOCK_CAP`
+    // items wide, and 31 x 256 B keeps the stage within ~8 KiB of stack.
+    const MAX_STAGED_ITEM_SIZE: usize = 256;
+
     /// Pushes a batch of items with one tail CAS per block segment.
     ///
     /// Whereas [`push`](Self::push) performs a `compare_exchange` on the tail
@@ -290,6 +295,15 @@ impl<T> Unbounded<T> {
     /// `WRITE` flags set with `Release` ordering; when a segment exactly fills
     /// a block the caller installs and links the next block exactly like
     /// `push` does at the block boundary.
+    ///
+    /// Segment lengths derive from the items actually pulled out of the
+    /// iterator, never from `ExactSizeIterator::len()` alone: `len()` is a
+    /// safe hint (only the unstable `TrustedLen` is a contract), and
+    /// reserving slots that end up unfilled would leave the queue with
+    /// reserved-but-unwritten slots — `pop` would then spin on `wait_write`
+    /// forever and the queue's `Drop` would run `drop_in_place` on
+    /// uninitialized values. An iterator that over-reports its length simply
+    /// ends the batch early.
     ///
     /// If the queue is closed before a segment is reserved, no further items
     /// are written (values still inside the iterator are dropped) — this is
@@ -312,17 +326,47 @@ impl<T> Unbounded<T> {
             return 0;
         }
 
+        // A stack-staged segment is `BLOCK_CAP` items wide; for very large
+        // `T` that could overflow small thread stacks, so fall back to
+        // per-item `push` (same semantics, one CAS per item).
+        if size_of::<T>() > Self::MAX_STAGED_ITEM_SIZE {
+            let mut written = 0;
+            for _ in 0..len {
+                let Some(value) = iter.next() else { break };
+                // The unbounded queue only fails `push` when closed; the
+                // value is dropped together with the error and the iterator
+                // drops the rest.
+                if self.push(value).is_err() {
+                    break;
+                }
+                written += 1;
+            }
+            return written;
+        }
+
         let mut tail = self.tail.index.load(Ordering::Acquire);
         let mut block = self.tail.block.load(Ordering::Acquire);
         let mut next_block: Option<Box<Block<T>>> = None;
         let backoff = Backoff::new();
         let mut written = 0usize;
 
+        // Values pulled from the iterator but not yet written into the queue,
+        // live in `[stage_start, stage_end)`. An iterator cannot be rewound,
+        // so the stage must survive CAS retries and the first-block-install
+        // race below.
+        let mut stage: [MaybeUninit<T>; BLOCK_CAP] = core::array::from_fn(|_| MaybeUninit::uninit());
+        let mut stage_start = 0usize;
+        let mut stage_end = 0usize;
+
         loop {
             // Check if the queue is closed.
             if tail & MARK_BIT != 0 {
-                // SAFETY (iterator contract): nothing pulled, nothing to
-                // return — the iterator drops the unwritten values.
+                // SAFETY: every slot in `[stage_start, stage_end)` holds a
+                // value pulled from the iterator by the staging loop below;
+                // the iterator can no longer drop them for us.
+                for slot in &mut stage[stage_start..stage_end] {
+                    unsafe { slot.assume_init_drop() };
+                }
                 return written;
             }
 
@@ -338,10 +382,40 @@ impl<T> Unbounded<T> {
                 continue;
             }
 
+            // (Re)fill the stage from the iterator. `len` is only a hint —
+            // an over-reporting `ExactSizeIterator` is plain safe code — so
+            // the iterator may dry up before `written == len`; an empty stage
+            // then ends the batch. (This is also why there is no
+            // `debug_assert` on `iter.len()` anymore: the lie itself is the
+            // gracefully handled case, not an invariant violation.)
+            if stage_start == stage_end {
+                let cap = (BLOCK_CAP - offset).min(len - written);
+                let mut m = 0;
+                while m < cap {
+                    match iter.next() {
+                        Some(value) => {
+                            stage[m].write(value);
+                            m += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if m == 0 {
+                    return written;
+                }
+                stage_start = 0;
+                stage_end = m;
+            }
+
+            // Reserve exactly what the stage holds. A CAS retry may have
+            // landed on an offset with less remaining space than the stage
+            // was filled for, so cap by the current block's remainder; the
+            // surplus stays staged for the next iteration.
+            let n = (stage_end - stage_start).min(BLOCK_CAP - offset);
+
             // If this segment is going to fill the block, allocate the next
             // one in advance so the wait for other threads is as short as
             // possible (mirrors `push`).
-            let n = (BLOCK_CAP - offset).min(len - written);
             if offset + n == BLOCK_CAP && next_block.is_none() {
                 next_block = Some(Block::<T>::new());
             }
@@ -378,16 +452,19 @@ impl<T> Unbounded<T> {
                 Ok(_) => unsafe {
                     // Fill the reserved slots. SAFETY: the CAS granted
                     // exclusive ownership of `[offset, offset+n)` in `block`,
-                    // and `iter` holds at least `len - written ≥ n` items.
+                    // and the stage holds `n` initialized values in
+                    // `[stage_start, stage_start + n)`; each `assume_init_read`
+                    // moves a value out, leaving that stage slot logically
+                    // uninitialized.
                     for k in 0..n {
-                        debug_assert_eq!(iter.len(), len - written - k);
-                        let value = iter.next().unwrap_unchecked();
+                        let value = stage[stage_start + k].assume_init_read();
                         let slot = (*block).slots.get_unchecked(offset + k);
                         slot.value.with_mut(|slot| {
                             slot.write(MaybeUninit::new(value));
                         });
                         slot.state.fetch_or(WRITE, Ordering::Release);
                     }
+                    stage_start += n;
                     written += n;
 
                     // If the segment filled the block, install the next one.
@@ -402,7 +479,7 @@ impl<T> Unbounded<T> {
                         tail = new_tail;
                     }
 
-                    if written == len {
+                    if stage_start == stage_end && written == len {
                         return written;
                     }
                 },
@@ -414,7 +491,6 @@ impl<T> Unbounded<T> {
             }
         }
     }
-
     /// Pops an item from the queue.
     pub fn pop(&self) -> Result<T, PopError> {
         let mut head = self.head.index.load(Ordering::Acquire);
