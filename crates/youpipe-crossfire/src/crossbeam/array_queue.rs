@@ -363,12 +363,7 @@ impl<T, const MP: bool, const MC: bool> ArrayQueue<T, MP, MC> {
                 // per-item", never "spurious weak-CAS failure ate all
                 // bounded retries" — Miri simulates those (it ate the
                 // bounded retries in batch_send_claims_only_free_prefix).
-                match self.tail.compare_exchange(
-                    tail,
-                    pos,
-                    Ordering::SeqCst,
-                    Ordering::Relaxed,
-                ) {
+                match self.tail.compare_exchange(tail, pos, Ordering::SeqCst, Ordering::Relaxed) {
                     Ok(_) => {
                         self.write_claimed(tail, values, n);
                         return n;
@@ -407,7 +402,11 @@ impl<T, const MP: bool, const MC: bool> ArrayQueue<T, MP, MC> {
     /// as `_try_push`/`_start_read`).
     #[inline(always)]
     fn advance(pos: usize, index: usize, one_lap: usize, cap: usize) -> usize {
-        if index + 1 < cap { pos + 1 } else { (pos & !(one_lap - 1)).wrapping_add(one_lap) }
+        if index + 1 < cap {
+            pos + 1
+        } else {
+            (pos & !(one_lap - 1)).wrapping_add(one_lap)
+        }
     }
 
     #[inline]

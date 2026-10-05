@@ -286,10 +286,10 @@ where
 // combines partials bottom-up (see `par_reduce_rec` in fused.rs).
 //
 // Two layers, mirroring `RangeOp`/`SinkOp`:
-//   * [`Reducer`] covers the accumulator side (seed / per-item fold /
-//     partial-combine) and is fed **post-stage** outputs;
-//   * [`ReduceOp`] / [`TryReduceOp`] wrap a stage chain + a `Reducer` into
-//     the item-level op the core's leaves drive.
+//   * [`Reducer`] covers the accumulator side (seed / per-item fold / partial-combine) and is fed
+//     **post-stage** outputs;
+//   * [`ReduceOp`] / [`TryReduceOp`] wrap a stage chain + a `Reducer` into the item-level op the
+//     core's leaves drive.
 
 /// Accumulator-side combinator, fed **post-stage** outputs by the
 /// [`ReduceOp`] wrappers.

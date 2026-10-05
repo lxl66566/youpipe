@@ -2472,10 +2472,7 @@ fn test_reduce_terminals_match_sequential() {
 
     // Filter chain: only survivors fold.
     let kept: u64 = mapped.iter().copied().filter(|x| x % 3 == 0).sum();
-    let s: u64 = pipe_ref(&data)
-        .map(f)
-        .filter(|&x: &u64| x % 3 == 0)
-        .sum();
+    let s: u64 = pipe_ref(&data).map(f).filter(|&x: &u64| x % 3 == 0).sum();
     assert_eq!(s, kept);
     assert_eq!(
         pipe_ref(&data).map(f).filter(|&x: &u64| x % 3 == 0).count(),
@@ -2566,7 +2563,11 @@ fn test_reduce_panic_drop_accounting() {
         }
     }
 
-    let n: u64 = if cfg!(miri) { 2_000 } else { 50_000 };
+    let n: u64 = if cfg!(miri) {
+        2_000
+    } else {
+        50_000
+    };
     let boom_at = n / 2;
     let drops = Arc::new(AtomicUsize::new(0));
     let d = drops.clone();
@@ -2609,7 +2610,11 @@ fn test_try_reduce_short_circuits() {
         }
     }
 
-    let n: u64 = if cfg!(miri) { 2_000 } else { 65_536 };
+    let n: u64 = if cfg!(miri) {
+        2_000
+    } else {
+        65_536
+    };
     let drops = Arc::new(AtomicUsize::new(0));
     let d = drops.clone();
     let items: Vec<InCounter> = (0..n)

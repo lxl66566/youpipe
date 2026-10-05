@@ -4,8 +4,8 @@ use crate::{
     builder::{
         Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, PipelineConfig,
         StageMarker, SyncMap, TryMap, Workload, fused_collect_scoped, fused_fold_scoped,
-        fused_for_each_scoped, fused_reduce_scoped, fused_try_collect_scoped, fused_try_fold_scoped,
-        fused_try_reduce_scoped,
+        fused_for_each_scoped, fused_reduce_scoped, fused_try_collect_scoped,
+        fused_try_fold_scoped, fused_try_reduce_scoped,
     },
     executor::compute::ComputePool,
 };
@@ -596,9 +596,7 @@ where
     /// ```rust
     /// # use youpipe::scope;
     /// let table: Vec<u64> = (0..100).collect();
-    /// let sum = scope(|s| {
-    ///     s.pipe(&table).map(|&x| x * 2).reduce(|a: u64, b| a + b)
-    /// });
+    /// let sum = scope(|s| s.pipe(&table).map(|&x| x * 2).reduce(|a: u64, b| a + b));
     /// assert_eq!(sum, Some(2 * (0..100u64).sum::<u64>()));
     /// ```
     ///

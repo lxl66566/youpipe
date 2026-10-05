@@ -688,12 +688,10 @@ mod loom_tests {
     /// itself spawns real threads and cannot exist under loom.
     ///
     /// Invariants checked by model exhaustion:
-    ///   * liveness — the parked waiter always returns (no lost wake: the
-    ///     sleeping bit is pre-published under the `is_blocked` mutex, and
-    ///     `CoreLatch::set`'s state swap to SET happens before the
-    ///     condvar notify decision);
-    ///   * the latch reads SET and the sleeping state is fully reclaimed on
-    ///     every interleaving.
+    ///   * liveness — the parked waiter always returns (no lost wake: the sleeping bit is
+    ///     pre-published under the `is_blocked` mutex, and `CoreLatch::set`'s state swap to SET
+    ///     happens before the condvar notify decision);
+    ///   * the latch reads SET and the sleeping state is fully reclaimed on every interleaving.
     #[test]
     fn sleeper_is_woken_by_latch_set() {
         loom::model(|| {

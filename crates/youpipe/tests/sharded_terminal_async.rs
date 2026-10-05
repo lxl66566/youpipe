@@ -151,7 +151,11 @@ fn sharded_async_terminal_semantics() {
     //    shard closes, the run must drain the remaining shards and return
     //    (fewer items) instead of hanging. Same contract as the shared
     //    ring's one-sender-of-many drop. ──
-    let n_panic: u64 = if cfg!(miri) { 200 } else { 10_000 };
+    let n_panic: u64 = if cfg!(miri) {
+        200
+    } else {
+        10_000
+    };
     let got = stream(0..n_panic)
         .with_cancel(inert_cancel())
         .stage_async(move |x: u64| async move {
@@ -168,7 +172,11 @@ fn sharded_async_terminal_semantics() {
     //    hang on the shard aggregation ──
     let token = CancellationToken::new();
     let fired = token.clone();
-    let n_cancel: u64 = if cfg!(miri) { 2_000 } else { 100_000 };
+    let n_cancel: u64 = if cfg!(miri) {
+        2_000
+    } else {
+        100_000
+    };
     let cancelled = stream(0..n_cancel)
         .with_cancel(token)
         .stage(move |x: u64| {

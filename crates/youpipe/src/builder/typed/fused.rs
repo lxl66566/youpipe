@@ -18,10 +18,10 @@ use std::{
 use super::{
     slots::Slots,
     traits::{
-        CountReducer, Filter, FoldReducer, FusedOp, FusedReduce, FusedSink, FusedStage,
-        FusedTryOp, FusedTryReduce, FusedTryStage, Identity, InfallibleChain, MapErr,
-        OptionReducer, RangeOp, RangeReduce, RangeTryOp, ReduceOp, Reducer, SinkOp, StageMarker,
-        SumReducer, SyncMap, TryMap, TryReduceOp,
+        CountReducer, Filter, FoldReducer, FusedOp, FusedReduce, FusedSink, FusedStage, FusedTryOp,
+        FusedTryReduce, FusedTryStage, Identity, InfallibleChain, MapErr, OptionReducer, RangeOp,
+        RangeReduce, RangeTryOp, ReduceOp, Reducer, SinkOp, StageMarker, SumReducer, SyncMap,
+        TryMap, TryReduceOp,
     },
 };
 use crate::{
@@ -119,16 +119,14 @@ pub(crate) fn resolve_exec_pool(
 /// leaf loops stay independently inlined so the auto-vectorization argument
 /// on `par_index_leaf` keeps holding):
 ///
-/// * `leaf` runs `[start, end)` sequentially on the current thread. Op
-///   failures come back as `Err`; panics propagate naturally into `join`'s
-///   unwind plumbing (the leaf guard has already dropped the partial state
-///   of its own range).
-/// * `drop_success_range` drops the resources a *successfully completed*
-///   range holds in shared buffers (the completed sibling's output slots),
-///   so the caller can free those buffers without leak or double-drop — the
-///   internal-node granularity of [`HybridStrategy::cleanup_success_chunk`].
-///   Only ever invoked for ranges whose subtree returned `Ok(())`; no-op for
-///   sink-only terminals.
+/// * `leaf` runs `[start, end)` sequentially on the current thread. Op failures come back as `Err`;
+///   panics propagate naturally into `join`'s unwind plumbing (the leaf guard has already dropped
+///   the partial state of its own range).
+/// * `drop_success_range` drops the resources a *successfully completed* range holds in shared
+///   buffers (the completed sibling's output slots), so the caller can free those buffers without
+///   leak or double-drop — the internal-node granularity of
+///   [`HybridStrategy::cleanup_success_chunk`]. Only ever invoked for ranges whose subtree returned
+///   `Ok(())`; no-op for sink-only terminals.
 ///
 /// Panic safety: a panicking leaf's unwind is caught by `join`, and internal
 /// nodes propagate the first `Err`, dropping the already-completed sibling's
@@ -155,8 +153,28 @@ where
     }
     let mid = start + (end - start) / 2;
     let (l, r) = pool.join(
-        || par_tree_rec(pool, input, start, mid, splits_left - 1, leaf, drop_success_range),
-        || par_tree_rec(pool, input, mid, end, splits_left - 1, leaf, drop_success_range),
+        || {
+            par_tree_rec(
+                pool,
+                input,
+                start,
+                mid,
+                splits_left - 1,
+                leaf,
+                drop_success_range,
+            )
+        },
+        || {
+            par_tree_rec(
+                pool,
+                input,
+                mid,
+                end,
+                splits_left - 1,
+                leaf,
+                drop_success_range,
+            )
+        },
     );
     match (l, r) {
         (Ok(()), Ok(())) => Ok(()),
@@ -627,13 +645,12 @@ where
 // `CountLatch::wait_spin`, shared failure-slot funnel) is identical for every
 // terminal. The strategies differ only in:
 //
-//   1. The recursive chunk driver — each strategy supplies `par_tree_rec`'s
-//      leaf + `drop_success_range` hooks: `collect` writes to a shared output
-//      `Slots<R>`, `for_each` is sink-only, `try_collect`'s no-filter fast path
-//      short-circuits into a shared error slot.
+//   1. The recursive chunk driver — each strategy supplies `par_tree_rec`'s leaf +
+//      `drop_success_range` hooks: `collect` writes to a shared output `Slots<R>`, `for_each` is
+//      sink-only, `try_collect`'s no-filter fast path short-circuits into a shared error slot.
 //   2. The failure cleanup — `collect`/`try_collect` must drop successful chunks' output ranges so
-//      the caller can free the buffers; `for_each` has nothing to clean (the failed chunk's
-//      leaf guard already dropped its own unread input tail).
+//      the caller can free the buffers; `for_each` has nothing to clean (the failed chunk's leaf
+//      guard already dropped its own unread input tail).
 //
 // [`HybridStrategy`] abstracts exactly those differences so the dispatcher is
 // written once as [`hybrid_dispatch`]. The strategy crosses into the
@@ -1206,9 +1223,9 @@ where
 /// Range resolution on each failure kind:
 /// - `Ok(())` chunk — output range fully init; the driver drops it via `cleanup_success_chunk` when
 ///   some other chunk failed.
-/// - `Err(e)` chunk — the fallible tree's leaf/internal-node cleanup has already dropped every
-///   live output slot and consumed every input slot in the chunk's range, so nothing remains to
-///   clean (mirrors the panicked chunk of the infallible strategies).
+/// - `Err(e)` chunk — the fallible tree's leaf/internal-node cleanup has already dropped every live
+///   output slot and consumed every input slot in the chunk's range, so nothing remains to clean
+///   (mirrors the panicked chunk of the infallible strategies).
 /// - Panicking chunk — unwinds through the recursion (leaf guard cleans its own partial range;
 ///   sibling ranges may leak, same documented behaviour as the single-tree path).
 struct TryStrategy<'a, R, E, OP> {
@@ -3808,8 +3825,11 @@ where
     ///
     /// ```rust
     /// # use youpipe::pipe;
-    /// let lens = pipe(["alpha".to_string(), "beta".to_string()])
-    ///     .fold(0usize, |a, s: String| a + s.len(), |a, b| a + b);
+    /// let lens = pipe(["alpha".to_string(), "beta".to_string()]).fold(
+    ///     0usize,
+    ///     |a, s: String| a + s.len(),
+    ///     |a, b| a + b,
+    /// );
     /// assert_eq!(lens, 9);
     /// ```
     ///
@@ -5178,7 +5198,18 @@ where
     let mid = start + (end - start) / 2;
     let left_leaves = split_leaf_count(mid - start, splits_left - 1);
     let (l, r) = pool.join(
-        || count_filter_rec(pool, input, stages, start, mid, splits_left - 1, counts, leaf_base),
+        || {
+            count_filter_rec(
+                pool,
+                input,
+                stages,
+                start,
+                mid,
+                splits_left - 1,
+                counts,
+                leaf_base,
+            )
+        },
         || {
             count_filter_rec(
                 pool,
@@ -5261,7 +5292,16 @@ fn place_filter_rec<'i, S, E>(
     let left_leaves = split_leaf_count(mid - start, splits_left - 1);
     pool.join(
         || place_filter_rec(pool, ctx, start, mid, splits_left - 1, leaf_base),
-        || place_filter_rec(pool, ctx, mid, end, splits_left - 1, leaf_base + left_leaves),
+        || {
+            place_filter_rec(
+                pool,
+                ctx,
+                mid,
+                end,
+                splits_left - 1,
+                leaf_base + left_leaves,
+            );
+        },
     );
 }
 
@@ -6358,14 +6398,13 @@ mod tests {
         let data: Vec<u64> = (0..10_007).collect();
 
         // keep: all / none / ~1/3 — `(x + 1) % k == 0` after the first map.
-        for (name, keep) in [
-            ("all", 1u64),
-            ("none", 10_000),
-            ("third", 3),
-        ] {
+        for (name, keep) in [("all", 1u64), ("none", 10_000), ("third", 3)] {
             let stages = SyncMap {
                 prev: Filter {
-                    prev: SyncMap { prev: Identity, f: |x: &u64| x + 1 },
+                    prev: SyncMap {
+                        prev: Identity,
+                        f: |x: &u64| x + 1,
+                    },
                     f: move |&x: &u64| x % keep == 0,
                 },
                 f: |x: u64| x * 2,

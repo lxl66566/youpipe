@@ -392,10 +392,8 @@ impl Drop for Registry {
 /// recompiles (the established methodology — see `YOUPIPE_OVERSPLIT`).
 fn workers_pinned_by_env() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("YOUPIPE_PIN_WORKERS")
-            .is_ok_and(|v| v == "1" || v == "true")
-    })
+    *ENABLED
+        .get_or_init(|| std::env::var("YOUPIPE_PIN_WORKERS").is_ok_and(|v| v == "1" || v == "true"))
 }
 
 // ── Global registry ──

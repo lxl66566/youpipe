@@ -75,7 +75,17 @@ fn sq_light(pools: Pools, data: Vec<u64>) -> usize {
 /// `compare_by_id` pairs them. Function names must be unique items, hence the
 /// explicit idents (same pattern as the zstdx-gungraun crates).
 macro_rules! fused_rows {
-    ($group:ident, $id:ident, $size:expr, $yp:ident, $ry:ident, $sq:ident, $f_yp:expr, $f_ry:expr, $f_sq:expr) => {
+    (
+        $group:ident,
+        $id:ident,
+        $size:expr,
+        $yp:ident,
+        $ry:ident,
+        $sq:ident,
+        $f_yp:expr,
+        $f_ry:expr,
+        $f_sq:expr
+    ) => {
         #[library_benchmark]
         #[bench::$id(youpipe_gungraun::both_pools(), data($size))]
         fn $yp(pools: Pools, data: Vec<u64>) -> usize {
@@ -155,10 +165,5 @@ fused_rows!(
 // `fn main() { main!(...) }` wrapper compiles but silently does nothing.
 main!(
     config = common::count_all_threads(),
-    library_benchmark_groups = [
-        cpu_heavy_1k,
-        cpu_heavy_100k,
-        light_10k,
-        light_100k
-    ]
+    library_benchmark_groups = [cpu_heavy_1k, cpu_heavy_100k, light_10k, light_100k]
 );

@@ -1,10 +1,9 @@
 //! Deterministic streaming-engine benches: instruction counts for the
 //! `stream()` data plane on a pinned 4-worker pool.
 //!
-//! * `single_stage` — one plain `.stage()`: exercises the fused pass-through
-//!   (pure-sync chains execute on the fused core, no channels).
-//! * `two_stage` — two `.stage()`s: adds one bounded inter-stage channel
-//!   handoff per item on top.
+//! * `single_stage` — one plain `.stage()`: exercises the fused pass-through (pure-sync chains
+//!   execute on the fused core, no channels).
+//! * `two_stage` — two `.stage()`s: adds one bounded inter-stage channel handoff per item on top.
 //!
 //! Counting caliber: all threads, process total (see `common/mod.rs`); the
 //! sequential anchor runs the same `both_pools()` setup so the fixed offset

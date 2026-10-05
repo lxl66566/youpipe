@@ -13,7 +13,11 @@ use youpipe::{ComputePool, pipe, pipe_ref, stream};
 
 fn cpu_work(x: u64) -> u64 {
     let mut r = x;
-    let iters = if cfg!(miri) { 2 } else { 100 };
+    let iters = if cfg!(miri) {
+        2
+    } else {
+        100
+    };
     for _ in 0..iters {
         r = r.wrapping_mul(7).wrapping_add(13);
     }
@@ -28,7 +32,11 @@ fn cpu_work(x: u64) -> u64 {
 fn nested_collect_inside_pool_worker() {
     let pool = ComputePool::new(8);
     for size in [1_000usize, 100_000] {
-        let size = if cfg!(miri) { size / 10 } else { size };
+        let size = if cfg!(miri) {
+            size / 10
+        } else {
+            size
+        };
         let data: Vec<u64> = (0..size as u64).collect();
         let expected: Vec<u64> = data.iter().map(|&x| cpu_work(x)).collect();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -55,8 +63,16 @@ fn nested_collect_inside_pool_worker() {
 fn nested_collect_all_workers_concurrently() {
     let workers = 8usize;
     let pool = ComputePool::new(workers);
-    let rounds = if cfg!(miri) { 2 } else { 20 };
-    let size: u64 = if cfg!(miri) { 256 } else { 4_096 };
+    let rounds = if cfg!(miri) {
+        2
+    } else {
+        20
+    };
+    let size: u64 = if cfg!(miri) {
+        256
+    } else {
+        4_096
+    };
     for _ in 0..rounds {
         let (tx, rx) = std::sync::mpsc::channel();
         let jobs: Vec<_> = (0..workers as u64)
@@ -99,7 +115,11 @@ fn nested_panic_propagates_inside_pool_worker() {
     let (tx, rx) = std::sync::mpsc::channel();
     let p = pool.clone();
     pool.submit(move || {
-        let n: u64 = if cfg!(miri) { 64 } else { 4_096 };
+        let n: u64 = if cfg!(miri) {
+            64
+        } else {
+            4_096
+        };
         let p2 = p.clone();
         let r = std::panic::catch_unwind(AssertUnwindSafe(move || {
             let _: Vec<u64> = pipe(0..n)
@@ -133,9 +153,19 @@ fn nested_try_collect_error_inside_pool_worker() {
     let (tx, rx) = std::sync::mpsc::channel();
     let p = pool.clone();
     pool.submit(move || {
-        let n: u64 = if cfg!(miri) { 128 } else { 8_192 };
+        let n: u64 = if cfg!(miri) {
+            128
+        } else {
+            8_192
+        };
         let r: Result<Vec<u64>, &str> = pipe(0..n)
-            .try_map(move |x: u64| if x == n / 2 { Err("stop") } else { Ok(x + 1) })
+            .try_map(move |x: u64| {
+                if x == n / 2 {
+                    Err("stop")
+                } else {
+                    Ok(x + 1)
+                }
+            })
             .with_compute_pool(p)
             .try_collect();
         tx.send(r).unwrap();
@@ -153,7 +183,11 @@ fn nested_for_each_inside_pool_worker() {
     let (tx, rx) = std::sync::mpsc::channel();
     let p = pool.clone();
     pool.submit(move || {
-        let n: u64 = if cfg!(miri) { 256 } else { 20_000 };
+        let n: u64 = if cfg!(miri) {
+            256
+        } else {
+            20_000
+        };
         let sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         {
             let acc = std::sync::Arc::clone(&sum);
@@ -164,9 +198,14 @@ fn nested_for_each_inside_pool_worker() {
         }
         // Every chunk's RMWs happen-before the driver's post-wait (the
         // latch's SeqCst chain), so this load observes the final sum.
-        tx.send(sum.load(std::sync::atomic::Ordering::Relaxed)).unwrap();
+        tx.send(sum.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap();
     });
-    let n: u64 = if cfg!(miri) { 256 } else { 20_000 };
+    let n: u64 = if cfg!(miri) {
+        256
+    } else {
+        20_000
+    };
     let got = rx
         .recv_timeout(std::time::Duration::from_secs(60))
         .expect("on-pool nested for_each deadlocked");
@@ -183,7 +222,11 @@ fn nested_pipe_inside_stream_stage_closure() {
     let outer: Vec<u64> = stream(0..8u64)
         .with_compute_pool(pool.clone())
         .stage(move |x: u64| {
-            let n: u64 = if cfg!(miri) { 512 } else { 8_192 };
+            let n: u64 = if cfg!(miri) {
+                512
+            } else {
+                8_192
+            };
             let inner: Vec<u64> = pipe(0..n)
                 .map(move |v: u64| v.wrapping_mul(2).wrapping_add(x))
                 .with_compute_pool(pool.clone())
@@ -191,7 +234,11 @@ fn nested_pipe_inside_stream_stage_closure() {
             inner.iter().sum::<u64>() + x
         })
         .run();
-    let n: u64 = if cfg!(miri) { 512 } else { 8_192 };
+    let n: u64 = if cfg!(miri) {
+        512
+    } else {
+        8_192
+    };
     let mut expected: Vec<u64> = (0..8u64)
         .map(|x| (0..n).map(|v| v * 2 + x).sum::<u64>() + x)
         .collect();

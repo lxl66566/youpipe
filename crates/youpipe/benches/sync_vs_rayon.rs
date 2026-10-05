@@ -491,7 +491,6 @@ fn bench_filter_selectivity(c: &mut Criterion) {
     group.finish();
 }
 
-
 /// Reduce-terminal family: the `.map(f).sum()` shape (todo perf #3) across
 /// borrowed/owned calibers, against rayon's `.map().sum()` and the old
 /// materialize-then-sum path (`collect()` + serial fold) the reduce core
@@ -551,19 +550,12 @@ fn bench_reduce_family(c: &mut Criterion) {
         );
 
         // rayon cross-library anchor (doubles as the drift control).
-        group.bench_with_input(
-            BenchmarkId::new("rayon_sum", size),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    let s: u64 = data
-                        .par_iter()
-                        .map(|&x| black_box(x.wrapping_add(1)))
-                        .sum();
-                    black_box(s)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("rayon_sum", size), &data, |b, data| {
+            b.iter(|| {
+                let s: u64 = data.par_iter().map(|&x| black_box(x.wrapping_add(1))).sum();
+                black_box(s)
+            });
+        });
 
         // sequential floor.
         group.bench_with_input(
@@ -601,12 +593,12 @@ criterion_group! {
 /// path (`Stealing` latch: the calling worker drives the batch and waits by
 /// stealing). Two regimes:
 ///
-/// - `nested_single`: one submitted job runs a nested `.collect()`; the
-///   other P-1 workers are idle/awake, so this isolates the batch ramp-up
-///   (how fast the pool distributes the injected chunks).
-/// - `nested_saturated`: P concurrent submitted jobs each run a nested
-///   `.collect()` — every worker is a hybrid driver waiting on its own
-///   latch while stealing; the throughput regime for the stealing wait.
+/// - `nested_single`: one submitted job runs a nested `.collect()`; the other P-1 workers are
+///   idle/awake, so this isolates the batch ramp-up (how fast the pool distributes the injected
+///   chunks).
+/// - `nested_saturated`: P concurrent submitted jobs each run a nested `.collect()` — every worker
+///   is a hybrid driver waiting on its own latch while stealing; the throughput regime for the
+///   stealing wait.
 ///
 /// The rayon rows run the same shape on a same-sized rayon pool
 /// (`ThreadPool::spawn` + nested `par_iter`), the direct analogue of an
@@ -614,7 +606,10 @@ criterion_group! {
 fn bench_nested_on_pool(c: &mut Criterion) {
     let threads = std::thread::available_parallelism().map_or(32, NonZeroUsize::get);
     let pool = youpipe::ComputePool::new(threads);
-    let rayon_pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+    let rayon_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap();
 
     let mut group = c.benchmark_group("sync_nested_on_pool");
     for size in [1_000, 100_000] {
@@ -650,10 +645,8 @@ fn bench_nested_on_pool(c: &mut Criterion) {
                     let (tx, rx) = std::sync::mpsc::channel();
                     let data = std::sync::Arc::clone(data);
                     rayon_pool.spawn(move || {
-                        let r: Vec<u64> = data
-                            .par_iter()
-                            .map(|&x| black_box(cpu_work(x)))
-                            .collect();
+                        let r: Vec<u64> =
+                            data.par_iter().map(|&x| black_box(cpu_work(x))).collect();
                         tx.send(r).unwrap();
                     });
                     black_box(rx.recv().unwrap())
@@ -702,10 +695,8 @@ fn bench_nested_on_pool(c: &mut Criterion) {
                         let tx = tx.clone();
                         let data = std::sync::Arc::clone(data);
                         rayon_pool.spawn(move || {
-                            let r: Vec<u64> = data
-                                .par_iter()
-                                .map(|&x| black_box(cpu_work(x)))
-                                .collect();
+                            let r: Vec<u64> =
+                                data.par_iter().map(|&x| black_box(cpu_work(x))).collect();
                             tx.send(r).unwrap();
                         });
                     }

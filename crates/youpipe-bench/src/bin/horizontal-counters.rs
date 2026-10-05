@@ -6,22 +6,23 @@
 //! `perf stat` / `perf record` sessions.
 //!
 //! Two modes:
-//! * `time` (default) — the measurement loop; warmup then a duration-driven
-//!   timed loop per (rep, side), interleaved `A-B-A-B` with the side order
-//!   flipped every rep to cancel position bias (same logic as the horizontal
-//!   harness).
-//! * `addr` — one kept-alive output per side after warmup, printing the
-//!   output `Vec` address / alignment / capacity and the containing VMA's
-//!   `AnonHugePages` from `/proc/self/smaps` (allocator / THP comparison).
+//! * `time` (default) — the measurement loop; warmup then a duration-driven timed loop per (rep,
+//!   side), interleaved `A-B-A-B` with the side order flipped every rep to cancel position bias
+//!   (same logic as the horizontal harness).
+//! * `addr` — one kept-alive output per side after warmup, printing the output `Vec` address /
+//!   alignment / capacity and the containing VMA's `AnonHugePages` from `/proc/self/smaps`
+//!   (allocator / THP comparison).
 //!
 //! Usage:
 //!   cargo run --release -p youpipe-bench --bin horizontal-counters -- \
 //!       --n 2000000,4000000 --reps 5 --duration-ms 700
 //!   ... --mode addr --n 4000000
 
-use std::fmt::Write as _;
-use std::hint::black_box as bb;
-use std::time::{Duration, Instant};
+use std::{
+    fmt::Write as _,
+    hint::black_box as bb,
+    time::{Duration, Instant},
+};
 
 use rayon::prelude::*;
 use youpipe::pipe_ref;
@@ -105,7 +106,15 @@ fn measure(
         let r = bb(r);
         let ns = t.elapsed().as_nanos();
         drop(r);
-        let _ = writeln!(out, "{},{},{},{},{}", side.name(), data.len(), rep, iters, ns);
+        let _ = writeln!(
+            out,
+            "{},{},{},{},{}",
+            side.name(),
+            data.len(),
+            rep,
+            iters,
+            ns
+        );
         iters += 1;
     }
     print!("{out}");
@@ -195,7 +204,7 @@ fn vma_of(addr: usize) -> Option<VmaInfo> {
                     "Size" => i.size_kb = kb,
                     "Rss" => i.rss_kb = kb,
                     "AnonHugePages" => i.anon_hugepages_kb = kb,
-                    _ => {}
+                    _ => {},
                 }
             }
         }
@@ -260,8 +269,7 @@ fn main() {
             probe_addr(Side::Rayon, &data, cfg.warmup);
             continue;
         }
-        let mut times: Vec<(Side, Vec<f64>)> =
-            cfg.sides.iter().map(|&s| (s, Vec::new())).collect();
+        let mut times: Vec<(Side, Vec<f64>)> = cfg.sides.iter().map(|&s| (s, Vec::new())).collect();
         for rep in 0..cfg.reps {
             // Flip the side order every rep: ABCABC position-bias cancel.
             let order = if rep % 2 == 0 {

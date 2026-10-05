@@ -24,14 +24,13 @@
 //! `stage_async` flip between fast and collapsed modes and would drown the
 //! terminal signal. The immune references are used instead:
 //!
-//! * `async1_*` — ONE sync prefix (cheap or cpu) into `stage_async` with an
-//!   instant-return future: the terminal is the async stage's output ring
-//!   with 128 hot producer tasks — the direct todo #1 (c) shape;
-//! * `async1_ordered_*` — ordered variant (ReorderBuffer downstream of the
-//!   shards);
-//! * `async0_*` — async-only chain (mixed-mode feeder channel consumed
-//!   directly): feeder-throughput-limited reference, expected knob-insensitive
-//!   (control for leakage into non-terminal channels).
+//! * `async1_*` — ONE sync prefix (cheap or cpu) into `stage_async` with an instant-return future:
+//!   the terminal is the async stage's output ring with 128 hot producer tasks — the direct todo #1
+//!   (c) shape;
+//! * `async1_ordered_*` — ordered variant (ReorderBuffer downstream of the shards);
+//! * `async0_*` — async-only chain (mixed-mode feeder channel consumed directly):
+//!   feeder-throughput-limited reference, expected knob-insensitive (control for leakage into
+//!   non-terminal channels).
 //!
 //! `cheap` (x+1) is the channel-dominated read; `cpu` (50 mul-adds inside
 //! the future) shows whether the effect survives realistic stages.
@@ -77,43 +76,35 @@ fn bench_sharded_term_async(c: &mut Criterion) {
         let data: Vec<u64> = (0..size as u64).collect();
         group.throughput(Throughput::Elements(size as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("async1_cheap", size),
-            &data,
-            |b, data| {
-                b.iter_batched(
-                    || warm_clone(data),
-                    |v| {
-                        let r = stream(v)
-                            .with_cancel(cancel.clone())
-                            .stage(bump)
-                            .stage_async(|x: u64| async move { bb(x.wrapping_add(1)) })
-                            .run();
-                        bb(r)
-                    },
-                    BatchSize::PerIteration,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("async1_cheap", size), &data, |b, data| {
+            b.iter_batched(
+                || warm_clone(data),
+                |v| {
+                    let r = stream(v)
+                        .with_cancel(cancel.clone())
+                        .stage(bump)
+                        .stage_async(|x: u64| async move { bb(x.wrapping_add(1)) })
+                        .run();
+                    bb(r)
+                },
+                BatchSize::PerIteration,
+            );
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("async1_cpu", size),
-            &data,
-            |b, data| {
-                b.iter_batched(
-                    || warm_clone(data),
-                    |v| {
-                        let r = stream(v)
-                            .with_cancel(cancel.clone())
-                            .stage(|x: u64| bb(cpu_work(x)))
-                            .stage_async(|x: u64| async move { bb(cpu_work(x)) })
-                            .run();
-                        bb(r)
-                    },
-                    BatchSize::PerIteration,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("async1_cpu", size), &data, |b, data| {
+            b.iter_batched(
+                || warm_clone(data),
+                |v| {
+                    let r = stream(v)
+                        .with_cancel(cancel.clone())
+                        .stage(|x: u64| bb(cpu_work(x)))
+                        .stage_async(|x: u64| async move { bb(cpu_work(x)) })
+                        .run();
+                    bb(r)
+                },
+                BatchSize::PerIteration,
+            );
+        });
 
         group.bench_with_input(
             BenchmarkId::new("async1_ordered_cpu", size),
@@ -135,22 +126,18 @@ fn bench_sharded_term_async(c: &mut Criterion) {
             },
         );
 
-        group.bench_with_input(
-            BenchmarkId::new("async0_cheap", size),
-            &data,
-            |b, data| {
-                b.iter_batched(
-                    || warm_clone(data),
-                    |v| {
-                        let r = stream(v)
-                            .stage_async(|x: u64| async move { bb(x.wrapping_add(1)) })
-                            .run();
-                        bb(r)
-                    },
-                    BatchSize::PerIteration,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("async0_cheap", size), &data, |b, data| {
+            b.iter_batched(
+                || warm_clone(data),
+                |v| {
+                    let r = stream(v)
+                        .stage_async(|x: u64| async move { bb(x.wrapping_add(1)) })
+                        .run();
+                    bb(r)
+                },
+                BatchSize::PerIteration,
+            );
+        });
     }
     group.finish();
 }

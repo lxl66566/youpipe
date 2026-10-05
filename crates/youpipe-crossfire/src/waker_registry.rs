@@ -1049,15 +1049,11 @@ mod tests {
         // Woken… but here the stale wake has not run yet, so the node is
         // Init and the fire delivers normally. Force the stale-first shape:
         stale.wake(); // node -> Woken (as if an older fire just landed)
-        // The complete fire must still wake the (re-armed) waiter instead of
-        // silently Skipping on the Woken node.
+                      // The complete fire must still wake the (re-armed) waiter instead of
+                      // silently Skipping on the Woken node.
         reg.fire();
         let state = <RegistrySingle as Registry>::get_waker_state(&reg, &o_waker, Ordering::SeqCst);
-        assert_eq!(
-            state,
-            WakerState::Woken as u8,
-            "re-armed episode must end Woken after fire"
-        );
+        assert_eq!(state, WakerState::Woken as u8, "re-armed episode must end Woken after fire");
     }
 
     #[test]

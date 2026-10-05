@@ -32,8 +32,6 @@ use gungraun::{Callgrind, EntryPoint, LibraryBenchmarkConfig};
 /// default per-function toggle is unusable for pool benches).
 pub fn count_all_threads() -> LibraryBenchmarkConfig {
     LibraryBenchmarkConfig::default()
-        .tool(
-            Callgrind::with_args(["--collect-atstart=yes"]).entry_point(EntryPoint::None),
-        )
+        .tool(Callgrind::with_args(["--collect-atstart=yes"]).entry_point(EntryPoint::None))
         .clone()
 }
