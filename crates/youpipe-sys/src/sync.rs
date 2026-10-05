@@ -169,7 +169,7 @@ mod shim {
     use std::sync as s;
 
     pub struct Mutex<T: ?Sized>(s::Mutex<T>);
-    pub struct MutexGuard<'a, T: ?Sized>(s::MutexGuard<'a, T>);
+    pub struct MutexGuard<'a, T: ?Sized>(Option<s::MutexGuard<'a, T>>);
     pub struct Condvar(s::Condvar);
 
     impl<T> Mutex<T> {
@@ -182,7 +182,7 @@ mod shim {
     impl<T: ?Sized> Mutex<T> {
         #[inline]
         pub fn lock(&self) -> MutexGuard<'_, T> {
-            MutexGuard(self.0.lock().unwrap_or_else(|e| e.into_inner()))
+            MutexGuard(Some(self.0.lock().unwrap_or_else(|e| e.into_inner())))
         }
     }
 
@@ -208,14 +208,14 @@ mod shim {
 
         #[inline]
         fn deref(&self) -> &Self::Target {
-            &self.0
+            self.0.as_ref().expect("guard moved into condvar wait")
         }
     }
 
     impl<T: ?Sized> std::ops::DerefMut for MutexGuard<'_, T> {
         #[inline]
         fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.0
+            self.0.as_mut().expect("guard moved into condvar wait")
         }
     }
 
@@ -243,24 +243,19 @@ mod shim {
         ///
         /// Matches the `parking_lot::Condvar::wait(&self, &mut MutexGuard)`
         /// signature even though std's (like loom's) consumes the guard and
-        /// returns it. We move the inner std guard out via
-        /// `ptr::read`, hand it to std by value, then write the returned
-        /// guard back through the same reference.
-        ///
-        /// # Safety of the move
-        ///
-        /// Between the `ptr::read` and `ptr::write`, `guard.0` is logically
-        /// uninitialized but we never observe it. `std::Condvar::wait` only
-        /// returns `Err` on poison (which we unwrap back into a usable
-        /// guard), so a panic here would leak the original guard rather than
-        /// double-free — acceptable for the test-only Miri path.
+        /// returns it. The guard temporarily moves out of the wrapper via
+        /// `Option::take`, same shape as the loom shim. The previous
+        /// `ptr::read`/`ptr::write` hand-off was unsound on the unwind
+        /// path: had `wait` panicked after taking ownership, std would have
+        /// dropped the guard during its unwind, the `ptr::write` would
+        /// never run, and the wrapper would hold a bitwise duplicate — a
+        /// double unlock/drop that Miri flags as UB. `Option` keeps the
+        /// wrapper's slot honestly empty instead.
         #[inline]
         pub fn wait<'a, T>(&self, guard: &mut MutexGuard<'a, T>) {
-            // SAFETY: see method-level comment.
-            let taken = unsafe { std::ptr::read(&guard.0) };
+            let taken = guard.0.take().expect("guard already in condvar wait");
             let returned = self.0.wait(taken).unwrap_or_else(|e| e.into_inner());
-            // SAFETY: see method-level comment.
-            unsafe { std::ptr::write(&mut guard.0, returned) };
+            guard.0 = Some(returned);
         }
 
         #[inline]
@@ -271,6 +266,34 @@ mod shim {
         #[inline]
         pub fn notify_all(&self) {
             self.0.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Exercises the `Option::take` hand-off end to end: lock, wait
+        /// under contention, deref the re-installed guard. The shim's only
+        /// consumer (`youpipe`'s pool) is not compiled in this crate's
+        /// tests, so without this the path is miri-dark.
+        #[test]
+        fn condvar_wait_moves_guard_out_and_back() {
+            let mutex = Mutex::new(0u8);
+            let condvar = Condvar::new();
+
+            std::thread::scope(|s| {
+                let signer = s.spawn(|| {
+                    *mutex.lock() = 1;
+                    condvar.notify_one();
+                });
+                let mut guard = mutex.lock();
+                while *guard == 0 {
+                    condvar.wait(&mut guard);
+                }
+                assert_eq!(*guard, 1);
+                signer.join().unwrap();
+            });
         }
     }
 }
