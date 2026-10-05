@@ -1251,6 +1251,9 @@ pub struct StreamPipe<S = StreamStart, I = (), O = (), R: AsyncRuntime = Default
     #[cfg(feature = "tokio-runtime")]
     async_pool: Option<R>,
     ordered: bool,
+    /// Pinned reorder-window ceiling for `.ordered()` runs (see
+    /// [`Self::with_reorder_window`]); `None` = the auto window.
+    reorder_window: Option<NonZeroUsize>,
     _marker: PhantomData<(O, R)>,
 }
 
@@ -1282,6 +1285,7 @@ where
         #[cfg(feature = "tokio-runtime")]
         async_pool: None,
         ordered: false,
+        reorder_window: None,
         _marker: PhantomData,
     }
 }
@@ -3027,6 +3031,39 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
         self
     }
 
+    /// Pin the reorder window of an [`.ordered()`](Self::ordered) run to at
+    /// most `window` slots (rounded up to a power of two).
+    ///
+    /// By default the window pre-sizes to the pipeline's in-flight occupancy
+    /// and grows on demand up to `next_pow2(n)` — correct for any per-item
+    /// latency skew, at the cost of memory proportional to the *observed*
+    /// reorder span. Pinning caps that memory: beyond the pinned window a
+    /// straggler's overtaking successors are dropped (counted in
+    /// [`ReorderBuffer::dropped`], kept closed by the run's
+    /// `emitted + dropped == n` accounting) instead of growing the buffer.
+    /// Only pin when a hard memory bound outweighs that robustness — e.g.
+    /// very large `n` with a known-bounded reorder spread.
+    ///
+    /// Inert without `.ordered()` (the unordered drains have no reorder
+    /// buffer). Values at or above `next_pow2(n)` are equivalent to the
+    /// default.
+    ///
+    /// ```rust
+    /// # use std::num::NonZeroUsize;
+    /// # use youpipe::stream;
+    /// let out: Vec<u64> = stream(0..100_000u64)
+    ///     .stage(|x| x + 1)
+    ///     .ordered()
+    ///     .with_reorder_window(NonZeroUsize::new(1 << 14).unwrap())
+    ///     .run();
+    /// assert_eq!(out.len(), 100_000);
+    /// ```
+    #[must_use]
+    pub fn with_reorder_window(mut self, window: NonZeroUsize) -> Self {
+        self.reorder_window = Some(window);
+        self
+    }
+
     /// Attach a managed async runtime so async stages (added via
     /// [`Self::stage_async`]) reuse it across runs instead of building a
     /// transient runtime per call.
@@ -3050,6 +3087,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
             compute_pool: self.compute_pool,
             async_pool: Some(pool),
             ordered: self.ordered,
+            reorder_window: self.reorder_window,
             _marker: PhantomData,
         }
     }
@@ -3199,6 +3237,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
             #[cfg(feature = "tokio-runtime")]
             async_pool: self.async_pool,
             ordered: self.ordered,
+            reorder_window: self.reorder_window,
             _marker: PhantomData,
         }
     }
@@ -3312,6 +3351,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
             #[cfg(feature = "tokio-runtime")]
             async_pool: self.async_pool,
             ordered: self.ordered,
+            reorder_window: self.reorder_window,
             _marker: PhantomData,
         }
     }
@@ -3369,6 +3409,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
             #[cfg(feature = "tokio-runtime")]
             async_pool: self.async_pool,
             ordered: self.ordered,
+            reorder_window: self.reorder_window,
             _marker: PhantomData,
         }
     }
@@ -3432,6 +3473,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
             compute_pool: self.compute_pool,
             async_pool: self.async_pool,
             ordered: self.ordered,
+            reorder_window: self.reorder_window,
             _marker: PhantomData,
         }
     }
@@ -4098,6 +4140,7 @@ where
             #[cfg(feature = "tokio-runtime")]
             async_pool,
             ordered,
+            reorder_window,
             _marker,
         } = self;
 
@@ -4341,10 +4384,14 @@ where
         );
 
         // Resolve the ordered drain's reorder window now that the spawn
-        // walk has accumulated the pipeline's in-flight occupancy (see
-        // `OrderedWindow::auto` for the sizing rationale and the growth
-        // soundness argument).
-        let window = OrderedWindow::auto(n, ctx.in_flight.get());
+        // walk has accumulated the pipeline's in-flight occupancy: the auto
+        // window pre-sizes to that occupancy and grows to the sound
+        // `next_pow2(n)` ceiling (see `OrderedWindow`); an explicit
+        // `with_reorder_window` pin replaces both with the caller's ceiling.
+        let window = match reorder_window {
+            Some(w) => OrderedWindow::fixed(n, w),
+            None => OrderedWindow::auto(n, ctx.in_flight.get()),
+        };
         // `ctx.cancel` feeds the ordered drain's accounting check: a fired
         // token legitimately shortens the stream, exempting the equality
         // form (see `OrderedAccounting`).

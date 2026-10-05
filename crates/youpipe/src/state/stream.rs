@@ -1,7 +1,8 @@
 #[cfg(feature = "tokio-runtime")]
-use crate::handoff::{AsyncRecvItem, ShardedAsyncReceiver};
+use core::num::NonZeroUsize;
+
 use crate::{
-    handoff::{RecvItem, ShardedReceiver, TryRecvError},
+    handoff::{AsyncRecvItem, RecvItem, ShardedAsyncReceiver, ShardedReceiver, TryRecvError},
     state::ReorderBuffer,
     sync::CancellationToken,
 };
@@ -81,6 +82,19 @@ impl OrderedWindow {
             initial: max.min((1 << 10).max(in_flight)),
             max,
         }
+    }
+
+    /// User-pinned ceiling (see `StreamPipe::with_reorder_window`): start at
+    /// and never grow past `window` slots (rounded up to a power of two, and
+    /// never above the sound `next_pow2(n)` ceiling). A straggler span beyond
+    /// it drops and counts instead of growing — the explicit memory-for-
+    /// robustness trade.
+    pub(crate) fn fixed(n: usize, window: NonZeroUsize) -> Self {
+        let max = window
+            .get()
+            .min(n.max(1).next_power_of_two())
+            .next_power_of_two();
+        Self { initial: max, max }
     }
 
     /// Sizing for [`run_ordered_collect`], whose `expected_items` is a
@@ -759,6 +773,19 @@ mod tests {
         let w = OrderedWindow::auto(10, 0);
         assert_eq!(w.initial, 16);
         assert_eq!(w.max, 16);
+    }
+
+    /// The pinned window (`with_reorder_window`) is both the initial size
+    /// and the growth ceiling, never above the sound `next_pow2(n)`.
+    #[test]
+    fn ordered_window_fixed_pins_the_ceiling() {
+        let w = OrderedWindow::fixed(1 << 21, NonZeroUsize::new(4_096).unwrap());
+        assert_eq!(w.initial, 4_096);
+        assert_eq!(w.max, 4_096);
+        // A pin above n collapses to the n ceiling.
+        let w = OrderedWindow::fixed(1_000, NonZeroUsize::new(1 << 22).unwrap());
+        assert_eq!(w.initial, 1_024);
+        assert_eq!(w.max, 1_024);
     }
 
     /// A fired cancel token exempts the equality form: the run fed fewer

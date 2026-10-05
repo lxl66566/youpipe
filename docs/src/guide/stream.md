@@ -27,7 +27,13 @@ oversized pool instead ([pools](../advanced/pools.md)).
 ## Terminals and ordering
 
 `.run()` returns a `Vec` in **completion order**; `.ordered()` restores input
-order via a reorder pass. `.try_run()` returns `std::io::Result<Vec<O>>`
+order via a reorder pass. The reorder window pre-sizes to the pipeline's
+in-flight occupancy and grows on demand up to `next_pow2(n)` — correct for
+any per-item latency skew, with memory proportional to the observed reorder
+span (see [internals](../dev/streaming.md#ordered-output-statereorderrs)).
+`with_reorder_window(nz)` pins a ceiling instead, trading counted drops
+under pathological stragglers for a hard memory bound.
+`.try_run()` returns `std::io::Result<Vec<O>>`
 instead of panicking when the async runtime cannot be built. `.for_each(f)`
 drains item-by-item on the calling thread with no output `Vec` — plain `&mut`
 capture works, no atomics needed:
