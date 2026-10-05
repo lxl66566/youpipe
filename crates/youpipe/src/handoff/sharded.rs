@@ -43,11 +43,16 @@ const MIN_SHARD_BUFFER: usize = 4;
 /// `max(MIN_SHARD_BUFFER, total_capacity / shards)` so the aggregate stays
 /// close to the single-channel backpressure point.
 #[must_use]
-pub fn sharded_mpsc_channel<T: Send + 'static>(
+pub(crate) fn sharded_mpsc_channel<T: Send + 'static>(
     shards: usize,
     total_capacity: usize,
 ) -> (Vec<MpscSender<T>>, ShardedReceiver<T>) {
-    let per = (total_capacity / shards.max(1)).max(MIN_SHARD_BUFFER);
+    // A 0-shard set used to construct "successfully" (`shards.max(1)`
+    // masked the division) and then panic far away on the first
+    // `drain_pass`/`recv_anchor` (`% 0`). Fail fast at the construction
+    // boundary instead.
+    assert!(shards > 0, "shards must be nonzero");
+    let per = (total_capacity / shards).max(MIN_SHARD_BUFFER);
     let mut txs = Vec::with_capacity(shards);
     let mut rxs = Vec::with_capacity(shards);
     for _ in 0..shards {
@@ -82,11 +87,13 @@ pub fn sharded_mpsc_channel<T: Send + 'static>(
 /// collector's pass cost stays bounded by `shards`.
 #[cfg(feature = "tokio-runtime")]
 #[must_use]
-pub fn sharded_mpsc_async_channel<T: Send + Unpin + 'static>(
+pub(crate) fn sharded_mpsc_async_channel<T: Send + Unpin + 'static>(
     shards: usize,
     total_capacity: usize,
 ) -> (Vec<MpscAsyncSender<T>>, ShardedAsyncReceiver<T>) {
-    let per = (total_capacity / shards.max(1)).max(MIN_SHARD_BUFFER);
+    // Same zero-shard guard as `sharded_mpsc_channel`.
+    assert!(shards > 0, "shards must be nonzero");
+    let per = (total_capacity / shards).max(MIN_SHARD_BUFFER);
     let mut txs = Vec::with_capacity(shards);
     let mut rxs = Vec::with_capacity(shards);
     for _ in 0..shards {

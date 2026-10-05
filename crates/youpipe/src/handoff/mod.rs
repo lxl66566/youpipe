@@ -1,5 +1,9 @@
 pub mod channel;
-pub mod sharded;
+// Crate-internal: every receiver method here is `pub(crate)`, so a public
+// module would only expose vestigial constructors (review R-5: an external
+// `sharded_mpsc_channel(0, ..)` constructed fine, then panicked at `% 0` on
+// the first drain pass).
+pub(crate) mod sharded;
 
 // ── Batched data-plane knob (todo #1 residual (d)) ──
 //
@@ -46,5 +50,5 @@ pub use channel::{
 };
 pub(crate) use channel::{Claim, claim_poll};
 #[cfg(feature = "tokio-runtime")]
-pub use sharded::{ShardedAsyncReceiver, sharded_mpsc_async_channel};
-pub use sharded::{ShardedReceiver, sharded_mpsc_channel};
+pub(crate) use sharded::{ShardedAsyncReceiver, sharded_mpsc_async_channel};
+pub(crate) use sharded::{ShardedReceiver, sharded_mpsc_channel};
