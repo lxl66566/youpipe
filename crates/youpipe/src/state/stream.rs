@@ -21,6 +21,83 @@ pub(crate) enum OrderedAccounting<'a> {
     Skip,
 }
 
+/// Resolved reorder-window sizing for one ordered drain: the initial slot
+/// capacity (a pre-size — the slot array still materializes lazily on the
+/// first out-of-order arrival) and the hard capacity ceiling the
+/// [`ReorderBuffer`] grows up to.
+///
+/// # Why the internal ceiling is `next_pow2(n)` and nothing smaller
+///
+/// A [`ReorderBuffer`] only ever aliases (and thus drops) when two *live*
+/// (un-flushed) seqs land `capacity` slots apart, so a window is drop-free
+/// iff it exceeds the maximum live span `max_arrived_seq − next_expected`.
+/// For the streaming collectors that span is bounded by `n − 1`:
+///
+/// 1. The single feeder assigns seqs `0..n-1` in input order, each exactly once (`ordered` +
+///    `expand` is rejected up front; cancellation only stops the feeder early, shrinking the fed
+///    prefix; a fired cancel token additionally exempts the equality accounting).
+/// 2. `next_expected == m` implies seq `m` was never *inserted* — inserting `m` flushes the
+///    contiguous run through `m` immediately. So when any `s > m` is inserted, every seq in `[m,
+///    s)` is still inside the pipeline, in the collector's batch scratch, or already occupying a
+///    slot: distinct and live, at most `n` of them.
+/// 3. All live seqs lie in `[0, n)` ⟹ every pair of live seqs differs by less than `n ≤
+///    next_pow2(n)` = the ceiling.
+///
+/// # Why `initial` is only the pipeline occupancy (growth does the rest)
+///
+/// Sizing the window at the pipeline's in-flight occupancy (Σ channel
+/// buffers + Σ worker batch claims) — the shape suggested by the 2026-10
+/// review — is NOT a sound span bound: a straggler parked in one worker's
+/// stage closure lets arbitrarily many successors overtake it through the
+/// other workers (overtaking needs only transient co-residency in one
+/// stage's worker set; over time the entire input can pass). Measured
+/// (2026-10 probe, release build, pre-fix code): n = 2 M, default buffers
+/// (256), 32 workers, seq 0 sleeping 400 ms — the live span reached ~2 M
+/// against a pipeline occupancy of ~900 and the 1 Mi window silently
+/// dropped ~1 M items (`got 1048576 of 2000000`); `with_buffer_size(64)`
+/// behaved identically. Hence the occupancy estimate only *pre-sizes* the
+/// window (the common-case reorder spread is what is physically in flight;
+/// a mis-estimate costs one amortized doubling), while growth toward
+/// `next_pow2(n)` carries correctness for skewed workloads. Memory stays
+/// proportional to the *observed* span: in-order runs never allocate,
+/// well-behaved runs allocate ~occupancy, and only a real straggler pays
+/// toward the `n`-sized ceiling (which the run already carries twice as
+/// input and output `Vec`s).
+#[derive(Clone, Copy)]
+pub(crate) struct OrderedWindow {
+    initial: usize,
+    max: usize,
+}
+
+impl OrderedWindow {
+    /// Default sizing: grow to the sound `next_pow2(n)` ceiling, pre-sized
+    /// to the pipeline occupancy estimate (`in_flight`, Σ channel buffers +
+    /// Σ worker batch claims, accumulated during the spawn walk — see
+    /// `StreamCtx::note_in_flight`), floored at 1 Ki slots to absorb
+    /// ordinary bursts without a rehash.
+    pub(crate) fn auto(n: usize, in_flight: usize) -> Self {
+        let max = n.max(1).next_power_of_two();
+        Self {
+            initial: max.min((1 << 10).max(in_flight)),
+            max,
+        }
+    }
+
+    /// Sizing for [`run_ordered_collect`], whose `expected_items` is a
+    /// capacity *hint*, not an item-count contract (external callers feed
+    /// arbitrary sender counts and seq patterns): pre-size from the hint
+    /// like the historical fixed window, but grow unboundedly — the public
+    /// helper must not drop on a span the hint underestimated.
+    pub(crate) fn open(expected: usize) -> Self {
+        Self {
+            initial: expected.max(1).next_power_of_two().clamp(1 << 10, 1 << 20),
+            // 1 << 63: for all practical purposes unbounded (a Vec can hold
+            // at most isize::MAX bytes), while staying a power of two.
+            max: 1usize << (usize::BITS - 1),
+        }
+    }
+}
+
 /// Post-drain accounting check shared by the ordered collectors: every item
 /// the run fed must be either emitted or counted as dropped by the
 /// [`ReorderBuffer`]. Debug-only; release builds keep just the counter
@@ -141,6 +218,7 @@ where
 pub(crate) fn drain_ordered<R, O>(
     rx: &R,
     expected_items: usize,
+    window: OrderedWindow,
     accounting: OrderedAccounting<'_>,
     sink: impl FnMut(O),
 ) where
@@ -150,6 +228,7 @@ pub(crate) fn drain_ordered<R, O>(
     drain_ordered_with(
         rx,
         expected_items,
+        window,
         accounting,
         crate::handoff::batch_recv_cap(),
         sink,
@@ -164,6 +243,7 @@ pub(crate) fn drain_ordered<R, O>(
 pub(crate) fn drain_ordered_with<R, O>(
     rx: &R,
     expected_items: usize,
+    window: OrderedWindow,
     accounting: OrderedAccounting<'_>,
     batch_cap: usize,
     mut sink: impl FnMut(O),
@@ -171,13 +251,7 @@ pub(crate) fn drain_ordered_with<R, O>(
     R: RecvItem<(u64, O)>,
     O: Send + 'static,
 {
-    // Size the reorder window to the expected item count (power-of-two,
-    // clamped to [1Ki, 1Mi] slots). Smaller windows are cheaper to allocate
-    // and scan; larger windows tolerate more reordering. The clamp keeps both
-    // tiny inputs (no over-allocation) and very large inputs (bounded memory)
-    // sane.
-    let capacity = expected_items.next_power_of_two().clamp(1 << 10, 1 << 20);
-    let mut buffer = ReorderBuffer::new(capacity);
+    let mut buffer = ReorderBuffer::with_max(window.initial, window.max);
     // Count emissions for the post-drain accounting check; the counter folds
     // into the sink closure, so the per-item cost is one increment.
     let mut emitted = 0usize;
@@ -294,14 +368,14 @@ where
 pub(crate) async fn drain_ordered_async<R, O>(
     rx: &R,
     expected_items: usize,
+    window: OrderedWindow,
     accounting: OrderedAccounting<'_>,
     mut sink: impl FnMut(O),
 ) where
     R: AsyncRecvItem<(u64, O)>,
     O: Send + 'static,
 {
-    let capacity = expected_items.next_power_of_two().clamp(1 << 10, 1 << 20);
-    let mut buffer = ReorderBuffer::new(capacity);
+    let mut buffer = ReorderBuffer::with_max(window.initial, window.max);
     // See `drain_ordered` for the accounting counter.
     let mut emitted = 0usize;
     let mut sink = |item: O| {
@@ -374,13 +448,13 @@ pub(crate) fn drain_unordered_sharded<O, S: FnMut(O)>(
 pub(crate) fn drain_ordered_sharded<O, S: FnMut(O)>(
     rx: &mut ShardedReceiver<(u64, O)>,
     expected_items: usize,
+    window: OrderedWindow,
     accounting: OrderedAccounting<'_>,
     mut sink: S,
 ) where
     O: Send + 'static,
 {
-    let capacity = expected_items.next_power_of_two().clamp(1 << 10, 1 << 20);
-    let mut buffer = ReorderBuffer::new(capacity);
+    let mut buffer = ReorderBuffer::with_max(window.initial, window.max);
     // See `drain_ordered` for the accounting counter.
     let mut emitted = 0usize;
     let mut sink = |item: O| {
@@ -442,13 +516,13 @@ pub(crate) async fn drain_unordered_async_sharded<O, S: FnMut(O)>(
 pub(crate) async fn drain_ordered_async_sharded<O, S: FnMut(O)>(
     rx: &mut ShardedAsyncReceiver<(u64, O)>,
     expected_items: usize,
+    window: OrderedWindow,
     accounting: OrderedAccounting<'_>,
     mut sink: S,
 ) where
     O: Send + Unpin + 'static,
 {
-    let capacity = expected_items.next_power_of_two().clamp(1 << 10, 1 << 20);
-    let mut buffer = ReorderBuffer::new(capacity);
+    let mut buffer = ReorderBuffer::with_max(window.initial, window.max);
     // See `drain_ordered` for the accounting counter.
     let mut emitted = 0usize;
     let mut sink = |item: O| {
@@ -490,9 +564,13 @@ where
     O: Send + 'static,
 {
     let mut results = Vec::with_capacity(expected_items);
-    drain_ordered(input_rx, expected_items, OrderedAccounting::Skip, |item| {
-        results.push(item);
-    });
+    drain_ordered(
+        input_rx,
+        expected_items,
+        OrderedWindow::open(expected_items),
+        OrderedAccounting::Skip,
+        |item| results.push(item),
+    );
     results
 }
 
@@ -501,20 +579,19 @@ mod tests {
     use super::*;
     use crate::handoff::channel;
 
-    /// Window overflow through the real drain loop. The window clamp
-    /// (`next_power_of_two().clamp(1 Ki, 1 Mi)`) only lets an alias happen
-    /// when the outstanding count exceeds the 1 Mi cap, so this feeds
-    /// `1 Mi + 1` items while skipping seq 0, then seq 0 to unblock the
-    /// prefix. Two aliases fire: seq `1 Mi + 1` lands on seq 1's slot, and
-    /// the late seq 0 lands on seq `1 Mi`'s slot (slot 0 — by then the
-    /// window has wrapped). A feeder thread is required — sending 1M items
-    /// into a bounded channel from the drain thread itself would deadlock on
-    /// backpressure. Both drops are counted and the post-drain accounting
-    /// (`emitted + dropped == expected`, no cancel token) must close exactly.
+    /// Pinned-window overflow through the real drain loop (the
+    /// `with_reorder_window` / `ReorderBuffer::with_max` semantics): with a
+    /// 1 Ki ceiling and seq 0 withheld, seq `1 Ki + 1` aliases seq 1's slot
+    /// and the late seq 0 aliases seq `1 Ki`'s (slot 0, wrapped). Both drops
+    /// are counted and the post-drain accounting (`emitted + dropped ==
+    /// expected`, no cancel token) must close exactly. (The historical
+    /// variant of this test exercised the 1 Mi auto clamp; the auto window
+    /// now grows instead of dropping — see
+    /// `drain_ordered_auto_window_grows_no_drops`.)
     #[test]
     fn drain_ordered_counts_window_overflow_drops() {
-        const SPAN: u64 = (1 << 20) + 1; // seqs 1..=SPAN, skipping seq 0
-        const DROPPED: usize = 2; // seqs 1 and 1 Mi (both aliased, see doc)
+        const SPAN: u64 = (1 << 10) + 1; // seqs 1..=SPAN, skipping seq 0
+        const DROPPED: usize = 2; // seqs 1 and 1 Ki (both aliased, see doc)
         let expected: usize = usize::try_from(SPAN).unwrap() + 1; // + seq 0
         let (tx, rx) = channel::<(u64, u64)>(1024);
         let feeder = std::thread::spawn(move || {
@@ -527,13 +604,17 @@ mod tests {
         drain_ordered(
             &rx,
             expected,
+            OrderedWindow {
+                initial: 1 << 10,
+                max: 1 << 10,
+            },
             OrderedAccounting::Validate { cancel: None },
             |i| {
                 out.push(i);
             },
         );
         feeder.join().unwrap();
-        // expected fed == SPAN + 1 emitted + DROPPED; seqs 1 and 1 Mi were
+        // expected fed == SPAN + 1 emitted + DROPPED; seqs 1 and 1 Ki were
         // overwritten. (The accounting check inside `drain_ordered` already
         // asserted `emitted + dropped == expected`; these asserts pin down
         // WHICH items vanished.)
@@ -541,13 +622,42 @@ mod tests {
         assert_eq!(out[0], 0, "seq 0 unblocks the prefix flush");
         assert!(!out.contains(&1), "the first aliased item must not survive");
         assert!(
-            !out.contains(&(1 << 20)),
+            !out.contains(&(1 << 10)),
             "the second aliased item must not survive"
         );
         let mut sorted = out.clone();
         sorted.sort_unstable();
-        let expected_items: Vec<u64> = (0..=SPAN).filter(|&s| s != 1 && s != (1 << 20)).collect();
+        let expected_items: Vec<u64> = (0..=SPAN).filter(|&s| s != 1 && s != (1 << 10)).collect();
         assert_eq!(sorted, expected_items);
+    }
+
+    /// The auto window (B6 fix): a span far beyond the 1 Ki initial size and
+    /// the pipeline occupancy must grow the reorder buffer instead of
+    /// dropping — this is the drain-level shape of the review's straggler
+    /// repro (seq 0 withheld while ~1 Ki +ε successors arrive).
+    #[test]
+    fn drain_ordered_auto_window_grows_no_drops() {
+        const N: u64 = 5000; // >> initial 1 Ki, >> any in-flight estimate
+        let n = usize::try_from(N).unwrap();
+        let (tx, rx) = channel::<(u64, u64)>(64);
+        let feeder = std::thread::spawn(move || {
+            for seq in 1..N {
+                tx.send((seq, seq)).unwrap();
+            }
+            tx.send((0, 0)).unwrap();
+        });
+        let mut out = Vec::new();
+        drain_ordered(
+            &rx,
+            n,
+            // Auto with a small occupancy estimate — exactly what a
+            // small-buffer pipeline resolves to.
+            OrderedWindow::auto(n, 64 + 8),
+            OrderedAccounting::Validate { cancel: None },
+            |i| out.push(i),
+        );
+        feeder.join().unwrap();
+        assert_eq!(out, (0..N).collect::<Vec<_>>());
     }
 
     /// Batch-cap equivalence of the unordered drain: cap 0 (the historical
@@ -602,6 +712,7 @@ mod tests {
         drain_ordered_with(
             &rx,
             usize::try_from(N).unwrap(),
+            OrderedWindow::auto(usize::try_from(N).unwrap(), 64),
             OrderedAccounting::Validate { cancel: None },
             8,
             |v| out.push(v),
@@ -625,6 +736,31 @@ mod tests {
         assert_eq!(got, (0..32).collect::<Vec<_>>());
     }
 
+    /// P-1 behavior pin: the auto window pre-sizes to the pipeline
+    /// occupancy (floored at 1 Ki), never to a fixed 1 Mi — a large-`n`
+    /// ordered run with a small pipeline allocates 16 KiB, not 16 MiB —
+    /// while the growth ceiling stays at the sound `next_pow2(n)`.
+    #[test]
+    fn ordered_window_auto_presizes_to_occupancy() {
+        // Large n, small occupancy (default buffers, few workers).
+        let w = OrderedWindow::auto(1 << 21, 900);
+        assert_eq!(w.initial, 1 << 10);
+        assert_eq!(w.max, 1 << 21);
+        // Occupancy above the floor but below the ceiling: pre-size to it
+        // (rounded up by `ReorderBuffer::with_max`).
+        let w = OrderedWindow::auto(1 << 21, 70_000);
+        assert_eq!(w.initial, 70_000);
+        assert_eq!(w.max, 1 << 21);
+        // Occupancy above n (e.g. `buffer ≥ n`): the n cap wins.
+        let w = OrderedWindow::auto(1_000, 1_000_000);
+        assert_eq!(w.initial, 1_024);
+        assert_eq!(w.max, 1_024);
+        // Tiny n: the 1 Ki floor cannot exceed the sound ceiling.
+        let w = OrderedWindow::auto(10, 0);
+        assert_eq!(w.initial, 16);
+        assert_eq!(w.max, 16);
+    }
+
     /// A fired cancel token exempts the equality form: the run fed fewer
     /// items than `expected_items` (feeder stopped early) and must not trip
     /// the debug assertion.
@@ -643,6 +779,7 @@ mod tests {
         drain_ordered(
             &rx,
             100,
+            OrderedWindow::auto(100, 0),
             OrderedAccounting::Validate {
                 cancel: Some(&token),
             },

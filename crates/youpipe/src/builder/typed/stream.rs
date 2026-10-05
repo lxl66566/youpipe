@@ -37,8 +37,8 @@ use crate::{
     pool::Registry,
     runtime::{AsyncRuntime, DefaultRuntime},
     state::{
-        FenceBarrier, FenceMode, OrderedAccounting, drain_ordered, drain_ordered_sharded,
-        drain_unordered_sharded,
+        FenceBarrier, FenceMode, OrderedAccounting, OrderedWindow, drain_ordered,
+        drain_ordered_sharded, drain_unordered_sharded,
     },
     sync::CancellationToken,
 };
@@ -78,6 +78,7 @@ fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
     ctx: &StreamCtx<'_, R>,
 ) -> Receiver<(u64, T)> {
     let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
+    ctx.note_in_flight(buffer + 1); // channel + one item in the bridge's hand
     let (s_tx, s_rx) = channel::<(u64, T)>(buffer);
     let cancel = ctx.cancel.clone();
     let pool = ctx.acquire_async().expect("failed to build async runtime");
@@ -964,6 +965,19 @@ fn forward_fenced<M, Tx>(
 /// stage workers' panic policy (pool jobs and dedicated threads abort the
 /// process on panic — `forward_fenced` itself contains no user code, this
 /// is just the shared safety net) and the lease's per-job slot release.
+/// In-flight items a fence forwarder holds beyond its (already-noted)
+/// output channel: the claim scratch (≤ one batch, like a stage worker)
+/// plus the [`FenceBarrier`]'s pending chunk — unbounded (≤ n) in
+/// [`FenceMode::Barrier`]: the whole stream can accumulate before the
+/// barrier releases.
+fn fence_hold(mode: FenceMode, n: usize) -> usize {
+    let scratch = crate::handoff::batch_recv_cap().max(1);
+    match mode.chunk_size() {
+        Some(k) => scratch + k,
+        None => scratch + n,
+    }
+}
+
 fn spawn_forwarder<M, Tx, R>(
     ctx: &StreamCtx<'_, R>,
     mid_rx: Receiver<(u64, M)>,
@@ -975,6 +989,7 @@ fn spawn_forwarder<M, Tx, R>(
     Tx: SendItem<(u64, M)>,
     R: AsyncRuntime,
 {
+    ctx.note_in_flight(fence_hold(mode, expected));
     let cancel = ctx.cancel.clone();
     ctx.spawn_stage_jobs(vec![move || {
         forward_fenced(mid_rx, fenced_tx, mode, expected, cancel.as_ref());
@@ -1734,6 +1749,14 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// Sync/expand stages not yet spawned; decremented alongside
     /// [`Self::worker_slots_left`] to preserve the invariant above.
     pub(crate) stages_left: Cell<usize>,
+    /// Upper bound of items simultaneously inside the run's data plane
+    /// (channels + worker batch claims + fence batches), accumulated during
+    /// the spawn walk via [`Self::note_in_flight`]. Purely a *pre-size*
+    /// hint for the ordered drain's reorder window
+    /// ([`OrderedWindow::auto`]): a missed term can only under-size the
+    /// initial window (the buffer grows on demand, drop-free), never lose
+    /// data. New spawn sites should note every term they contribute.
+    pub(crate) in_flight: Cell<usize>,
     /// Custom compute pool (cloned from the builder's `with_compute_pool`).
     /// When `None`, sync stages use [`ComputePool::global`].
     pub compute_pool: Option<ComputePool>,
@@ -1768,6 +1791,13 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
 impl<R: AsyncRuntime> StreamCtx<'_, R> {
     pub fn buffer_size(&self, parallelism: usize) -> usize {
         self.config.buffer_size.max(parallelism * 4)
+    }
+
+    /// Accumulate one term of the run's in-flight occupancy estimate (see
+    /// [`Self::in_flight`]). Called exactly once per spawned stage/channel
+    /// during the spawn walk.
+    pub fn note_in_flight(&self, items: usize) {
+        self.in_flight.set(self.in_flight.get() + items);
     }
 
     /// Whether this run's terminal stage should shard its output channel:
@@ -1823,6 +1853,10 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
         // floor.
         let granted = requested.min(slots.saturating_sub(after)).max(1);
         self.worker_slots_left.set(slots - granted);
+        // In-flight estimate: each granted worker holds at most one claim
+        // batch (`batch_recv_cap()` items, or the single anchored item with
+        // the batch knob off).
+        self.note_in_flight(granted * crate::handoff::batch_recv_cap().max(1));
         granted
     }
 
@@ -1867,7 +1901,12 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     /// options kind ([`SyncStageOptions`] / [`AsyncStageOptions`] /
     /// [`FenceOptions`]) carries it.
     pub fn stage_buffer(&self, buffer: Option<NonZeroUsize>, parallelism: usize) -> usize {
-        buffer.map_or_else(|| self.buffer_size(parallelism), NonZeroUsize::get)
+        let buffer = buffer.map_or_else(|| self.buffer_size(parallelism), NonZeroUsize::get);
+        // In-flight estimate: one output channel of this capacity per call
+        // site (the sharded fan-out variants note their extra shards at the
+        // `sharded_*_channel` construction sites).
+        self.note_in_flight(buffer);
+        buffer
     }
 
     /// Resolve an async stage's task fan-out: the stage's explicit
@@ -2122,6 +2161,9 @@ where
             // YOUPIPE_SHARDED_TERM=1: one SPSC ring per worker instead of one
             // shared ring — removes both the send-side producer CAS
             // contention and the collector's shared cache lines (todo #1).
+            // `stage_buffer` noted one shard's capacity; the other shards
+            // are extra in-flight capacity.
+            ctx.note_in_flight((parallelism - 1) * buffer);
             let (txs, out_rx) = sharded_mpsc_channel::<(u64, M)>(parallelism, buffer);
             spawn_stage_fanout::<_, _, MpscSender<(u64, M)>, R>(ctx, mid_rx, txs, self.f);
             return FinalRx::SyncSharded(out_rx);
@@ -2187,6 +2229,9 @@ where
         if ctx.sharded_terminal(parallelism) {
             // See `SyncStage::spawn_single` — the feeder being async changes
             // nothing about the terminal fan-in shape.
+            // `stage_buffer` noted one shard's capacity; the other shards
+            // are extra in-flight capacity.
+            ctx.note_in_flight((parallelism - 1) * buffer);
             let (txs, out_rx) = sharded_mpsc_channel::<(u64, M)>(parallelism, buffer);
             spawn_stage_fanout::<_, _, MpscSender<(u64, M)>, R>(ctx, mid_rx, txs, self.f);
             return FinalRx::SyncSharded(out_rx);
@@ -2311,6 +2356,7 @@ where
         if ctx.sharded_terminal(parallelism) {
             // See `SyncStage::spawn_single`; expand workers benefit from the
             // same send-side de-contention as plain sync workers.
+            ctx.note_in_flight((parallelism - 1) * buffer);
             let (txs, out_rx) = sharded_mpsc_channel::<(u64, N)>(parallelism, buffer);
             spawn_expand_stage_fanout::<_, _, MpscSender<(u64, N)>, R>(ctx, mid_rx, txs, self.f);
             return FinalRx::SyncSharded(out_rx);
@@ -2682,6 +2728,7 @@ where
 {
     let concurrency = ctx.stage_io_concurrency(opts);
     let buffer = ctx.stage_buffer(opts.buffer, concurrency);
+    ctx.note_in_flight(concurrency); // one in-flight item per consumer task
     let (a_out_tx, a_out_rx) = async_channel::<(u64, M)>(buffer);
     let pool = ctx.acquire_async().expect("failed to build async runtime");
     let f = Arc::new(f);
@@ -2801,8 +2848,12 @@ where
 {
     let concurrency = ctx.stage_io_concurrency(opts);
     let buffer = ctx.stage_buffer(opts.buffer, concurrency);
+    ctx.note_in_flight(concurrency); // one in-flight item per consumer task
     let shards = ctx.sharded_async_terminal(concurrency);
     if shards > 0 {
+        // `stage_buffer` noted one shard's capacity; the other shards are
+        // extra in-flight capacity.
+        ctx.note_in_flight((shards - 1) * buffer);
         let (txs, out_rx) = sharded_mpsc_async_channel::<(u64, M)>(shards, buffer);
         // Task i owns shard `i % shards` for its whole life (temporal
         // locality: a task's sends always hit the same ring); tasks beyond
@@ -3395,10 +3446,13 @@ trait Terminal<T: Send + Unpin + 'static>: Sized {
     type Out: Send + 'static;
     /// Result for an empty input (nothing is spawned at all).
     fn drain_empty(self) -> Self::Out;
+    /// `window` is the resolved reorder-window sizing for the ordered
+    /// variant (see [`OrderedWindow`]); unordered drains ignore it.
     fn drain_sync<R: RecvItem<(u64, T)>>(
         self,
         rx: R,
         ordered: bool,
+        window: OrderedWindow,
         n: usize,
         cancel: Option<&CancellationToken>,
     ) -> Self::Out;
@@ -3410,6 +3464,7 @@ trait Terminal<T: Send + Unpin + 'static>: Sized {
         self,
         rx: ShardedReceiver<(u64, T)>,
         ordered: bool,
+        window: OrderedWindow,
         n: usize,
         cancel: Option<&CancellationToken>,
     ) -> Self::Out;
@@ -3418,6 +3473,7 @@ trait Terminal<T: Send + Unpin + 'static>: Sized {
         self,
         rx: R,
         ordered: bool,
+        window: OrderedWindow,
         n: usize,
         cancel: Option<&CancellationToken>,
     ) -> impl Future<Output = Self::Out>;
@@ -3429,6 +3485,7 @@ trait Terminal<T: Send + Unpin + 'static>: Sized {
         self,
         rx: ShardedAsyncReceiver<(u64, T)>,
         ordered: bool,
+        window: OrderedWindow,
         n: usize,
         cancel: Option<&CancellationToken>,
     ) -> impl Future<Output = Self::Out>;
@@ -3448,20 +3505,22 @@ impl<T: Send + Unpin + 'static> Terminal<T> for VecCollector {
         self,
         rx: R,
         ordered: bool,
+        window: OrderedWindow,
         n: usize,
         cancel: Option<&CancellationToken>,
     ) -> Vec<T> {
-        collect_sync(rx, ordered, n, cancel)
+        collect_sync(rx, ordered, window, n, cancel)
     }
 
     fn drain_sync_sharded(
         self,
         rx: ShardedReceiver<(u64, T)>,
         ordered: bool,
+        window: OrderedWindow,
         n: usize,
         cancel: Option<&CancellationToken>,
     ) -> Vec<T> {
-        collect_sync_sharded(rx, ordered, n, cancel)
+        collect_sync_sharded(rx, ordered, window, n, cancel)
     }
 
     #[cfg(feature = "tokio-runtime")]
@@ -3469,10 +3528,11 @@ impl<T: Send + Unpin + 'static> Terminal<T> for VecCollector {
         self,
         rx: R,
         ordered: bool,
+        window: OrderedWindow,
         n: usize,
         cancel: Option<&CancellationToken>,
     ) -> Vec<T> {
-        collect_async(rx, ordered, n, cancel).await
+        collect_async(rx, ordered, window, n, cancel).await
     }
 
     #[cfg(feature = "tokio-runtime")]
@@ -3480,6 +3540,7 @@ impl<T: Send + Unpin + 'static> Terminal<T> for VecCollector {
         self,
         mut rx: ShardedAsyncReceiver<(u64, T)>,
         ordered: bool,
+        window: OrderedWindow,
         n: usize,
         cancel: Option<&CancellationToken>,
     ) -> Vec<T> {
@@ -3488,6 +3549,7 @@ impl<T: Send + Unpin + 'static> Terminal<T> for VecCollector {
             drain_ordered_async_sharded(
                 &mut rx,
                 n,
+                window,
                 OrderedAccounting::Validate { cancel },
                 |item| {
                     results.push(item);
@@ -3517,20 +3579,22 @@ impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<T> for ForEachCollector<F>
         self,
         rx: R,
         ordered: bool,
+        window: OrderedWindow,
         n: usize,
         cancel: Option<&CancellationToken>,
     ) {
-        for_each_sync(rx, ordered, n, cancel, self.f);
+        for_each_sync(rx, ordered, window, n, cancel, self.f);
     }
 
     fn drain_sync_sharded(
         self,
         rx: ShardedReceiver<(u64, T)>,
         ordered: bool,
+        window: OrderedWindow,
         n: usize,
         cancel: Option<&CancellationToken>,
     ) {
-        for_each_sync_sharded(rx, ordered, n, cancel, self.f);
+        for_each_sync_sharded(rx, ordered, window, n, cancel, self.f);
     }
 
     #[cfg(feature = "tokio-runtime")]
@@ -3538,10 +3602,11 @@ impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<T> for ForEachCollector<F>
         self,
         rx: R,
         ordered: bool,
+        window: OrderedWindow,
         n: usize,
         cancel: Option<&CancellationToken>,
     ) {
-        for_each_async(rx, ordered, n, cancel, self.f).await;
+        for_each_async(rx, ordered, window, n, cancel, self.f).await;
     }
 
     #[cfg(feature = "tokio-runtime")]
@@ -3549,12 +3614,19 @@ impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<T> for ForEachCollector<F>
         self,
         mut rx: ShardedAsyncReceiver<(u64, T)>,
         ordered: bool,
+        window: OrderedWindow,
         n: usize,
         cancel: Option<&CancellationToken>,
     ) {
         if ordered {
-            drain_ordered_async_sharded(&mut rx, n, OrderedAccounting::Validate { cancel }, self.f)
-                .await;
+            drain_ordered_async_sharded(
+                &mut rx,
+                n,
+                window,
+                OrderedAccounting::Validate { cancel },
+                self.f,
+            )
+            .await;
         } else {
             drain_unordered_async_sharded(&mut rx, self.f).await;
         }
@@ -3567,6 +3639,7 @@ impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<T> for ForEachCollector<F>
 fn collect_sync_sharded<T>(
     mut rx: ShardedReceiver<(u64, T)>,
     ordered: bool,
+    window: OrderedWindow,
     n: usize,
     cancel: Option<&CancellationToken>,
 ) -> Vec<T>
@@ -3575,9 +3648,15 @@ where
 {
     let mut results = Vec::with_capacity(n);
     if ordered {
-        drain_ordered_sharded(&mut rx, n, OrderedAccounting::Validate { cancel }, |item| {
-            results.push(item);
-        });
+        drain_ordered_sharded(
+            &mut rx,
+            n,
+            window,
+            OrderedAccounting::Validate { cancel },
+            |item| {
+                results.push(item);
+            },
+        );
     } else {
         drain_unordered_sharded(&mut rx, |item| results.push(item));
     }
@@ -3588,14 +3667,20 @@ where
 /// [`drain_unordered`]/[`drain_ordered`] loops with the user closure as the
 /// sink.
 #[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
-fn for_each_sync<R, T, F>(rx: R, ordered: bool, n: usize, cancel: Option<&CancellationToken>, f: F)
-where
+fn for_each_sync<R, T, F>(
+    rx: R,
+    ordered: bool,
+    window: OrderedWindow,
+    n: usize,
+    cancel: Option<&CancellationToken>,
+    f: F,
+) where
     R: RecvItem<(u64, T)>,
     T: Send + Unpin + 'static,
     F: FnMut(T),
 {
     if ordered {
-        drain_ordered(&rx, n, OrderedAccounting::Validate { cancel }, f);
+        drain_ordered(&rx, n, window, OrderedAccounting::Validate { cancel }, f);
     } else {
         crate::state::drain_unordered(&rx, f);
     }
@@ -3606,6 +3691,7 @@ where
 fn for_each_sync_sharded<T, F>(
     mut rx: ShardedReceiver<(u64, T)>,
     ordered: bool,
+    window: OrderedWindow,
     n: usize,
     cancel: Option<&CancellationToken>,
     f: F,
@@ -3614,7 +3700,13 @@ fn for_each_sync_sharded<T, F>(
     F: FnMut(T),
 {
     if ordered {
-        drain_ordered_sharded(&mut rx, n, OrderedAccounting::Validate { cancel }, f);
+        drain_ordered_sharded(
+            &mut rx,
+            n,
+            window,
+            OrderedAccounting::Validate { cancel },
+            f,
+        );
     } else {
         drain_unordered_sharded(&mut rx, f);
     }
@@ -3628,6 +3720,7 @@ fn for_each_sync_sharded<T, F>(
 async fn for_each_async<R, T, F>(
     rx: R,
     ordered: bool,
+    window: OrderedWindow,
     n: usize,
     cancel: Option<&CancellationToken>,
     f: F,
@@ -3637,7 +3730,7 @@ async fn for_each_async<R, T, F>(
     F: FnMut(T),
 {
     if ordered {
-        drain_ordered_async(&rx, n, OrderedAccounting::Validate { cancel }, f).await;
+        drain_ordered_async(&rx, n, window, OrderedAccounting::Validate { cancel }, f).await;
     } else {
         crate::state::drain_unordered_async(&rx, f).await;
     }
@@ -4112,6 +4205,7 @@ where
             lease,
             worker_slots_left: Cell::new(worker_slots_left),
             stages_left: Cell::new(stages_left),
+            in_flight: Cell::new(0),
             compute_pool: Some(pool),
             #[cfg(feature = "tokio-runtime")]
             async_pool,
@@ -4134,6 +4228,12 @@ where
         }
 
         let buffer = ctx.buffer_size(per_stage_parallelism);
+        // In-flight estimate, feeder side: the feeder channel's capacity,
+        // the one item held in a blocked `send`, and the collector's batch
+        // scratch (`batch_recv_cap()` items claimed but not yet inserted).
+        // (The feeder prefetches nothing beyond that one item — `push_items`
+        // sends straight from the input iterator.)
+        ctx.note_in_flight(buffer + 1 + crate::handoff::batch_recv_cap());
 
         // Pick the feeder channel type from the chain's innermost real stage.
         //
@@ -4240,6 +4340,11 @@ where
             "terminal channel must be single-consumer (Single or Sharded variant)"
         );
 
+        // Resolve the ordered drain's reorder window now that the spawn
+        // walk has accumulated the pipeline's in-flight occupancy (see
+        // `OrderedWindow::auto` for the sizing rationale and the growth
+        // soundness argument).
+        let window = OrderedWindow::auto(n, ctx.in_flight.get());
         // `ctx.cancel` feeds the ordered drain's accounting check: a fired
         // token legitimately shortens the stream, exempting the equality
         // form (see `OrderedAccounting`).
@@ -4252,23 +4357,25 @@ where
         // (e.g. a user `for_each` closure on this thread) resumes unchanged.
         let results =
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match final_rx {
-                FinalRx::Sync(rx) => Ok(terminal.drain_sync(rx, ordered, n, cancel)),
-                FinalRx::SyncSingle(rx) => Ok(terminal.drain_sync(rx, ordered, n, cancel)),
-                FinalRx::SyncSharded(rx) => Ok(terminal.drain_sync_sharded(rx, ordered, n, cancel)),
+                FinalRx::Sync(rx) => Ok(terminal.drain_sync(rx, ordered, window, n, cancel)),
+                FinalRx::SyncSingle(rx) => Ok(terminal.drain_sync(rx, ordered, window, n, cancel)),
+                FinalRx::SyncSharded(rx) => {
+                    Ok(terminal.drain_sync_sharded(rx, ordered, window, n, cancel))
+                },
                 #[cfg(feature = "tokio-runtime")]
                 FinalRx::Async(rx) => {
                     let pool = ctx.acquire_async()?;
-                    Ok(pool.block_on(terminal.drain_async(rx, ordered, n, cancel)))
+                    Ok(pool.block_on(terminal.drain_async(rx, ordered, window, n, cancel)))
                 },
                 #[cfg(feature = "tokio-runtime")]
                 FinalRx::AsyncSingle(rx) => {
                     let pool = ctx.acquire_async()?;
-                    Ok(pool.block_on(terminal.drain_async(rx, ordered, n, cancel)))
+                    Ok(pool.block_on(terminal.drain_async(rx, ordered, window, n, cancel)))
                 },
                 #[cfg(feature = "tokio-runtime")]
                 FinalRx::AsyncSharded(rx) => {
                     let pool = ctx.acquire_async()?;
-                    Ok(pool.block_on(terminal.drain_async_sharded(rx, ordered, n, cancel)))
+                    Ok(pool.block_on(terminal.drain_async_sharded(rx, ordered, window, n, cancel)))
                 },
             })) {
                 Ok(Ok(results)) => results,
@@ -4300,7 +4407,13 @@ where
 #[allow(clippy::needless_pass_by_value)]
 // `rx` is the terminal drain of the
 // pipeline: `run` passes the sole receiver by value to express "consume fully".
-fn collect_sync<R, T>(rx: R, ordered: bool, n: usize, cancel: Option<&CancellationToken>) -> Vec<T>
+fn collect_sync<R, T>(
+    rx: R,
+    ordered: bool,
+    window: OrderedWindow,
+    n: usize,
+    cancel: Option<&CancellationToken>,
+) -> Vec<T>
 where
     R: RecvItem<(u64, T)>,
     T: Send + Unpin + 'static,
@@ -4310,9 +4423,15 @@ where
         // Not `run_ordered_collect`: the internal drain validates the
         // `emitted + dropped == n` accounting (the public helper cannot —
         // see `OrderedAccounting`).
-        drain_ordered(&rx, n, OrderedAccounting::Validate { cancel }, |item| {
-            results.push(item);
-        });
+        drain_ordered(
+            &rx,
+            n,
+            window,
+            OrderedAccounting::Validate { cancel },
+            |item| {
+                results.push(item);
+            },
+        );
     } else {
         crate::state::drain_unordered(&rx, |item| results.push(item));
     }
@@ -4331,6 +4450,7 @@ where
 async fn collect_async<R, T>(
     rx: R,
     ordered: bool,
+    window: OrderedWindow,
     n: usize,
     cancel: Option<&CancellationToken>,
 ) -> Vec<T>
@@ -4340,9 +4460,15 @@ where
 {
     let mut results = Vec::with_capacity(n);
     if ordered {
-        drain_ordered_async(&rx, n, OrderedAccounting::Validate { cancel }, |item| {
-            results.push(item);
-        })
+        drain_ordered_async(
+            &rx,
+            n,
+            window,
+            OrderedAccounting::Validate { cancel },
+            |item| {
+                results.push(item);
+            },
+        )
         .await;
     } else {
         crate::state::drain_unordered_async(&rx, |item| results.push(item)).await;
@@ -4492,6 +4618,7 @@ mod tests {
             lease: None,
             worker_slots_left: Cell::new(0),
             stages_left: Cell::new(0),
+            in_flight: Cell::new(0),
             compute_pool: None,
             async_pool: Some(pool.clone()),
             cached_pool: OnceLock::new(),

@@ -24,18 +24,23 @@ struct Slot<T> {
 /// flushed position. Out-of-order arrivals are buffered until their
 /// predecessors arrive.
 ///
-/// # Capacity precondition
+/// # Capacity, growth, and drops
 ///
-/// The buffer uses power-of-two masking, so sequence numbers are mapped to
-/// slots via `seq & mask`. If the number of *simultaneously outstanding*
-/// (un-flushed) items ever exceeds `capacity`, two distinct sequence numbers
-/// alias the same slot and the older item is **dropped**. Callers must size
-/// the buffer to at least the maximum out-of-order window. The streaming
-/// collectors clamp the window to `[1 Ki, 1 Mi]` slots, which is ample for
-/// realistic worker counts. Every such drop is counted ([`Self::dropped`])
-/// and asserted in debug builds, so an overflow can no longer go unnoticed;
-/// the ordered collectors additionally validate `emitted + dropped ==
-/// expected` after the drain (see `state::stream`).
+/// The buffer maps sequence numbers to slots via `seq & mask` (power-of-two
+/// masking). Aliasing — two distinct *live* (un-flushed) seqs landing on one
+/// slot — happens when the live span exceeds the capacity. Instead of
+/// silently overwriting, an aliasing insert first **grows** the slot array
+/// (doubling, rehashing the occupied slots; see [`Self::with_max`]) up to
+/// `max_capacity`; only at that caller-pinned ceiling is the older item
+/// dropped and counted in [`Self::dropped`]. A duplicate seq (identical tag)
+/// is dropped immediately — the buffer is single-item-per-seq.
+///
+/// With `max_capacity ≥ next_pow2(item count)` and seqs `0..n` assigned by
+/// one FIFO feeder, growth makes drops unreachable (span bound proof in
+/// `state::stream::OrderedWindow`) — that is how the ordered collectors
+/// size it, so they lose no items by construction. The ordered collectors
+/// additionally validate `emitted + dropped == expected` after the drain
+/// (see `state::stream`).
 ///
 /// The slot array is allocated lazily on the first out-of-order arrival: an
 /// in-order stream (the common case) never touches it, so constructing the
@@ -45,25 +50,51 @@ pub struct ReorderBuffer<T> {
     next_expected: u64,
     len: usize,
     mask: usize,
-    /// Items dropped by an occupied-slot overwrite (window-overflow alias or
-    /// duplicate seq). A plain `usize`: the buffer is confined to the single
-    /// collector thread (`insert_into`/`flush_*` all take `&mut self` from
-    /// the drain loops), so no atomic is needed on the hot path.
+    /// Hard capacity ceiling (power of two, ≥ current capacity). Aliasing
+    /// inserts grow toward it; at it, the older item is dropped and counted.
+    max_capacity: usize,
+    /// Items dropped by occupied-slot overwrites (span overflow at the
+    /// pinned `max_capacity`, or a duplicate seq). A plain `usize`: the
+    /// buffer is confined to the single collector thread
+    /// (`insert_into`/`flush_*` all take `&mut self` from the drain
+    /// loops), so no atomic is needed on the hot path.
     dropped: usize,
 }
 
 impl<T> ReorderBuffer<T> {
+    /// Fixed-capacity buffer: no growth, an aliasing insert drops the older
+    /// item (the pre-growth semantics, kept for callers that pin memory
+    /// explicitly).
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        Self::with_max_inner(capacity, None)
+    }
+
+    /// Buffer that grows on demand: the slot array starts at
+    /// `initial_capacity` (materialized lazily on the first out-of-order
+    /// arrival) and doubles — rehashing occupied slots, never dropping —
+    /// whenever the live span would alias, up to `max_capacity` (both
+    /// rounded up to powers of two; a `max_capacity` below the initial
+    /// capacity disables growth).
+    #[must_use]
+    pub fn with_max(initial_capacity: usize, max_capacity: usize) -> Self {
+        Self::with_max_inner(initial_capacity, Some(max_capacity))
+    }
+
+    fn with_max_inner(capacity: usize, max_capacity: Option<usize>) -> Self {
         let cap = capacity.max(1).next_power_of_two();
+        let max = match max_capacity {
+            Some(m) => m.max(1).next_power_of_two().max(cap),
+            None => cap,
+        };
         Self {
             // Lazy: `ensure_slots` materializes the array on the first
-            // out-of-order arrival. In-order streams pay zero allocation
-            // (and zero zero-init of up to 1 Mi slots).
+            // out-of-order arrival. In-order streams pay zero allocation.
             slots: Vec::new(),
             next_expected: 0,
             len: 0,
             mask: cap - 1,
+            max_capacity: max,
             dropped: 0,
         }
     }
@@ -104,45 +135,117 @@ impl<T> ReorderBuffer<T> {
             return;
         }
         self.ensure_slots();
-        // `seq as usize` is safe across pointer widths: `& self.mask` only
-        // keeps the low log2(capacity) bits, so truncation on 32-bit targets
-        // is harmless (capacity is always < 2³²).
-        #[allow(clippy::cast_possible_truncation)]
-        let idx = (seq as usize) & self.mask;
-        // Slow path: out-of-order arrival, or in-order arrival while gaps are
-        // still buffered (the slot write + read-back is the 3 stores + 2 loads
-        // + len bookkeeping the fast path avoids).
-        let slot = &mut self.slots[idx];
         let tag = seq.wrapping_add(1);
-        if slot.tag != UNOCCUPIED {
-            // Occupied slot: either a duplicate seq (single-item-per-seq
-            // contract, e.g. `expand`) or — with a different tag — the
-            // capacity precondition violated (outstanding window >
-            // capacity, two seqs aliasing one slot). The older item is
-            // dropped to avoid a leak and counted either way, keeping the
-            // collector's `emitted + dropped == expected` accounting closed
-            // (see `dropped`); see the type-level doc.
-            if slot.tag == tag {
+        // Slow path: out-of-order arrival, or in-order arrival while gaps
+        // are still buffered (the slot write + read-back is the 3 stores + 2
+        // loads + len bookkeeping the fast path avoids). Kept in the
+        // historical single-pass shape — one index computation, one tag
+        // load, one store set on the hot path. Measurement note (2026-10,
+        // sharded_term/single_ordered_cpu): this drain is bistable on the
+        // bench box (~29 ms vs ~80 ms rounds, both values reproduced from
+        // UNCHANGED binaries minutes apart), which masqueraded as +26 %/+
+        // 74 % regressions in cross-session criterion runs; a same-binary
+        // env-knob A/B (occupancy-sized vs full pre-size, 4 interleaved
+        // rounds) measured +2.5 % noise — the growth cascade is below the
+        // noise floor, and this shape matches the pre-growth codegen.
+        //
+        // `seq as usize` is safe across pointer widths: `& self.mask` only
+        // keeps the low log2(capacity) bits, so truncation on 32-bit
+        // targets is harmless (capacity is always < 2³²).
+        #[allow(clippy::cast_possible_truncation)]
+        let mut idx = (seq as usize) & self.mask;
+        if self.slots[idx].tag != UNOCCUPIED {
+            if self.slots[idx].tag == tag {
+                // Duplicate seq (single-item-per-seq contract, e.g. `expand`
+                // combined with `ordered` — rejected by the streaming
+                // runner, but this is a public type). The older item is
+                // dropped and counted, keeping the collector's
+                // `emitted + dropped == expected` accounting closed.
                 debug_assert!(
                     false,
                     "duplicate seq {seq} — ReorderBuffer is single-item-per-seq; use without \
                      `expand`"
                 );
+            } else if self.grow_for(seq) {
+                // Occupied by a different seq: the live span reached the
+                // capacity (two seqs `capacity` apart alias one slot).
+                // Grown — re-map `seq`'s slot at the new capacity.
+                #[allow(clippy::cast_possible_truncation)]
+                let new_idx = (seq as usize) & self.mask;
+                idx = new_idx;
             }
-            // No debug_assert on the capacity-violation arm: the window
-            // precondition is owned by the caller's sizing (see `drain_ordered`);
-            // violations degrade gracefully here (drop + count), and the unit
-            // tests below exercise that path deliberately. An assert made them
-            // unrunnable with debug assertions on — unnoticed until the
-            // profile fix actually enabled debug assertions for `cargo test`.
-            self.dropped += 1;
-            unsafe { slot.item.assume_init_drop() };
-            self.len -= 1;
+            // No debug_assert on the at-ceiling overwrite below: the
+            // ceiling is caller policy (see `OrderedWindow`), violations
+            // degrade gracefully (drop + count), and the unit tests
+            // exercise that path deliberately.
+            if self.slots[idx].tag != UNOCCUPIED {
+                // At the pinned ceiling (`grow_for` returned false — the
+                // capacity, and thus `idx`, is unchanged) or a duplicate
+                // seq: overwrite the older aliased item in place.
+                self.dropped += 1;
+                // SAFETY: occupied slot holds an init item (tag checked).
+                unsafe { self.slots[idx].item.assume_init_drop() };
+                self.len -= 1;
+            }
         }
+        let slot = &mut self.slots[idx];
         slot.tag = tag;
         slot.item.write(item);
         self.len += 1;
         self.flush_ready_into(sink);
+    }
+
+    /// Grow the slot array until `seq` maps to a free slot, or `max_capacity`
+    /// is reached. Returns whether `seq`'s slot is free on return.
+    ///
+    /// Rehash soundness: occupied seqs are pairwise distinct modulo the
+    /// current capacity (inductively — any alias that would break it
+    /// triggered this growth instead of an overwrite), and distinct mod `c`
+    /// implies distinct mod `2c` (congruence mod `2c` implies congruence
+    /// mod `c`), so re-placing each occupied slot at `seq & new_mask` never
+    /// collides. Doubling also keeps the amortized growth cost O(1) per
+    /// insert.
+    fn grow_for(&mut self, seq: u64) -> bool {
+        loop {
+            if self.mask + 1 >= self.max_capacity {
+                // At the pinned ceiling — cannot grow further.
+                #[allow(clippy::cast_possible_truncation)]
+                return self.slots[(seq as usize) & self.mask].tag == UNOCCUPIED;
+            }
+            self.double();
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = (seq as usize) & self.mask;
+            if self.slots[idx].tag == UNOCCUPIED {
+                return true;
+            }
+            // Still aliased (e.g. occupied seqs `capacity` and
+            // `2·capacity` apart from `seq`): keep doubling.
+        }
+    }
+
+    /// Double the slot array, re-placing occupied slots at their new
+    /// indices. `Slot` moves are byte copies of the `MaybeUninit` payload;
+    /// unoccupied source slots carry no item and are discarded.
+    fn double(&mut self) {
+        let old = std::mem::take(&mut self.slots);
+        let new_cap = (self.mask + 1) * 2;
+        let mut slots: Vec<Slot<T>> = (0..new_cap)
+            .map(|_| Slot {
+                tag: UNOCCUPIED,
+                item: MaybeUninit::uninit(),
+            })
+            .collect();
+        for slot in old {
+            if slot.tag != UNOCCUPIED {
+                // seq = tag − 1 (wrapping); truncation is harmless as in
+                // `insert_into`.
+                #[allow(clippy::cast_possible_truncation)]
+                let idx = slot.tag.wrapping_sub(1) as usize & (new_cap - 1);
+                slots[idx] = slot;
+            }
+        }
+        self.slots = slots;
+        self.mask = new_cap - 1;
     }
 
     /// Insert `item` and return any newly-contiguous run as a `Vec`.
@@ -223,14 +326,23 @@ impl<T> ReorderBuffer<T> {
         self.len == 0
     }
 
+    /// Current slot capacity (power of two). The array itself materializes
+    /// lazily on the first out-of-order arrival (see [`Self::ensure_slots`]);
+    /// this reports the reserved capacity regardless.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.mask + 1
+    }
+
     #[must_use]
     pub fn next_expected(&self) -> u64 {
         self.next_expected
     }
 
-    /// Items dropped by occupied-slot overwrites so far (window-overflow
-    /// alias or duplicate seq). Release builds expose the count without
-    /// panicking; debug builds additionally assert at the drop site.
+    /// Items dropped by occupied-slot overwrites so far (span overflow at
+    /// the pinned `max_capacity`, or a duplicate seq). Release builds
+    /// expose the count without panicking; debug builds additionally assert
+    /// at the duplicate-seq drop site.
     #[must_use]
     pub fn dropped(&self) -> usize {
         self.dropped
@@ -367,6 +479,93 @@ mod tests {
         assert_eq!(out, vec![10, 20]);
         assert_eq!(out.len() + buf.dropped(), inserted);
         assert!(buf.is_empty());
+    }
+
+    /// Growth absorbs a span beyond the initial capacity: nothing is
+    /// dropped, every item is emitted in seq order, and the capacity ends
+    /// at the smallest power of two that held the span.
+    #[test]
+    fn test_growth_absorbs_span_overflow() {
+        let mut buf = ReorderBuffer::<i32>::with_max(2, 1 << 10);
+        let mut out = Vec::new();
+        // Skip seq 0, buffer seqs 1..=5 (span 5 > capacity 2 → doubling).
+        for seq in 1..=5u64 {
+            buf.insert_into(seq, i32::try_from(seq).unwrap() * 10, &mut |i| {
+                out.push(i);
+            });
+        }
+        assert_eq!(buf.dropped(), 0);
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf.capacity(), 8);
+        // Close the gap: everything flushes in order.
+        buf.insert_into(0, 0, &mut |i| out.push(i));
+        assert_eq!(out, vec![0, 10, 20, 30, 40, 50]);
+        assert!(buf.is_empty());
+        assert_eq!(buf.dropped(), 0);
+    }
+
+    /// Growth may need several doublings for one insert: occupied seqs at
+    /// `capacity`-strides from the arriving seq re-alias at every
+    /// intermediate size (distinct mod `c` does not imply distinct mod
+    /// `2c` the other way), so `grow_for` must keep doubling until the
+    /// arriving seq's slot is free.
+    #[test]
+    fn test_growth_repeated_doubling() {
+        let mut buf = ReorderBuffer::<i32>::with_max(2, 1 << 10);
+        let mut out = Vec::new();
+        // Occupied seqs 1, 5 (5 & 1 == 1: aliased at cap 2, grew to 4).
+        buf.insert_into(1, 10, &mut |i| out.push(i));
+        buf.insert_into(5, 50, &mut |i| out.push(i));
+        // 5 & 1 aliases seq 1 at cap 2 → doubles to 4 (5 & 3 == 1, still
+        // aliased) → 8 (slot 5 free).
+        assert_eq!(buf.capacity(), 8);
+        // Arriving seq 9: 9 & 3 == 1 == 1 & 3 → still aliased at 4, must
+        // grow to 8 (9 & 7 == 1, 1 & 7 == 1 → aliased again) … to 16.
+        buf.insert_into(9, 90, &mut |i| out.push(i));
+        assert_eq!(buf.capacity(), 16);
+        assert_eq!(buf.dropped(), 0);
+        assert_eq!(buf.len(), 3);
+        // Release the prefix: 0, 1 flush in order; the flush stops at the
+        // seq-2 gap, leaving 5 and 9 buffered (delivered by
+        // `flush_remaining` below).
+        buf.insert_into(0, 0, &mut |i| out.push(i));
+        assert_eq!(out, vec![0, 10]);
+        assert_eq!(buf.len(), 2, "seqs 5 and 9 stay buffered behind the gap");
+        let mut tail = buf.flush_remaining();
+        out.append(&mut tail);
+        assert_eq!(out, vec![0, 10, 50, 90]);
+        assert!(buf.is_empty());
+        assert_eq!(buf.dropped(), 0);
+    }
+
+    /// `with_max` pins the ceiling: a span beyond it drops (and counts) the
+    /// older item exactly like the fixed-capacity buffer — the memory knob
+    /// `StreamPipe::with_reorder_window` relies on.
+    #[test]
+    fn test_growth_stops_at_max() {
+        let mut buf = ReorderBuffer::<i32>::with_max(2, 2);
+        let mut out = Vec::new();
+        let inserted = 3;
+        buf.insert_into(0, 10, &mut |i| out.push(i)); // fast path, emitted
+        buf.insert_into(3, 30, &mut |i| out.push(i)); // buffered in slot 1
+        assert_eq!(buf.dropped(), 0);
+        buf.insert_into(1, 20, &mut |i| out.push(i)); // aliases seq 3 at the ceiling
+        assert_eq!(buf.capacity(), 2, "no growth past max_capacity");
+        assert_eq!(buf.dropped(), 1);
+        for item in buf.flush_remaining() {
+            out.push(item);
+        }
+        assert_eq!(out, vec![10, 20]);
+        assert_eq!(out.len() + buf.dropped(), inserted);
+    }
+
+    /// `max_capacity` below the initial capacity is clamped up: the ceiling
+    /// can never sit below the starting size (growth within `[initial,
+    /// max]` is then empty, i.e. disabled).
+    #[test]
+    fn test_with_max_clamped_to_initial() {
+        let buf = ReorderBuffer::<i32>::with_max(16, 2);
+        assert_eq!(buf.capacity(), 16);
     }
 
     /// The slot array stays unallocated while arrivals are in order: the
