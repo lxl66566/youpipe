@@ -123,6 +123,16 @@ impl ComputePool {
     }
 
     /// Submit a single `'static` job to the pool.
+    ///
+    /// # Panics
+    ///
+    /// A panic escaping `job` **aborts the process** (same contract as
+    /// rayon's `spawn`): fire-and-forget jobs have no result slot to
+    /// capture the payload into, and an unwind escaping a worker would
+    /// unwind through the scheduler loop and the local-deque consumers
+    /// that execute jobs bare. Catch panics inside `job` if a process
+    /// abort is unacceptable — [`Self::join`] propagates panics to the
+    /// caller and [`Self::join_captured`] returns them as values.
     pub fn submit<F>(&self, job: F)
     where
         F: FnOnce() + Send + 'static,
@@ -162,6 +172,11 @@ impl ComputePool {
     /// straight into the injector's segment-reserving `push_n` — no
     /// intermediate `Vec<JobRef>` allocation (the same trick the fused
     /// hybrid dispatcher's injection side uses).
+    ///
+    /// # Panics
+    ///
+    /// Same abort-on-panic contract as [`Self::submit`]: a panic escaping
+    /// any job aborts the process rather than unwinding a pool worker.
     pub fn submit_batch<F, I>(&self, jobs: I)
     where
         F: FnOnce() + Send + 'static,
