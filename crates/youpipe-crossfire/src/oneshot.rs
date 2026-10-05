@@ -487,7 +487,9 @@ impl<T> RxOneshot<T> {
             let sleep = tokio::time::sleep(timeout);
             self.recv_async_with_timer(sleep).await
         }
-        #[cfg(feature = "async_std")]
+        // tokio takes precedence when both timer features are enabled (feature
+        // unification can turn both on; two blocks would fail the E0308 check).
+        #[cfg(all(feature = "async_std", not(feature = "tokio")))]
         {
             let sleep = async_std::task::sleep(timeout);
             self.recv_async_with_timer(sleep).await

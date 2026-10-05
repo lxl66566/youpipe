@@ -182,8 +182,10 @@ impl<F: Flavor> AsyncTx<F> {
         self.send_with_timer(item, sleep)
     }
 
-    #[cfg(feature = "async_std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "async_std")))]
+    // tokio takes precedence when both timer features are enabled (feature
+    // unification can turn both on; duplicate defs would fail the build).
+    #[cfg(all(feature = "async_std", not(feature = "tokio")))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "async_std", not(feature = "tokio")))))]
     #[inline]
     pub fn send_timeout(
         &self, item: F::Item, duration: std::time::Duration,

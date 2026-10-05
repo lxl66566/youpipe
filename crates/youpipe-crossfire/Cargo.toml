@@ -10,7 +10,9 @@
 # this copy carries youpipe-local extensions: the try_send_batch /
 # try_recv_batch fast paths, the RegistrySingle retry-on-Skip +
 # node-state get_waker_state fixes (2026-09 intermittent-hang forensics),
-# and their tests.
+# and their tests. The `async_std` timer methods additionally gate on
+# `not(feature = "tokio")` (tokio wins) — upstream compiles duplicate
+# definitions when both features are on.
 #
 # Design C: the blocking wake target is thread::current(), which never
 # changes, so the waker node lives in a thread_local and is only re-armed
@@ -105,6 +107,10 @@ transmute_ptr_to_ref    = "allow"
 len_without_is_empty    = "allow"
 new_without_default     = "allow"
 result_unit_err         = "allow"
+# Upstream's timeout helpers put an explicit 'a on &self that clippy would
+# elide; those fns only compile under the tokio/async_std features. Keep
+# the signatures diffable against the fork repo.
+needless_lifetimes      = "allow"
 
 [lints.rust]
 # `loom` is switched by the cargo feature here (unlike youpipe's rustflag

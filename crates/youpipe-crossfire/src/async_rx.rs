@@ -155,8 +155,10 @@ impl<F: Flavor> AsyncRx<F> {
         let sleep = tokio::time::sleep(duration);
         self.recv_with_timer(sleep)
     }
-    #[cfg(feature = "async_std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "async_std")))]
+    // tokio takes precedence when both timer features are enabled (feature
+    // unification can turn both on; duplicate defs would fail the build).
+    #[cfg(all(feature = "async_std", not(feature = "tokio")))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "async_std", not(feature = "tokio")))))]
     #[inline]
     pub fn recv_timeout(
         &self, duration: std::time::Duration,

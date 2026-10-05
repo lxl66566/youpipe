@@ -182,11 +182,11 @@
 //!
 //! * `compat`: Enable the [compat] model, which has the same API namespace struct as V2.x
 //!
-//! * `tokio`: Enable [send_timeout](crate::AsyncTx::send_timeout()), [recv_timeout](crate::AsyncRx::recv_timeout()) with tokio sleep function. (conflict
-//!   with `async_std` feature)
+//! * `tokio`: Enable [send_timeout](crate::AsyncTx::send_timeout()), [recv_timeout](crate::AsyncRx::recv_timeout()) with tokio sleep function. Takes
+//!   precedence over `async_std` when both features are enabled.
 //!
-//! * `async_std`: Enable send_timeout, recv_timeout with async-std sleep function. (conflict
-//!   with `tokio` feature)
+//! * `async_std`: Enable send_timeout, recv_timeout with async-std sleep function. Only
+//!   effective when the `tokio` feature is not enabled.
 //!
 //! * `trace_log`: Development mode, to enable internal log while testing or benchmark, to debug deadlock issues.
 //!

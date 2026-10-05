@@ -260,8 +260,10 @@ impl<const THRESHOLD: usize> WaitGroupInline<THRESHOLD> {
     /// # Safety
     ///
     /// Only one thread is allow to wait
-    #[cfg(feature = "async_std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "async_std")))]
+    // tokio takes precedence when both timer features are enabled (feature
+    // unification can turn both on; duplicate defs would fail the build).
+    #[cfg(all(feature = "async_std", not(feature = "tokio")))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "async_std", not(feature = "tokio")))))]
     #[inline]
     pub unsafe fn wait_async_timeout<'a>(
         &'a self, timeout: Duration,
@@ -434,8 +436,10 @@ impl<T> WaitGroup<T> {
     /// # Safety
     ///
     /// Only one thread is allow to wait
-    #[cfg(feature = "async_std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "async_std")))]
+    // tokio takes precedence when both timer features are enabled (feature
+    // unification can turn both on; duplicate defs would fail the build).
+    #[cfg(all(feature = "async_std", not(feature = "tokio")))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "async_std", not(feature = "tokio")))))]
     #[inline]
     pub fn wait_async_timeout<'a>(
         &'a self, timeout: Duration,
@@ -662,8 +666,10 @@ impl<T> WaitGroupZero<T> {
     /// # Safety
     ///
     /// Only one thread is allow to wait
-    #[cfg(feature = "async_std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "async_std")))]
+    // tokio takes precedence when both timer features are enabled (feature
+    // unification can turn both on; duplicate defs would fail the build).
+    #[cfg(all(feature = "async_std", not(feature = "tokio")))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "async_std", not(feature = "tokio")))))]
     #[inline]
     pub fn wait_async_timeout<'a>(
         &'a self, timeout: Duration,
