@@ -398,7 +398,7 @@ mod tests {
             rx.drain_pass(&mut |v: usize| seen.push(v)),
             "shard 0 still open while the producer sleeps"
         );
-        assert_eq!(seen, []);
+        assert_eq!(seen, [] as [usize; 0]);
         match rx.recv_anchor() {
             Ok(v) => seen.push(v),
             Err(ChannelError::Closed) => panic!("anchor closed while shard 0 is alive"),
@@ -478,7 +478,7 @@ mod tests {
                 rx.drain_pass(&mut |v: usize| seen.push(v)),
                 "shard 0 still open while the producer sleeps"
             );
-            assert_eq!(seen, []);
+            assert_eq!(seen, [] as [usize; 0]);
             match rx.recv_anchor().await {
                 Ok(v) => seen.push(v),
                 Err(ChannelError::Closed) => panic!("anchor closed while shard 0 is alive"),

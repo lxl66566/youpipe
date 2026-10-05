@@ -303,7 +303,10 @@ fn knob_e2e_streaming_topology_with_batch() {
         }
     });
     assert_eq!(out.len(), n);
-    assert_eq!(out.iter().sum::<u64>(), (0..n as u64).map(|x| x + 1).sum());
+    assert_eq!(
+        out.iter().sum::<u64>(),
+        (0..n as u64).map(|x| x + 1).sum::<u64>()
+    );
 
     // ordered (ReorderBuffer re-sequencing over batched arrival runs)
     let out = with_deadline("ordered stage", {

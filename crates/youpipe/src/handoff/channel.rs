@@ -9,7 +9,7 @@ use crossfire::{mpmc, mpsc};
 #[cfg(feature = "crossfire-trace")]
 macro_rules! trace_ch {
     ($shared:expr, $op:expr) => {
-        log::debug!("{} @{:p}", $op, $shared as *const _);
+        log::debug!("{} @{:p}", $op, std::ptr::from_ref($shared));
     };
 }
 
