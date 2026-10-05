@@ -52,7 +52,12 @@ their hot paths can be tuned in-tree without waiting on upstream releases:
   reserves a contiguous run of up to 31 tail slots with **one** CAS and fills
   it with plain stores — segment semantics identical to `push` (WRITE-flag
   `Release` publication, block-boundary install order, closed check before
-  each reservation). `Registry::inject_batch` uses it, collapsing the fused
+  each reservation). Items are staged on the stack from the iterator
+  *before* the CAS and the reservation covers exactly the staged count:
+  `ExactSizeIterator::len()` is a capacity hint only (it is safe code, so
+  it may lie), and reserved-but-unwritten slots would stall `pop` on
+  `wait_write` forever and make queue `Drop` run `drop_in_place` on
+  uninitialized slots. `Registry::inject_batch` uses it, collapsing the fused
   dispatcher's `num_threads−1 ≤ 31` chunk-job CASes into one per dispatch
   (−0.5…−2.6 % on the cpu_heavy fused path); the streaming `submit_batch`
   benefits identically. The review also records what was tried and rejected —
