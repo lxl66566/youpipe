@@ -1,0 +1,4 @@
+# Vendored fork: upstream calls `int::is_multiple_of` (stable 1.87), so the
+# crate's clippy MSRV must match its Cargo.toml rust-version, not the
+# workspace's 1.85.
+msrv = "1.87"

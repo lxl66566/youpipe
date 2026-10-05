@@ -7,6 +7,7 @@ members         = [
   "crates/youpipe-criterion-perf-counters",
   "crates/youpipe-crossfire",
   "crates/youpipe-gungraun",
+  "crates/youpipe-hotpath",
   "crates/youpipe-st3",
   "crates/youpipe-sys",
 ]
@@ -20,7 +21,8 @@ exclude         = ["crates/youpipe-fuzz"]
 default-members = ["crates/youpipe", "crates/youpipe-sys"]
 
 # Shared metadata for the crates on the publish train. The vendored source
-# forks (youpipe-st3, youpipe-concurrent-queue, youpipe-crossfire) inherit
+# forks (youpipe-st3, youpipe-concurrent-queue, youpipe-crossfire,
+# youpipe-hotpath) inherit
 # these too: manifest inheritance doesn't affect their sources, which stay
 # diffable against their upstream repos. Fork-specific provenance fields
 # (edition, authors, license, description) stay per-crate. Crates off the
@@ -41,10 +43,6 @@ license      = "Apache-2.0"
 [workspace.dependencies]
 criterion         = "0.8"
 crossbeam-channel = "0.5"
-# youpipe's probes and the bench profile binary's `HotpathGuard` share a
-# process-global state: the two crates must resolve ONE hotpath instance, so
-# the requirement is single-sourced here.
-hotpath           = "0.24"
 libc              = "0.2"
 log               = "0.4"
 loom              = "0.7"
@@ -58,6 +56,10 @@ tokio             = { version = "1", features = ["macros", "rt-multi-thread", "s
 # lab-bench consumers need divergent `default-features` settings.
 concurrent-queue = { package = "youpipe-concurrent-queue", path = "crates/youpipe-concurrent-queue", version = "0.6" }
 crossfire        = { package = "youpipe-crossfire", path = "crates/youpipe-crossfire", version = "0.6" }
+# youpipe's probes and the bench profile binary's `HotpathGuard` share a
+# process-global state: the two crates must resolve ONE hotpath instance, so
+# the (vendored, patched) hotpath is single-sourced here.
+hotpath          = { package = "youpipe-hotpath", path = "crates/youpipe-hotpath", version = "0.6" }
 st3              = { package = "youpipe-st3", path = "crates/youpipe-st3", version = "0.6" }
 youpipe-sys      = { path = "crates/youpipe-sys", version = "0.6" }
 

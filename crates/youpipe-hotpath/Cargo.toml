@@ -1,0 +1,427 @@
+# Fork of hotpath (https://github.com/pawurb/hotpath-rs) v0.24.0,
+# vendored into youpipe.
+#
+# Provenance: crates.io hotpath 0.24.0, unmodified except the alloc-stack
+# patch in src/lib_on/functions/alloc/ (see MAX_DEPTH below). Upstream
+# 0.28.4 still ships the same code, so an upgrade does not fix it.
+#
+# The patch: `MAX_DEPTH` 64 → 1024, and the push assert moved before the
+# depth increment. youpipe's recursive join ladders nest >64 instrumented
+# frames (each active recursion level holds a push), so upstream aborts
+# with "assertion failed: depth < MAX_DEPTH" under `--features
+# hotpath-alloc`; worse, the increment-before-assert poisons depth to 64,
+# and the pops that run during unwinding then read elements[64] — panic in
+# a destructor, double panic, SIGABRT. 1024 slots = 16 KiB per touched
+# thread, only under the opt-in hotpath-alloc feature.
+#
+# Lib-only: upstream's [[bin]]/[[test]] targets and dev-dependencies are
+# dropped. Package renamed so it can never be confused with the crates.io
+# release; the lib name stays `hotpath` (the hotpath-macros codegen emits
+# `hotpath::...` paths). Sources stay excluded from `cargo fmt --all`
+# (rustfmt.toml ignore) and must otherwise remain diffable upstream.
+[package]
+name                   = "youpipe-hotpath"
+version.workspace      = true
+edition                = "2021"
+# Upstream calls `int::is_multiple_of` (stable 1.87); pinned per-crate
+# instead of inheriting the workspace's 1.85.
+rust-version           = "1.87"
+description            = "youpipe fork of the hotpath profiler (lib only)"
+license                = "MIT"
+repository.workspace   = true
+readme                 = "README.md"
+categories             = ["development-tools"]
+keywords               = ["profiling", "performance"]
+
+[package.metadata.docs.rs]
+features = [
+    "hotpath",
+    "hotpath-alloc",
+]
+
+[features]
+async-channel = [
+    "dep:tokio",
+    "tokio/sync",
+    "tokio/macros",
+    "tokio/rt-multi-thread",
+    "dep:async-channel",
+]
+async-lock = ["dep:async-lock"]
+axum-0-8 = [
+    "dep:axum",
+    "dep:tower-layer",
+    "dep:tower-service",
+    "dep:pin-project-lite",
+]
+crossbeam = ["dep:crossbeam-channel"]
+default = ["threads"]
+demo = [
+    "hotpath",
+    "sqlx",
+    "dep:sqlx",
+    "diesel",
+    "diesel/sqlite",
+    "dep:libsqlite3-sys",
+    "reqwest-0-13",
+    "axum-0-8",
+]
+dev = ["dep:time"]
+diesel = ["dep:diesel"]
+flume = [
+    "dep:flume",
+    "dep:tokio",
+    "tokio/rt-multi-thread",
+]
+futures = [
+    "dep:tokio",
+    "tokio/sync",
+    "tokio/macros",
+    "tokio/rt-multi-thread",
+    "dep:futures-channel",
+]
+hotpath = [
+    "hotpath-macros/hotpath",
+    "dep:arc-swap",
+    "dep:cfg-if",
+    "dep:crossbeam-channel",
+    "dep:hdrhistogram",
+    "dep:prettytable-rs",
+    "dep:quanta",
+    "dep:regex",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tiny_http",
+    "dep:futures-util",
+    "dep:pin-project-lite",
+    "dep:libc",
+]
+hotpath-alloc = [
+    "dep:tokio",
+    "hotpath-meta?/hotpath-alloc",
+    "hotpath-macros/hotpath-alloc",
+]
+hotpath-alloc-meta = ["hotpath-meta/hotpath-alloc-meta"]
+hotpath-cpu = [
+    "hotpath-macros/hotpath-cpu",
+    "dep:object",
+    "dep:rustc-demangle",
+    "dep:flate2",
+    "dep:serde",
+    "dep:serde_json",
+]
+hotpath-mcp = [
+    "hotpath",
+    "dep:rmcp",
+    "dep:tokio",
+    "tokio/rt",
+    "tokio/net",
+    "dep:axum",
+    "dep:tokio-util",
+    "dep:schemars",
+]
+hotpath-mcp-meta = [
+    "hotpath-meta/hotpath-mcp-meta",
+    "hotpath-meta/axum-0-8",
+]
+hotpath-meta = [
+    "dep:hotpath-meta",
+    "hotpath-meta/hotpath-meta",
+    "hotpath-meta/crossbeam",
+]
+parking_lot = ["dep:parking_lot"]
+reqwest-0-12 = [
+    "dep:reqwest-012",
+    "dep:reqwest-middleware-04",
+    "reqwest-middleware-04/multipart",
+    "reqwest-middleware-04/json",
+    "dep:async-trait",
+    "dep:http",
+]
+reqwest-0-13 = [
+    "dep:reqwest",
+    "dep:reqwest-middleware-05",
+    "reqwest-middleware-05/multipart",
+    "reqwest-middleware-05/json",
+    "reqwest-middleware-05/query",
+    "reqwest-middleware-05/form",
+    "dep:async-trait",
+    "dep:http",
+]
+sqlx = [
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]
+threads = []
+toasty = [
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]
+tokio = [
+    "dep:tokio",
+    "tokio/sync",
+    "tokio/macros",
+    "tokio/rt-multi-thread",
+    "tokio/time",
+]
+tui = [
+    "dep:serde",
+    "dep:serde_json",
+    "dep:eyre",
+    "dep:clap",
+    "dep:prettytable-rs",
+    "dep:reqwest",
+    "reqwest/json",
+    "reqwest/rustls",
+    "dep:crossterm",
+    "dep:ratatui",
+    "dep:crossbeam-channel",
+    "dep:tokio",
+    "tokio/rt",
+    "crossbeam",
+]
+ureq-3 = ["dep:ureq"]
+utils = [
+    "dep:serde",
+    "dep:serde_json",
+    "dep:eyre",
+    "dep:clap",
+    "dep:prettytable-rs",
+    "dep:ureq",
+    "ureq/json",
+    "ureq/rustls",
+    "ureq/gzip",
+]
+
+[lib]
+name = "hotpath"
+path = "src/lib.rs"
+
+[dependencies.arc-swap]
+version = "1.7"
+optional = true
+
+[dependencies.async-channel]
+version = "2"
+optional = true
+
+[dependencies.async-lock]
+version = "3"
+optional = true
+
+[dependencies.async-trait]
+version = "0.1"
+optional = true
+
+[dependencies.axum]
+version = "0.8"
+optional = true
+
+[dependencies.cfg-if]
+version = "1.0"
+optional = true
+
+[dependencies.clap]
+version = "4"
+features = ["derive"]
+optional = true
+
+[dependencies.crossbeam-channel]
+version = "0.5"
+optional = true
+
+[dependencies.crossterm]
+version = "0.29"
+optional = true
+
+[dependencies.diesel]
+version = "2.3"
+optional = true
+default-features = false
+
+[dependencies.eyre]
+version = "0.6"
+optional = true
+
+[dependencies.flate2]
+version = "1"
+optional = true
+
+[dependencies.flume]
+version = "0.12.0"
+optional = true
+
+[dependencies.futures-channel]
+version = "0.3"
+features = ["sink"]
+optional = true
+
+[dependencies.futures-util]
+version = "0.3"
+features = ["sink"]
+optional = true
+
+[dependencies.hdrhistogram]
+version = "7"
+optional = true
+default-features = false
+
+[dependencies.hotpath-macros]
+version = "0.24.0"
+
+[dependencies.hotpath-meta]
+version = "0.24.0"
+optional = true
+
+[dependencies.http]
+version = "1"
+optional = true
+
+[dependencies.libc]
+version = "0.2.172"
+optional = true
+
+[dependencies.libsqlite3-sys]
+version = "0.30"
+features = ["bundled"]
+optional = true
+
+[dependencies.object]
+version = "0.36"
+features = [
+    "read",
+    "std",
+]
+optional = true
+default-features = false
+
+[dependencies.parking_lot]
+version = "0.12"
+optional = true
+
+[dependencies.pin-project-lite]
+version = "0.2.12"
+optional = true
+
+[dependencies.prettytable-rs]
+version = "0.10"
+optional = true
+default-features = false
+
+[dependencies.quanta]
+version = "0.12"
+optional = true
+
+[dependencies.ratatui]
+version = "0.30"
+optional = true
+
+[dependencies.regex]
+version = "1"
+optional = true
+
+[dependencies.reqwest]
+version = "0.13"
+optional = true
+default-features = false
+
+[dependencies.reqwest-012]
+version = "0.12"
+optional = true
+default-features = false
+package = "reqwest"
+
+[dependencies.reqwest-middleware-04]
+version = "0.4"
+optional = true
+package = "reqwest-middleware"
+
+[dependencies.reqwest-middleware-05]
+version = "0.5"
+optional = true
+package = "reqwest-middleware"
+
+[dependencies.rmcp]
+version = "1.4"
+features = [
+    "server",
+    "transport-streamable-http-server",
+    "transport-streamable-http-server-session",
+]
+optional = true
+
+[dependencies.rustc-demangle]
+version = "0.1.24"
+optional = true
+
+[dependencies.schemars]
+version = "1"
+optional = true
+
+[dependencies.serde]
+version = "1.0.130"
+features = ["derive"]
+optional = true
+
+[dependencies.serde_json]
+version = "1.0"
+optional = true
+
+[dependencies.sqlx]
+version = "0.9"
+features = [
+    "sqlite",
+    "runtime-tokio",
+]
+optional = true
+default-features = false
+
+[dependencies.time]
+version = "0.3"
+features = [
+    "formatting",
+    "local-offset",
+    "macros",
+]
+optional = true
+
+[dependencies.tiny_http]
+version = "0.12"
+optional = true
+
+[dependencies.tokio]
+version = "1.47"
+features = ["rt"]
+optional = true
+
+[dependencies.tokio-util]
+version = "0.7"
+optional = true
+
+[dependencies.tower-layer]
+version = "0.3"
+optional = true
+
+[dependencies.tower-service]
+version = "0.3"
+optional = true
+
+[dependencies.tracing]
+version = "0.1"
+optional = true
+
+[dependencies.tracing-subscriber]
+version = "0.3"
+features = ["registry"]
+optional = true
+default-features = false
+
+[dependencies.ureq]
+version = "3"
+optional = true
+default-features = false
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+priority = 0
+check-cfg = ["cfg(tokio_unstable)"]
