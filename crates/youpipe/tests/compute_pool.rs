@@ -130,3 +130,75 @@ fn test_hybrid_driver_assists_when_workers_busy() {
         42
     );
 }
+
+/// Panic semantics of a job `submit`ted from inside `join`'s A closure.
+///
+/// The on-pool submit fast path parks the HeapJob on the calling worker's
+/// local deque — LIFO, on top of `job_b`. The join wait loop then pops and
+/// executes it bare. Pre-fix, its panic unwound live through the join frame,
+/// leaving `job_b`'s stack-allocated StackJob dangling in the deque → SIGSEGV
+/// on the next pop/steal. The fix gives `HeapJob::execute` an `AbortIfPanic`,
+/// so the panic aborts — the same outcome a submit-job panic already had in
+/// the main loop / `wait_until_cold`, and rayon `spawn`'s semantics.
+///
+/// Asserted in a subprocess (an abort kills the process by design). Pre-fix
+/// the child segfaults (SIGSEGV) or survives with corrupted stacks — either
+/// way the parent's signal assert fails.
+#[test]
+#[cfg(all(unix, not(miri)))]
+fn submit_panic_inside_join_aborts_not_unwinds() {
+    const CHILD_MODE: &str = "YOUIPE_TEST_JOIN_SUBMIT_PANIC_CHILD";
+    if std::env::var_os(CHILD_MODE).is_some() {
+        submit_panic_inside_join_child();
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("submit_panic_inside_join_aborts_not_unwinds")
+        .env(CHILD_MODE, "1")
+        .status()
+        .expect("spawn child test binary");
+    // SIGABRT = 6 on every Unix this crate targets (no libc dev-dep; the
+    // constant is stable in POSIX).
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(6),
+        "submit-job panic in join's wait loop must abort, got {status:?}"
+    );
+}
+
+/// Child half of [`submit_panic_inside_join_aborts_not_unwinds`]: the review's
+/// SIGSEGV repro. The iterations keep the pre-fix failure observable (the
+/// dangling `job_b` ref is only executed on a LATER pop/steal); post-fix the
+/// first iteration aborts inside `HeapJob::execute` and never returns here.
+#[cfg(all(unix, not(miri)))]
+fn submit_panic_inside_join_child() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    for iter in 0..5 {
+        // new_pinned: bypasses the recycling cache, so each drop really
+        // terminates (and drains) the pool.
+        let pool = youpipe::ComputePool::new_pinned(2);
+        let (p2, p3) = (pool.clone(), pool.clone());
+        let h = std::thread::spawn(move || {
+            let r = catch_unwind(AssertUnwindSafe(move || {
+                p2.join(
+                    move || {
+                        // On-pool submit: HeapJob lands on this worker's
+                        // local deque, LIFO on top of job_b.
+                        p3.submit(move || {
+                            std::thread::sleep(std::time::Duration::from_micros(200));
+                            panic!("boom {iter}");
+                        });
+                    },
+                    move || {
+                        std::thread::sleep(std::time::Duration::from_micros(500));
+                    },
+                );
+            }));
+            r.is_err()
+        });
+        assert!(h.join().unwrap(), "submitted job's panic must surface");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        drop(pool);
+    }
+}

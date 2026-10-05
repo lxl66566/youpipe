@@ -81,6 +81,14 @@ profile config except where noted in their `Cargo.toml` headers.
 2. `Sleep::new_injected_jobs` bumps the packed atomic counters and wakes parked workers via `wake_any_threads`
 3. Worker wakes → `find_work()` searches by priority
 
+Local-deque invariant: unlike rayon (whose `spawn` always injects, so its
+local deques hold only self-capturing `StackJob`s), our on-pool fast path
+parks uncaptured `HeapJob`s in the caller's local deque, and join's wait
+loop executes popped jobs bare. Every job type admitted to a local deque
+must therefore uphold `Job::execute`'s no-unwind contract (`StackJob`
+captures into its result slot, hybrid `ChunkJob` into its fail slot,
+`HeapJob` aborts via `AbortIfPanic`) — see `WorkerThread::push`.
+
 ### On-pool callers of the fused terminals (`Stealing` latch)
 
 A fused terminal (`.collect()` / `.for_each()` / `.try_collect()`) reached

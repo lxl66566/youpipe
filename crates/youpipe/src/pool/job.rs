@@ -22,6 +22,14 @@ pub(crate) enum JobResult<T> {
 ///
 /// `execute` may be called from a different thread than the one which
 /// scheduled the job, so the implementer must ensure appropriate `Send`/`Sync`.
+///
+/// # Panics
+///
+/// Implementations must not let a panic escape `execute` — capture it into a
+/// result/failure slot or abort. Consumers pop jobs bare (join's wait loop has
+/// no panic guard of its own), and a live unwind through them both bypasses
+/// callers' unwind cleanups and, for stack-allocated jobs still queued behind
+/// it, leaves their `JobRef`s dangling in the deques (UB).
 pub(crate) trait Job {
     /// # Safety
     ///
@@ -228,7 +236,24 @@ where
     unsafe fn execute(this: *const ()) {
         unsafe {
             let this = Box::from_raw(this as *mut Self);
+            // A HeapJob has no result slot to capture a panic into, so it
+            // aborts (the `Job::execute` no-unwind contract). Unlike rayon,
+            // whose `spawn` always injects to the global queue, our on-pool
+            // submit fast path parks HeapJobs in the local deque, whose
+            // consumer — join's wait loop — executes them bare: a live unwind
+            // there destroyed the join frame while its stack-allocated `job_b`
+            // ref still sat in the deque → SIGSEGV on the next pop/steal.
+            // Abort also unifies submit-panic semantics with the main loop
+            // and `wait_until_cold` (their own `AbortIfPanic` guards already
+            // aborted it) and with rayon `spawn`. The alternative — capturing
+            // at the join call site and resuming after B — was rejected: it
+            // re-runs the measured +33 % hot-path catch regression (see
+            // `StackJob::run_inline`'s note) and a resumed foreign unwind
+            // escapes `join_captured`'s value contract, bypassing the fused
+            // tree's sibling cleanup (the leak class fixed before it).
+            let abort = unwind::AbortIfPanic;
             (this.job)();
+            mem::forget(abort);
         }
     }
 }

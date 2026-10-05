@@ -468,6 +468,20 @@ impl WorkerThread {
     }
 
     /// Push a job onto the local deque (overflow spills to the injector).
+    ///
+    /// # Local-deque invariant
+    ///
+    /// Unlike rayon (whose local deques hold only self-capturing `StackJob`s
+    /// — `spawn` always injects to the global queue), our on-pool fast paths
+    /// also admit heap jobs here: `submit` via [`Registry::inject_or_push`],
+    /// hybrid chunks via [`Self::push_batch`]. The deques' consumers execute
+    /// popped jobs bare — [`join_on_captured`](super::join)'s wait loop has
+    /// no panic guard — so every job type admitted to a local deque must
+    /// uphold the `Job::execute` no-unwind contract: `StackJob` captures
+    /// into its result slot, hybrid `ChunkJob` into its fail slot, `HeapJob`
+    /// aborts. A job that could unwind past `execute` would destroy the
+    /// waiter's frame while its stack-allocated jobs' refs still sit in the
+    /// deque → UB.
     #[inline]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     /// # Safety

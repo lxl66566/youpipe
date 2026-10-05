@@ -151,6 +151,11 @@ where
                     unsafe { job_b.run_captured(false) }
                 };
             }
+            // Foreign job (nested join's StackJob, hybrid chunk, on-pool
+            // submit's HeapJob) — executed bare: safe only under the
+            // local-deque no-unwind invariant (see `WorkerThread::push`).
+            // A live unwind from here would destroy this frame while
+            // `job_b`'s ref still sits in the deque → UB.
             unsafe { WorkerThread::execute(job) };
         } else {
             // Local deque empty (B was stolen). Steal work while waiting.
