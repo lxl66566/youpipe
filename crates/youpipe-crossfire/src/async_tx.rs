@@ -131,7 +131,12 @@ impl<F: Flavor> AsyncTx<F> {
     /// You should rely on the Drop trait of the message to cleanup.
     #[inline(always)]
     pub fn send<'a>(&'a self, item: F::Item) -> SendFuture<'a, F> {
-        SendFuture { tx: self, item: MaybeUninit::new(item), waker: None }
+        SendFuture {
+            tx: self,
+            item: MaybeUninit::new(item),
+            consumed: false,
+            waker: None,
+        }
     }
 
     /// Attempts to send a message without blocking.
@@ -236,7 +241,13 @@ impl<F: Flavor> AsyncTx<F> {
     where
         FR: Future<Output = R>,
     {
-        SendTimeoutFuture { tx: self, item: MaybeUninit::new(item), waker: None, sleep: fut }
+        SendTimeoutFuture {
+            tx: self,
+            item: MaybeUninit::new(item),
+            consumed: false,
+            waker: None,
+            sleep: fut,
+        }
     }
 
     /// Internal function might change in the future. For public version, use AsyncSink::poll_send() instead.
@@ -315,7 +326,18 @@ impl<F: Flavor> AsyncTx<F> {
 #[must_use]
 pub struct SendFuture<'a, F: Flavor> {
     tx: &'a AsyncTx<F>,
+    /// Ownership invariant (exactly-once drop, review R-1): `!consumed` IFF
+    /// this future still owns the item stored in `item`. Every path that
+    /// moves the item out — a successful send into the channel (direct
+    /// `try_send`, the backoff retry, or the `try_send_oneshot` direct-copy
+    /// that stamps `WakerState::Done`), or the `assume_init_read` into the
+    /// returned `SendError` — sets `consumed = true` and must not touch
+    /// `item` afterwards. `Drop` drops the item iff `!consumed`, regardless
+    /// of whether the future was ever polled: `waker` is only set by
+    /// `poll`, so a future dropped before its first poll (e.g. the other
+    /// `tokio::select!` branch resolving immediately) used to leak it.
     item: MaybeUninit<F::Item>,
+    consumed: bool,
     waker: Option<<F::Send as Registry>::Waker>,
 }
 
@@ -324,11 +346,20 @@ unsafe impl<F: Flavor> Send for SendFuture<'_, F> where F::Item: Send {}
 impl<F: Flavor> Drop for SendFuture<'_, F> {
     #[inline]
     fn drop(&mut self) {
-        // Cancelling the future, poll is not ready
+        // Cancelling the future, poll is not ready. Exactly-once: the item
+        // is dropped iff the future still owns it (see `consumed`).
+        let mut owned = !self.consumed;
         if let Some(waker) = self.waker.as_ref() {
-            if self.tx.shared.abandon_send_waker(waker) && needs_drop::<F::Item>() {
-                unsafe { self.item.assume_init_drop() };
+            // abandon_send_waker() returns false only for WakerState::Done:
+            // the item was direct-copied into the channel, ownership left
+            // with it. (Defensive: the Done-stamping paths in `poll` already
+            // set `consumed = true` before returning Ready.)
+            if !self.tx.shared.abandon_send_waker(waker) {
+                owned = false;
             }
+        }
+        if owned && needs_drop::<F::Item>() {
+            unsafe { self.item.assume_init_drop() };
         }
     }
 }
@@ -345,10 +376,14 @@ where
         match _self.tx.poll_send::<false>(ctx, &_self.item, &mut _self.waker) {
             Poll::Ready(Ok(())) => {
                 debug_assert!(_self.waker.is_none());
+                // Item moved into the channel; the future no longer owns it.
+                _self.consumed = true;
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(())) => {
                 let _ = _self.waker.take();
+                // Ownership moves into the SendError below.
+                _self.consumed = true;
                 Poll::Ready(Err(SendError(unsafe { _self.item.assume_init_read() })))
             }
             Poll::Pending => Poll::Pending,
@@ -365,7 +400,9 @@ where
 {
     tx: &'a AsyncTx<F>,
     sleep: FR,
+    /// Same exactly-once ownership invariant as `SendFuture::consumed`.
     item: MaybeUninit<F::Item>,
+    consumed: bool,
     waker: Option<<F::Send as Registry>::Waker>,
 }
 
@@ -383,11 +420,17 @@ where
 {
     #[inline]
     fn drop(&mut self) {
+        // Cancelling the future, poll is not ready. Exactly-once: the item
+        // is dropped iff the future still owns it (see `consumed`).
+        let mut owned = !self.consumed;
         if let Some(waker) = self.waker.as_ref() {
-            // Cancelling the future, poll is not ready
-            if self.tx.shared.abandon_send_waker(waker) && needs_drop::<F::Item>() {
-                unsafe { self.item.assume_init_drop() };
+            // See SendFuture::drop: false == Done == direct-copied away.
+            if !self.tx.shared.abandon_send_waker(waker) {
+                owned = false;
             }
+        }
+        if owned && needs_drop::<F::Item>() {
+            unsafe { self.item.assume_init_drop() };
         }
     }
 }
@@ -408,10 +451,14 @@ where
         match _self.tx.poll_send::<false>(ctx, &_self.item, &mut _self.waker) {
             Poll::Ready(Ok(())) => {
                 debug_assert!(_self.waker.is_none());
+                // Item moved into the channel; the future no longer owns it.
+                _self.consumed = true;
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(())) => {
                 let _ = _self.waker.take();
+                // Ownership moves into the Disconnected error below.
+                _self.consumed = true;
                 Poll::Ready(Err(SendTimeoutError::Disconnected(unsafe {
                     _self.item.assume_init_read()
                 })))
@@ -420,11 +467,14 @@ where
                 let sleep = unsafe { Pin::new_unchecked(&mut _self.sleep) };
                 if sleep.poll(ctx).is_ready() {
                     if _self.tx.shared.abandon_send_waker(&_self.waker.take().unwrap()) {
+                        // Ownership moves into the Timeout error below.
+                        _self.consumed = true;
                         return Poll::Ready(Err(SendTimeoutError::Timeout(unsafe {
                             _self.item.assume_init_read()
                         })));
                     } else {
                         // Message already sent in background (on_recv).
+                        _self.consumed = true;
                         return Poll::Ready(Ok(()));
                     }
                 }
@@ -983,5 +1033,151 @@ impl<T, F: Flavor<Item = T> + FlavorMP> SenderType for MAsyncTx<F> {
     #[inline(always)]
     fn new(shared: Arc<ChannelShared<F>>) -> Self {
         MAsyncTx::new(shared)
+    }
+}
+
+// Exactly-once drop regression tests (review R-1): the item stored in a
+// SendFuture / SendTimeoutFuture must be dropped exactly once on every
+// ownership path — dropped before the first poll (the `tokio::select!`
+// cancellation leak this fixes), dropped after a Pending poll, successful
+// send (ownership moves to the receiver), Disconnected, and Timeout.
+#[cfg(test)]
+mod drop_tests {
+    use crate::spsc;
+    use crate::{SendError, SendTimeoutError};
+    use std::future::{pending, Future};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+
+    #[derive(Clone)]
+    struct Tracked(Arc<AtomicUsize>);
+
+    impl Tracked {
+        fn new(c: &Arc<AtomicUsize>) -> Self {
+            Self(c.clone())
+        }
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn drops(c: &Arc<AtomicUsize>) -> usize {
+        c.load(Ordering::SeqCst)
+    }
+
+    // (1) The leak being fixed: a future dropped before its first poll
+    // (e.g. the other `select!` branch resolved immediately) never ran
+    // `poll`, so `waker` was None and Drop skipped the item entirely.
+    #[test]
+    fn send_future_dropped_before_first_poll_drops_item() {
+        let (tx, rx) = spsc::bounded_async::<Tracked>(4);
+        let c = Arc::new(AtomicUsize::new(0));
+        let fut = tx.send(Tracked::new(&c));
+        assert_eq!(drops(&c), 0);
+        drop(fut);
+        assert_eq!(drops(&c), 1, "never-polled future must still drop its item");
+        drop(tx);
+        drop(rx);
+    }
+
+    #[test]
+    fn send_timeout_future_dropped_before_first_poll_drops_item() {
+        let (tx, rx) = spsc::bounded_async::<Tracked>(4);
+        let c = Arc::new(AtomicUsize::new(0));
+        let fut = tx.send_with_timer(Tracked::new(&c), pending::<()>());
+        drop(fut);
+        assert_eq!(drops(&c), 1, "never-polled future must still drop its item");
+        drop(tx);
+        drop(rx);
+    }
+
+    // (2) select! race shape: polled once while the channel is full
+    // (Pending, waker registered), then dropped.
+    #[test]
+    fn send_future_dropped_after_pending_poll_drops_item() {
+        let (tx, rx) = spsc::bounded_async::<Tracked>(1);
+        let c = Arc::new(AtomicUsize::new(0));
+        tx.try_send(Tracked::new(&c)).unwrap();
+        assert_eq!(drops(&c), 0);
+
+        let mut fut = tx.send(Tracked::new(&c));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+        drop(fut);
+        assert_eq!(drops(&c), 1, "cancelled item dropped; filler still in channel");
+        drop(rx.try_recv().unwrap());
+        assert_eq!(drops(&c), 2);
+        drop(tx);
+        drop(rx);
+    }
+
+    // (3) Successful send: the item belongs to the receiver; the sender
+    // side must not drop it again.
+    #[test]
+    fn send_future_success_moves_item_to_receiver() {
+        let (tx, rx) = spsc::bounded_async::<Tracked>(1);
+        let c = Arc::new(AtomicUsize::new(0));
+        let mut fut = tx.send(Tracked::new(&c));
+        let mut cx = Context::from_waker(Waker::noop());
+        match Pin::new(&mut fut).poll(&mut cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(SendError(_))) => panic!("channel open, must send"),
+            Poll::Pending => panic!("channel empty, must be ready"),
+        }
+        drop(fut);
+        assert_eq!(drops(&c), 0, "sender must not double-drop a sent item");
+        drop(rx.try_recv().unwrap());
+        assert_eq!(drops(&c), 1, "receiver owns the item now");
+        drop(tx);
+        drop(rx);
+    }
+
+    // Disconnected: the item is moved out into the SendError exactly once.
+    #[test]
+    fn send_future_disconnected_returns_item_once() {
+        let (tx, rx) = spsc::bounded_async::<Tracked>(1);
+        let c = Arc::new(AtomicUsize::new(0));
+        drop(rx);
+        let mut fut = tx.send(Tracked::new(&c));
+        let mut cx = Context::from_waker(Waker::noop());
+        match Pin::new(&mut fut).poll(&mut cx) {
+            Poll::Ready(Err(SendError(_item))) => {} // _item dropped here
+            Poll::Ready(Ok(())) => panic!("receiver gone, must error"),
+            Poll::Pending => panic!("must be ready"),
+        }
+        assert_eq!(drops(&c), 1, "item dropped once via the error");
+        drop(fut);
+        assert_eq!(drops(&c), 1, "future must not drop it a second time");
+        drop(tx);
+    }
+
+    // Timeout: the item is moved out into the Timeout error exactly once
+    // (timer driven by send_with_timer, no runtime feature needed).
+    #[test]
+    fn send_timeout_future_timeout_returns_item_once() {
+        let (tx, rx) = spsc::bounded_async::<Tracked>(1);
+        let c = Arc::new(AtomicUsize::new(0));
+        tx.try_send(Tracked::new(&c)).unwrap();
+
+        let mut fut = tx.send_with_timer(Tracked::new(&c), std::future::ready(()));
+        let mut cx = Context::from_waker(Waker::noop());
+        match Pin::new(&mut fut).poll(&mut cx) {
+            Poll::Ready(Err(SendTimeoutError::Timeout(_item))) => {} // dropped here
+            Poll::Ready(Err(SendTimeoutError::Disconnected(_))) => panic!("rx alive"),
+            Poll::Ready(Ok(())) => panic!("channel full, must time out"),
+            Poll::Pending => panic!("timer ready, must resolve"),
+        }
+        assert_eq!(drops(&c), 1, "item dropped once via the timeout error");
+        drop(fut);
+        assert_eq!(drops(&c), 1, "future must not drop it a second time");
+        drop(rx.try_recv().unwrap());
+        assert_eq!(drops(&c), 2);
+        drop(tx);
+        drop(rx);
     }
 }
