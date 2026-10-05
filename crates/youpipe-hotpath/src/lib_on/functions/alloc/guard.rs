@@ -190,6 +190,31 @@ fn sampled_start(wrapper: bool, skipped: bool) -> Option<Instant> {
     }
 }
 
+// youpipe fork (review R-9): counts sync guards dropped on a thread other
+// than their creating one. Such a drop cannot pop the alloc-stack frame it
+// pushed: the stack is thread-local and its cells unsynchronized, so a
+// remote pop would race the origin thread's own accounting (and is
+// impossible once that thread has exited). Synchronizing the stack would
+// tax every tracked allocation, so the leak is counted and documented
+// (`MeasurementGuardSync`) instead of being "fixed" with a data race.
+pub(crate) static SYNC_GUARD_CROSS_THREAD_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Guard measuring a synchronous region: created by `#[measure]` on sync
+/// functions and by the `measure_block!` macro.
+///
+/// # Cross-thread drop limitation (youpipe fork, review R-9)
+///
+/// This guard is `Send`, and a `measure_block!` block may contain `.await`,
+/// so the guard can migrate to another worker thread between creation and
+/// drop. The alloc stack it pushed is thread-local and unsynchronized:
+/// popping it from another thread would race the creating thread's own
+/// push/pop/allocation accounting (and is impossible once that thread has
+/// exited), so a cross-thread drop intentionally skips the pop. The
+/// creating thread's alloc depth stays one level higher for the rest of
+/// its life; each such leak is counted in `SYNC_GUARD_CROSS_THREAD_DROPS`
+/// so it stays observable. Prefer `#[measure]` on async functions: its
+/// poll path balances via a per-poll RAII guard and attributes allocations
+/// through an `AsyncAllocBridge` instead of the thread-local stack.
 #[must_use = "guard is dropped immediately without measuring anything"]
 pub struct MeasurementGuardSync {
     name: &'static str,
@@ -246,6 +271,10 @@ impl Drop for MeasurementGuardSync {
             .map(|start| end.duration_since(start).as_nanos() as u64);
         let elapsed_since_start_ns = crate::lib_on::elapsed_since_start_ns(end);
         let cross_thread = crate::tid::current_tid() != self.tid;
+
+        if cross_thread {
+            SYNC_GUARD_CROSS_THREAD_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
 
         if self.caller_scoped && !cross_thread {
             crate::lib_on::caller_stack::pop_caller();
@@ -377,6 +406,10 @@ impl MeasurementGuardSyncWithLog {
         let result_str = crate::output::format_debug_truncated(result);
         let cross_thread = crate::tid::current_tid() != self.tid;
 
+        if cross_thread {
+            SYNC_GUARD_CROSS_THREAD_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+
         if self.caller_scoped && !cross_thread {
             crate::lib_on::caller_stack::pop_caller();
         }
@@ -413,6 +446,10 @@ impl Drop for MeasurementGuardSyncWithLog {
             .map(|start| end.duration_since(start).as_nanos() as u64);
         let elapsed_since_start_ns = crate::lib_on::elapsed_since_start_ns(end);
         let cross_thread = crate::tid::current_tid() != self.tid;
+
+        if cross_thread {
+            SYNC_GUARD_CROSS_THREAD_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
 
         if self.caller_scoped && !cross_thread {
             crate::lib_on::caller_stack::pop_caller();
@@ -524,6 +561,53 @@ impl Drop for MeasurementGuardAsyncWithLog {
             self.wrapper,
             Some(self.tid),
             None,
+        );
+    }
+}
+
+#[cfg(all(test, feature = "hotpath-alloc"))]
+mod cross_thread_tests {
+    use super::*;
+
+    fn alloc_depth() -> u32 {
+        crate::functions::alloc::core::ALLOCATIONS.with(|stack| stack.depth.get())
+    }
+
+    /// R-9: a sync guard dropped on another thread cannot pop its TLS
+    /// alloc-stack frame, so the creating thread keeps the +1 depth for
+    /// good (documented limitation). The drop itself must stay panic-free
+    /// and the leak must be counted so it is observable rather than silent
+    /// depth corruption.
+    // Ignored under miri: guard creation samples time through quanta's
+    // TSC calibration (inline asm), which miri rejects — a pre-existing
+    // limitation of every timed path in this crate, not of this test.
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn cross_thread_drop_is_counted_and_leaks_exactly_one_frame() {
+        let leaks_before = SYNC_GUARD_CROSS_THREAD_DROPS.load(Ordering::Relaxed);
+        let depth_before = alloc_depth();
+
+        // Control: same-thread create/drop keeps the depth balanced.
+        drop(MeasurementGuardSync::new("same_thread_guard", false, false));
+        assert_eq!(alloc_depth(), depth_before);
+
+        // Create here, drop on another thread.
+        let (tx, rx) = std::sync::mpsc::channel::<MeasurementGuardSync>();
+        tx.send(MeasurementGuardSync::new("cross_thread_guard", false, false))
+            .unwrap();
+        let handle = std::thread::spawn(move || {
+            drop(rx.recv().unwrap());
+        });
+        handle.join().unwrap();
+
+        assert_eq!(
+            alloc_depth(),
+            depth_before + 1,
+            "origin thread keeps the orphaned frame (documented limitation)"
+        );
+        assert_eq!(
+            SYNC_GUARD_CROSS_THREAD_DROPS.load(Ordering::Relaxed),
+            leaks_before + 1
         );
     }
 }

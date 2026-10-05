@@ -160,6 +160,13 @@ impl Drop for SuspendAllocTracking {
 /// # }
 /// ```
 ///
+/// # Limitations
+///
+/// If the block contains `.await`, the guard may be dropped on a different
+/// worker thread than the one that created it; the alloc-stack frame pushed
+/// on the creating thread can then never be popped (see
+/// [`MeasurementGuardSync`]). Prefer `#[measure]` on async functions.
+///
 /// # See Also
 ///
 /// * [`measure`](hotpath_macros::measure) - Attribute macro for instrumenting functions
