@@ -19,11 +19,15 @@ use crate::instant::Instant;
 #[cfg(feature = "hotpath-alloc")]
 #[inline]
 fn measure_poll_alloc<R>(poll_fn: impl FnOnce() -> R) -> (R, Option<u64>, Option<u64>) {
-    crate::functions::alloc::guard::push_alloc_stack();
+    // youpipe fork (review B9): RAII pairing, not bare push/pop — a panic
+    // unwinding through the inner poll must still pop, or the polling
+    // thread's TLS depth leaks +1 per panicking poll until the MAX_DEPTH
+    // assert aborts an unrelated call.
+    let guard = crate::functions::alloc::guard::AllocStackGuard::new();
 
     let result = poll_fn();
 
-    let (bytes, count) = crate::functions::alloc::guard::pop_alloc_stack();
+    let (bytes, count) = guard.pop();
 
     (result, Some(bytes), Some(count))
 }
@@ -385,5 +389,59 @@ where
         }
 
         result
+    }
+}
+
+#[cfg(all(test, feature = "hotpath-alloc"))]
+mod alloc_stack_tests {
+    use super::*;
+    use crate::functions::alloc::core::{ALLOCATIONS, MAX_DEPTH};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::pin::pin;
+    use std::task::Waker;
+
+    fn alloc_depth() -> u32 {
+        ALLOCATIONS.with(|stack| stack.depth.get())
+    }
+
+    /// Regression test for review B9: a panic unwinding through an
+    /// instrumented poll used to skip the TLS alloc-stack pop, leaking +1
+    /// depth per caught panic. 2 * MAX_DEPTH polls make an unfixed build
+    /// blow past the depth assert inside this test instead of failing
+    /// quietly on some later, unrelated call.
+    ///
+    /// `visible = false` keeps the test hermetic: no futures-state worker,
+    /// no metrics server — `measure_poll_alloc` runs on this path exactly
+    /// like on the visible one.
+    #[test]
+    fn panicking_poll_does_not_leak_alloc_stack_depth() {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        // The default hook would print 2 * MAX_DEPTH panic backtraces.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let depth_before = alloc_depth();
+        for _ in 0..(2 * MAX_DEPTH as u32) {
+            let fut = InstrumentedFuture::new(
+                async { panic!("poll boom"); },
+                "tests/panicking_poll",
+                None,
+                None,
+                false,
+                None,
+            );
+            let mut fut = pin!(fut);
+            let result = catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(&mut cx)));
+            assert!(result.is_err(), "every poll must panic");
+            assert_eq!(
+                alloc_depth(),
+                depth_before,
+                "alloc stack depth must rebalance after each caught panic"
+            );
+        }
+
+        std::panic::set_hook(prev_hook);
     }
 }

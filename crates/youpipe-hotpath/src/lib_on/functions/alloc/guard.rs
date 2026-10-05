@@ -88,6 +88,44 @@ pub(crate) fn pop_alloc_stack() -> (u64, u64) {
     })
 }
 
+/// RAII pairing for one TLS alloc-stack push (youpipe fork, review B9).
+///
+/// Upstream measured each instrumented inner poll with a bare push/pop: a
+/// panic unwinding through the poll skipped the pop, so the polling
+/// thread's depth leaked +1 per panicking poll until the depth assert in
+/// `push_alloc_stack` aborted an unrelated instrumented call. Sync
+/// measurements were already unwind-safe (`MeasurementGuardSync` pops in
+/// Drop); this guard gives the async poll path the same guarantee.
+pub(crate) struct AllocStackGuard {
+    armed: bool,
+}
+
+impl AllocStackGuard {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        push_alloc_stack();
+        Self { armed: true }
+    }
+
+    /// Pop the paired frame and report its totals. When `Drop` runs the pop
+    /// instead (unwind path), the values are discarded: what matters there
+    /// is keeping the depth balanced, not a panicking poll's metrics.
+    #[inline]
+    pub(crate) fn pop(mut self) -> (u64, u64) {
+        self.armed = false;
+        pop_alloc_stack()
+    }
+}
+
+impl Drop for AllocStackGuard {
+    #[inline]
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = pop_alloc_stack();
+        }
+    }
+}
+
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn send_alloc_measurement(
