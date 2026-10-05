@@ -3815,8 +3815,32 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if `.ordered()` is combined with `.expand()` (see
-    /// [`FenceMode`] docs), if the async runtime cannot be constructed
+    /// How a panicking stage closure is transported depends on the topology
+    /// `run()` picked for the chain:
+    ///
+    /// - Fused pass-through: caught per chunk, resumed on the caller after
+    ///   partial-state cleanup — catchable with `catch_unwind`.
+    /// - Streaming topology (any `expand` / `fence` / `stage_async` /
+    ///   `with_cancel`, or any pin that opts the chain out of the
+    ///   pass-through): a panic escaping a sync `.stage()` / `.expand()`
+    ///   closure **aborts the process** — it does not unwind the caller.
+    ///   Those workers are pool jobs or detached OS threads; an escaped
+    ///   unwind would silently drop the worker and truncate the pipeline's
+    ///   output, so the run aborts instead, under the same contract as
+    ///   [`ComputePool::submit`](crate::ComputePool::submit). Note how
+    ///   little it takes to flip tiers: adding a single `.fence()` to an
+    ///   otherwise pass-through-eligible chain turns a catchable stage
+    ///   panic into a process abort.
+    /// - `.stage_async()` closures: captured at the task boundary and
+    ///   re-raised on the caller after the drain — catchable.
+    ///
+    /// Panics in the caller-side sink of [`for_each`](Self::for_each) and
+    /// the fold/reduce combinators propagate normally (they run on the
+    /// calling thread), as do panics in the input iterator (collected by
+    /// [`stream`](crate::stream) before any topology exists).
+    ///
+    /// Additionally, panics if `.ordered()` is combined with `.expand()`
+    /// (see [`FenceMode`] docs), if the async runtime cannot be constructed
     /// (e.g. OS thread/resource limits), or if `run()` is invoked inside an
     /// async context on a chain with an async stage (e.g. from a tokio/axum
     /// handler) — the terminal drives its collector via
@@ -4075,7 +4099,9 @@ where
     ///
     /// # Panics
     ///
-    /// Same programming-error panics as [`run`](Self::run).
+    /// Same panic contract as [`run`](Self::run) — including the stage-panic
+    /// transport described there — except that async-runtime construction
+    /// failure is returned as `Err` instead of panicking.
     pub fn try_run(mut self) -> std::io::Result<Vec<O>> {
         // Fused pass-through: a chain of pure, unpinned `SyncStage`s without
         // cancellation is semantically `pipe(items).map(f1)….map(fk).collect()`
