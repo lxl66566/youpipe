@@ -606,9 +606,28 @@ impl WorkerThread {
         unsafe {
             self.wait_until(registry.thread_infos[index].terminate.as_core_latch());
         }
-        // Drain remaining local work.
-        while let Some(job) = self.try_pop_local() {
-            unsafe { Self::execute(job) };
+        // Drain remaining local work, then whatever is still queued in the
+        // injector. A `JobRef` owns its heap box, so a job left unexecuted
+        // here would leak — and were the pool ever revived (pool cache), the
+        // stale task would run at a random later point. Every worker runs
+        // this drain, and each pass re-checks both queues: a job executed
+        // during the drain may itself submit, landing in its executor's own
+        // local deque or the injector, so we loop until a full pass finds
+        // nothing new. The last worker to stop therefore leaves both queues
+        // empty (any push is followed by its pusher's own drain pass).
+        loop {
+            let mut ran = false;
+            while let Some(job) = self.try_pop_local() {
+                ran = true;
+                unsafe { Self::execute(job) };
+            }
+            while let Some(job) = registry.pop_injected_job() {
+                ran = true;
+                unsafe { Self::execute(job) };
+            }
+            if !ran {
+                break;
+            }
         }
         // Let registry know we are done.
         unsafe { Latch::set(&raw const registry.thread_infos[index].stopped) };

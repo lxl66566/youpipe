@@ -202,3 +202,59 @@ fn submit_panic_inside_join_child() {
         drop(pool);
     }
 }
+
+/// Pending injector jobs must be executed when the pool terminates
+/// (REVIEW-2026-10-06 B7). Pre-fix, `wait_until_out_of_work` only drained the
+/// local deque: submit jobs still queued in the injector were neither run nor
+/// freed — their `JobRef` boxes leaked and the closures' drops never ran
+/// (observed 0/8). The two holder jobs park both workers on the barrier so
+/// the eight counted jobs provably sit in the injector when `drop(pool)`
+/// fires the terminate latches.
+#[test]
+fn terminating_pool_drains_pending_injected_jobs() {
+    use std::{
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    struct Counted(Arc<AtomicUsize>);
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    // new_pinned bypasses the recycling cache, so the drop is a real
+    // terminate (a cached park would leave the workers alive to consume the
+    // queue anyway).
+    let pool = youpipe::ComputePool::new_pinned(2);
+    let hold = Arc::new(Barrier::new(3));
+    for _ in 0..2 {
+        let hold = Arc::clone(&hold);
+        pool.submit(move || {
+            hold.wait();
+        });
+    }
+    // Let both workers pick up a holder before queueing the counted jobs.
+    std::thread::sleep(Duration::from_millis(100));
+    for _ in 0..8 {
+        let dropped = Arc::clone(&dropped);
+        pool.submit(move || drop(Counted(dropped)));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    drop(pool);
+    // Release the holders: each worker then sees terminate, drains its deque
+    // and the injector, and only afterwards sets `stopped`.
+    hold.wait();
+    // The handle's drop returns before the workers finish; poll for the
+    // final count instead of asserting an instant.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while dropped.load(Ordering::SeqCst) < 8 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(dropped.load(Ordering::SeqCst), 8);
+}

@@ -574,8 +574,13 @@ no-regression evidence.
 `ComputePool::Drop` calls `Registry::terminate()`, which decrements a ref-count
 (`terminate_count`); when the last clone drops (count 1→0) it sets each worker's
 `terminate` OnceLatch and tickles it awake. Each worker's `wait_until_out_of_work`
-then drains its remaining local-deque work, sets its `stopped` latch, and exits;
-`Registry::Drop` blocks on every spawned worker's `stopped` before returning.
+then drains its remaining local-deque work **and the injector** (a `JobRef` owns
+its heap box — an unexecuted job is a leak, and a revived pool would run it at a
+random later point), sets its `stopped` latch, and exits; `Registry::Drop` blocks
+on every spawned worker's `stopped` before returning. Dropping the last handle
+therefore waits for every submitted job, not just the running ones. Note a
+submit-job closure that panics aborts the process wherever it executes
+(`HeapJob::execute`'s `AbortIfPanic` — rayon `spawn` semantics).
 
 ### Transient pool recycling (accepted, 2026-09)
 
