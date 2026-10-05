@@ -643,6 +643,55 @@ fn test_stream_no_stage_pass_through_identity() {
     assert_eq!(stream(items.clone()).run(), items);
 }
 
+/// Zero-stage chains pinned to the streaming path (`with_cancel`, even
+/// unfired — both knobs opt out of the fused pass-through) must still hand
+/// the collector a Single-variant terminal channel: `StreamStart` used to
+/// inherit the `spawn_single` default, which returns the MPMC feeder
+/// receiver as `FinalRx::Sync` and tripped the terminal-channel
+/// debug_assert — every downstream debug build panicked on this legal API
+/// shape (review B8).
+#[test]
+fn test_zero_stage_streaming_with_cancel_identity() {
+    use youpipe::CancellationToken;
+
+    let token = CancellationToken::new();
+    let r: Vec<u64> = stream(0..10u64).with_cancel(token).run();
+    assert_eq!(r, (0..10u64).collect::<Vec<_>>());
+}
+
+/// Ordered flavour: the zero-stage bridge is FIFO, so the ordered drain's
+/// accounting must hold exactly (no cancel exemption needed).
+#[test]
+fn test_zero_stage_streaming_with_cancel_ordered() {
+    use youpipe::CancellationToken;
+
+    let token = CancellationToken::new();
+    let r: Vec<u64> = stream(0..10u64).with_cancel(token).ordered().run();
+    assert_eq!(r, (0..10u64).collect::<Vec<_>>());
+}
+
+/// Pre-fired token: the feeder pushes nothing and the bridge forwarder
+/// stops on its first cancel check — the run returns short without hanging
+/// on the bridge or leaking the token (collector returns once every
+/// channel end drops).
+#[test]
+fn test_zero_stage_streaming_with_cancel_fired() {
+    use youpipe::CancellationToken;
+
+    let token = CancellationToken::new();
+    token.cancel();
+    let r: Vec<u64> = stream(0..100u64).with_cancel(token).run();
+    assert!(r.len() < 100, "cancelled zero-stage run must abort early");
+}
+
+/// `with_compute_workers` pin — the other pass-through opt-out — takes the
+/// same zero-stage streaming path.
+#[test]
+fn test_zero_stage_streaming_with_compute_workers() {
+    let r: Vec<u64> = stream(0..10u64).with_compute_workers(2).run();
+    assert_eq!(r, (0..10u64).collect::<Vec<_>>());
+}
+
 /// Stage panics propagate to the `run()` caller on the pass-through (the
 /// fused core cleans up partial state and resumes the unwind) instead of
 /// the streaming path's process abort. Catching the unwind here doubles as

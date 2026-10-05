@@ -105,8 +105,14 @@ feed the sole async collector). The `StageSpawn` trait gains a
 MPSC instead of MPMC; `StreamPipe::try_run` calls `spawn_single` for the
 terminal path — covering sync stages, fence links, expand, and
 `AsyncStage` (whose `spawn_single` override builds the output channel as
-`mpsc_async_channel`). Intermediate stage channels remain MPMC (their
-receivers are shared across multiple worker threads via `clone`).
+`mpsc_async_channel`). A zero-stage chain pinned to the streaming path
+(`with_cancel` / worker pins) dispatches on `StreamStart`, whose
+`spawn_single` bridges the MPMC feeder receiver into an MPSC ring on a
+dedicated OS thread (the standard cross-mode bridge shape and lease
+exemption) — without the override the terminal-channel debug_assert
+rejected the identity chain's MPMC receiver. Intermediate stage channels
+remain MPMC (their receivers are shared across multiple worker threads via
+`clone`).
 
 The collector itself is generic over a `RecvItem` (sync) or `AsyncRecvItem`
 (async) trait, so `collect_sync` / `collect_async` drain either the MPMC or

@@ -1958,6 +1958,39 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
         FinalRx::Sync(rx)
     }
 
+    fn spawn_single<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, I)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<I>
+    where
+        Self: Sized,
+    {
+        // Zero-stage chain on the streaming path (reachable only through
+        // `with_cancel` / a `with_compute_workers` pin, which opt the chain
+        // out of the fused pass-through): the trait hands over the MPMC
+        // feeder receiver, but the terminal contract requires a Single
+        // variant. Bridge through an MPSC ring on a dedicated OS thread —
+        // the same shape and lease exemption as the other cross-mode
+        // bridges (`bridge_async_to_sync` et al.): a bridge thread is
+        // OS-scheduled, never a channel-parking pool job, so it must not
+        // consume a `ParkingLease` slot the run did not reserve.
+        let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
+        let (tx, out_rx) = mpsc_channel::<(u64, I)>(buffer);
+        let cancel = ctx.cancel.clone();
+        std::thread::spawn(move || {
+            while let Ok(item) = rx.recv() {
+                if cancel_active(cancel.as_ref()) {
+                    return;
+                }
+                if tx.send(item).is_err() {
+                    return;
+                }
+            }
+        });
+        FinalRx::SyncSingle(out_rx)
+    }
+
     fn stage_budget(&self) -> StageBudget {
         StageBudget::default()
     }
@@ -2014,6 +2047,39 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
         // the feeder's mixed-mode channel becomes the AsyncStage's input
         // channel — no bridge thread needed.
         FinalRx::Async(rx)
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_async_feeder_single<R: AsyncRuntime>(
+        self,
+        rx: AsyncReceiver<(u64, I)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<I>
+    where
+        Self: Sized,
+    {
+        // Async-feeder counterpart of `spawn_single`: bridge the async
+        // feeder receiver into an MPSC-async terminal via one runtime task.
+        // Unreachable through `run()` today — the async-feeder branch
+        // requires `first_consumer_is_async() == Some(true)`, i.e. a real
+        // first stage — but overriding keeps the "outermost stage's
+        // `_single` methods return a Single variant" contract total instead
+        // of resting on that dispatch invariant.
+        let buffer = ctx.buffer_size(ctx.per_stage_parallelism);
+        let (tx, out_rx) = mpsc_async_channel::<(u64, I)>(buffer);
+        let cancel = ctx.cancel.clone();
+        let pool = ctx.acquire_async().expect("failed to build async runtime");
+        pool.spawn(async move {
+            while let Ok(item) = rx.recv().await {
+                if cancel_active(cancel.as_ref()) {
+                    return;
+                }
+                if tx.send(item).await.is_err() {
+                    return;
+                }
+            }
+        });
+        FinalRx::AsyncSingle(out_rx)
     }
 }
 
@@ -4398,6 +4464,53 @@ mod tests {
         drop(rx);
         let mut batch = vec![1u32, 2, 3];
         assert!(!fence_batch_send(&tx, &mut batch, true));
+    }
+
+    /// `StreamStart::spawn_async_feeder_single` bridges the async feeder
+    /// receiver into an MPSC-async terminal. Unreachable through `run()`
+    /// (the async-feeder branch requires a real first consumer), so its
+    /// Single-terminal contract is verified directly — a future change to
+    /// the feeder-type predicate would otherwise dispatch it untested.
+    #[cfg(all(test, feature = "tokio-runtime"))]
+    #[test]
+    fn stream_start_async_feeder_single_bridges() {
+        use crate::runtime::TokioPool;
+
+        let cfg = PipelineConfig::default();
+        let pool = TokioPool::build(1).expect("build test runtime");
+        let ctx: StreamCtx<'_, TokioPool> = StreamCtx {
+            config: &cfg,
+            cancel: None,
+            n: 4,
+            per_stage_parallelism: 1,
+            dedicated_threads: false,
+            sharded_terminal: false,
+            lease: None,
+            worker_slots_left: Cell::new(0),
+            stages_left: Cell::new(0),
+            compute_pool: None,
+            async_pool: Some(pool.clone()),
+            cached_pool: OnceLock::new(),
+            async_panic: OnceLock::new(),
+            _marker: PhantomData,
+        };
+        let (tx, rx) = sync_async_channel::<(u64, u8)>(4);
+        for i in 0u8..4 {
+            tx.send((u64::from(i), i)).expect("push into async feeder");
+        }
+        drop(tx);
+        let FinalRx::AsyncSingle(rx) = StreamStart.spawn_async_feeder_single::<TokioPool>(rx, &ctx)
+        else {
+            panic!("StreamStart::spawn_async_feeder_single must return AsyncSingle");
+        };
+        let got = pool.block_on(async {
+            let mut v = Vec::new();
+            while let Ok((_, x)) = rx.recv().await {
+                v.push(x);
+            }
+            v
+        });
+        assert_eq!(got, vec![0, 1, 2, 3]);
     }
 
     #[test]
