@@ -120,19 +120,21 @@ pub(crate) fn resolve_exec_pool(
 /// on `par_index_leaf` keeps holding):
 ///
 /// * `leaf` runs `[start, end)` sequentially on the current thread. Op failures come back as `Err`;
-///   panics propagate naturally into `join`'s unwind plumbing (the leaf guard has already dropped
-///   the partial state of its own range).
+///   panics are captured by the join plumbing (the leaf guard has already dropped the partial state
+///   of its own range) and reach the internal-node match below as values.
 /// * `drop_success_range` drops the resources a *successfully completed* range holds in shared
 ///   buffers (the completed sibling's output slots), so the caller can free those buffers without
 ///   leak or double-drop — the internal-node granularity of
 ///   [`HybridStrategy::cleanup_success_chunk`]. Only ever invoked for ranges whose subtree returned
 ///   `Ok(())`; no-op for sink-only terminals.
 ///
-/// Panic safety: a panicking leaf's unwind is caught by `join`, and internal
-/// nodes propagate the first `Err`, dropping the already-completed sibling's
-/// range via `drop_success_range`. On return, the whole `[start, end)` range
-/// is fully resolved: every slot is either init (success path) or dropped,
-/// and every input slot is consumed.
+/// Panic safety: a panicking leaf never unwinds past this recursion — it is
+/// captured at each join boundary and handed back as `Err` (a self-run B's
+/// escape is covered by the unwind-only `SiblingGuard`), so the internal-node
+/// match always runs and drops every completed sibling's range via
+/// `drop_success_range`. On return, the whole `[start, end)` range is fully
+/// resolved: every slot is either init (success path) or dropped, and every
+/// input slot is consumed.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn par_tree_rec<IN: ?Sized + Sync, E, L, D>(
     pool: &ComputePool,
@@ -144,7 +146,7 @@ fn par_tree_rec<IN: ?Sized + Sync, E, L, D>(
     drop_success_range: &D,
 ) -> Result<(), E>
 where
-    E: Send,
+    E: Send + From<PanicPayload>,
     L: Fn(&IN, usize, usize) -> Result<(), E> + Sync,
     D: Fn(usize, usize) + Sync,
 {
@@ -152,7 +154,19 @@ where
         return leaf(input, start, end);
     }
     let mid = start + (end - start) / 2;
-    let (l, r) = pool.join(
+    // Unwind backstop for the one panic `join_captured` lets escape: a
+    // self-run B (see `join_on_captured`'s self-pop branch). Any panic that
+    // unwinds past the join call below therefore implies A completed
+    // successfully — the guard drops exactly the left range, then lets the
+    // unwind continue toward the chunk boundary's `halt_unwinding`. Every
+    // other panic (A's, a stolen B's, a leaf's) is captured inside the join
+    // machinery and comes back as a value through the match below.
+    let g = SiblingGuard {
+        start,
+        mid,
+        drop_success_range,
+    };
+    let (l, r) = pool.join_captured(
         || {
             par_tree_rec(
                 pool,
@@ -176,28 +190,45 @@ where
             )
         },
     );
-    match (l, r) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(p), Ok(())) => {
-            // SAFETY (hook contract): the right sibling completed, so its
-            // range's shared resources are live and droppable (e.g. its
-            // output slots are fully init — the no-filter cores never leave
-            // holes).
-            drop_success_range(mid, end);
-            Err(p)
-        },
-        (Ok(()), Err(p)) => {
-            // SAFETY (hook contract): the left sibling completed.
-            drop_success_range(start, mid);
-            Err(p)
-        },
-        (Err(p), Err(_)) => {
-            // SAFETY (hook contract): both siblings completed (each with its
-            // own failure).
-            drop_success_range(start, mid);
-            drop_success_range(mid, end);
-            Err(p)
-        },
+    std::mem::forget(g);
+    let l_ok = matches!(l, Ok(Ok(())));
+    let r_ok = matches!(r, Ok(Ok(())));
+    if l_ok && r_ok {
+        return Ok(());
+    }
+    // SAFETY (hook contract): a non-success branch's range was fully cleaned
+    // inside its own recursion (internal-node match + leaf guard), so only
+    // the completed siblings' ranges hold live shared resources here (e.g.
+    // fully-init output slots — the no-filter cores never leave holes).
+    if l_ok {
+        drop_success_range(start, mid);
+    }
+    if r_ok {
+        drop_success_range(mid, end);
+    }
+    // Both branches completed, each with its own failure. A panic outranks
+    // an op failure; among equal kinds the left (first) failure wins — the
+    // same ordering `ErasedFailure::record` enforces at chunk level.
+    Err(match (l, r) {
+        (Err(p), _) | (_, Err(p)) => E::from(p),
+        (Ok(Err(e)), _) | (Ok(Ok(())), Ok(Err(e))) => e,
+        (Ok(Ok(())), Ok(Ok(()))) => unreachable!("handled by the early return above"),
+    })
+}
+
+/// Unwind-only sibling cleanup for [`par_tree_rec`] (see its comment for the
+/// escape-path invariant). Forgotten on every normal return.
+struct SiblingGuard<'a, D: Fn(usize, usize)> {
+    start: usize,
+    mid: usize,
+    drop_success_range: &'a D,
+}
+
+impl<D: Fn(usize, usize)> Drop for SiblingGuard<'_, D> {
+    fn drop(&mut self) {
+        // SAFETY (hook contract): the escaping unwind implies the join's A
+        // side completed, so `[start, mid)` is fully init and droppable.
+        (self.drop_success_range)(self.start, self.mid);
     }
 }
 
@@ -664,10 +695,10 @@ where
 /// `Panic` variant is reachable. The fallible strategy (`TryStrategy`)
 /// additionally carries the op's first `Err(e)`.
 ///
-/// A panic outranks an op failure: the single-tree path propagates a panicking
-/// leaf's unwind straight through the parent's `Result` match (discarding any
-/// sibling `Err` it was about to return), so "panic wins" reproduces the
-/// tree's observable semantics.
+/// A panic outranks an op failure: the tree recursion hands a panicking leaf
+/// back as an `Err` whose payload displaces any op failure recorded earlier
+/// (see [`ErasedFailure::record`]), so "panic wins" reproduces the tree's
+/// observable semantics.
 enum ErasedFailure {
     /// Op-level failure, type-erased (only produced by fallible strategies).
     /// Boxed once per failed run — failures are cold, the boxing cost is
@@ -700,6 +731,35 @@ impl ErasedFailure {
 enum TryFailure<E> {
     Error(E),
     Panic(PanicPayload),
+}
+
+impl<E> From<PanicPayload> for TryFailure<E> {
+    fn from(p: PanicPayload) -> Self {
+        TryFailure::Panic(p)
+    }
+}
+
+/// Classify a strategy failure into the erased sum: a panic keeps its payload
+/// unboxed (`Panic`), everything else is the op failure (`Op`). Needed because
+/// the tree recursion now hands panics back as `Err` values (see
+/// [`par_tree_rec`]) instead of unwinding through the erased boundary.
+trait ErasedFailureFrom: Sized {
+    fn into_erased(self) -> ErasedFailure;
+}
+
+impl ErasedFailureFrom for PanicPayload {
+    fn into_erased(self) -> ErasedFailure {
+        ErasedFailure::Panic(self)
+    }
+}
+
+impl<E: Any + Send> ErasedFailureFrom for TryFailure<E> {
+    fn into_erased(self) -> ErasedFailure {
+        match self {
+            TryFailure::Panic(p) => ErasedFailure::Panic(p),
+            TryFailure::Error(e) => ErasedFailure::Op(Box::new(e)),
+        }
+    }
 }
 
 /// Per-operation execution strategy for hybrid flat/tree top-level dispatch.
@@ -798,6 +858,7 @@ unsafe impl<IN: ?Sized> Sync for ErasedStrategy<IN> {}
 impl<IN: ?Sized, S> From<&S> for ErasedStrategy<IN>
 where
     S: HybridStrategy<IN>,
+    S::Failure: ErasedFailureFrom,
 {
     fn from(strategy: &S) -> Self {
         let ctx = ptr::from_ref(strategy).cast::<()>();
@@ -808,12 +869,12 @@ where
             run_chunk: |ctx, pool, input, start, end, splits| unsafe {
                 (*ctx.cast::<S>())
                     .run_chunk(pool, input, start, end, splits)
-                    .map_err(|f| ErasedFailure::Op(Box::new(f)))
+                    .map_err(ErasedFailureFrom::into_erased)
             },
             run_sequential: |ctx, input, start, end| unsafe {
                 (*ctx.cast::<S>())
                     .run_sequential(input, start, end)
-                    .map_err(|f| ErasedFailure::Op(Box::new(f)))
+                    .map_err(ErasedFailureFrom::into_erased)
             },
             cleanup_success: |ctx, start, end| unsafe {
                 (*ctx.cast::<S>()).cleanup_success_chunk(start, end);
@@ -1226,8 +1287,9 @@ where
 /// - `Err(e)` chunk — the fallible tree's leaf/internal-node cleanup has already dropped every live
 ///   output slot and consumed every input slot in the chunk's range, so nothing remains to clean
 ///   (mirrors the panicked chunk of the infallible strategies).
-/// - Panicking chunk — unwinds through the recursion (leaf guard cleans its own partial range;
-///   sibling ranges may leak, same documented behaviour as the single-tree path).
+/// - Panicking chunk — comes back as `TryFailure::Panic` through the recursion's
+///   per-level halt (leaf guard cleans its own partial range; completed sibling
+///   ranges are dropped at each internal node), so nothing leaks either.
 struct TryStrategy<'a, R, E, OP> {
     output: &'a Slots<R>,
     op: &'a OP,
@@ -1258,7 +1320,7 @@ where
             // slots are uninit.
             let in_slice = unsafe { input.as_slice(start, end) };
             let out_slice = unsafe { self.output.as_mut_slice(start, end) };
-            par_index_try_leaf(in_slice, out_slice, self.op)
+            par_index_try_leaf(in_slice, out_slice, self.op).map_err(TryFailure::Error)
         };
         let drop_success_range = |start: usize, end: usize| {
             // SAFETY (hook contract): only called for completed ranges, so
@@ -1266,7 +1328,6 @@ where
             unsafe { self.output.drop_range(start, end) };
         };
         par_tree_rec(pool, input, start, end, splits, &leaf, &drop_success_range)
-            .map_err(TryFailure::Error)
     }
 
     #[inline]
@@ -2549,9 +2610,9 @@ where
     )
     .err()
     .map(|f| match f {
-        ErasedFailure::Op(b) => match b.downcast::<TryFailure<OP::Error>>() {
-            Ok(tf) => *tf,
-            Err(_) => unreachable!("try reduce strategy only records TryFailure"),
+        ErasedFailure::Op(b) => match b.downcast::<OP::Error>() {
+            Ok(e) => TryFailure::Error(*e),
+            Err(_) => unreachable!("try reduce strategy only records op failures"),
         },
         ErasedFailure::Panic(p) => TryFailure::Panic(p),
     });
@@ -2608,9 +2669,9 @@ where
     )
     .err()
     .map(|f| match f {
-        ErasedFailure::Op(b) => match b.downcast::<TryFailure<OP::Error>>() {
-            Ok(tf) => *tf,
-            Err(_) => unreachable!("try reduce strategy only records TryFailure"),
+        ErasedFailure::Op(b) => match b.downcast::<OP::Error>() {
+            Ok(e) => TryFailure::Error(*e),
+            Err(_) => unreachable!("try reduce strategy only records op failures"),
         },
         ErasedFailure::Panic(p) => TryFailure::Panic(p),
     });
@@ -2689,9 +2750,9 @@ where
 }
 
 /// Drive the fallible index core over `[0, n)` and convert the output buffer into
-/// a `Vec<R>`. On error, the recursion has already dropped all init output
-/// slots; on panic, the panic propagates (and the output buffer's init slots
-/// may leak, same as `par_index_collect`).
+/// a `Vec<R>`. On error or panic, the recursion has already dropped all init
+/// output slots (panics travel the same value channel as op errors — see
+/// [`par_tree_rec`]).
 ///
 /// Hybrid flat/tree dispatch (shared with `collect` / `for_each` via
 /// [`TryStrategy`]): `num_threads` broad chunks injected in one
@@ -2731,9 +2792,9 @@ where
     )
     .err()
     .map(|f| match f {
-        ErasedFailure::Op(b) => match b.downcast::<TryFailure<E>>() {
-            Ok(tf) => *tf,
-            Err(_) => unreachable!("try strategy only records TryFailure<E>"),
+        ErasedFailure::Op(b) => match b.downcast::<E>() {
+            Ok(e) => TryFailure::Error(*e),
+            Err(_) => unreachable!("try strategy only records op failures of E"),
         },
         ErasedFailure::Panic(p) => TryFailure::Panic(p),
     });
@@ -2749,8 +2810,8 @@ where
             Err(e)
         },
         Some(TryFailure::Panic(p)) => {
-            // Mirrors the single-tree path: a panic unwinds past the buffer
-            // management (init slots may leak, documented above).
+            // Recursion already dropped every live output slot; resume the
+            // panic for the caller.
             drop(input);
             drop(output);
             panic::resume_unwind(p);
@@ -4928,7 +4989,7 @@ where
             // output is uninit.
             let in_slice = unsafe { input.get_unchecked(start..end) };
             let out_slice = unsafe { self.output.as_mut_slice(start, end) };
-            par_index_try_leaf_by_ref(in_slice, out_slice, self.op)
+            par_index_try_leaf_by_ref(in_slice, out_slice, self.op).map_err(TryFailure::Error)
         };
         let drop_success_range = |start: usize, end: usize| {
             // SAFETY (hook contract): only called for completed ranges, so
@@ -4936,7 +4997,6 @@ where
             unsafe { self.output.drop_range(start, end) };
         };
         par_tree_rec(pool, input, start, end, splits, &leaf, &drop_success_range)
-            .map_err(TryFailure::Error)
     }
 
     #[inline]
@@ -4998,9 +5058,9 @@ where
     )
     .err()
     .map(|f| match f {
-        ErasedFailure::Op(b) => match b.downcast::<TryFailure<F>>() {
-            Ok(tf) => *tf,
-            Err(_) => unreachable!("try strategy only records TryFailure<F>"),
+        ErasedFailure::Op(b) => match b.downcast::<F>() {
+            Ok(e) => TryFailure::Error(*e),
+            Err(_) => unreachable!("try strategy only records op failures of F"),
         },
         ErasedFailure::Panic(p) => TryFailure::Panic(p),
     });
@@ -5012,8 +5072,8 @@ where
             Err(e)
         },
         Some(TryFailure::Panic(p)) => {
-            // Mirrors the owned path: a panic unwinds past the buffer
-            // management (init slots may leak, documented there).
+            // Recursion already dropped every live output slot; resume the
+            // panic for the caller.
             drop(output);
             panic::resume_unwind(p);
         },
@@ -5229,8 +5289,9 @@ where
 /// Pass 2: write leaf `leaf_base`'s survivors into the leaf's slice of the
 /// shared output buffer (`offsets`/`counts` from the scan). On unwind the
 /// leaf guard drops the written prefix; fully completed siblings' outputs
-/// leak when the root frees the buffer — the same accepted panic-path
-/// precedent as the index-try collect ("init slots may leak").
+/// leak when the root frees the buffer — a known, accepted panic-path leak
+/// (the index cores fixed theirs via `join_captured` + sibling cleanup; this
+/// merge-based filter path still resumes panics straight through its joins).
 struct FilterPlaceCtx<'i, 'a, S, E>
 where
     S: FusedStage<&'i E>,

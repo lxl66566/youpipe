@@ -8,6 +8,10 @@
 
 use std::{any::Any, sync::Arc};
 
+/// A join result with a captured panic as the `Err` side (see
+/// [`join_captured`]).
+pub(crate) type Captured<T> = Result<T, Box<dyn Any + Send>>;
+
 use super::{
     job::StackJob,
     latch::{AsCoreLatch, SpinLatch},
@@ -38,6 +42,29 @@ where
     })
 }
 
+/// Value-returning [`join`]: a panicking closure comes back as
+/// `Err(payload)` instead of the panic resuming through this frame.
+///
+/// Callers that must clean up per-branch state on failure (the fused tree
+/// recursion's sibling cleanup) need this: a resumed unwind skips every
+/// statement between the `join` call and the caller's own unwinder, so the
+/// completed sibling's cleanup would be silently bypassed.
+pub(crate) fn join_captured<A, B, RA, RB>(
+    registry: &Arc<Registry>,
+    oper_a: A,
+    oper_b: B,
+) -> (Captured<RA>, Captured<RB>)
+where
+    A: FnOnce() -> RA + Send,
+    B: FnOnce() -> RB + Send,
+    RA: Send,
+    RB: Send,
+{
+    registry.in_worker(|worker_thread, _injected| unsafe {
+        join_on_captured(worker_thread, oper_a, oper_b)
+    })
+}
+
 /// Join implementation assuming we're already on `worker_thread`.
 ///
 /// # Safety
@@ -46,10 +73,37 @@ where
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) unsafe fn join_on<A, B, RA, RB>(
     worker_thread: &WorkerThread,
-    injected: bool,
+    _injected: bool,
     oper_a: A,
     oper_b: B,
 ) -> (RA, RB)
+where
+    A: FnOnce() -> RA + Send,
+    B: FnOnce() -> RB + Send,
+    RA: Send,
+    RB: Send,
+{
+    let (a, b) = unsafe { join_on_captured(worker_thread, oper_a, oper_b) };
+    // `resume_unwinding` never returns, so each closure body runs only on the
+    // Err path; the Ok path is a plain unwrap.
+    (
+        a.unwrap_or_else(|p| unwind::resume_unwinding(p)),
+        b.unwrap_or_else(|p| unwind::resume_unwinding(p)),
+    )
+}
+
+/// [`join_on`]'s value-returning core (see [`join_captured`]).
+///
+/// # Safety
+///
+/// Same contract as [`join_on`]: `worker_thread` must be the current thread's
+/// `WorkerThread`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) unsafe fn join_on_captured<A, B, RA, RB>(
+    worker_thread: &WorkerThread,
+    oper_a: A,
+    oper_b: B,
+) -> (Captured<RA>, Captured<RB>)
 where
     A: FnOnce() -> RA + Send,
     B: FnOnce() -> RB + Send,
@@ -69,47 +123,46 @@ where
     unsafe { worker_thread.push(job_b_ref) };
 
     // Execute A inline. Hopefully B gets stolen in the meantime.
-    let status_a = unwind::halt_unwinding(oper_a);
-    let result_a = match status_a {
-        Ok(v) => v,
-        Err(err) => unsafe { join_recover_from_panic(worker_thread, &job_b.latch, err) },
-    };
+    let result_a = unwind::halt_unwinding(oper_a);
 
-    // Now try to pop and run B, or wait for it if stolen.
-    while !job_b.latch.probe() {
+    // Now try to pop and run B, or wait for it if stolen. Even when A panicked
+    // we must run this to completion: B (its StackJob on this frame) may hold
+    // references into our stack, so this frame cannot unwind past it until B
+    // has finished — the panic rides back as a value instead.
+    let result_b = loop {
+        if job_b.latch.probe() {
+            break unsafe { job_b.into_result_captured() };
+        }
         if let Some(job) = worker_thread.try_pop_local() {
             if job_b_id == job.id() {
-                // Found B! Run it inline.
-                let result_b = unsafe { job_b.run_inline(injected) };
-                return (result_a, result_b);
+                // Found B — run it inline. Two shapes by A's outcome:
+                //
+                // * A ok (the hot case): run B directly. A panicking B is
+                //   then the ONE panic that escapes `join_on_captured` as a
+                //   live unwind — safe because the caller (the fused tree
+                //   recursion) parks a sibling-cleanup guard at the join
+                //   call that knows A completed. Wrapping this call in
+                //   `catch_unwind` instead (even isolated in a cold
+                //   helper) regressed sync_cpu_heavy/100K by +33 % in
+                //   same-session A/B vs a rayon control — this branch is
+                //   that layout-sensitive.
+                // * A failed (cold, batch already doomed): capture B's
+                //   panic as a value so the caller's match sees both
+                //   failures instead of losing A's result to the unwind.
+                break if result_a.is_ok() {
+                    Ok(unsafe { job_b.run_inline(false) })
+                } else {
+                    unsafe { job_b.run_captured(false) }
+                };
             }
             unsafe { WorkerThread::execute(job) };
         } else {
             // Local deque empty (B was stolen). Steal work while waiting.
             unsafe { worker_thread.wait_until(job_b.latch.as_core_latch()) };
             debug_assert!(job_b.latch.probe());
-            break;
+            break unsafe { job_b.into_result_captured() };
         }
-    }
+    };
 
-    (result_a, unsafe { job_b.into_result() })
-}
-
-/// If A panics, we still must wait for B to complete (it may hold references
-/// into our stack frame).
-///
-/// # Safety
-///
-/// Same contract as [`join_on`]: `worker_thread` must be the current thread's
-/// `WorkerThread`, and `job_b_latch` must belong to a job still owning its
-/// stack frame until this returns.
-#[cold]
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-unsafe fn join_recover_from_panic(
-    worker_thread: &WorkerThread,
-    job_b_latch: &SpinLatch<'_>,
-    err: Box<dyn Any + Send>,
-) -> ! {
-    unsafe { worker_thread.wait_until(job_b_latch.as_core_latch()) };
-    unwind::resume_unwinding(err)
+    (result_a, result_b)
 }

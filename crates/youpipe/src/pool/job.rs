@@ -109,6 +109,12 @@ where
         unsafe { JobRef::new(self) }
     }
 
+    // `run_inline` was removed with join's self-pop switch to
+    // `JobRef::execute`: it bypassed the job's `halt_unwinding`, so a self-run
+    // B's panic escaped as a live unwind instead of a value (and re-adding a
+    // catch at the call site cost +33 % on sync_cpu_heavy/100K — see
+    // `join_on_captured`).
+
     /// # Safety
     ///
     /// The job must never have been scheduled: no concurrent `execute` may run
@@ -117,12 +123,47 @@ where
         self.func.into_inner().unwrap()(stolen)
     }
 
+    /// [`run_inline`](Self::run_inline) with the panic captured as a value —
+    /// used by `join_on_captured`'s self-pop branch only when the OTHER side
+    /// already failed (a cold, already-doomed batch), so both failures reach
+    /// the caller's match instead of the unwind eating A's result.
+    ///
+    /// `cold` + `inline(never)` are load-bearing: the `catch_unwind`
+    /// landingpad must stay out of the callers' codegen (see
+    /// `join_on_captured`'s self-pop comment for the measured cost).
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`run_inline`](Self::run_inline).
+    #[cold]
+    #[inline(never)]
+    pub(crate) unsafe fn run_captured(&self, stolen: bool) -> Result<R, Box<dyn Any + Send>> {
+        // SAFETY: contract above — sole owner, never scheduled concurrently.
+        let func = unsafe { (*self.func.get()).take().unwrap() };
+        unwind::halt_unwinding(move || func(stolen))
+    }
+
     /// # Safety
     ///
     /// The job must have been executed exactly once (latch set), so the result
     /// slot is populated and no other thread can still access it.
     pub(crate) unsafe fn into_result(self) -> R {
         self.result.into_inner().into_return_value()
+    }
+
+    /// [`into_result`](Self::into_result) without the resume: a stored panic
+    /// comes back as `Err(payload)` for [`join_captured`](crate::pool::join::join_captured)
+    /// callers that handle panics as values.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`into_result`](Self::into_result).
+    pub(crate) unsafe fn into_result_captured(self) -> Result<R, Box<dyn Any + Send>> {
+        match self.result.into_inner() {
+            JobResult::None => unreachable!(),
+            JobResult::Ok(x) => Ok(x),
+            JobResult::Panic(p) => Err(p),
+        }
     }
 }
 

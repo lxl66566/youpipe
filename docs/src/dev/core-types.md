@@ -76,6 +76,19 @@ already-completed sibling's output range. `MAY_FILTER = false` guarantees
 written ranges have no holes, so `drop_range` is sound without per-slot
 validity tracking. Miri (tree-borrows) passes on all paths.
 
+The sibling cleanup only works because the tree recursion calls the
+value-returning `join_captured` instead of plain `join`: `join` *resumes* a
+captured panic straight through the caller's frame, which would skip the
+internal-node match and leak every completed sibling's output (this exact
+leak shipped for a while — it only reproduced on low-core-count machines,
+where `chunk_splits >= 1` gives chunks real join trees inside them; a
+32-core dev box keeps `chunk_splits == 0` and never enters the buggy path).
+The one panic `join_captured` still lets escape — a self-run branch B, kept
+un-caught on purpose because adding a `catch_unwind` on that hot path alone
+regressed `sync_cpu_heavy/100K` by +33 % through codegen layout shifts — is
+caught one level up by the recursion's unwind-only `SiblingGuard`, which
+knows the inline side already completed and drops exactly that range.
+
 ### `Pipe<S, I, O>` — Data-First Fused Pipeline
 
 `Pipe` is the data-first fused pipeline. Built by `pipe(items)`, it carries the

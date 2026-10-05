@@ -1,6 +1,6 @@
 use std::sync::{Arc, OnceLock};
 
-use crate::pool::{self, Registry};
+use crate::pool::{self, Registry, join::Captured};
 
 /// Global work-stealing compute pool backed by a rayon-style scheduler.
 ///
@@ -192,6 +192,20 @@ impl ComputePool {
         RB: Send,
     {
         pool::join::join(&self.registry, a, b)
+    }
+
+    /// Value-returning [`join`](Self::join): a panicking closure comes back as
+    /// `Err(payload)` instead of the panic resuming through the caller's frame.
+    /// For callers that clean up sibling state between the `join` call and
+    /// their own unwinder (the fused tree recursion).
+    pub fn join_captured<A, B, RA, RB>(&self, a: A, b: B) -> (Captured<RA>, Captured<RB>)
+    where
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send,
+    {
+        pool::join::join_captured(&self.registry, a, b)
     }
 
     /// Returns a reference to the underlying registry.
