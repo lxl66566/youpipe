@@ -2411,6 +2411,20 @@ where
         let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
         let parallelism = ctx.stage_workers(&self.opts);
         let buffer = ctx.stage_buffer(self.opts.buffer, parallelism);
+        if ctx.sharded_terminal(parallelism) {
+            // See `ExpandStage::spawn_single` and
+            // `SyncStage::spawn_async_feeder_single`: async-first chains
+            // with an expand terminal get the same per-worker SPSC fan-in.
+            // This arm was missing (review P-9): under the knob the
+            // terminal silently degraded to the shared MPSC ring and lost
+            // the per-shard CAS-free sends. `stage_buffer` noted one
+            // shard's capacity; the other shards are extra in-flight
+            // capacity.
+            ctx.note_in_flight((parallelism - 1) * buffer);
+            let (txs, out_rx) = sharded_mpsc_channel::<(u64, N)>(parallelism, buffer);
+            spawn_expand_stage_fanout::<_, _, MpscSender<(u64, N)>, R>(ctx, mid_rx, txs, self.f);
+            return FinalRx::SyncSharded(out_rx);
+        }
         let (out_tx, out_rx) = mpsc_channel::<(u64, N)>(buffer);
         spawn_expand_stage(ctx, mid_rx, out_tx, parallelism, self.f);
         FinalRx::SyncSingle(out_rx)

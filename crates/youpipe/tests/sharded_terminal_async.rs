@@ -98,6 +98,47 @@ fn sharded_async_terminal_semantics() {
     expected.sort_unstable();
     assert_eq!(got, expected);
 
+    // ── Async feeder into an expand terminal (review P-9:
+    //    `ExpandStage::spawn_async_feeder_single`): this shape previously
+    //    missed the sharded branch and degraded to the shared MPSC ring
+    //    under the knob. Functional check only — the knob binary exposes
+    //    no path-selection introspection (same caveat as every block
+    //    above); the sharded branch is taken whenever the knob is on and
+    //    the stage's worker count exceeds one. ──
+    let mut got = stream(0..n_aux() as u64)
+        .with_cancel(inert_cancel())
+        .stage_async(|x: u64| async move { x.wrapping_add(1_000_000) })
+        .expand_emit(|x: u64, out: &mut Vec<u64>| {
+            out.push(x);
+            out.push(x.wrapping_add(100_000));
+        })
+        .run();
+    got.sort_unstable();
+    let mut expected: Vec<u64> = (0..n_aux() as u64)
+        .flat_map(|x| [x + 1_000_000, x + 1_100_000])
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(got, expected);
+
+    // ── Same shape with a trailing async terminal (async feeder → expand
+    //    mid-chain → async terminal): the expand feeds the async terminal's
+    //    consumer crowd; its own terminal stays the sharded async one. ──
+    let mut got = stream(0..n_aux() as u64)
+        .with_cancel(inert_cancel())
+        .stage_async(|x: u64| async move { x.wrapping_add(1_000_000) })
+        .expand_emit(|x: u64, out: &mut Vec<u64>| {
+            out.push(x % 7);
+            out.push(x % 11);
+        })
+        .stage_async(|x: u64| async move { x + 1 })
+        .run();
+    got.sort_unstable();
+    let mut expected: Vec<u64> = (0..n_aux() as u64)
+        .flat_map(|x| [(x + 1_000_000) % 7 + 1, (x + 1_000_000) % 11 + 1])
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(got, expected);
+
     // ── for_each terminal: exactly-n invocations, nothing duplicated ──
     let seen = AtomicUsize::new(0);
     let checksum = AtomicUsize::new(0);
