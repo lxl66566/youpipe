@@ -1181,9 +1181,12 @@ the campaign tip, 4 interleaved pairs), the bad commit itself measures
 the grid costs nothing on a lucky layout. Alignment does not fix
 everything: `cpu_balanced_readback/100K` keeps a ~+7 % wobble that
 bisects to `98c8d4d` (crossfire-only changes, likewise unreachable from
-that path) and survives `align-all-functions=6` — that residual is
-thin-LTO/heap address sensitivity, not a semantic regression, and no
-tool we have stabilizes it.
+that path) and survives both `align-all-functions=6` and LLVM's JCC
+branch-target alignment (`-x86-align-branch-boundary=32` plus
+`-x86-align-branch=fused,jcc,jmp,call,ret,indirect` — tested 2026-10-06,
+no effect; the flags were NOT adopted). That residual is most likely
+heap/page placement of the output buffer the fold reads, not code
+layout, and no compiler flag we have stabilizes it.
 
 Practical consequences:
 
