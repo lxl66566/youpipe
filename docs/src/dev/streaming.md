@@ -387,7 +387,10 @@ The bistability above is attributed with a dedicated harness
 (`crates/youpipe-bench/src/bin/convoy-probe.rs`): one shape × R in-process
 runs, per-run wall time plus per-thread `/proc` context-switch deltas
 grouped by thread name (`yp-pool` = stage workers / feeder / forwarder,
-`tokio-worker`, `main`), optional crossfire episode dump
+`tokio-worker`, `main`; threads that die inside a run — e.g. the transient
+pool under `--cpu-workers` — are flagged `exited=N` per group, since Linux
+discards their counters at exit and their switches are unobservable),
+optional crossfire episode dump
 (`--features crossfire-trace` + `CONVOY_TRACE_PATH`). Calibre: 100 K `u64`
 items, `taskset -c 1-31` (pool = 31 threads), 8 runs per cell; bistable
 cells report min–max because the median is a mode mixture that shifts

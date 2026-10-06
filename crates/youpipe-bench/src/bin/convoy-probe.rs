@@ -46,37 +46,41 @@ fn cpu_work(x: u64) -> u64 {
 
 // ── /proc context-switch accounting ──
 
-/// Per-group (name, voluntary, nonvoluntary) counters, summed over the
-/// threads collapsed into that group.
-type ThreadDelta = Vec<(String, u64, u64)>;
+/// Per-thread snapshot entry: (tid, group, voluntary, nonvoluntary). Per-TID
+/// (not per-group sums) so a thread that dies mid-run is detectable instead
+/// of silently shrinking its group total (which could clamp to 0 delta).
+type ThreadSnap = Vec<(u32, &'static str, u64, u64)>;
 
-/// Snapshot every thread's ctxt-switch counters, grouped by collapsed comm:
-/// `yp-pool-*` (stage workers / feeder / fence forwarder in pool mode),
-/// `tokio-worker` (async runtime), `main/dedicated` (collector thread plus
-/// dedicated-mode unnamed worker threads).
-fn snapshot() -> ThreadDelta {
-    let mut out: Vec<(String, u64, u64)> = Vec::new();
+/// Per-group within-run delta: (group, voluntary, nonvoluntary, exited),
+/// `exited` counting threads alive at `before` but gone at `after`.
+type GroupDelta = Vec<(String, u64, u64, usize)>;
+
+/// Collapse a comm into its display group: `yp-pool-*` (stage workers /
+/// feeder / fence forwarder in pool mode), `tokio-worker` (async runtime),
+/// `main/dedicated` (collector thread plus dedicated-mode unnamed worker
+/// threads).
+fn group_of(comm: &str) -> &'static str {
+    if comm.starts_with("yp-pool-") {
+        "yp-pool"
+    } else if comm.starts_with("tokio-runtime-w") {
+        "tokio-worker"
+    } else {
+        "main/dedicated"
+    }
+}
+
+/// Snapshot every thread's ctxt-switch counters keyed by TID.
+fn snapshot() -> ThreadSnap {
+    let mut out = Vec::new();
     let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
         return out;
     };
     for e in dir.flatten() {
-        let Some((comm, v, nv)) = task_status(&e.file_name().to_string_lossy()) else {
+        let tid_str = e.file_name().to_string_lossy().into_owned();
+        let (Ok(tid), Some((comm, v, nv))) = (tid_str.parse::<u32>(), task_status(&tid_str)) else {
             continue;
         };
-        let group = if comm.starts_with("yp-pool-") {
-            "yp-pool"
-        } else if comm.starts_with("tokio-runtime-w") {
-            "tokio-worker"
-        } else {
-            "main/dedicated"
-        };
-        match out.iter_mut().find(|(g, ..)| g == group) {
-            Some((_, ov, onv)) => {
-                *ov += v;
-                *onv += nv;
-            },
-            None => out.push((group.to_owned(), v, nv)),
-        }
+        out.push((tid, group_of(&comm), v, nv));
     }
     out
 }
@@ -98,17 +102,45 @@ fn task_status(tid: &str) -> Option<(String, u64, u64)> {
     Some((name?, v, nv))
 }
 
-fn delta(before: &ThreadDelta, after: &ThreadDelta) -> ThreadDelta {
-    after
-        .iter()
-        .map(|(g, v, nv)| {
-            let (ov, onv) = before
-                .iter()
-                .find(|(bg, ..)| bg == g)
-                .map_or((0, 0), |&(_, x, y)| (x, y));
-            (g.clone(), v.saturating_sub(ov), nv.saturating_sub(onv))
-        })
-        .collect()
+fn group_slot<'a>(groups: &'a mut GroupDelta, g: &str) -> &'a mut (String, u64, u64, usize) {
+    let idx = match groups.iter().position(|(bg, ..)| bg == g) {
+        Some(i) => i,
+        None => {
+            groups.push((g.to_owned(), 0, 0, 0));
+            groups.len() - 1
+        },
+    };
+    &mut groups[idx]
+}
+
+/// Within-run per-group delta from two per-TID snapshots.
+///
+/// Threads born inside the run (no `before` entry) contribute their full
+/// lifetime counters — correct, since birth was inside the run. Threads that
+/// DIED inside the run (in `before`, gone from `after` — e.g. the transient
+/// pool spawned under `--cpu-workers`) are counted as `exited`: Linux
+/// discards a thread's ctxt-switch counters at exit, so their switches are
+/// unobservable from snapshots and are NOT part of v/nv. In-run sampling
+/// would perturb the very switches under measurement, so flagging is the
+/// honest accounting (review BS-2). TIDs are assumed not reused within one
+/// run (monotonic until pid_max wraparound).
+fn delta(before: &ThreadSnap, after: &ThreadSnap) -> GroupDelta {
+    let mut groups: GroupDelta = Vec::new();
+    for &(tid, g, v, nv) in after {
+        let (ov, onv) = before
+            .iter()
+            .find(|&&(btid, ..)| btid == tid)
+            .map_or((0, 0), |&(_, _, bv, bnv)| (bv, bnv));
+        let s = group_slot(&mut groups, g);
+        s.1 += v.saturating_sub(ov);
+        s.2 += nv.saturating_sub(onv);
+    }
+    for &(tid, g, ..) in before {
+        if !after.iter().any(|&(atid, ..)| atid == tid) {
+            group_slot(&mut groups, g).3 += 1;
+        }
+    }
+    groups
 }
 
 // ── shapes ──
@@ -358,7 +390,7 @@ fn main() {
     let handle = runtime.as_ref().map(|r| r.handle().clone());
 
     let mut times: Vec<f64> = Vec::with_capacity(c.runs);
-    let mut rows: Vec<(f64, ThreadDelta)> = Vec::new();
+    let mut rows: Vec<(f64, GroupDelta)> = Vec::new();
     for i in 0..c.runs {
         if c.delay_ms > 0 && i > 0 {
             sleep(Duration::from_millis(c.delay_ms));
@@ -451,12 +483,21 @@ fn main() {
     );
     if c.threads {
         println!(
-            "# per-run ctx-switch deltas by thread group (v=voluntary/futex-park, nv=involuntary):"
+            "# per-run ctx-switch deltas by thread group (v=voluntary/futex-park,\n             # \
+             nv=involuntary). exited=N marks threads that died inside the run\n             # \
+             (e.g. the transient pool under --cpu-workers): Linux discards their\n             # \
+             counters at exit, so their switches are NOT included in v/nv."
         );
         for (i, (dt, d)) in rows.iter().enumerate() {
             let parts: Vec<String> = d
                 .iter()
-                .map(|(g, v, nv)| format!("{g}:v={v},nv={nv}"))
+                .map(|(g, v, nv, ex)| {
+                    if *ex > 0 {
+                        format!("{g}:v={v},nv={nv},exited={ex}")
+                    } else {
+                        format!("{g}:v={v},nv={nv}")
+                    }
+                })
                 .collect();
             println!("run {:2}  {:9.3} ms  {}", i + 1, dt, parts.join("  "));
         }
