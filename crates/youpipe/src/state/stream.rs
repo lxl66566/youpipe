@@ -1,10 +1,8 @@
-#[cfg(feature = "tokio-runtime")]
 use core::num::NonZeroUsize;
-
+#[cfg(feature = "tokio-runtime")]
+use crate::handoff::{AsyncRecvItem, ShardedAsyncReceiver, WakerSlot};
 use crate::{
-    handoff::{
-        AsyncRecvItem, RecvItem, ShardedAsyncReceiver, ShardedReceiver, TryRecvError, WakerSlot,
-    },
+    handoff::{RecvItem, ShardedReceiver, TryRecvError},
     state::ReorderBuffer,
     sync::CancellationToken,
 };
