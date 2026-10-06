@@ -91,6 +91,15 @@ LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg st3_loom" \
     cargo test -p youpipe-st3 --release --test integration
 ```
 
+Toolchain-upgrade precondition for st3: the fork's `arc_new_in_place`
+(`youpipe-st3/src/lib.rs`) hand-writes std's private `ArcInner` layout
+(`{strong, weak, data}`, effectively repr(C)). It is backed by the
+`debug_or_loom_assert!` ref-count checks at the end of that function, but
+std does not contract that layout — after a toolchain upgrade, run the
+crate's debug tests first (`cargo test -p youpipe-st3`) and only then trust
+release results: a layout change trips the assertions loudly instead of
+corrupting memory silently (2026-10 review R-10).
+
 What the models cover:
 
 - **SleepMask** — set/clear vs `wake_scan` interleavings, including the
