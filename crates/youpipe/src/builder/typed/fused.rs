@@ -5376,7 +5376,15 @@ fn place_filter_rec<'i, S, E>(
                 g.written += 1;
             }
         }
-        debug_assert_eq!(g.written, cnt);
+        // Kept as a REAL assert, not `debug_assert_eq!`: a non-deterministic
+        // predicate keeping FEWER items in pass 2 than pass 1 counted would
+        // leave `[written, cnt)` uninit yet `into_vec`-returned — UB in
+        // release builds (review R-4). One compare per leaf; the panic is
+        // unwind-safe (the still-armed guard above drops the written prefix).
+        assert_eq!(
+            g.written, cnt,
+            "non-deterministic filter predicate: pass 2 kept fewer items than pass 1 counted"
+        );
         // Success: disarm the cleanup Drop.
         std::mem::forget(g);
         return;
@@ -6517,6 +6525,38 @@ mod tests {
             .try_collect();
         let expected: Vec<i32> = (1..=1000).collect();
         assert_eq!(result.unwrap(), expected);
+    }
+
+    /// Review R-4 regression: a non-deterministic predicate that keeps FEWER
+    /// items in the place pass than the count pass counted must PANIC with a
+    /// clear message — it used to be a `debug_assert_eq!`, so release builds
+    /// returned `[written, cnt)` uninit slots from `into_vec` (UB).
+    #[test]
+    fn test_filter_ctp_undercount_panics() {
+        let pool = ComputePool::global();
+        let n: usize = 999;
+        let data: Vec<u64> = (0..n as u64).collect();
+        // Pass 1 consumes call indices `0..n` (keeps everything: every leaf's
+        // `cnt` is its full size); pass 2 consumes `n..2n` (keeps nothing) —
+        // the count-then-place ordering makes the two call ranges disjoint,
+        // no scheduling dependence.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let stages = Filter {
+            prev: Identity,
+            f: move |_: &&u64| counter.fetch_add(1, Ordering::Relaxed) < n,
+        };
+        let r = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            fused_filter_collect_by_ref_ctp(pool, &data, &stages, 4);
+        }));
+        let err = r.expect_err("under-counting pass 2 must panic, not return uninit slots");
+        let msg = err
+            .downcast_ref::<String>()
+            .expect("assert_eq panic payload is a String");
+        assert!(
+            msg.contains("non-deterministic filter predicate"),
+            "unexpected panic message: {msg}"
+        );
     }
 
     /// Count-then-place by-ref filter collect: identical output to the merge
