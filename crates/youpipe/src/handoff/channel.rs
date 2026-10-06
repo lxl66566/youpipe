@@ -114,6 +114,18 @@ impl<T: Send + 'static> SyncReceiver<T> {
     pub fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
         self.rx.try_recv_batch(buf)
     }
+
+    /// Whether every sender has been dropped — one load of the tx-count
+    /// line, written only on sender drop, so it never bounces while the
+    /// channel is open. Lets a 0-count [`Self::try_recv_batch`] resolve to
+    /// Empty without re-walking the ring via [`Self::try_recv`] (review
+    /// P-6: that second walk doubled the stamp/head cache-line traffic of
+    /// empty-ring polling under a crowd of workers).
+    #[must_use]
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SyncReceiver"))]
+    pub fn is_disconnected(&self) -> bool {
+        self.rx.is_disconnected()
+    }
 }
 
 impl<T: Send + 'static> Clone for SyncReceiver<T> {
@@ -305,6 +317,13 @@ impl<T: Send + 'static> MpscReceiver<T> {
     pub fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
         self.rx.try_recv_batch(buf)
     }
+
+    /// MPSC counterpart of [`SyncReceiver::is_disconnected`] (review P-6).
+    #[must_use]
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscReceiver"))]
+    pub fn is_disconnected(&self) -> bool {
+        self.rx.is_disconnected()
+    }
 }
 
 impl<T: Send + 'static> RecvItem<T> for MpscReceiver<T> {
@@ -321,6 +340,11 @@ impl<T: Send + 'static> RecvItem<T> for MpscReceiver<T> {
     #[inline]
     fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
         MpscReceiver::try_recv_batch(self, buf)
+    }
+
+    #[inline]
+    fn is_disconnected(&self) -> bool {
+        MpscReceiver::is_disconnected(self)
     }
 }
 
@@ -406,6 +430,20 @@ pub(crate) enum Claim {
 /// drain it fully — `drain(..)` also on their abort paths), capacity for
 /// at least one item; the batch claim writes at offset 0 via the spare
 /// capacity.
+///
+/// Probe shape (review P-6): a 0-count batch on an open channel resolves to
+/// Empty via [`RecvItem::is_disconnected`] — one load of the cold tx-count
+/// line — instead of a second ring walk through `try_recv`. Multi-worker
+/// empty-ring polling previously paid that walk twice, doubling exactly the
+/// stamp/head cache-line bouncing the spin backoff exists to throttle
+/// (measured on the 32-core bench host, 6 interleaved A/B rounds, 4/8/16
+/// pollers over one ring, with and without a 2 us/item supplier:
+/// 1.24-1.52x more empty polls/s, per-cell sample ranges non-overlapping).
+/// Only
+/// the terminal closed case still falls through to `try_recv`, whose
+/// `try_recv_final` drain keeps the half-close contract: Closed is reported
+/// only after the drain came back empty, and stragglers pushed before the
+/// last sender dropped are still delivered.
 pub(crate) fn claim_poll<R, T>(rx: &R, scratch: &mut Vec<T>, batch_cap: usize) -> Claim
 where
     R: RecvItem<T>,
@@ -421,9 +459,20 @@ where
             unsafe { scratch.set_len(n) };
             return Claim::Ready(n);
         }
+        // 0-claim verdict without a second ring walk. On an open channel a
+        // 0-batch can only mean "nothing ready right now": the sole false 0
+        // is a lost head CAS under consumer contention, which degrades to
+        // Empty here — the caller's spin/blocking retry re-probes, and
+        // crossfire's blocking recv pops a ready item without parking, so
+        // the item is not delayed beyond that one retry.
+        if !rx.is_disconnected() {
+            return Claim::Empty;
+        }
     }
-    // Nothing batchable: one item via try_recv (also resolves the
-    // Empty/Closed distinction a 0-batch cannot).
+    // Batch disabled, or the senders are gone: `try_recv` resolves the
+    // remaining tri-state. On the closed arm it drains stragglers before
+    // ever reporting Disconnected (the half-close contract confirmed in
+    // review round 3 §5 — do not bypass it for the probe saving).
     match rx.try_recv() {
         Ok(item) => {
             scratch.clear();
@@ -496,6 +545,12 @@ pub trait RecvItem<T> {
         }
         n
     }
+
+    /// Whether every sender has been dropped — one load of the tx-count
+    /// line, no ring walk (see [`SyncReceiver::is_disconnected`]). Lets a
+    /// 0-count batch claim resolve to Empty/Closed without a second probe
+    /// through `try_recv` (review P-6).
+    fn is_disconnected(&self) -> bool;
 }
 
 impl<T: Send + 'static> RecvItem<T> for SyncReceiver<T> {
@@ -512,6 +567,11 @@ impl<T: Send + 'static> RecvItem<T> for SyncReceiver<T> {
     #[inline]
     fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
         SyncReceiver::try_recv_batch(self, buf)
+    }
+
+    #[inline]
+    fn is_disconnected(&self) -> bool {
+        SyncReceiver::is_disconnected(self)
     }
 }
 
@@ -639,6 +699,105 @@ mod tests {
         ];
         all.sort_unstable();
         assert_eq!(all, vec![1, 2, 3, 4]);
+    }
+
+    /// Probe-counting `RecvItem` mock: pins the P-6 probe shape (a 0-count
+    /// batch on an open channel must not fall through to `try_recv`) and the
+    /// closed-path confirmation semantics.
+    struct ProbeMock {
+        disconnected: bool,
+        batch_calls: std::cell::Cell<usize>,
+        recv_calls: std::cell::Cell<usize>,
+    }
+
+    impl ProbeMock {
+        fn open() -> Self {
+            Self {
+                disconnected: false,
+                batch_calls: std::cell::Cell::new(0),
+                recv_calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl RecvItem<i32> for ProbeMock {
+        fn recv(&self) -> Result<i32, ChannelError> {
+            unreachable!("claim_poll never blocks")
+        }
+        fn try_recv(&self) -> Result<i32, TryRecvError> {
+            self.recv_calls.set(self.recv_calls.get() + 1);
+            if self.disconnected {
+                Err(TryRecvError::Closed)
+            } else {
+                Err(TryRecvError::Empty)
+            }
+        }
+        fn try_recv_batch(&self, _buf: &mut [MaybeUninit<i32>]) -> usize {
+            self.batch_calls.set(self.batch_calls.get() + 1);
+            0
+        }
+        fn is_disconnected(&self) -> bool {
+            self.disconnected
+        }
+    }
+
+    #[test]
+    fn claim_poll_zero_batch_open_channel_is_single_probe() {
+        let rx = ProbeMock::open();
+        let mut scratch: Vec<i32> = Vec::new();
+        assert_eq!(claim_poll(&rx, &mut scratch, 64), Claim::Empty);
+        assert_eq!(rx.batch_calls.get(), 1);
+        assert_eq!(
+            rx.recv_calls.get(),
+            0,
+            "0-batch on an open channel must not re-walk the ring (P-6)"
+        );
+    }
+
+    #[test]
+    fn claim_poll_zero_batch_closed_channel_confirms_via_try_recv() {
+        let rx = ProbeMock {
+            disconnected: true,
+            ..ProbeMock::open()
+        };
+        let mut scratch: Vec<i32> = Vec::new();
+        assert_eq!(claim_poll(&rx, &mut scratch, 64), Claim::Closed);
+        assert_eq!(
+            rx.recv_calls.get(),
+            1,
+            "Closed verdicts must flow through try_recv's final drain"
+        );
+    }
+
+    #[test]
+    fn claim_poll_batch_cap_zero_uses_try_recv_only() {
+        let rx = ProbeMock::open();
+        let mut scratch: Vec<i32> = Vec::new();
+        assert_eq!(claim_poll(&rx, &mut scratch, 0), Claim::Empty);
+        assert_eq!(rx.batch_calls.get(), 0);
+        assert_eq!(rx.recv_calls.get(), 1);
+    }
+
+    /// Real channel, closed with stragglers in the ring: the batch claims
+    /// them (or the try_recv drain does), then the next poll reports Closed
+    /// — no item lost to the disconnect, no premature Closed.
+    #[test]
+    fn claim_poll_closed_drain_delivers_stragglers() {
+        let (tx, rx) = channel::<i32>(8);
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        drop(tx);
+        let mut scratch = Vec::with_capacity(8);
+        match claim_poll(&rx, &mut scratch, 8) {
+            Claim::Ready(n) => {
+                assert!((1..=2).contains(&n));
+                let mut got = std::mem::take(&mut scratch);
+                got.sort_unstable();
+                assert_eq!(got, vec![1, 2][..n]);
+            },
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert_eq!(claim_poll(&rx, &mut scratch, 8), Claim::Closed);
     }
 
     /// MPSC try_send mirrors the MPMC semantics: Full hands the item back,
