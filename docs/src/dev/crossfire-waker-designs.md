@@ -646,3 +646,97 @@ weak 升级失败，一次 fire 就能把全部死条目在单次锁内清完，
   复测两组 NEW/OLD 对称（31–44 vs 30–37ms，OLD 亦有 99ms 轮），判定为
   调度/邻载噪声而非回归——机制上两者唤醒会计等价（见上），锁次数差异
   只会向有利方向。
+
+## 14. async 轨 episode 间复用：WakerSlot + Reuse 状态（2026-10，review P-4）
+
+> 设计 C（§11）把 blocking 轨的 waker 节点变成 per-thread 不死对象后，async
+> 轨成为 40/48B 分配类的最后来源：per-call future（`recv()`/`send()` 返回的
+> 一次性 future）每次 contended poll 分配一个 `Arc<WakerInner>`，episode 结束
+> 随 future 一起 drop。review P-4 点名的"第四象限"：节点所有权既不能是
+> per-thread（async 的唤醒目标是 per-task 的 executor Waker，不是线程），也
+> 不能写一次句柄后原地改写（ ThinWaker 里的 `Waker` 不可变）。
+
+### 14.1 形态
+
+- **所有权：per-endpoint slot**。`AsyncWakerSlot`（youpipe 侧别名
+  `WakerSlot`）= `Option<ArcWaker>`，由 parking 循环的属主（stage task、
+  bridge task、collector、sharded anchor）持有，跨 episode 存活；
+  `AsyncRx::recv_cached(&mut slot)` / `AsyncTx::send_cached(item, &mut slot)`
+  借用 slot 构造 future，语义（cancellation-safety、exactly-once、close 行为）
+  与 per-call 版本逐分支等价，只是 episode 完成时把节点留在 slot 里。
+- **重臂协议：`will_wake` 校验 + 现有状态机**。注册时 slot 里的节点若
+  未注册（Woken——fire 已消费条目；或新引入的 Reuse——见下）且
+  `will_wake(ctx)` 成立，则 `reset_init` + 原地重注册，零分配；waker 身份
+  变化（issue #14 语义）或节点仍处注册态时按旧逻辑重建。ThinWaker 句柄
+  只在节点创建时写一次，复用不触碰 UnsafeCell——与考古 §4 的门论证无关。
+- **新状态 `WakerState::Reuse = 2`**（此前是注释掉的 Copy 化石位）：
+  "已从注册表摘除、留待复用"。两个出口在摘除后打戳：注册表的
+  `cancel_waker`（rx 侧 episode 完成路径）与 `cancel_reuse_waker`（tx 侧
+  double-check 幸运重试路径）。`wake()`/`close_wake()` 的谓词是
+  `<= Waiting`，天然不碰 Reuse；`wake()` 显式对 Reuse 返回 `Skip`（否则
+  CAS 重试循环会卡死），`abandon_*_waker` 对 Reuse 视作"无 token 可传递"
+  （与 Closed 分支同构）。
+
+### 14.2 实测发现的两个关键事实（半成品草案没覆盖的）
+
+1. **分配大头不在唤醒路径，而在"注册后幸运重试"窗口**。`poll_item` 的
+   `try_recv_final` / `poll_send` 的 `sender_double_check`：注册完 waker、
+   双检时发现 item/slot 已经就绪，episode 以**仍处注册态（Init）的节点**
+   结束。草案只保留了 Woken（被唤醒消费）出口，实测该窗口贡献了约
+   2/3 的新分配（Multi 侧 160 次中约 2/3、Single 侧全部 56 次）。
+   `Reuse` 戳 + 两个出口的"摘除后保留"就是为它设计的。
+2. **`block_on` 根 future 的 waker 身份每变一次**。current-thread
+   `Runtime::block_on` 直接 `while let ... = rx.recv_cached(&mut slot).await`
+   的循环，每次被唤醒后 `will_wake` 不成立，退化为逐 episode 重建——
+   行为正确但零收益。tokio **spawned task** 的 waker 身份稳定（指向 task
+   本体），youpipe 的全部调用点都是 spawned task（含
+   `Handle::block_on` 的 bridge 线程，实测同样稳定）。测试与文档均按
+   spawned task 语义断言。
+
+### 14.3 验证与数据（2026-10，debug 构建，计数分配器按
+`ARC_WAKER_ALLOC_SIZE`（=48B，seq 为 AtomicU64 后的 `Arc<WakerInner>`）
+分桶）
+
+- **机制级 A/B**（`youpipe-crossfire/tests/waker_alloc.rs`，专用测试二进制
+  避免计数器被并行测试踩：current-thread runtime + 慢生产者 ×64 item，
+  消费者为 spawned task）：
+  - per-call `recv()` 循环：**65** 个 48B 分配（≈1/episode，地板证明
+    workload 真的 park）；
+  - `recv_cached(&mut slot)` 循环：**1**（endpoint 首 episode 一次，
+  之后全程复用）。
+- **youpipe pipeline 级**（`tests/async_waker_alloc.rs` 绊线测试，
+  512 item、io_concurrency=8 的 park-heavy 异步 stage）：全程 48B 桶
+  ~143-153（含 debug 构建 tokio 运行时自身 ~130 的同尺寸噪声），
+  crossfire 节点数 ≈ 端点数。开发期用默认 io_concurrency=128 的同负载
+  测得：草案（只保留 Woken 出口）216 个 crossfire 节点 → 完整实现 132
+  个，其中 **129 = 128 个 stage task + 1 个 bridge 的首 episode**——
+  稳态结构性归一到"每 parking endpoint 恰一个节点"，关闭时随任务
+  结束 drop（计数一致：inner drop ≈ alloc）。
+- 回归测试断言：crossfire 侧 cached ≤ 4 且 plain ≥ ITEMS/2（机制）；
+  youpipe 侧 ≤ 256（wiring 绊线——防止调用点退回 per-call future）。
+- **墙钟 A/B**（`bench_ab.sh -a main -b HEAD -r 3 youpipe_async`，持
+  bench.lock，交错 3 轮）：`io_async_pure/youpipe_async/{200,500,2000}` 三格
+  −0.1~−0.7%，spread 0.3~1.3%，verdict 全部 noise——与 blocking 侧（§11.4）
+  的经验一致：分配结构性归零的兑现价值在分配计数本身，墙钟中性偏正、
+  不可归因；无回归是放行依据。
+
+### 14.4 边界与残留（诚实清单）
+
+- **per-call future 的适配**：`poll_send` 成功路径改走注册表
+  `cancel_waker`（与 rx 侧 `on_recv_waker!` 对称），因此
+  `RecvFuture`/`SendFuture`/`RecvTimeoutFuture`/`SendTimeoutFuture` 在
+  Ready 后显式 drop slot 里保留的节点（否则 Drop 的 abandon 路径会对
+  已消费节点触发一次多余 on_send/on_recv fire；`SendTimeoutFuture` 原有
+  `debug_assert!(waker.is_none())` 在新语义下必须先 take）。
+- **`AsyncStream`/`AsyncSink`**（持久对象，跨 poll 持有 waker 字段）：
+  免费获得复用，但 Drop 无法区分"已消费保留"与"唤醒在途"的 Woken
+  节点，前者会多传一次 token（一次良性 spurious fire，F11 同类）。
+  每对象至多一次，记录在案不修。
+- **Single 注册表的 Waiting 节点重poll**：Multi 的
+  `Err(<Woken) + will_wake → Some(Pending)`（"not consumed, no re-reg"）
+  分支在 Single 的 `_reg_waker_async` 里没有对应物——仍处注册态的
+  Waiting 节点被 drop+重建（与 upstream 行为一致）。实测每 run ≤7 次
+  （spurious re-poll 才会走到），保留 upstream 语义不补。
+- **`block_on` 根循环**：见 §14.2-2，退化正确、无收益。
+- youpipe 侧 `bridge_async_to_sync` 的 `Handle::block_on` 循环实测复用
+  正常（multi-thread handle 的根 waker 稳定），但该形态无独立断言。

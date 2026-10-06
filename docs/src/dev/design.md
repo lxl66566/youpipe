@@ -136,6 +136,11 @@ own workspace crate, `crates/youpipe-sys`:
 `CachePadded<T>` plus the `Mutex`/`Condvar`/atomics/`thread_yield` shims that
 switch backend by compilation context (parking_lot / miri-std / `--cfg loom`).
 `pool/` and `handoff/` source their primitives from there.
+`CachePadded` aligns to 128 B on x86_64/aarch64 (crossbeam-utils gating:
+Intel's adjacent-line prefetcher fetches 64 B pairs, so 64 B padding still
+false-shares at the prefetch-pair level; also keeps one strategy for every
+padded line in the process, the vendored crossbeam queues included) and 64 B
+elsewhere; loom drops the padding, miri keeps the 64 B floor.
 
 ---
 
