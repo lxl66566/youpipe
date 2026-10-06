@@ -45,8 +45,8 @@ pub(crate) fn batch_recv_cap() -> usize {
 pub use channel::{
     AsyncReceiver, AsyncRecvItem, AsyncSender, ChannelError, MpscAsyncReceiver, MpscAsyncSender,
     MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, Sender, SyncReceiver, SyncSender,
-    TryRecvError, TryRecvItem, TrySendError, WakerSlot, async_channel, channel,
-    mpsc_async_channel, mpsc_channel, sync_async_channel,
+    TryRecvError, TryRecvItem, TrySendError, WakerSlot, async_channel, channel, mpsc_async_channel,
+    mpsc_channel, sync_async_channel,
 };
 pub(crate) use channel::{Claim, claim_poll};
 #[cfg(feature = "tokio-runtime")]

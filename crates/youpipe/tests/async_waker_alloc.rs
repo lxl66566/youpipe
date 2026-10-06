@@ -23,7 +23,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use youpipe::{stream, AsyncStageOptions};
+use youpipe::{AsyncStageOptions, stream};
 
 static WAKER_CLASS: AtomicU64 = AtomicU64::new(0);
 
@@ -36,12 +36,14 @@ unsafe impl GlobalAlloc for CountingAlloc {
         }
         unsafe { System.alloc(layout) }
     }
+
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if layout.size() == crossfire::ARC_WAKER_ALLOC_SIZE {
             WAKER_CLASS.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { System.alloc_zeroed(layout) }
     }
+
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -85,8 +87,8 @@ fn async_stage_waker_alloc_wiring() {
     // 500+ for this workload.
     assert!(
         pipeline <= 256,
-        "waker-class allocations {pipeline} exceed the wiring bound; \
-         a parking loop probably regressed to per-call recv()/send()"
+        "waker-class allocations {pipeline} exceed the wiring bound; a parking loop probably \
+         regressed to per-call recv()/send()"
     );
 
     // Floor proof: the same bucket over a plain per-call `recv()` loop
@@ -121,8 +123,7 @@ fn async_stage_waker_alloc_wiring() {
     println!("plain recv() loop:    waker-class allocs = {plain}");
     assert!(
         plain >= 20,
-        "plain recv() loop allocated only {plain} waker nodes; \
-         the workload does not actually park, so the pipeline bound above \
-         proves nothing"
+        "plain recv() loop allocated only {plain} waker nodes; the workload does not actually \
+         park, so the pipeline bound above proves nothing"
     );
 }

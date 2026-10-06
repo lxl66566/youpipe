@@ -3848,21 +3848,18 @@ where
     /// How a panicking stage closure is transported depends on the topology
     /// `run()` picked for the chain:
     ///
-    /// - Fused pass-through: caught per chunk, resumed on the caller after
-    ///   partial-state cleanup — catchable with `catch_unwind`.
-    /// - Streaming topology (any `expand` / `fence` / `stage_async` /
-    ///   `with_cancel`, or any pin that opts the chain out of the
-    ///   pass-through): a panic escaping a sync `.stage()` / `.expand()`
-    ///   closure **aborts the process** — it does not unwind the caller.
-    ///   Those workers are pool jobs or detached OS threads; an escaped
-    ///   unwind would silently drop the worker and truncate the pipeline's
-    ///   output, so the run aborts instead, under the same contract as
-    ///   [`ComputePool::submit`](crate::ComputePool::submit). Note how
-    ///   little it takes to flip tiers: adding a single `.fence()` to an
-    ///   otherwise pass-through-eligible chain turns a catchable stage
-    ///   panic into a process abort.
-    /// - `.stage_async()` closures: captured at the task boundary and
-    ///   re-raised on the caller after the drain — catchable.
+    /// - Fused pass-through: caught per chunk, resumed on the caller after partial-state cleanup —
+    ///   catchable with `catch_unwind`.
+    /// - Streaming topology (any `expand` / `fence` / `stage_async` / `with_cancel`, or any pin
+    ///   that opts the chain out of the pass-through): a panic escaping a sync `.stage()` /
+    ///   `.expand()` closure **aborts the process** — it does not unwind the caller. Those workers
+    ///   are pool jobs or detached OS threads; an escaped unwind would silently drop the worker and
+    ///   truncate the pipeline's output, so the run aborts instead, under the same contract as
+    ///   [`ComputePool::submit`](crate::ComputePool::submit). Note how little it takes to flip
+    ///   tiers: adding a single `.fence()` to an otherwise pass-through-eligible chain turns a
+    ///   catchable stage panic into a process abort.
+    /// - `.stage_async()` closures: captured at the task boundary and re-raised on the caller after
+    ///   the drain — catchable.
     ///
     /// Panics in the caller-side sink of [`for_each`](Self::for_each) and
     /// the fold/reduce combinators propagate normally (they run on the

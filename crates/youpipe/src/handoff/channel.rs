@@ -223,7 +223,10 @@ impl<T: Send + Unpin + 'static> AsyncReceiver<T> {
     /// parking loop.
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncReceiver"))]
     pub async fn recv_cached(&self, slot: &mut WakerSlot) -> Result<T, ChannelError> {
-        self.rx.recv_cached(slot).await.map_err(|_| ChannelError::Closed)
+        self.rx
+            .recv_cached(slot)
+            .await
+            .map_err(|_| ChannelError::Closed)
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncReceiver"))]
@@ -446,7 +449,10 @@ impl<T: Send + Unpin + 'static> MpscAsyncReceiver<T> {
     /// parking loop.
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncReceiver"))]
     pub async fn recv_cached(&self, slot: &mut WakerSlot) -> Result<T, ChannelError> {
-        self.rx.recv_cached(slot).await.map_err(|_| ChannelError::Closed)
+        self.rx
+            .recv_cached(slot)
+            .await
+            .map_err(|_| ChannelError::Closed)
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncReceiver"))]
@@ -654,7 +660,8 @@ pub trait AsyncRecvItem<T> {
     /// collector anchors keep one slot per run, so a per-burst-gap park does
     /// not allocate).
     fn recv_cached<'s>(
-        &'s self, slot: &'s mut WakerSlot,
+        &'s self,
+        slot: &'s mut WakerSlot,
     ) -> impl Future<Output = Result<T, ChannelError>>;
     fn try_recv(&self) -> Result<T, TryRecvError>;
 }
@@ -785,6 +792,7 @@ mod tests {
         fn recv(&self) -> Result<i32, ChannelError> {
             unreachable!("claim_poll never blocks")
         }
+
         fn try_recv(&self) -> Result<i32, TryRecvError> {
             self.recv_calls.set(self.recv_calls.get() + 1);
             if self.disconnected {
@@ -793,10 +801,12 @@ mod tests {
                 Err(TryRecvError::Empty)
             }
         }
+
         fn try_recv_batch(&self, _buf: &mut [MaybeUninit<i32>]) -> usize {
             self.batch_calls.set(self.batch_calls.get() + 1);
             0
         }
+
         fn is_disconnected(&self) -> bool {
             self.disconnected
         }

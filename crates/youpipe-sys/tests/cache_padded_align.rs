@@ -12,7 +12,11 @@ use youpipe_sys::CachePadded;
 fn cache_padded_alignment_matches_target() {
     #[cfg(loom)]
     assert_eq!(align_of::<CachePadded<u8>>(), 1);
-    #[cfg(all(not(loom), any(target_arch = "x86_64", target_arch = "aarch64"), not(miri)))]
+    #[cfg(all(
+        not(loom),
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(miri)
+    ))]
     assert_eq!(align_of::<CachePadded<u8>>(), 128);
     #[cfg(all(
         not(loom),

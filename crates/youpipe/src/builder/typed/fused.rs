@@ -5217,9 +5217,9 @@ fn env_filter_collect_override() -> Option<FilterCollectVariant> {
             "ctp" => Some(FilterCollectVariant::Ctp),
             "wtc" => Some(FilterCollectVariant::Wtc),
             other => panic!(
-                "YOUPIPE_FILTER_COLLECT: invalid value {other:?} (leave unset for the Auto \
-                 length gate, or \"merge\" for the merge tree, \"ctp\" for count-then-place, \
-                 \"wtc\" for write-then-compact)"
+                "YOUPIPE_FILTER_COLLECT: invalid value {other:?} (leave unset for the Auto length \
+                 gate, or \"merge\" for the merge tree, \"ctp\" for count-then-place, \"wtc\" for \
+                 write-then-compact)"
             ),
         },
     })
@@ -5252,16 +5252,14 @@ fn auto_filter_collect_variant(n: usize) -> FilterCollectVariant {
 
 /// Resolve the effective variant for one collect: explicit mode > env knob >
 /// Auto length gate (see [`FilterCollectMode`]'s resolution-order contract).
-fn resolve_filter_collect_variant(
-    mode: FilterCollectMode,
-    n: usize,
-) -> FilterCollectVariant {
+fn resolve_filter_collect_variant(mode: FilterCollectMode, n: usize) -> FilterCollectVariant {
     match mode {
         FilterCollectMode::Merge => FilterCollectVariant::Merge,
         FilterCollectMode::Ctp => FilterCollectVariant::Ctp,
         FilterCollectMode::Wtc => FilterCollectVariant::Wtc,
-        FilterCollectMode::Auto => env_filter_collect_override()
-            .unwrap_or_else(|| auto_filter_collect_variant(n)),
+        FilterCollectMode::Auto => {
+            env_filter_collect_override().unwrap_or_else(|| auto_filter_collect_variant(n))
+        },
     }
 }
 
@@ -6579,10 +6577,7 @@ mod tests {
     /// threshold, wtc at or above.
     #[test]
     fn test_auto_filter_collect_gate() {
-        assert_eq!(
-            auto_filter_collect_variant(0),
-            FilterCollectVariant::Merge
-        );
+        assert_eq!(auto_filter_collect_variant(0), FilterCollectVariant::Merge);
         assert_eq!(
             auto_filter_collect_variant(FILTER_COLLECT_AUTO_WTC_MIN_N - 1),
             FilterCollectVariant::Merge
