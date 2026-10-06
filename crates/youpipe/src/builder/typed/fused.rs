@@ -25,7 +25,7 @@ use super::{
     },
 };
 use crate::{
-    builder::config::{PipelineConfig, Workload},
+    builder::config::{FilterCollectMode, PipelineConfig, Workload},
     executor::compute::ComputePool,
     pool::{
         job::{Job, JobRef},
@@ -5188,38 +5188,81 @@ where
 // stages consume items by value, so a count pass cannot re-run them. See
 // docs/src/dev/benchmarks.md (filter-chain collect).
 
-/// Which implementation by-ref filter collects use. Parsed once from
-/// `YOUPIPE_FILTER_COLLECT`: unset/`"merge"` → merge tree (default), `"ctp"`
-/// → count-then-place, `"wtc"` → write-then-compact. Invalid values panic at
-/// first use — see `nt_store_policy` for why failing loudly beats silently
-/// misreading a knob.
-///
-/// Shape guidance (three-sided A/B, docs/src/dev/benchmarks.md filter-chain
-/// collect): merge wins small/mid batches at mid/high selectivity; wtc wins
-/// ≥100K batches at any selectivity and small batches; ctp wins ≥100K
-/// batches keeping ≳30 % — the merge default is only wrong for ≥100K, which
-/// is exactly where the knobs are for.
-#[derive(Clone, Copy)]
+/// Which implementation by-ref filter collects use. Shape guidance
+/// (three-sided A/B, docs/src/dev/benchmarks.md filter-chain collect): merge
+/// wins small/mid batches at mid/high selectivity; wtc wins ≥100K batches at
+/// any selectivity and small batches; ctp wins ≥100K batches keeping ≳30 %.
+/// [`FilterCollectMode::Auto`] encodes exactly that large-batch half (see
+/// [`FILTER_COLLECT_AUTO_WTC_MIN_N`]); the explicit modes and the env knob
+/// pin one variant for A/B or escape hatches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FilterCollectVariant {
     Merge,
     Ctp,
     Wtc,
 }
 
-fn filter_collect_variant() -> FilterCollectVariant {
-    static VARIANT: OnceLock<FilterCollectVariant> = OnceLock::new();
+/// Process-wide override parsed once from `YOUPIPE_FILTER_COLLECT`: unset →
+/// `None` ([`FilterCollectMode::Auto`]'s length gate decides), `"merge"` →
+/// merge tree, `"ctp"` → count-then-place, `"wtc"` → write-then-compact.
+/// The knob only applies to `Auto` pipes — an explicit [`FilterCollectMode`]
+/// set through the builder wins. Invalid values panic at first use — see
+/// `nt_store_policy` for why failing loudly beats silently misreading a knob.
+fn env_filter_collect_override() -> Option<FilterCollectVariant> {
+    static VARIANT: OnceLock<Option<FilterCollectVariant>> = OnceLock::new();
     *VARIANT.get_or_init(|| match std::env::var("YOUPIPE_FILTER_COLLECT") {
-        Err(_) => FilterCollectVariant::Merge,
+        Err(_) => None,
         Ok(v) => match v.as_str() {
-            "merge" => FilterCollectVariant::Merge,
-            "ctp" => FilterCollectVariant::Ctp,
-            "wtc" => FilterCollectVariant::Wtc,
+            "merge" => Some(FilterCollectVariant::Merge),
+            "ctp" => Some(FilterCollectVariant::Ctp),
+            "wtc" => Some(FilterCollectVariant::Wtc),
             other => panic!(
-                "YOUPIPE_FILTER_COLLECT: invalid value {other:?} (leave unset or \"merge\" for \
-                 the merge tree, \"ctp\" for count-then-place, \"wtc\" for write-then-compact)"
+                "YOUPIPE_FILTER_COLLECT: invalid value {other:?} (leave unset for the Auto \
+                 length gate, or \"merge\" for the merge tree, \"ctp\" for count-then-place, \
+                 \"wtc\" for write-then-compact)"
             ),
         },
     })
+}
+
+/// [`FilterCollectMode::Auto`]'s length gate: `n >= 100_000` → wtc, below →
+/// merge tree. Placed at the smallest measured length where wtc beat the
+/// merge tree at every selectivity (100K: keep33 −24 %, keep50 −31 %,
+/// keep90 −38 %, all 25/25 stable; keep10 −0.1 % noise); at 10K keep90 wtc
+/// REGRESSED +25 % (0/25) and 10K..100K is unmeasured, so the gate sits on
+/// the conservative measured point instead of interpolating. The 1K
+/// single-shape win (keep33 −12.8 %, 25/25) is real but one shape wide —
+/// not enough to open a second small-batch window. ctp is never chosen by
+/// Auto even where it is fastest (≥100K keeping ≳30 %, −10…−23 % vs wtc):
+/// its chain runs twice, observable to side-effecting closures — a default
+/// must keep the merge tree's single-pass semantics. Gated on item count,
+/// not payload bytes: the crossovers above were measured in items; payload
+/// size only modulates wtc's internal compaction threshold
+/// ([`WTC_PARALLEL_COMPACT_MIN_BYTES`]).
+const FILTER_COLLECT_AUTO_WTC_MIN_N: usize = 100_000;
+
+/// [`FilterCollectMode::Auto`]'s pure length gate (unit-tested below).
+fn auto_filter_collect_variant(n: usize) -> FilterCollectVariant {
+    if n >= FILTER_COLLECT_AUTO_WTC_MIN_N {
+        FilterCollectVariant::Wtc
+    } else {
+        FilterCollectVariant::Merge
+    }
+}
+
+/// Resolve the effective variant for one collect: explicit mode > env knob >
+/// Auto length gate (see [`FilterCollectMode`]'s resolution-order contract).
+fn resolve_filter_collect_variant(
+    mode: FilterCollectMode,
+    n: usize,
+) -> FilterCollectVariant {
+    match mode {
+        FilterCollectMode::Merge => FilterCollectVariant::Merge,
+        FilterCollectMode::Ctp => FilterCollectVariant::Ctp,
+        FilterCollectMode::Wtc => FilterCollectVariant::Wtc,
+        FilterCollectMode::Auto => env_filter_collect_override()
+            .unwrap_or_else(|| auto_filter_collect_variant(n)),
+    }
 }
 
 /// Number of leaves the range-split recursion produces for a `len`-item
@@ -5532,10 +5575,14 @@ where
 // driver-sequential sweep pays cross-core transfers for lines the workers
 // just wrote; a size gate would buy only that window). ctp keeps the ≥100K
 // mid/high-selectivity crown (−10…−23 % vs wtc) and loses everywhere else.
-// Verdict: merge stays the DEFAULT; all three live behind the
-// `YOUPIPE_FILTER_COLLECT` knob (merge for small/mid batches at mid/high
-// selectivity, wtc for ≥100K at any selectivity and for small batches,
-// ctp for ≥100K batches keeping ≳30 %). See docs/src/dev/benchmarks.md
+// Verdict: the DEFAULT is `FilterCollectMode::Auto` — merge below
+// [`FILTER_COLLECT_AUTO_WTC_MIN_N`] (100K items), wtc at or above (the only
+// region with stable multi-selectivity wtc wins); see that constant for why
+// the gate sits there and why ctp is never the automatic choice. The knob
+// (`YOUPIPE_FILTER_COLLECT`) and `with_filter_collect` pin one variant for
+// A/B or escape hatches (merge for small/mid batches at mid/high
+// selectivity, wtc for ≥100K at any selectivity and for small batches, ctp
+// for ≥100K batches keeping ≳30 %). See docs/src/dev/benchmarks.md
 // (filter-chain collect).
 //
 // Survivors land leaf-contiguous, NOT at their exact input indices. An
@@ -6146,6 +6193,7 @@ pub(super) fn fused_collect_by_ref<'i, S, E>(
     input: &'i [E],
     stages: S,
     workload: Workload,
+    mode: FilterCollectMode,
     pool: &ComputePool,
 ) -> Vec<S::Output>
 where
@@ -6166,7 +6214,7 @@ where
     }
     let plan = SplitPlan::new(n, num_threads, workload);
     if S::MAY_FILTER {
-        return match filter_collect_variant() {
+        return match resolve_filter_collect_variant(mode, n) {
             FilterCollectVariant::Merge => {
                 join_fused_collect_by_ref(pool, input, &stages, 0, n, plan.depth)
             },
@@ -6525,6 +6573,57 @@ mod tests {
             .try_collect();
         let expected: Vec<i32> = (1..=1000).collect();
         assert_eq!(result.unwrap(), expected);
+    }
+
+    /// `FilterCollectMode::Auto`'s length gate: merge strictly below the
+    /// threshold, wtc at or above.
+    #[test]
+    fn test_auto_filter_collect_gate() {
+        assert_eq!(
+            auto_filter_collect_variant(0),
+            FilterCollectVariant::Merge
+        );
+        assert_eq!(
+            auto_filter_collect_variant(FILTER_COLLECT_AUTO_WTC_MIN_N - 1),
+            FilterCollectVariant::Merge
+        );
+        assert_eq!(
+            auto_filter_collect_variant(FILTER_COLLECT_AUTO_WTC_MIN_N),
+            FilterCollectVariant::Wtc
+        );
+        assert_eq!(
+            auto_filter_collect_variant(usize::MAX),
+            FilterCollectVariant::Wtc
+        );
+    }
+
+    /// The public `with_filter_collect` override and the Auto default must
+    /// produce identical output through the full `pipe_ref` dispatch, on
+    /// both sides of the length gate (parallel paths: 20K below, 100K+3
+    /// above).
+    #[test]
+    fn test_with_filter_collect_modes_match() {
+        for n in [20_007usize, FILTER_COLLECT_AUTO_WTC_MIN_N + 3] {
+            let data: Vec<u64> = (0..n as u64).collect();
+            let expected: Vec<u64> = data
+                .iter()
+                .map(|&x| x + 1)
+                .filter(|&x| x % 3 == 0)
+                .collect();
+            for mode in [
+                FilterCollectMode::Auto,
+                FilterCollectMode::Merge,
+                FilterCollectMode::Ctp,
+                FilterCollectMode::Wtc,
+            ] {
+                let out: Vec<u64> = pipe_ref(&data)
+                    .map(|&x: &u64| x + 1)
+                    .filter(|&x: &u64| x % 3 == 0)
+                    .with_filter_collect(mode)
+                    .collect();
+                assert_eq!(out, expected, "mode={mode:?} n={n}");
+            }
+        }
     }
 
     /// Review R-4 regression: a non-deterministic predicate that keeps FEWER

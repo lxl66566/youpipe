@@ -7,6 +7,7 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | Knob | Effect | Applies to | Reach for when |
 | --- | --- | --- | --- |
 | `with_workload(Workload)` | fork/join split granularity | fused only | item costs are skewed |
+| `with_filter_collect(FilterCollectMode)` | implementation of by-ref filter collects (default `Auto`: merge tree < 100K items, write-then-compact ≥ 100K) | fused by-ref `.collect()` with a filter stage | the Auto gate mismatches your shape (all identical output; see [dev/benchmarks](../dev/benchmarks.md) "filter-chain collect") |
 | `with_buffer_size(n)` | channel capacity between stages | streaming | bursty producers, memory bounds |
 | `with_io_concurrency(n)` | in-flight async tasks per async stage | streaming | IO waits are cheap and plentiful |
 | `.ordered()` | reorder pass restoring input order | streaming | output must match input order |
@@ -21,7 +22,10 @@ Every knob has a sensible default; tune only when a measured problem points at o
 `Workload` and `buffer_size`/`async_workers`/`io_concurrency` are disjoint: a
 fused `pipe()` ignores the streaming knobs (it has no channels and no async
 runtime); `stream()` ignores `Workload` (its MPMC channels load-balance skew
-per item already).
+per item already). `with_filter_collect` is likewise fused-only — and within
+the fused path only a by-ref chain (`pipe_ref`) containing a filter stage and
+ending in `.collect()` consults it; an explicit mode beats the
+`YOUPIPE_FILTER_COLLECT` env knob, which beats the `Auto` length gate.
 
 ## Workload: split granularity (fused)
 

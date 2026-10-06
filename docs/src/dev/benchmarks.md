@@ -368,21 +368,39 @@ rayon drift controls within ±4 % noise):
 | 100K keep 50 % | 80.9 µs | 49.1 µs | 55.9 µs | **−30.9 % (25/25)** |
 | 100K keep 90 % | 107.1 µs | 54.3 µs | 66.9 µs | **−37.5 % (25/25)** |
 
-Verdict: **the merge tree stays the default.** wtc wins or ties
-everywhere except mid/high-selectivity 10K — keep90 +25 % stable — where
-the survivor payload (72 KB @ keep90) sits under the 256 KB
+wtc wins or ties everywhere except mid/high-selectivity 10K — keep90 +25 %
+stable — where the survivor payload (72 KB @ keep90) sits under the 256 KB
 parallel-compaction threshold and the driver-sequential sweep pays
 cross-core transfers for cache lines the workers just wrote; at 1K the
 payload is too small for that to matter, at ≥ 100K the parallel wave
-amortizes it. A size gate would need data points between 10K and 100K to
-place and only buys that one window — not worth the complexity (same call
-as the ctp crossover). ctp keeps the ≥ 100K mid/high-selectivity crown
-(−10…−23 % vs wtc: exact-size buffer, no compaction pass) but loses
-everywhere else. Per-shape guidance: `merge` for small/mid batches at
-mid/high selectivity; `wtc` for ≥ 100K batches at any selectivity, and
-for small batches; `ctp` for ≥ 100K batches that keep ≳ 30 %. The ctp
-boolean knob was promoted to the three-way `YOUPIPE_FILTER_COLLECT`
-(unset/`merge`/`ctp`/`wtc`; invalid values panic) accordingly.
+amortizes it. ctp keeps the ≥ 100K mid/high-selectivity crown (−10…−23 %
+vs wtc: exact-size buffer, no compaction pass) but loses everywhere else.
+
+**Default policy (review P-2): `FilterCollectMode::Auto`.** The merge-tree
+default was only right for small/mid batches — ≥ 100K users ate the wtc
+loss at every selectivity. `Auto` gates on item count: merge tree below
+100K, wtc at or above (`FILTER_COLLECT_AUTO_WTC_MIN_N`, fused.rs). The gate
+sits on the smallest measured length with stable multi-selectivity wtc
+wins (100K) rather than interpolating the unmeasured 10K..100K range
+(keep90 @ 10K is a stable +25 % regression, so a lower gate is not free);
+the 1K single-shape win (−12.8 %) is too narrow to open a second
+small-batch window. ctp is never chosen automatically — its chain runs
+twice, observable to side-effecting closures; a default must keep the
+merge tree's single-pass semantics. `with_filter_collect(FilterCollectMode)`
+(`PipeRef` / `PipelineConfig`) pins a variant; the `YOUPIPE_FILTER_COLLECT`
+knob (unset/`merge`/`ctp`/`wtc`; invalid values panic) overrides only
+`Auto` — explicit API beats env. The returned `Vec`'s spare capacity may
+differ across variants (wtc keeps the n-slot buffer); values and order are
+identical.
+
+Post-landing confirmation (same-binary A/B, env knob = `merge` baseline vs
+unset Auto, one interleaved session, 3 s/50 samples; rayon rows as drift
+controls): 100K keep33 **−31.8 %**, keep50 **−29.3 %**, keep90 **−34.0 %**
+(all p < 0.05); 100K keep10 +3.0 % against a +2.0 % rayon drift control
+(net ≈ +1 %, matching the knob-era "noise" verdict for that shape). Below
+the gate the path is bit-identical to the old default: 1K −0.03 %, 10K
+keep33 −0.27 %, 10K keep90 +0.25 % (all n.s. — and keep90 @ 10K is exactly
+the shape the gate exists to protect from wtc's +25 %).
 
 ### `for_each()` vs rayon (`sync_for_each`, cpu_heavy per item, borrowed input)
 

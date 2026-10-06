@@ -2,7 +2,7 @@ mod config;
 
 mod typed;
 
-pub use config::{PipelineConfig, Workload};
+pub use config::{FilterCollectMode, PipelineConfig, Workload};
 pub use typed::{
     AsyncStageOptions, FenceOptions, Filter, FusedStage, FusedTryStage, Identity, InfallibleChain,
     MapErr, Pipe, PipeRef, RangePipe, StageMarker, StreamPipe, StreamStart, SyncMap,

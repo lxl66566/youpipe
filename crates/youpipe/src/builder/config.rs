@@ -45,6 +45,48 @@ pub enum Workload {
     Custom(std::num::NonZeroUsize),
 }
 
+/// Which implementation a by-ref **filter collect** uses: a `pipe_ref(..)`
+/// chain that contains a [`Filter`](crate::Filter) stage, terminated by
+/// `.collect()`. Output is identical across all variants — same values, same
+/// order — only performance differs (and the returned `Vec`'s spare
+/// capacity, see [`FilterCollectMode::Wtc`]).
+///
+/// Resolution order: an explicit variant set here wins; otherwise the
+/// `YOUPIPE_FILTER_COLLECT` environment knob (`"merge"` / `"ctp"` / `"wtc"`)
+/// applies; otherwise [`FilterCollectMode::Auto`]'s length gate decides.
+///
+/// Fused by-ref only: owned and fallible filter collects always use the
+/// merge tree (their stages consume items by value, so the count-then-place
+/// and compact cores cannot re-run or move them), and non-filtering chains
+/// have no variant to choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilterCollectMode {
+    /// Length-gated: merge tree below `100_000` items, write-then-compact at
+    /// or above. See [`FilterCollectMode::Wtc`] for the measured basis of
+    /// the gate, and why the (at >= 100K high selectivity even faster)
+    /// count-then-place variant is never chosen automatically: it runs the
+    /// chain TWICE, which is observable to side-effecting closures.
+    #[default]
+    Auto,
+    /// Per-leaf `Vec`s concatenated up a join tree. Best for small/mid
+    /// batches at mid/high selectivity; at large sizes each survivor moves
+    /// O(depth) times through `extend`.
+    Merge,
+    /// Count-then-place: pass 1 counts survivors per leaf, pass 2 re-runs the
+    /// chain and writes straight into one exactly-sized buffer. Fastest for
+    /// batches of 100K+ items keeping ~30 % or more, but the chain runs
+    /// TWICE (observable side effects, double stage cost) and it loses on
+    /// every smaller shape.
+    Ctp,
+    /// Write-then-compact: one pass writes survivors leaf-contiguously into
+    /// an n-slot buffer, a compaction pass moves each surviving segment down
+    /// at most once. Beat the merge tree at every measured >= 100K
+    /// selectivity (10-90 % keep); regressed at 10K high selectivity — hence
+    /// Auto's gate. The returned `Vec` may keep the n-slot capacity instead
+    /// of shrinking to the survivor count (length and contents unchanged).
+    Wtc,
+}
+
 /// Top-level configuration for a pipeline run.
 ///
 /// All fields are `pub(crate)` — construction and mutation go through
@@ -57,7 +99,8 @@ pub enum Workload {
 ///
 /// Not every field applies to every engine — a fused `pipe()` run reads only
 /// `compute_workers` and `workload` (there are no channels and no async
-/// runtime in the fused path); a `stream()` run reads all of them. Setting a
+/// runtime in the fused path; only by-ref filter collects additionally read
+/// `filter_collect`); a `stream()` run reads all of them. Setting a
 /// field your engine ignores is harmless (it is silently unused), but the
 /// per-engine builders (`Pipe::with_compute_workers`, `StreamPipe::with_*`)
 /// expose only the knobs that actually take effect.
@@ -116,6 +159,9 @@ pub struct PipelineConfig {
     pub(crate) io_concurrency: usize,
     /// Expected workload distribution pattern. Fused-only (see [`Workload`]).
     pub(crate) workload: Workload,
+    /// By-ref filter collect implementation. Fused by-ref-only (see
+    /// [`FilterCollectMode`]).
+    pub(crate) filter_collect: FilterCollectMode,
 }
 
 impl Default for PipelineConfig {
@@ -131,6 +177,7 @@ impl Default for PipelineConfig {
             buffer_size: 256,
             io_concurrency: 128,
             workload: Workload::Balanced,
+            filter_collect: FilterCollectMode::Auto,
         }
     }
 }
@@ -223,6 +270,15 @@ impl PipelineConfig {
     #[must_use]
     pub fn with_workload(mut self, workload: Workload) -> Self {
         self.workload = workload;
+        self
+    }
+
+    /// Sets the by-ref filter collect implementation (default
+    /// [`FilterCollectMode::Auto`]; see that type for variant semantics and
+    /// the resolution order).
+    #[must_use]
+    pub fn with_filter_collect(mut self, mode: FilterCollectMode) -> Self {
+        self.filter_collect = mode;
         self
     }
 }

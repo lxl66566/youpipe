@@ -70,7 +70,8 @@ pub mod state;
 pub mod sync;
 
 pub use builder::{
-    AsyncStageOptions, FenceOptions, Filter, FusedStage, FusedTryStage, Identity, InfallibleChain,
+    AsyncStageOptions, FenceOptions, Filter, FilterCollectMode, FusedStage, FusedTryStage,
+    Identity, InfallibleChain,
     MapErr, Pipe, PipeRef, PipelineConfig, RangePipe, StageMarker, StreamPipe, StreamStart,
     SyncMap, SyncStageOptions, TryMap, TryPipe, TryPipeRef, Workload, pipe, pipe_range, pipe_ref,
     stream,

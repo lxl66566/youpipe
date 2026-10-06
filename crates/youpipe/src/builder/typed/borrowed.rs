@@ -21,7 +21,7 @@ use super::{
     traits::{CountReducer, FoldReducer, OptionReducer, SumReducer},
 };
 use crate::{
-    builder::{PipelineConfig, Workload},
+    builder::{FilterCollectMode, PipelineConfig, Workload},
     executor::compute::ComputePool,
 };
 
@@ -151,6 +151,18 @@ impl<'a, S, T, O> PipeRef<'a, S, T, O> {
         self
     }
 
+    /// Set the filter collect implementation for this chain — see
+    /// [`FilterCollectMode`] (default [`FilterCollectMode::Auto`]: merge
+    /// tree below 100K items, write-then-compact at or above).
+    ///
+    /// Only `.collect()` chains that contain a filter stage consult this;
+    /// output is identical across modes.
+    #[must_use]
+    pub fn with_filter_collect(mut self, mode: FilterCollectMode) -> Self {
+        self.config.filter_collect = mode;
+        self
+    }
+
     /// Append a synchronous map stage: `Fn(O) -> N`. The output type changes
     /// to `N`; the input item type `&'a T` is unchanged.
     pub fn map<N>(
@@ -254,7 +266,13 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        fused_collect_by_ref(self.items, self.stages, self.config.workload, pool)
+        fused_collect_by_ref(
+            self.items,
+            self.stages,
+            self.config.workload,
+            self.config.filter_collect,
+            pool,
+        )
     }
 
     /// Execute the fused pipeline, applying `f` to each output for its side
