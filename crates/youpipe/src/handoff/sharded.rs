@@ -28,7 +28,9 @@ use super::channel::{
     ChannelError, MpscReceiver, MpscSender, RecvItem, TryRecvError, mpsc_channel,
 };
 #[cfg(feature = "tokio-runtime")]
-use super::channel::{MpscAsyncReceiver, MpscAsyncSender, TryRecvItem, mpsc_async_channel};
+use super::channel::{
+    MpscAsyncReceiver, MpscAsyncSender, TryRecvItem, WakerSlot, mpsc_async_channel,
+};
 
 /// Minimum per-shard capacity. Below this the ring degenerates into a
 /// producer/consumer ping-pong (park on every `Full`), which the
@@ -108,6 +110,7 @@ pub(crate) fn sharded_mpsc_async_channel<T: Send + Unpin + 'static>(
             cursor: 0,
             open: shards,
         },
+        slots: (0..shards).map(|_| WakerSlot::new()).collect(),
     })
 }
 
@@ -287,6 +290,11 @@ impl<T: Send + 'static> ShardedReceiver<T> {
 #[cfg(feature = "tokio-runtime")]
 pub struct ShardedAsyncReceiver<T: Send + Unpin + 'static> {
     inner: ShardSet<MpscAsyncReceiver<T>>,
+    /// Per-shard waker-node slots (P-4): the anchor parks on one shard per
+    /// burst gap; a slot lets that shard's waker node be re-armed in place
+    /// instead of reallocated per episode (one allocation per shard, ever,
+    /// instead of one per park).
+    slots: Vec<WakerSlot>,
 }
 
 #[cfg(feature = "tokio-runtime")]
@@ -305,11 +313,11 @@ impl<T: Send + Unpin + 'static> ShardedAsyncReceiver<T> {
     /// Awaiting one shard's `recv()` registers the collector task's waker
     /// with that shard only — crossfire's MPSC receiver registry is a
     /// per-channel single-slot `WeakCell`, so aggregating wakers across
-    /// shards means re-registering with every open shard per park cycle
-    /// (`ArcWaker::new_async` allocates on each registration — the
-    /// per-thread immortal-waker cache only covers *blocking* wakers).
-    /// At shard counts in the tens that allocation traffic per wake would
-    /// exceed the anchor cost it replaces. The one-shard anchor instead
+    /// shards means re-registering with every open shard per park cycle.
+    /// At shard counts in the tens that traffic per wake would exceed the
+    /// anchor cost it replaces (each registration historically allocated a
+    /// fresh `ArcWaker`; the per-shard slots below now make the anchor's
+    /// re-registration allocation-free, P-4). The one-shard anchor instead
     /// trades wake latency for batching — items landing in other shards
     /// wait for the next burst pass, the same trade the sync receiver
     /// makes (measured as a net win there, todo #1). Liveness argument is
@@ -323,7 +331,7 @@ impl<T: Send + Unpin + 'static> ShardedAsyncReceiver<T> {
             if self.inner.closed[i] {
                 continue;
             }
-            match self.inner.rxs[i].recv().await {
+            match self.inner.rxs[i].recv_cached(&mut self.slots[i]).await {
                 Ok(item) => {
                     self.inner.cursor = (i + 1) % n;
                     return Ok(item);

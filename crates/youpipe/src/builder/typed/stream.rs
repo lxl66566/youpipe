@@ -21,7 +21,7 @@ use super::{
 #[cfg(feature = "tokio-runtime")]
 use crate::handoff::{
     AsyncReceiver, AsyncRecvItem, MpscAsyncReceiver, MpscAsyncSender, ShardedAsyncReceiver,
-    async_channel, mpsc_async_channel, sharded_mpsc_async_channel, sync_async_channel,
+    WakerSlot, async_channel, mpsc_async_channel, sharded_mpsc_async_channel, sync_async_channel,
 };
 #[cfg(feature = "tokio-runtime")]
 use crate::state::{
@@ -84,7 +84,8 @@ fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
     let pool = ctx.acquire_async().expect("failed to build async runtime");
     std::thread::spawn(move || {
         pool.block_on(async move {
-            while let Ok(item) = rx.recv().await {
+            let mut rx_slot = WakerSlot::new();
+            while let Ok(item) = rx.recv_cached(&mut rx_slot).await {
                 if cancel_active(cancel.as_ref()) {
                     return;
                 }
@@ -1616,7 +1617,8 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
                 let pool = ctx.acquire_async().expect("failed to build async runtime");
                 std::thread::spawn(move || {
                     pool.block_on(async move {
-                        while let Ok(item) = r.recv().await {
+                        let mut rx_slot = WakerSlot::new();
+                        while let Ok(item) = r.recv_cached(&mut rx_slot).await {
                             if cancel_active(cancel.as_ref()) {
                                 return;
                             }
@@ -2113,11 +2115,13 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
         let cancel = ctx.cancel.clone();
         let pool = ctx.acquire_async().expect("failed to build async runtime");
         pool.spawn(async move {
-            while let Ok(item) = rx.recv().await {
+            let mut rx_slot = WakerSlot::new();
+            let mut tx_slot = WakerSlot::new();
+            while let Ok(item) = rx.recv_cached(&mut rx_slot).await {
                 if cancel_active(cancel.as_ref()) {
                     return;
                 }
-                if tx.send(item).await.is_err() {
+                if tx.send_cached(item, &mut tx_slot).await.is_err() {
                     return;
                 }
             }
@@ -2764,15 +2768,20 @@ where
         // `enter` would have no RAII guard anyway).
         pool.spawn(CatchTaskPanic {
             fut: async move {
+                // Cross-episode waker-node slots (P-4): per task, not per
+                // item — a parked recv/send reuses its node instead of
+                // allocating a fresh one per park episode.
+                let mut rx_slot = WakerSlot::new();
+                let mut tx_slot = WakerSlot::new();
                 loop {
-                    let Ok((seq, item)) = rx.recv().await else {
+                    let Ok((seq, item)) = rx.recv_cached(&mut rx_slot).await else {
                         break;
                     };
                     if cancel_active(c.as_ref()) {
                         break;
                     }
                     let out = f(item).await;
-                    if tx.send((seq, out)).await.is_err() {
+                    if tx.send_cached((seq, out), &mut tx_slot).await.is_err() {
                         break;
                     }
                 }
@@ -2819,15 +2828,20 @@ fn spawn_async_terminal_tasks<F, In, M, Fut, R, I>(
         let slot = fail.clone();
         pool.spawn(CatchTaskPanic {
             fut: async move {
+                // Cross-episode waker-node slots (P-4): per task, not per
+                // item — a parked recv/send reuses its node instead of
+                // allocating a fresh one per park episode.
+                let mut rx_slot = WakerSlot::new();
+                let mut tx_slot = WakerSlot::new();
                 loop {
-                    let Ok((seq, item)) = rx.recv().await else {
+                    let Ok((seq, item)) = rx.recv_cached(&mut rx_slot).await else {
                         break;
                     };
                     if cancel_active(c.as_ref()) {
                         break;
                     }
                     let out = f(item).await;
-                    if tx.send((seq, out)).await.is_err() {
+                    if tx.send_cached((seq, out), &mut tx_slot).await.is_err() {
                         break;
                     }
                 }
@@ -2962,11 +2976,13 @@ where
             let (a_in_tx, a_in_rx) = async_channel::<(u64, T)>(buffer);
             let pool = ctx.acquire_async().expect("failed to build async runtime");
             pool.spawn(async move {
-                while let Ok(item) = prev_async_rx.recv().await {
+                let mut rx_slot = WakerSlot::new();
+                let mut tx_slot = WakerSlot::new();
+                while let Ok(item) = prev_async_rx.recv_cached(&mut rx_slot).await {
                     if cancel_active(bridge_cancel.as_ref()) {
                         return;
                     }
-                    if a_in_tx.send(item).await.is_err() {
+                    if a_in_tx.send_cached(item, &mut tx_slot).await.is_err() {
                         return;
                     }
                 }

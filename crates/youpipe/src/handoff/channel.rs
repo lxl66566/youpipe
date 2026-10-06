@@ -136,6 +136,13 @@ impl<T: Send + 'static> Clone for SyncReceiver<T> {
     }
 }
 
+/// Caller-owned waker-node cache slot for cross-episode reuse in async
+/// recv/send loops (see [`AsyncReceiver::recv_cached`] /
+/// [`AsyncSender::send_cached`]): a task loop that parks per item otherwise
+/// pays one ~48B allocation per park episode; with a slot it pays one per
+/// task. One slot per endpoint, local to the loop's task.
+pub type WakerSlot = crossfire::AsyncWakerSlot<crossfire::ArcWaker>;
+
 /// Async MPMC sender.
 pub struct AsyncSender<T: Send + Unpin + 'static> {
     tx: crossfire::MAsyncTx<mpmc::Array<T>>,
@@ -177,6 +184,17 @@ impl<T: Send + Unpin + 'static> AsyncSender<T> {
         self.tx.send(item).await.map_err(|_| ChannelError::Closed)
     }
 
+    /// [`Self::send`] with cross-episode waker-node reuse via a caller-owned
+    /// [`WakerSlot`]: identical semantics, no per-episode allocation in a
+    /// parking loop.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncSender"))]
+    pub async fn send_cached(&self, item: T, slot: &mut WakerSlot) -> Result<(), ChannelError> {
+        self.tx
+            .send_cached(item, slot)
+            .await
+            .map_err(|_| ChannelError::Closed)
+    }
+
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncSender"))]
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         self.tx.try_send(item).map_err(|e| match e {
@@ -198,6 +216,14 @@ impl<T: Send + Unpin + 'static> AsyncReceiver<T> {
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncReceiver"))]
     pub async fn recv(&self) -> Result<T, ChannelError> {
         self.rx.recv().await.map_err(|_| ChannelError::Closed)
+    }
+
+    /// [`Self::recv`] with cross-episode waker-node reuse via a caller-owned
+    /// [`WakerSlot`]: identical semantics, no per-episode allocation in a
+    /// parking loop.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncReceiver"))]
+    pub async fn recv_cached(&self, slot: &mut WakerSlot) -> Result<T, ChannelError> {
+        self.rx.recv_cached(slot).await.map_err(|_| ChannelError::Closed)
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncReceiver"))]
@@ -368,6 +394,17 @@ impl<T: Send + Unpin + 'static> MpscAsyncSender<T> {
         self.tx.send(item).await.map_err(|_| ChannelError::Closed)
     }
 
+    /// [`Self::send`] with cross-episode waker-node reuse via a caller-owned
+    /// [`WakerSlot`]: identical semantics, no per-episode allocation in a
+    /// parking loop.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncSender"))]
+    pub async fn send_cached(&self, item: T, slot: &mut WakerSlot) -> Result<(), ChannelError> {
+        self.tx
+            .send_cached(item, slot)
+            .await
+            .map_err(|_| ChannelError::Closed)
+    }
+
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncSender"))]
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         self.tx.try_send(item).map_err(|e| match e {
@@ -402,6 +439,14 @@ impl<T: Send + Unpin + 'static> MpscAsyncReceiver<T> {
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncReceiver"))]
     pub async fn recv(&self) -> Result<T, ChannelError> {
         self.rx.recv().await.map_err(|_| ChannelError::Closed)
+    }
+
+    /// [`Self::recv`] with cross-episode waker-node reuse via a caller-owned
+    /// [`WakerSlot`]: identical semantics, no per-episode allocation in a
+    /// parking loop.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncReceiver"))]
+    pub async fn recv_cached(&self, slot: &mut WakerSlot) -> Result<T, ChannelError> {
+        self.rx.recv_cached(slot).await.map_err(|_| ChannelError::Closed)
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncReceiver"))]
@@ -605,6 +650,12 @@ pub trait AsyncRecvItem<T> {
     /// Wait for one item. Resolves to `Err(ChannelError::Closed)` once every
     /// sender has been dropped.
     fn recv(&self) -> impl Future<Output = Result<T, ChannelError>>;
+    /// [`Self::recv`] with cross-episode waker-node reuse (the async
+    /// collector anchors keep one slot per run, so a per-burst-gap park does
+    /// not allocate).
+    fn recv_cached<'s>(
+        &'s self, slot: &'s mut WakerSlot,
+    ) -> impl Future<Output = Result<T, ChannelError>>;
     fn try_recv(&self) -> Result<T, TryRecvError>;
 }
 
@@ -612,6 +663,11 @@ impl<T: Send + Unpin + 'static> AsyncRecvItem<T> for AsyncReceiver<T> {
     #[inline]
     async fn recv(&self) -> Result<T, ChannelError> {
         AsyncReceiver::recv(self).await
+    }
+
+    #[inline]
+    async fn recv_cached<'s>(&'s self, slot: &'s mut WakerSlot) -> Result<T, ChannelError> {
+        AsyncReceiver::recv_cached(self, slot).await
     }
 
     #[inline]
@@ -624,6 +680,11 @@ impl<T: Send + Unpin + 'static> AsyncRecvItem<T> for MpscAsyncReceiver<T> {
     #[inline]
     async fn recv(&self) -> Result<T, ChannelError> {
         MpscAsyncReceiver::recv(self).await
+    }
+
+    #[inline]
+    async fn recv_cached<'s>(&'s self, slot: &'s mut WakerSlot) -> Result<T, ChannelError> {
+        MpscAsyncReceiver::recv_cached(self, slot).await
     }
 
     #[inline]

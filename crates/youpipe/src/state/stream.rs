@@ -2,7 +2,9 @@
 use core::num::NonZeroUsize;
 
 use crate::{
-    handoff::{AsyncRecvItem, RecvItem, ShardedAsyncReceiver, ShardedReceiver, TryRecvError},
+    handoff::{
+        AsyncRecvItem, RecvItem, ShardedAsyncReceiver, ShardedReceiver, TryRecvError, WakerSlot,
+    },
     state::ReorderBuffer,
     sync::CancellationToken,
 };
@@ -356,6 +358,9 @@ where
     R: AsyncRecvItem<(u64, O)>,
     O: Send + 'static,
 {
+    // One waker-node slot per collector (P-4): the per-burst-gap anchor park
+    // reuses its node instead of allocating a fresh one per gap.
+    let mut slot = WakerSlot::new();
     loop {
         // Burst-drain: pop everything already queued without awaiting.
         loop {
@@ -368,7 +373,7 @@ where
         // Queue is drained but channel may still be open. Await exactly one
         // item to register a waker; the next iteration's burst-drain picks up
         // anything that arrived in the meantime.
-        match rx.recv().await {
+        match rx.recv_cached(&mut slot).await {
             Ok((_, item)) => sink(item),
             Err(_) => return,
         }
@@ -396,6 +401,8 @@ pub(crate) async fn drain_ordered_async<R, O>(
         emitted += 1;
         sink(item);
     };
+    // Same per-collector waker-node slot as `drain_unordered_async`.
+    let mut slot = WakerSlot::new();
     loop {
         loop {
             match rx.try_recv() {
@@ -412,7 +419,7 @@ pub(crate) async fn drain_ordered_async<R, O>(
                 },
             }
         }
-        if let Ok((seq, o)) = rx.recv().await {
+        if let Ok((seq, o)) = rx.recv_cached(&mut slot).await {
             buffer.insert_into(seq, o, &mut sink);
         } else {
             for item in buffer.flush_remaining() {
