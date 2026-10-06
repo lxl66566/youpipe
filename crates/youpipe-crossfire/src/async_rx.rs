@@ -135,6 +135,19 @@ impl<F: Flavor> AsyncRx<F> {
         RecvFuture { rx: self, waker: None }
     }
 
+    /// Like [`recv()`](Self::recv), but borrows a caller-owned
+    /// [`AsyncWakerSlot`] so the waker node allocated on a contended poll is
+    /// reused across calls instead of reallocated per episode (youpipe P-4:
+    /// a task loop that parks per item otherwise pays one 48B allocation per
+    /// recv). Semantics (cancellation-safety, close behavior) are identical
+    /// to `recv()`.
+    #[inline(always)]
+    pub fn recv_cached<'a>(
+        &'a self, slot: &'a mut AsyncWakerSlot<<F::Recv as Registry>::Waker>,
+    ) -> CachedRecvFuture<'a, F> {
+        CachedRecvFuture { rx: self, slot, done: false }
+    }
+
     // NOTE: we cannot use async fn recv_timeout signature because &self is not Send
     /// Receives a message from the channel with a timeout.
     /// Will await when channel is empty.
@@ -320,6 +333,50 @@ impl<F: Flavor> AsyncRx<F> {
     }
 }
 
+/// Caller-owned cache slot enabling cross-episode reuse of the async waker
+/// node (the 48-byte `Arc<WakerInner>`).
+///
+/// A per-call future ([`RecvFuture`]/[`SendFuture`]) allocates a fresh node
+/// on its first contended poll and drops it when the future completes, so a
+/// task loop that parks per item pays one allocation per episode. Passing a
+/// slot to [`AsyncRx::recv_cached`] / [`AsyncTx::send_cached`] lets the node
+/// survive across calls: the registry re-arms a consumed (`Woken`) node in
+/// place when `will_wake` still holds and rebuilds only when the executor's
+/// waker identity changed (issue #14 pattern). The `ThinWaker` handle is
+/// written once at node creation and never rewritten, so — unlike the
+/// blocking-side cache designs — no `UnsafeCell` write is involved in reuse.
+///
+/// Use one slot per endpoint (one for a receiver loop, one per sender), not
+/// shared between different channels; a slot moved to a different task
+/// degrades to a rebuild on the first poll (`will_wake` mismatch), never to
+/// incorrect behavior.
+///
+/// Generic over the registry's waker node type (`W` is always `ArcWaker`
+/// for the real registries; inferred at the call site, users never name it).
+pub struct AsyncWakerSlot<W> {
+    pub(crate) node: Option<W>,
+}
+
+impl<W> AsyncWakerSlot<W> {
+    #[inline]
+    pub fn new() -> Self {
+        Self { node: None }
+    }
+}
+
+impl<W> Default for AsyncWakerSlot<W> {
+    #[inline]
+    fn default() -> Self {
+        Self { node: None }
+    }
+}
+
+impl<W: fmt::Debug> fmt::Debug for AsyncWakerSlot<W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AsyncWakerSlot").field("node", &self.node).finish()
+    }
+}
+
 /// A fixed-sized future object constructed by [AsyncRx::recv()]
 #[must_use]
 pub struct RecvFuture<'a, F: Flavor> {
@@ -354,7 +411,62 @@ impl<F: Flavor> Future for RecvFuture<'_, F> {
                 }
             }
             Ok(item) => {
+                // Drop a slot-kept (Woken) node (per-call future; reuse does
+                // not apply) so Drop::drop will not abandon it — abandoning a
+                // consumed node fires a spurious on_send.
+                let _ = _self.waker.take();
                 debug_assert!(_self.waker.is_none());
+                Poll::Ready(Ok(item))
+            }
+        }
+    }
+}
+
+/// Future returned by [`AsyncRx::recv_cached`]; borrows the caller's
+/// [`AsyncWakerSlot`] so the waker node allocated on a contended poll is
+/// reused across calls. Cancellation-safety is identical to [`RecvFuture`].
+#[must_use]
+pub struct CachedRecvFuture<'a, F: Flavor> {
+    rx: &'a AsyncRx<F>,
+    slot: &'a mut AsyncWakerSlot<<F::Recv as Registry>::Waker>,
+    /// Completed: Drop must not abandon a kept node — after Ready the slot
+    /// node (if any) is consumed (Woken) and reserved for reuse; abandoning
+    /// it would Closed-stamp it plus fire a spurious on_send.
+    done: bool,
+}
+
+unsafe impl<F: Flavor> Send for CachedRecvFuture<'_, F> {}
+
+impl<F: Flavor> Drop for CachedRecvFuture<'_, F> {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.done {
+            if let Some(waker) = self.slot.node.take() {
+                self.rx.shared.abandon_recv_waker(&waker);
+            }
+        }
+    }
+}
+
+impl<F: Flavor> Future for CachedRecvFuture<'_, F> {
+    type Output = Result<F::Item, RecvError>;
+
+    #[inline]
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
+        let _self = self.get_mut();
+        match _self.rx.poll_item::<false>(ctx, &mut _self.slot.node) {
+            Err(e) => {
+                if !e.is_empty() {
+                    let _ = _self.slot.node.take();
+                    _self.done = true;
+                    Poll::Ready(Err(RecvError {}))
+                } else {
+                    Poll::Pending
+                }
+            }
+            Ok(item) => {
+                // The kept (Woken) node stays in the slot for the next call.
+                _self.done = true;
                 Poll::Ready(Ok(item))
             }
         }
@@ -412,8 +524,16 @@ where
                 }
                 Poll::Pending
             }
-            Err(TryRecvError::Disconnected) => Poll::Ready(Err(RecvTimeoutError::Disconnected)),
-            Ok(item) => Poll::Ready(Ok(item)),
+            Err(TryRecvError::Disconnected) => {
+                // Drop a slot-kept (Woken) node so Drop::drop will not
+                // abandon it (spurious on_send fire). See RecvFuture::poll.
+                let _ = _self.waker.take();
+                Poll::Ready(Err(RecvTimeoutError::Disconnected))
+            }
+            Ok(item) => {
+                let _ = _self.waker.take();
+                Poll::Ready(Ok(item))
+            }
         }
     }
 }
@@ -919,5 +1039,92 @@ impl<T, F: Flavor<Item = T> + FlavorMC> ReceiverType for MAsyncRx<F> {
     #[inline(always)]
     fn new(shared: Arc<ChannelShared<F>>) -> Self {
         MAsyncRx::new(shared)
+    }
+}
+
+#[cfg(test)]
+mod cached_tests {
+    use super::*;
+    use crate::mpmc;
+
+    // Cross-episode slot reuse (youpipe P-4): the parked future registers a
+    // waker node, the wake consumes it, and the completed episode keeps the
+    // node in the caller's slot. End-to-end over a real tokio waker — this
+    // exercises the will_wake-same-task identity the reuse depends on.
+    #[tokio::test]
+    async fn cached_recv_reuse_end_to_end() {
+        let (tx, rx) = mpmc::bounded_async::<u32>(1);
+        let producer = tokio::spawn(async move {
+            for i in 0..50u32 {
+                tokio::task::yield_now().await;
+                if tx.send(i).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let mut slot = AsyncWakerSlot::new();
+        let mut got = Vec::new();
+        while let Ok(v) = rx.recv_cached(&mut slot).await {
+            got.push(v);
+        }
+        producer.await.unwrap();
+        assert_eq!(got, (0..50).collect::<Vec<_>>());
+    }
+
+    // Cancellation-safety: a cached future dropped while registered must
+    // abandon the node (Closed, slot cleared) — not keep it for reuse — and
+    // the next call on the same slot must behave like a fresh recv().
+    #[tokio::test]
+    async fn cached_recv_cancellation_then_reuse() {
+        let (tx, rx) = mpmc::bounded_async::<u32>(2);
+        let mut slot = AsyncWakerSlot::new();
+        tokio::select! {
+            biased;
+            v = rx.recv_cached(&mut slot) => panic!("unexpected ready {v:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        tx.send(7).await.unwrap();
+        assert_eq!(rx.recv_cached(&mut slot).await.unwrap(), 7);
+        drop(tx);
+        assert!(rx.recv_cached(&mut slot).await.is_err());
+    }
+
+    // Send side: backpressure parks via the slot; item ownership stays
+    // exactly-once across cached sends and cancellations.
+    #[tokio::test]
+    async fn cached_send_backpressure_and_cancellation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct Tracked(std::sync::Arc<AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (tx, rx) = mpmc::bounded_async::<Tracked>(1);
+        let drops = std::sync::Arc::new(AtomicUsize::new(0));
+
+        // Fill the ring, then cancel a parked cached send: the item must be
+        // dropped exactly once.
+        tx.send(Tracked(drops.clone())).await.unwrap();
+        let mut slot = AsyncWakerSlot::new();
+        tokio::select! {
+            biased;
+            r = tx.send_cached(Tracked(drops.clone()), &mut slot) => panic!("unexpected {r:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        // Same slot continues to work: drain one, park-free fast path first,
+        // then a real contended send that must complete.
+        assert!(rx.recv().await.is_ok());
+        tx.send_cached(Tracked(drops.clone()), &mut slot).await.unwrap();
+        assert!(rx.recv().await.is_ok());
+        drop(tx);
+        assert!(rx.recv().await.is_err());
+        // Both delivered items drop after recv, the cancelled one in Drop.
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
     }
 }

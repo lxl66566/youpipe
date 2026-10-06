@@ -267,6 +267,9 @@ pub use backoff::detect_backoff_cfg;
 
 #[allow(dead_code)]
 mod collections;
+// `pub` re-exports: the slot-reuse API (`AsyncWakerSlot`) names the concrete
+// waker node type in its public signatures (youpipe P-4).
+pub use waker::{ArcWaker, ARC_WAKER_ALLOC_SIZE};
 #[allow(dead_code)]
 mod waker;
 #[allow(private_bounds)]

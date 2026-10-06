@@ -46,7 +46,10 @@ fn reg_lock(inner: &Mutex<RegistryMultiInner>) -> MutexGuard<'_, RegistryMultiIn
 
 // pub(crate) on type alias does not matter, mpmc::List alias works because RegistryMulti is pub
 
-pub(crate) trait Registry: Send + Sync + 'static {
+// `pub` (not `pub(crate)`) so the `Waker` associated type can appear in the
+// public slot-reuse signatures (`recv_cached`/`send_cached`); the module is
+// private, so the trait stays unnameable outside the crate.
+pub trait Registry: Send + Sync + 'static {
     type Waker: Send + Unpin + 'static + Debug;
 
     fn get_waker_state(&self, o_waker: &Option<Self::Waker>, order: Ordering) -> u8;
@@ -211,6 +214,31 @@ impl RegistrySingle {
 
     #[inline(always)]
     fn _reg_waker_async(&self, ctx: &mut Context, o_waker: &mut Option<SingleWaker>) {
+        // Cross-episode reuse (youpipe P-4): a consumed (Woken) node is no
+        // longer in the cell (fire() pops before waking), so it can be
+        // re-armed in place when the wake target is unchanged; rebuild only
+        // on a waker identity change (issue #14 pattern: check will_wake
+        // instead of refreshing the handle). The ThinWaker handle is written
+        // once at node creation, so unlike the blocking-side cache designs
+        // no UnsafeCell write is involved in reuse.
+        if let Some(waker) = o_waker.take() {
+            let state = waker.get_state_relaxed();
+            // Reuse gates: a consumed (Woken) or retired (Reuse) node is no
+            // longer registered (fire() popped the cell / cancel retired it),
+            // so it can be re-armed in place when the wake target is
+            // unchanged; rebuild only on a waker identity change (issue #14
+            // pattern: check will_wake instead of refreshing the handle).
+            if (state >= WakerState::Woken as u8 || state == WakerState::Reuse as u8)
+                && waker.will_wake(ctx)
+            {
+                waker.reset_init();
+                self.cell.replace(waker.weak());
+                *o_waker = Some(waker);
+                return;
+            }
+            // Not reusable (still registered, or the executor's waker
+            // changed): drop; a stale cell entry, if any, is replaced below.
+        }
         // XXX don't know what the waker was, always generate new
         let waker = ArcWaker::new_async(ctx);
         //let waker = ThinWaker::Async(ctx.waker().clone());
@@ -232,6 +260,23 @@ impl RegistrySingle {
 
 impl Registry for RegistrySingle {
     type Waker = SingleWaker;
+
+    #[inline(always)]
+    fn cancel_waker(&self, o_waker: &mut Option<SingleWaker>) {
+        // Keep an unregistered node in the slot for cross-episode reuse
+        // (see _reg_waker_async): consumed (Woken — fire() popped the cell
+        // before waking) or already retired (Reuse). A still-registered
+        // (Init/Waiting) node is retired here; its cell entry goes stale
+        // and is replaced by the next registration, and a fire that pops
+        // the stale entry sees Reuse in wake() and skips.
+        if let Some(waker) = o_waker.take() {
+            let state = waker.get_state_relaxed();
+            if state < WakerState::Woken as u8 && state != WakerState::Reuse as u8 {
+                waker.retire();
+            }
+            *o_waker = Some(waker);
+        }
+    }
 
     #[inline(always)]
     fn get_waker_state(&self, o_waker: &Option<SingleWaker>, order: Ordering) -> u8 {
@@ -399,42 +444,55 @@ impl RegistryMulti {
         &self, ctx: &mut Context, o_waker: &mut Option<ArcWaker>,
     ) -> Option<Poll<()>> {
         if let Some(waker) = o_waker.as_ref() {
-            match waker.try_change_state(WakerState::Woken, WakerState::Init) {
-                Ok(_) => {
-                    if waker.will_wake(ctx) {
-                        self.reg_waker(waker);
-                        return None;
-                    }
+            if waker.get_state() == WakerState::Reuse as u8 {
+                // Retired from a completed episode (entry cleared, not
+                // registered): re-arm in place when the wake target is
+                // unchanged; on identity change fall through to a fresh node.
+                if waker.will_wake(ctx) {
+                    let waker = o_waker.take().unwrap();
+                    waker.reset_init();
+                    self.reg_waker(&waker);
+                    *o_waker = Some(waker);
+                    return None;
                 }
-                Err(state) => {
-                    if state < WakerState::Woken as u8 {
+            } else {
+                match waker.try_change_state(WakerState::Woken, WakerState::Init) {
+                    Ok(_) => {
                         if waker.will_wake(ctx) {
-                            trace_log!(
-                                "{} {:?}: will_wake {:?}",
-                                self._tag,
-                                tokio_task_id!(),
-                                waker
-                            );
-                            // Normally only selection or multiplex future will get here.
-                            // No need to reg again, since waker is not consumed.
-                            return Some(Poll::Pending);
-                        } else {
-                            // Spurious woken by runtime, waker can not be re-used (issue 38)
-                            // If we se Woken here, only possible otherside has woken it
-                            if waker.get_state_relaxed() < WakerState::Woken as u8 {
-                                self._clear_wakers(waker, true);
-                            }
-                            trace_log!(
-                                "{} {:?}: drop waker {:?}",
-                                self._tag,
-                                tokio_task_id!(),
-                                waker
-                            );
+                            self.reg_waker(waker);
+                            return None;
                         }
-                    } else if state == WakerState::Closed as u8 {
-                        return Some(Poll::Ready(()));
-                    } else {
-                        panic!("state: impossible for async {:?}", state);
+                    }
+                    Err(state) => {
+                        if state < WakerState::Woken as u8 {
+                            if waker.will_wake(ctx) {
+                                trace_log!(
+                                    "{} {:?}: will_wake {:?}",
+                                    self._tag,
+                                    tokio_task_id!(),
+                                    waker
+                                );
+                                // Normally only selection or multiplex future will get here.
+                                // No need to reg again, since waker is not consumed.
+                                return Some(Poll::Pending);
+                            } else {
+                                // Spurious woken by runtime, waker can not be re-used (issue 38)
+                                // If we se Woken here, only possible otherside has woken it
+                                if waker.get_state_relaxed() < WakerState::Woken as u8 {
+                                    self._clear_wakers(waker, true);
+                                }
+                                trace_log!(
+                                    "{} {:?}: drop waker {:?}",
+                                    self._tag,
+                                    tokio_task_id!(),
+                                    waker
+                                );
+                            }
+                        } else if state == WakerState::Closed as u8 {
+                            return Some(Poll::Ready(()));
+                        } else {
+                            panic!("state: impossible for async {:?}", state);
+                        }
                     }
                 }
             }
@@ -778,11 +836,36 @@ impl Registry for RegistryMulti {
     #[inline(always)]
     fn cancel_waker(&self, o_waker: &mut Option<ArcWaker>) {
         if let Some(waker) = o_waker.take() {
+            let state = waker.get_state_relaxed();
             // If we se Woken here, only possible otherside has woken it
-            if waker.get_state_relaxed() >= WakerState::Woken as u8 {
+            if state >= WakerState::Woken as u8 {
+                // Consumed: its queue entry was popped by fire()/close()
+                // before the wake, so the node is no longer registered.
+                // Keep it in the slot for cross-episode reuse (youpipe P-4):
+                // an async caller holding the slot across recv()/send()
+                // calls re-arms it via _reg_waker_async instead of
+                // allocating a fresh node per episode. Per-call futures drop
+                // it a moment later when the future itself is dropped - same
+                // net effect as before.
+                *o_waker = Some(waker);
                 return;
             }
+            if state == WakerState::Reuse as u8 {
+                // Already retired by a completed episode: not registered,
+                // nothing to clear.
+                *o_waker = Some(waker);
+                return;
+            }
+            // Still registered (e.g. the reg-then-lucky-retry window where
+            // an item arrived between reg_waker and commit_waiting): clear
+            // the queue entry, then retire the node into the slot for the
+            // same cross-episode reuse. A fire racing between the clear and
+            // the retire stamp at worst spurious-wakes the owner (F11) or
+            // skips in wake(); the next registration re-arms from either
+            // stamp.
             self._clear_wakers(&waker, true);
+            waker.retire();
+            *o_waker = Some(waker);
         }
     }
 
@@ -869,7 +952,12 @@ impl RegistrySend for RegistryMulti {
                 }
             } else {
                 self._clear_wakers(waker, true);
-                let _ = o_waker.take();
+                // Retire instead of drop (youpipe P-4): this is the sender's
+                // lucky-retry window (a slot freed between reg_waker and the
+                // double-check) — the cleared node stays in `o_waker` and is
+                // re-armed in place by the next registration instead of
+                // reallocating.
+                waker.retire();
                 state as u8
             }
         } else {
@@ -1517,6 +1605,90 @@ mod tests {
         assert_eq!(waker.get_state(), WakerState::Init as u8);
         assert_eq!(other.get_state(), WakerState::Closed as u8);
         assert_eq!(reg_a.len(), 0);
+    }
+    // Cross-episode node reuse (youpipe P-4): a consumed (Woken) node's
+    // queue entry was popped by fire() before the wake, so completing an
+    // episode must KEEP the node in the slot instead of dropping it — the
+    // next registration re-arms it in place, and a task loop holding the
+    // slot across calls stops allocating one 48B node per park episode.
+    #[test]
+    fn test_registry_multi_cancel_keeps_consumed_node_for_reuse() {
+        let reg = <RegistryMulti as RegistryRecv>::new();
+        let mut o_waker: Option<ArcWaker> = None;
+        <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+        let node = o_waker.as_ref().unwrap().clone_node().to_arc();
+
+        // Consume the registration (entry popped + node Woken).
+        <RegistryMulti as Registry>::fire(&reg);
+        assert_eq!(node.get_state(), WakerState::Woken as u8);
+        assert_eq!(reg.len(), 0);
+
+        // Completed episode: the consumed node stays in the slot...
+        <RegistryMulti as Registry>::cancel_waker(&reg, &mut o_waker);
+        let kept = o_waker.as_ref().expect("consumed node kept for reuse");
+        assert!(kept.same_node(&node));
+
+        // ...and the next episode re-arms the SAME node.
+        <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+        assert!(o_waker.as_ref().unwrap().same_node(&node));
+        assert_eq!(node.get_state(), WakerState::Init as u8);
+        assert_eq!(reg.len(), 1);
+    }
+
+    // Same contract on the single-slot registry: cancel keeps a consumed
+    // node, and the next async registration re-arms it in place (identity,
+    // not a fresh allocation) when the wake target is unchanged.
+    #[test]
+    fn test_registry_single_async_reuse_rearms_consumed_node() {
+        use std::task::{Context, Waker};
+        let reg = <RegistrySingle as RegistryRecv>::new();
+        let mut o_waker: Option<SingleWaker> = None;
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        <RegistrySingle as RegistryRecv>::reg_waker_async(&reg, &mut cx, &mut o_waker);
+        let node = o_waker.as_ref().unwrap().clone_node().to_arc();
+
+        // Consume: fire pops the cell and wakes (Init -> Woken).
+        <RegistrySingle as Registry>::fire(&reg);
+        assert_eq!(node.get_state(), WakerState::Woken as u8);
+
+        // Completed episode keeps the consumed node...
+        <RegistrySingle as Registry>::cancel_waker(&reg, &mut o_waker);
+        assert!(o_waker.as_ref().is_some_and(|w| w.same_node(&node)));
+
+        // ...and the next registration re-arms it in place (same identity,
+        // back to Init, re-registered in the cell).
+        <RegistrySingle as RegistryRecv>::reg_waker_async(&reg, &mut cx, &mut o_waker);
+        assert!(o_waker.as_ref().is_some_and(|w| w.same_node(&node)));
+        assert_eq!(node.get_state(), WakerState::Init as u8);
+
+        // A changed waker identity must rebuild instead: mismatched
+        // will_wake drops the consumed node and registers a fresh one.
+        let cx2_waker = distinct_waker();
+        let mut cx2 = Context::from_waker(&cx2_waker);
+        <RegistrySingle as RegistryRecv>::reg_waker_async(&reg, &mut cx2, &mut o_waker);
+        assert!(!o_waker.as_ref().unwrap().same_node(&node));
+    }
+
+    /// A waker identity distinct from `Waker::noop()` (will_wake mismatch).
+    fn distinct_waker() -> std::task::Waker {
+        use std::sync::Arc;
+        use std::task::{RawWaker, RawWakerVTable, Waker};
+        unsafe fn clone(p: *const ()) -> RawWaker {
+            unsafe { Arc::increment_strong_count(p) };
+            RawWaker::new(p, &VT)
+        }
+        unsafe fn wake(p: *const ()) {
+            drop(unsafe { Arc::from_raw(p) });
+        }
+        unsafe fn wake_by_ref(_: *const ()) {}
+        unsafe fn drop_fn(p: *const ()) {
+            drop(unsafe { Arc::from_raw(p) });
+        }
+        static VT: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
+        let arc: Arc<()> = Arc::new(());
+        // SAFETY: vtable maintains the Arc's refcount across clone/drop.
+        unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(arc).cast::<()>(), &VT)) }
     }
 }
 

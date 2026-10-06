@@ -1,3 +1,4 @@
+use crate::async_rx::AsyncWakerSlot;
 use crate::flavor::FlavorMP;
 use crate::sink::AsyncSink;
 #[cfg(feature = "trace_log")]
@@ -131,11 +132,25 @@ impl<F: Flavor> AsyncTx<F> {
     /// You should rely on the Drop trait of the message to cleanup.
     #[inline(always)]
     pub fn send<'a>(&'a self, item: F::Item) -> SendFuture<'a, F> {
-        SendFuture {
+        SendFuture { tx: self, item: MaybeUninit::new(item), consumed: false, waker: None }
+    }
+
+    /// Like [`send()`](Self::send), but borrows a caller-owned
+    /// [`AsyncWakerSlot`] so the waker node allocated on a contended poll is
+    /// reused across calls instead of reallocated per episode (youpipe P-4:
+    /// a task loop that parks per item otherwise pays one 48B allocation per
+    /// send). Semantics (cancellation-safety, close behavior, exactly-once
+    /// item ownership) are identical to `send()`.
+    #[inline(always)]
+    pub fn send_cached<'a>(
+        &'a self, item: F::Item, slot: &'a mut AsyncWakerSlot<<F::Send as Registry>::Waker>,
+    ) -> CachedSendFuture<'a, F> {
+        CachedSendFuture {
             tx: self,
             item: MaybeUninit::new(item),
             consumed: false,
-            waker: None,
+            slot,
+            done: false,
         }
     }
 
@@ -273,8 +288,14 @@ impl<F: Flavor> AsyncTx<F> {
         loop {
             if shared.inner.try_send(item) {
                 shared.on_send();
-                if let Some(_waker) = o_waker.take() {
-                    trace_log!("tx{:?}: send {:?}", tokio_task_id!(), _waker);
+                if o_waker.is_some() {
+                    trace_log!("tx{:?}: send {:?}", tokio_task_id!(), o_waker);
+                    // Complete the episode through the registry (mirrors the
+                    // rx side's on_recv_waker): a consumed (Woken) node
+                    // stays in `o_waker` for cross-episode reuse (youpipe
+                    // P-4), a still-registered one is unregistered and
+                    // dropped. See RegistryMulti::cancel_waker.
+                    shared.senders.cancel_waker(o_waker);
                 } else {
                     trace_log!("tx{:?}: send", tokio_task_id!());
                 }
@@ -375,6 +396,11 @@ where
         let mut _self = self.get_mut();
         match _self.tx.poll_send::<false>(ctx, &_self.item, &mut _self.waker) {
             Poll::Ready(Ok(())) => {
+                // Drop a slot-kept (Woken) node: this per-call future owns
+                // its waker so reuse does not apply, and the node must not
+                // reach Drop::drop, which would abandon (Closed-stamp) a
+                // consumed node and fire a spurious on_recv.
+                let _ = _self.waker.take();
                 debug_assert!(_self.waker.is_none());
                 // Item moved into the channel; the future no longer owns it.
                 _self.consumed = true;
@@ -384,6 +410,71 @@ where
                 let _ = _self.waker.take();
                 // Ownership moves into the SendError below.
                 _self.consumed = true;
+                Poll::Ready(Err(SendError(unsafe { _self.item.assume_init_read() })))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Future returned by [`AsyncTx::send_cached`]; borrows the caller's
+/// [`AsyncWakerSlot`] so the waker node allocated on a contended poll is
+/// reused across calls. Same exactly-once item ownership invariant as
+/// [`SendFuture::consumed`].
+#[must_use]
+pub struct CachedSendFuture<'a, F: Flavor> {
+    tx: &'a AsyncTx<F>,
+    item: MaybeUninit<F::Item>,
+    consumed: bool,
+    slot: &'a mut AsyncWakerSlot<<F::Send as Registry>::Waker>,
+    /// Completed: Drop must not abandon a kept node — after Ready the slot
+    /// node (if any) is consumed (Woken) and reserved for reuse, and
+    /// abandoning it would Closed-stamp it plus fire a spurious on_recv.
+    done: bool,
+}
+
+unsafe impl<F: Flavor> Send for CachedSendFuture<'_, F> where F::Item: Send {}
+
+impl<F: Flavor> Drop for CachedSendFuture<'_, F> {
+    #[inline]
+    fn drop(&mut self) {
+        // Cancelling the future, poll is not ready. Exactly-once: see
+        // SendFuture::drop.
+        let mut owned = !self.consumed;
+        if !self.done {
+            if let Some(waker) = self.slot.node.take() {
+                if !self.tx.shared.abandon_send_waker(&waker) {
+                    owned = false;
+                }
+            }
+        }
+        if owned && needs_drop::<F::Item>() {
+            unsafe { self.item.assume_init_drop() };
+        }
+    }
+}
+
+impl<F: Flavor> Future for CachedSendFuture<'_, F>
+where
+    F::Item: Unpin,
+{
+    type Output = Result<(), SendError<F::Item>>;
+
+    #[inline]
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
+        let _self = self.get_mut();
+        match _self.tx.poll_send::<false>(ctx, &_self.item, &mut _self.slot.node) {
+            Poll::Ready(Ok(())) => {
+                // The kept (Woken) node stays in the slot for the next call.
+                _self.consumed = true;
+                _self.done = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(())) => {
+                let _ = _self.slot.node.take();
+                // Ownership moves into the SendError below.
+                _self.consumed = true;
+                _self.done = true;
                 Poll::Ready(Err(SendError(unsafe { _self.item.assume_init_read() })))
             }
             Poll::Pending => Poll::Pending,
@@ -450,6 +541,10 @@ where
         let mut _self = unsafe { self.get_unchecked_mut() };
         match _self.tx.poll_send::<false>(ctx, &_self.item, &mut _self.waker) {
             Poll::Ready(Ok(())) => {
+                // Drop a slot-kept (Woken) node: per-call future, reuse does
+                // not apply, and it must not reach Drop::drop, which would
+                // abandon it (spurious on_recv fire).
+                let _ = _self.waker.take();
                 debug_assert!(_self.waker.is_none());
                 // Item moved into the channel; the future no longer owns it.
                 _self.consumed = true;

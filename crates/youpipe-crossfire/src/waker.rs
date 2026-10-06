@@ -16,7 +16,12 @@ use std::thread;
 pub enum WakerState {
     Init = 0, // A temporary state, https://github.com/frostyplanet/crossfire-rs/issues/22
     Waiting = 1,
-    //Copy = 2, // Omit due to skipping direct copy on async or with deadline
+    /// Retired from a completed episode: the registry entry was cleared, the
+    /// node is kept in the caller's slot for in-place re-arming on the next
+    /// registration (async cross-episode reuse, youpipe P-4). Never set by
+    /// `wake()`/`close_wake()` (those only act on `<= Waiting`), so a retired
+    /// node can only be re-registered or dropped by its owner.
+    Reuse = 2,
     Woken = 3,
     Closed = 4, // Channel closed, or timeout cancellation
     Done = 5,
@@ -59,6 +64,15 @@ impl Deref for ArcWaker {
         self.0.as_ref()
     }
 }
+
+// TEMP probes for measurement, removed before commit
+
+/// Heap block size of one `Arc<WakerInner>` allocation: `ArcInner` header
+/// (strong + weak, 2 ptr-size words) + the node body (`WakerInner`'s align
+/// is a word, so no padding is inserted). Testing hook for the
+/// alloc-counting regression tests that guard cross-episode node reuse.
+pub const ARC_WAKER_ALLOC_SIZE: usize =
+    core::mem::size_of::<WakerInner>() + 2 * core::mem::size_of::<usize>();
 
 impl ArcWaker {
     #[inline(always)]
@@ -258,7 +272,16 @@ impl WakerInner {
         Ok(())
     }
 
+    /// Retire a cleared (no longer registered) node for cross-episode
+    /// reuse (youpipe P-4). SeqCst: the next registration (possibly on
+    /// another thread after the slot moved) must observe it before it
+    /// inspects the registry state machine — a stale `Init` read would
+    /// misroute into the "still registered" branch.
     #[inline(always)]
+    pub fn retire(&self) {
+        self.state.store(WakerState::Reuse as u8, Ordering::SeqCst);
+    }
+
     pub fn reset_init(&self) {
         // this is before we put into registry (which will extablish happen-before relationship),
         // it safe to use Relaxed
@@ -339,7 +362,9 @@ impl WakerInner {
         // both >= WakerState::Waiting is certain
         let mut state = self.get_state_relaxed();
         loop {
-            if state >= WakerState::Woken as u8 {
+            if state >= WakerState::Woken as u8 || state == WakerState::Reuse as u8 {
+                // Reuse: retired node whose stale entry a late fire popped —
+                // nobody is waiting through it, pass the fire budget on.
                 return WakeResult::Skip;
             } else if state == WakerState::Waiting as u8 {
                 self.state.store(WakerState::Woken as u8, Ordering::SeqCst);
@@ -383,7 +408,9 @@ impl<T> WakerInner<*const T> {
         // both >= WakerState::Waiting is certain
         let mut state = self.get_state_relaxed();
         loop {
-            if state >= WakerState::Woken as u8 {
+            if state >= WakerState::Woken as u8 || state == WakerState::Reuse as u8 {
+                // Reuse: retired node whose stale entry a late fire popped —
+                // nobody is waiting through it, pass the fire budget on.
                 return WakeResult::Skip;
             } else if state == WakerState::Waiting as u8 {
                 let p = self.get_payload();

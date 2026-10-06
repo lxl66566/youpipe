@@ -294,6 +294,8 @@ impl<F: Flavor> ChannelShared<F> {
                     // We are awake, but give up sending, should notify another sender for safety
                     self.on_recv();
                 } else if state == WakerState::Closed as u8 {
+                } else if state == WakerState::Reuse as u8 {
+                    // Retired node (not registered): nothing to pass on.
                 } else {
                     debug_assert_eq!(state, WakerState::Done as u8);
                     // Unused code for direct_copy
@@ -314,6 +316,8 @@ impl<F: Flavor> ChannelShared<F> {
                 self.on_send();
             } else if state == WakerState::Closed as u8 {
                 // Closed
+            } else if state == WakerState::Reuse as u8 {
+                // Retired node (not registered): nothing to pass on.
             } else {
                 debug_assert_eq!(state, WakerState::Done as u8);
                 // Unused code for direct_copy
