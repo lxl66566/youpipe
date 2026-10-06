@@ -1196,6 +1196,13 @@ Practical consequences:
 - `codegen-units = 1` alone never killed the lottery; it only made the
   dice rolls rarer and bigger. Function alignment is what makes the grid
   stable.
+- The flag is repo-local: rustflags do not propagate to downstream
+  crates, and neither does the lottery. A downstream binary's layout is an
+  independent draw driven by its own dependency graph, so a "regression"
+  of this class measured in our bench binary says nothing about theirs
+  (and vice versa). Perf-sensitive downstream A/B comparisons need the
+  same flag in THEIR `.cargo/config.toml`, where it covers the whole
+  dependency graph.
 
 
 ## Horizontal cross-library comparison (2026-09)
