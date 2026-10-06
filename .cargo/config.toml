@@ -13,9 +13,22 @@
 # pinned in Cargo.toml's `[profile.dev]` instead, where cargo can emit the
 # matching `-C debug-assertions=on`. Override or disable by setting
 # `RUSTFLAGS` in the environment (Cargo appends those after these).
+# `-C llvm-args=-align-all-functions=5` (32-byte function alignment): this
+# crate is acutely codegen-layout-sensitive (single codegen unit — any
+# unrelated source edit reshuffles the hot loops' instruction layout).
+# Measured 2026-10: an async-only refactor (5e6bd83, code unreachable from
+# the sync path) regressed horizontal cpu_balanced 100K-4M by +29..+40 %
+# through pure layout shift; with 32 B function alignment the same commit
+# measures 1.00x against its parent. The flag costs nothing on the aligned
+# side (v0.6.0 base: 1.00x with/without) and converts the layout lottery
+# into a stable grid.
 [build]
-rustflags = ["-C", "panic=unwind"]
-
+rustflags = [
+    "-C",
+    "panic=unwind",
+    "-C",
+    "llvm-args=-align-all-functions=5",
+]
 # Miri configuration.
 #
 # The global compute pool (`ComputePool::global()`, held in a `OnceLock`)
