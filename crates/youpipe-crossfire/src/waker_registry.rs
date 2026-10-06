@@ -19,6 +19,7 @@ use loom::sync::{Mutex, MutexGuard};
 use parking_lot as _;
 #[cfg(all(not(feature = "loom"), not(miri)))]
 use parking_lot::{Mutex, MutexGuard};
+use smallvec::SmallVec;
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::fmt::Debug;
@@ -78,6 +79,17 @@ pub(crate) trait Registry: Send + Sync + 'static {
     #[inline(always)]
     fn fire(&self) -> WakeResult {
         WakeResult::Next
+    }
+
+    /// Fire `n` channel events at once: deliver as many wakes as `n`
+    /// sequential `fire()` calls would. Implementations may amortize
+    /// locking across the batch (youpipe P-3: the batch send/recv paths
+    /// used to pay one registry mutex acquisition per item).
+    #[inline(always)]
+    fn fire_n(&self, n: usize) {
+        for _ in 0..n {
+            self.fire();
+        }
     }
 }
 
@@ -249,6 +261,15 @@ impl Registry for RegistrySingle {
     fn fire(&self) -> WakeResult {
         self._fire();
         WakeResult::Next
+    }
+
+    #[inline(always)]
+    fn fire_n(&self, _n: usize) {
+        // The cell holds at most one registration and fire()'s
+        // retry-on-Skip loop already drains it; the single waiter can only
+        // re-arm after it runs, i.e. after this call returns, so the
+        // remaining n-1 events have no additional waiter to wake.
+        self.fire();
     }
 }
 
@@ -597,6 +618,99 @@ impl RegistryMulti {
     }
 }
 
+impl RegistryMulti {
+    /// Batched fire for `n` events, equivalent in wake accounting to `n`
+    /// sequential `fire()` calls: each event owes a wake to one committed
+    /// (Waiting-state) waiter, and Init-state / stale-live entries met on
+    /// the way are woken as well — exactly what the per-item fire() loop
+    /// does with its Next/Skip results. The registry mutex is taken once
+    /// per collection round instead of once per waiter (P-3, review
+    /// 2026-10-06: a 64-item backpressured batch used to pay 64
+    /// lock+pop+unpark round trips on the same mutex producers register
+    /// on).
+    ///
+    /// While the lock is held no new registration can appear (every
+    /// (re-)registration takes it), so the seq-snapshot boundary the
+    /// per-item fire() loop needs — to stop re-waking a waiter that just
+    /// re-armed inside the same fire — cannot be crossed here: re-arms
+    /// happen only after our wakes, outside this critical section.
+    #[inline]
+    fn _fire_n(&self, n: usize) {
+        let mut remaining = n;
+        while remaining > 0 {
+            // Snapshot fast path, same contract as pop_first(): EMPTY here
+            // means no registration was visible at this load.
+            let flag = self.state.load(Ordering::SeqCst);
+            if flag == MULTI_EMPTY {
+                return;
+            }
+            // (waker, consumed_event): `consumed_event` mirrors the per-item
+            // accounting — only a Waiting read at collection time spends an
+            // event; Init entries are the "wake and keep going" Next case.
+            let mut wakers: SmallVec<[(ArcWaker, bool); 8]> = SmallVec::new();
+            let mut exhausted = false;
+            {
+                let mut guard = reg_lock(&self.inner);
+                if flag & MULTI_HAS_SELECT > 0 {
+                    for select in &guard.selectors {
+                        select.wake();
+                    }
+                }
+                if flag & MULTI_HAS_WAKER > 0 {
+                    let mut has_pop = false;
+                    while remaining > 0 {
+                        match guard.queue.pop_front() {
+                            Some(entry) => {
+                                has_pop = true;
+                                if let Some(inner) = entry.upgrade_live() {
+                                    // Advisory read; wake() re-reads and
+                                    // CASes the node state as the authority.
+                                    let committed = inner._get_state(Ordering::Relaxed)
+                                        == WakerState::Waiting as u8;
+                                    if committed {
+                                        remaining -= 1;
+                                    }
+                                    wakers.push((ArcWaker::from_arc(inner), committed));
+                                }
+                            }
+                            None => {
+                                exhausted = true;
+                                break;
+                            }
+                        }
+                    }
+                    if has_pop && guard.queue.is_empty() {
+                        self.state.store(guard.check_select(), Ordering::SeqCst);
+                    }
+                } else {
+                    // Only selectors under this flag snapshot; done with them.
+                    return;
+                }
+            }
+            // Wake outside the critical section, like the per-item fire().
+            let mut wasted = 0;
+            for (waker, committed) in &wakers {
+                let r = waker.wake();
+                trace_log!("wake {} {:?} {:?}", self._tag, waker, r);
+                if *committed && r == WakeResult::Skip {
+                    // The waiter abandoned between our state read and the
+                    // wake (timeout/cancel), so its wake landed on a
+                    // >=Woken node: hand the event it consumed back so the
+                    // loop collects another waiter — the batched mirror of
+                    // the per-item fire() continuing past a Skip.
+                    wasted += 1;
+                }
+            }
+            remaining += wasted;
+            if exhausted {
+                // No more waiters to hand events to; same as per-item fire
+                // running its pop loop dry.
+                return;
+            }
+        }
+    }
+}
+
 impl Registry for RegistryMulti {
     type Waker = ArcWaker;
 
@@ -699,6 +813,11 @@ impl Registry for RegistryMulti {
             }
         }
         WakeResult::Next
+    }
+
+    #[inline(always)]
+    fn fire_n(&self, n: usize) {
+        self._fire_n(n)
     }
 
     //    #[inline(always)]
@@ -1294,6 +1413,80 @@ mod tests {
         assert_eq!(reg.len(), 2);
         reg.cancel_waker(&mut o_waker);
         assert_eq!(reg.len(), 0);
+    }
+
+    // P-3 (batched fire): fire_n must deliver the same wakes as n sequential
+    // fire() calls — one committed (Waiting) waiter per event.
+    #[test]
+    fn test_registry_multi_fire_n_wakes_n_waiters() {
+        let reg = <RegistryMulti as RegistryRecv>::new();
+        const N: usize = 8;
+        let mut waiters = Vec::new();
+        for _ in 0..N {
+            let w = ArcWaker::new_blocking();
+            reg.reg_waker(&w);
+            w.commit_waiting();
+            waiters.push(w);
+        }
+        assert_eq!(reg.len(), N);
+        reg.fire_n(3);
+        let woken = waiters.iter().filter(|w| w.get_state() == WakerState::Woken as u8).count();
+        assert_eq!(woken, 3);
+        assert_eq!(reg.len(), N - 3);
+        // More events than waiters left: wakes everyone, drains the queue.
+        reg.fire_n(N);
+        let woken = waiters.iter().filter(|w| w.get_state() == WakerState::Woken as u8).count();
+        assert_eq!(woken, N);
+        assert_eq!(reg.len(), 0);
+    }
+
+    // Init-state entries (a waiter still in its registration double-check)
+    // must not consume an event: fire_n(1) wakes them AND the committed
+    // waiter behind them, mirroring the per-item fire() Next behavior.
+    #[test]
+    fn test_registry_multi_fire_n_wakes_past_init_entries() {
+        let reg = <RegistryMulti as RegistryRecv>::new();
+        let init_w = ArcWaker::new_blocking();
+        reg.reg_waker(&init_w); // stays Init
+        let waiting_w = ArcWaker::new_blocking();
+        reg.reg_waker(&waiting_w);
+        waiting_w.commit_waiting();
+        reg.fire_n(1);
+        assert_eq!(init_w.get_state(), WakerState::Woken as u8, "Init entry ripped through");
+        assert_eq!(waiting_w.get_state(), WakerState::Woken as u8, "committed waiter woken");
+        assert_eq!(reg.len(), 0);
+    }
+
+    // A waiter that abandoned (state >= Woken, e.g. Closed) before the
+    // collection must not eat an event; the next committed waiter still
+    // gets its wake. (The collect-Waiting/wake-Skip race this also guards
+    // is not deterministically constructible in a plain test.)
+    #[test]
+    fn test_registry_multi_fire_n_skips_abandoned_waiter() {
+        let reg = <RegistryMulti as RegistryRecv>::new();
+        let gone = ArcWaker::new_blocking();
+        reg.reg_waker(&gone);
+        gone.commit_waiting();
+        let live = ArcWaker::new_blocking();
+        reg.reg_waker(&live);
+        live.commit_waiting();
+        let _ = gone.abandon(); // Waiting -> Closed
+        reg.fire_n(1);
+        assert_eq!(gone.get_state(), WakerState::Closed as u8);
+        assert_eq!(live.get_state(), WakerState::Woken as u8, "event handed to next waiter");
+        assert_eq!(reg.len(), 0);
+    }
+
+    // fire_n(0) is a no-op even with waiters registered.
+    #[test]
+    fn test_registry_multi_fire_n_zero_is_noop() {
+        let reg = <RegistryMulti as RegistryRecv>::new();
+        let w = ArcWaker::new_blocking();
+        reg.reg_waker(&w);
+        w.commit_waiting();
+        reg.fire_n(0);
+        assert_eq!(w.get_state(), WakerState::Waiting as u8);
+        assert_eq!(reg.len(), 1);
     }
 
     // Regression: residue left behind an earlier live waiter must turn stale

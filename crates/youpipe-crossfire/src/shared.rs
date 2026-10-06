@@ -56,33 +56,32 @@ impl<F: Flavor> ChannelShared<F> {
     }
 
     /// youpipe fork extension (batch recv): claim a run of ready items with
-    /// amortized cursor updates. The per-item `on_recv` fire is preserved
-    /// exactly — each claimed item frees one slot for a parked producer, so
-    /// the batch must wake as many producers as the per-item path would.
+    /// amortized cursor updates. Each claimed item frees one slot for a
+    /// parked producer, so the batch fires one recv event per item —
+    /// merged into a single registry lock acquisition via `fire_n` (P-3),
+    /// with the same wake accounting as the per-item `on_recv` path.
     /// Returns the count claimed (0 = nothing ready right now; use
     /// `try_recv` to distinguish Empty from Disconnected).
     #[inline(always)]
     pub(crate) fn try_recv_batch(&self, out: &mut [MaybeUninit<F::Item>]) -> usize {
         let n = self.inner.try_recv_batch(out);
-        for _ in 0..n {
-            self.on_recv();
-        }
+        self.senders.fire_n(n);
         n
     }
 
-    /// youpipe fork extension (batch send): non-blocking prefix send with
-    /// the per-item `on_send` fire preserved (each new item owes one
-    /// consumer wake). Returns 0 once the receiver is dropped — callers
-    /// fall back to per-item `send` to obtain the `Disconnected` error.
+    /// youpipe fork extension (batch send): non-blocking prefix send.
+    /// Each new item owes one consumer wake; the fires are merged into a
+    /// single registry lock acquisition via `fire_n` (P-3), with the same
+    /// wake accounting as the per-item `on_send` path. Returns 0 once the
+    /// receiver is dropped — callers fall back to per-item `send` to
+    /// obtain the `Disconnected` error.
     #[inline(always)]
     pub(crate) unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<F::Item>]) -> usize {
         if self.is_rx_closed() {
             return 0;
         }
         let n = self.inner.try_send_batch(values);
-        for _ in 0..n {
-            self.on_send();
-        }
+        self.recvs.fire_n(n);
         n
     }
 

@@ -601,3 +601,48 @@ crossfire 25 测试 + youpipe 全量 release 测试 + 双 crate miri + clippy �
 同构死锁不存在；跨 registry stale entry 偷一次 fire（Relaxed seq 无 hb，
 loom 契约"一个事件内恢复"）仍是已知理论残余，事件流枯竭的闭环场景由本次
 Single 修复消除了主通道（collector 通道），Multi 侧未观察到实例。
+
+## 13. fire_n：批量事件的单锁合并（2026-10，review P-3）
+
+批量收/发路径（`ChannelShared::try_recv_batch` / `try_send_batch`）原先对
+每个 item 调一次 `on_recv`/`on_send` → `fire()`：背压下一个 64-batch 付出
+64 次 registry 互斥锁 + 64 次队头 pop + 64 次 unpark，且与 waiter 的注册
+争同一把锁（`shared.rs` 两个 `for _ in 0..n` 循环）。
+
+新增 `Registry::fire_n(n)`（trait 默认实现 = n 次 `fire()`，公开 API 不变）：
+
+- `RegistryMulti`：**一轮锁**内从队头弹出条目，攒到 `n` 个 committed
+  （Waiting 态）waiter 或队列耗尽为止；途中遇到的 Init 态 / stale-live 条目
+  照常收集唤醒（对应 per-item fire 对 `Next` 结果的"唤醒并继续"），随后
+  **锁外**逐个 `wake()`——与 per-item fire 的"锁内 pop、锁外 wake"一致。
+  - 收集时的 Waiting 判定（Relaxed 读）只是建议值，权威在 `wake()` 的状态
+    机 CAS；判断错的代价是多醒/少醒一个 double-check 中的 waiter，与
+    per-item 路径的既有竞态同构。
+  - 若某 committed 条目的 wake 落空（`Skip`：collect-wake 间隙内 waiter
+    超时 abandon），把该事件还回计数、再收集一轮——批量化镜像 per-item
+    fire 对 Skip 继续弹出的语义，保证不丢事件。
+  - 持锁期间不可能出现新注册（一切 (re-)registration 都过锁），因此
+    per-item fire 循环里防"唤醒-重臂-被同一 fire 再消费"的 seq 快照边界
+    在这里天然不会被越过：重臂只发生在我们的唤醒之后。
+- `RegistrySingle`：单槽至多一个注册、`fire()` 的 Skip 重试已穷尽语义，
+  `fire_n(n)` = 一次 `fire()`（唯一 waiter 只能在本次调用返回后才重臂）。
+
+**确定性验证**（临时 `reg_lock` 计数器插桩，验证后移除）：80 个 committed
+waiter、64 次事件的形状下，64 × `fire()` = **64 次锁获取、64 次唤醒落地**；
+`fire_n(64)` = **1 次锁获取、64 个 waiter 唤醒**——唤醒会计严格等价，锁次
+数 64:1。注意验证时 waiter 必须存活（测试持有 `ArcWaker`）：节点死掉时
+weak 升级失败，一次 fire 就能把全部死条目在单次锁内清完，会得出错误的
+计数（本节验证即踩过此坑）。
+
+**墙钟 A/B**（CAP=64 环、2^21 item、64-batch；4 个 blocking producer park +
+1 个批量轮询 consumer，与对称的 batch-send 形状；二进制级 NEW/OLD 交错，
+共 13 组配对、每组内 15 轮取中位数；持 bench.lock）：本机当日 load 0.7–8
+波动、多场景呈快/慢双稳（~2.4x），中位数跨组仅半定量可信：
+
+- `send_batch_c4`：NEW 中位数稳定 20.9–24.2ms vs OLD 22.0–28.1ms（NEW 略
+  优 ~5–8%，中置信度）；
+- 其余场景 NEW 与 OLD 的 min 全部持平（±2ms）；`recv_batch_p4` 在高邻载
+  时段 NEW 出现过 4/11 组 ~96ms 慢态、OLD 0/11，但在安静窗口（load<1）
+  复测两组 NEW/OLD 对称（31–44 vs 30–37ms，OLD 亦有 99ms 轮），判定为
+  调度/邻载噪声而非回归——机制上两者唤醒会计等价（见上），锁次数差异
+  只会向有利方向。
