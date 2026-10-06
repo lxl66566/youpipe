@@ -60,6 +60,18 @@ pub fn run(
         .build()
         .expect("build tokio runtime");
 
+    // Seed the blocking pool's first thread before t0: it is lazily spawned
+    // on the first `spawn_blocking`, which would otherwise charge one thread
+    // spawn to the head of the timed region — a cost only this engine pays
+    // (rayon/youpipe pre-build their pools untimed; review BS-3). Later
+    // ramp-up spawns stay in-region deliberately: they overlap real IO and
+    // are tokio's genuine on-demand-pool behavior under this load shape.
+    rt.block_on(async {
+        tokio::task::spawn_blocking(|| ())
+            .await
+            .expect("blocking-pool seed");
+    });
+
     let t0 = Instant::now();
     rt.block_on(async move {
         let mut handles = Vec::with_capacity(pairs.len());
