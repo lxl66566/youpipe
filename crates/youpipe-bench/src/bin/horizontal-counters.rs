@@ -73,7 +73,9 @@ fn run_iter(side: Side, data: &[u64]) -> Vec<u64> {
 
 /// `clone_input` mirrors the horizontal harness: each side's job closes over
 /// its own clone of the data. Shared-input mode exists to probe whether the
-/// buffer sharing itself moves the needle.
+/// buffer sharing itself moves the needle. Returns the timed loop's
+/// per-iteration times (the same rows emitted as CSV) so the summary is
+/// computed over exactly the timed regime.
 fn measure(
     side: Side,
     data: &[u64],
@@ -81,7 +83,7 @@ fn measure(
     duration: Duration,
     rep: usize,
     clone_input: bool,
-) {
+) -> Vec<f64> {
     let owned;
     let data = if clone_input {
         owned = data.to_vec();
@@ -100,6 +102,7 @@ fn measure(
     // cascade by 3-4x context switches and +30% wall — measured 2026-09-25.
     // Keep the gap at plain allocator cost, like the horizontal harness.
     let mut out = String::new();
+    let mut times = Vec::new();
     while t0.elapsed() < duration {
         let t = Instant::now();
         let r = run_iter(side, data);
@@ -115,9 +118,11 @@ fn measure(
             iters,
             ns
         );
+        times.push(ns as f64);
         iters += 1;
     }
     print!("{out}");
+    times
 }
 
 /// Print the output `Vec`'s address/alignment/size and the containing VMA's
@@ -278,13 +283,15 @@ fn main() {
                 cfg.sides.iter().rev().copied().collect()
             };
             for &side in &order {
-                measure(side, &data, cfg.warmup, cfg.duration, rep, cfg.clone_input);
-                // Slot index is side-stable regardless of run order.
+                let ts = measure(side, &data, cfg.warmup, cfg.duration, rep, cfg.clone_input);
+                // Slot index is side-stable regardless of run order. The
+                // summary reuses the CSV's own timed iterations: a separate
+                // extra sample here would run on the shared `&data` — a
+                // different allocator/VMA regime than the per-side clones
+                // the timed loop just used, so the printed ratio could
+                // diverge from the CSV data (review BS-1).
                 let slot = times.iter_mut().find(|(s, _)| *s == side).unwrap();
-                let t = Instant::now();
-                let r = run_iter(side, &data);
-                drop(bb(r));
-                slot.1.push(t.elapsed().as_nanos() as f64);
+                slot.1.extend(ts);
             }
         }
         for (side, ts) in &times {
