@@ -1157,6 +1157,47 @@ most) was simply never exercised by them. Consequences:
   tuples and the `zstd_shape` group (see dev/scheduler.md "flat top-level
   dispatch") are built that way.
 
+## Codegen layout lottery and 32 B function alignment (2026-10-06)
+
+The review-fix campaign's acceptance bench surfaced the sharpest instance
+of the layout trap yet: horizontal `cpu_balanced` 100K-4M regressed
++29…+40 % against v0.6.0. A same-session interleaved bisect (the rayon
+and std-threads controls stayed flat, so the environment was clean) pinned
+the first bad commit to `5e6bd83` — a P-4 change touching **only async
+parking code that the sync fused-collect path never executes**. The
+regression was a pure instruction-layout shift under `codegen-units = 1`
+(plus thin LTO letting a crossfire-only edit reshuffle the bench binary):
+the hot leaf loops landed on worse addresses.
+
+Mitigation, now permanent in `.cargo/config.toml`:
+
+```
+rustflags = ["-C", "panic=unwind", "-C", "llvm-args=-align-all-functions=5"]
+```
+
+With 32-byte function alignment both endpoints measure 1.00x (v0.6.0 vs
+the campaign tip, 4 interleaved pairs), the bad commit itself measures
+1.00x against its parent, and v0.6.0 with the flag is 1.00x vs without —
+the grid costs nothing on a lucky layout. Alignment does not fix
+everything: `cpu_balanced_readback/100K` keeps a ~+7 % wobble that
+bisects to `98c8d4d` (crossfire-only changes, likewise unreachable from
+that path) and survives `align-all-functions=6` — that residual is
+thin-LTO/heap address sensitivity, not a semantic regression, and no
+tool we have stabilizes it.
+
+Practical consequences:
+
+- Any cross-commit benchmark comparison must be same-session interleaved
+  AND should treat ±10 % on a single sub-case as layout noise until
+  bisected; ±30 % is not the ceiling anymore — we measured +40 %.
+- The `~/.cargo/config.toml` host profile (`lto = "thin"` on `bench`) makes
+  the lottery span crates: an edit in `youpipe-crossfire` can shift the
+  fused collect loop that generics monomorphize into the bench binary.
+- `codegen-units = 1` alone never killed the lottery; it only made the
+  dice rolls rarer and bigger. Function alignment is what makes the grid
+  stable.
+
+
 ## Horizontal cross-library comparison (2026-09)
 
 `crates/youpipe/benches/horizontal.rs` answers the "what should I pick for my workload?"
@@ -1237,37 +1278,39 @@ bar's absolute value is ratio × that number.
   (`taskset -c 1-31`, core 0 left to OS/IRQ housekeeping), 5 rounds ×
   700 ms measurement, ~2-8 % cross-round spread on most cells.
 
-### Results (median ms per iteration, 5 interleaved rounds; 2026-10-01 rerun for the 0.6.0 release)
+### Results (median ms per iteration, 5 interleaved rounds; 2026-10-06 rerun on the post-review tip with 32 B function alignment)
 
 | Scenario | n | Best | Runner-up | Rest |
 | --- | --- | --- | --- | --- |
-| cpu_balanced | 1K | youpipe 0.011 | rayon 0.036 | std threads 0.547 |
-| cpu_balanced | 10K | youpipe 0.013 | rayon 0.062 | std threads 0.572 |
-| cpu_balanced | 100K | youpipe 0.052 | rayon 0.122 | std threads 0.781 |
-| cpu_balanced | 1M | rayon 0.463 | youpipe 0.483 | std threads 2.830 |
-| cpu_balanced | 2M | youpipe 0.801 | rayon 0.823 | std threads 6.618 |
-| cpu_balanced | 4M | youpipe 1.565 | rayon 1.672 | std threads 12.817 |
-| cpu_unbalanced | 10K | youpipe (default) 0.038 | youpipe (Unbalanced) 0.038 | rayon 0.080, std threads 0.569 |
-| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.193 | youpipe (default) 0.242 | rayon 0.259, std threads 0.865 |
-| io_async | 500 | futures 9.135 | tokio 9.427 | youpipe 9.565 |
-| io_async | 2K | futures 17.565 | youpipe 18.422 | tokio 18.572 |
-| io_async | 5K | futures 34.473 | youpipe 35.135 | tokio 35.863 |
-| io_blocking | 500 | tokio 9.024 | youpipe (512 thr) 9.384 | std threads 19.482, youpipe (31 thr) 55.796 |
-| io_blocking | 2K | tokio 12.900 | youpipe (512 thr) 14.834 | std threads 52.699, youpipe (31 thr) 226.953 |
-| mixed_cpu_io | 500 | futures 9.148 | youpipe 9.639 | tokio 11.040 |
-| mixed_cpu_io | 2K | futures 9.359 | youpipe 11.089 | tokio 14.357 |
-| real_doc | 1K | tokio 10.965 | youpipe 11.044 | rayon 37.993 |
-| real_doc | 4K | youpipe 15.611 | tokio 17.677 | rayon 137.540 |
-| real_web | 500 | youpipe 12.931 | futures 14.139 | tokio 14.200 |
-| real_web | 2K | youpipe 22.397 | tokio 27.123 | futures 29.247 |
+| cpu_balanced | 1K | youpipe 0.009 | rayon 0.038 | std threads 0.560 |
+| cpu_balanced | 10K | youpipe 0.012 | rayon 0.072 | std threads 0.583 |
+| cpu_balanced | 100K | youpipe 0.052 | rayon 0.141 | std threads 0.796 |
+| cpu_balanced | 1M | youpipe 0.492 | rayon 0.501 | std threads 2.843 |
+| cpu_balanced | 2M | youpipe 0.817 | rayon 0.862 | std threads 6.222 |
+| cpu_balanced | 4M | youpipe 1.601 | rayon 1.737 | std threads 12.117 |
+| cpu_unbalanced | 10K | youpipe (default) 0.037 | youpipe (Unbalanced) 0.039 | rayon 0.086, std threads 0.589 |
+| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.195 | youpipe (default) 0.234 | rayon 0.280, std threads 0.883 |
+| io_async | 500 | futures 9.130 | tokio 9.427 | youpipe 9.482 |
+| io_async | 2K | futures 17.602 | youpipe 18.461 | tokio 18.573 |
+| io_async | 5K | futures 34.692 | youpipe 35.205 | tokio 35.355 |
+| io_blocking | 500 | tokio 9.054 | youpipe (512 thr) 9.378 | std threads 19.180, youpipe (32 thr) 53.690 |
+| io_blocking | 2K | tokio 12.871 | youpipe (512 thr) 14.827 | std threads 50.295, youpipe (32 thr) 222.755 |
+| mixed_cpu_io | 500 | futures 9.115 | youpipe 9.555 | tokio 11.112 |
+| mixed_cpu_io | 2K | futures 9.380 | youpipe 11.169 | tokio 14.378 |
+| real_doc | 1K | youpipe 10.787 | tokio 10.872 | rayon 36.982 |
+| real_doc | 4K | youpipe 15.149 | tokio 17.717 | rayon 133.500 |
+| real_web | 500 | youpipe 12.913 | futures 13.703 | tokio 14.339 |
+| real_web | 2K | youpipe 22.619 | tokio 27.492 | futures 29.314 |
 
 ### Reading the results
 
 - **Balanced CPU** (`pipe_ref` vs `par_iter`, both borrowing warm data):
-  youpipe leads 1K–100K (−69 % @ 1K, −79 % @ 10K, −57 % @ 100K), rayon
-  edges 1 M (+4 %), and youpipe is back ahead at 2 M (−3 %) and 4 M (−6 %).
-  The ≥2 M regime is memory-bound (≥ 32 MB of R+W buffer traffic, outside
-  the cache-resident range); the 2026-09-25 attributions (see "NT-store
+  youpipe leads at every size — 1K–100K by −63…−83 % (0.009 vs 0.038 ms @
+  1K), and since the 2026-10-06 rerun also the memory-bound ≥1 M regime:
+  −2 % @ 1 M, −5 % @ 2 M, −8 % @ 4 M (the 10-01 rerun still had rayon
+  edging 1 M by +4 %). The ≥2 M regime is memory-bound (≥ 32 MB of R+W
+  buffer traffic, outside the cache-resident range); the 2026-09-25
+  attributions (see "NT-store
   attribution" and "Attributing the 2M/4M fused-collect gap" below) pinned
   the then-gap on plain output stores' read-for-ownership + L3 pollution
   (non-temporal leaf stores, `YOUPIPE_NT_STORE`, closed and reversed it:

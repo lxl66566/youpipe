@@ -26,6 +26,10 @@ Usage:
     uv run perf/plot-horizontal.py [results.json] [outdir]
 
 Defaults: results.json = perf/horizontal/results.json, outdir = docs/src/assets.
+
+NixOS note: uv's isolated env cannot find libstdc++.so.6 (matplotlib's
+numpy import fails). Prefix with the nix-store gcc lib, e.g.
+    LD_LIBRARY_PATH=/nix/store/<hash>-gcc-<ver>-lib/lib uv run ...
 """
 
 from __future__ import annotations
