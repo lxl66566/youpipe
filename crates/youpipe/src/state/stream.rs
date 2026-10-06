@@ -656,7 +656,9 @@ mod tests {
     /// repro (seq 0 withheld while ~1 Ki +ε successors arrive).
     #[test]
     fn drain_ordered_auto_window_grows_no_drops() {
-        const N: u64 = 5000; // >> initial 1 Ki, >> any in-flight estimate
+        // Miri: 1280 still exceeds the 1 Ki initial window (forces one
+        // doubling) but keeps the interpreted channel ping-pong tractable.
+        const N: u64 = if cfg!(miri) { 1280 } else { 5000 }; // >> initial 1 Ki, >> any in-flight estimate
         let n = usize::try_from(N).unwrap();
         let (tx, rx) = channel::<(u64, u64)>(64);
         let feeder = std::thread::spawn(move || {
@@ -685,8 +687,10 @@ mod tests {
     /// inside a batch claim would show up here.
     #[test]
     fn drain_unordered_batch_cap_equivalence() {
-        const P: usize = 4;
-        const N: u64 = 2_000;
+        // Miri: fewer producers/items — the equivalence argument is
+        // scale-free, the interpreted ops are not.
+        const P: usize = if cfg!(miri) { 2 } else { 4 };
+        const N: u64 = if cfg!(miri) { 200 } else { 2_000 };
         for cap in [0usize, 3] {
             let (tx, rx) = channel::<(u64, u64)>(16);
             let mut hs = Vec::new();
@@ -715,7 +719,7 @@ mod tests {
     /// does per-item arrivals.
     #[test]
     fn drain_ordered_batch_resequences_out_of_order() {
-        const N: u64 = 1_000;
+        const N: u64 = if cfg!(miri) { 300 } else { 1_000 };
         let (tx, rx) = channel::<(u64, u64)>(64);
         // feed in a stride pattern so every batch claim (cap 8) mixes
         // non-consecutive seqs
