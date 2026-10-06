@@ -6662,7 +6662,11 @@ mod tests {
     #[test]
     fn test_filter_ctp_by_ref_matches_merge_tree() {
         let pool = ComputePool::global();
-        let data: Vec<u64> = (0..10_007).collect();
+        // Same miri scaling as the wtc sibling below: 10K at depth 20 is
+        // >20 interpreted minutes (B5's debug assertions made miri slower
+        // still); 503 keeps the same split shapes.
+        let n: u64 = if cfg!(miri) { 503 } else { 10_007 };
+        let data: Vec<u64> = (0..n).collect();
 
         // keep: all / none / ~1/3 — `(x + 1) % k == 0` after the first map.
         for (name, keep) in [("all", 1u64), ("none", 10_000), ("third", 3)] {
