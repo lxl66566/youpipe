@@ -224,7 +224,11 @@ payload is recorded (`CatchTaskPanic`, see [Panic
 semantics](#panic-semantics)) and re-raised on the `run()` caller after the
 collector returns — verified by `tests/sharded_terminal_async.rs`
 (unordered/ordered/expand/for_each, `io_concurrency` 1 / 2 / above
-`async_workers` sharing, producer panic, cancel, single-item input).
+`async_workers` sharing, producer panic, cancel, single-item input; plus
+the async-feeder expand terminal — `ExpandStage::spawn_async_feeder_single`
+gained its sharded branch in review round 4 (P-9), previously async-first
+expand-terminal chains silently degraded to the shared ring under the
+knob).
 
 Measured verdict (2026-09-29, `sharded_term_async` bench, 10 interleaved
 same-binary knob rounds): the async flavour **regresses the shapes it was
@@ -279,8 +283,13 @@ as `YOUPIPE_SHARDED_TERM`; A/B through the runtime knob, same binary):
 Integration points (all behind the one knob, cap clamped 2..=4096, default
 64): the collector's burst phase (`drain_unordered/ordered[_sharded]`,
 batch claim then a single per-item `try_recv` probe to resolve the
-inconclusive 0-claim into Empty/Closed), the worker/fence-forwarder burst
-phase (`claim_burst` in `handoff/channel.rs` — batch first, anchor on miss),
+inconclusive 0-claim into Empty/Closed — the collector is the sole
+consumer, so the probe runs once per burst gap, not under a polling
+crowd), the worker/fence-forwarder burst phase (`claim_poll` →
+`anchor_claim` in `handoff/channel.rs` — batch first, anchor on miss; a
+0-claim resolves Empty via one `is_disconnected` tx-count load instead of a
+second ring walk, review P-6: 1.24–1.52x more empty polls/s under 4/8/16
+pollers, `Closed` verdicts still flow through `try_recv`'s final drain),
 and the feeder push loop (`push_items`: stage a batch, send the free
 prefix, per-item send the tail). Cap 0 = the historical per-item loops
 byte-for-byte. Async terminals keep per-item `try_recv` (p50 ≈ 20 ns,
