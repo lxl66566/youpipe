@@ -35,7 +35,7 @@ use super::channel::{
 /// Minimum per-shard capacity. Below this the ring degenerates into a
 /// producer/consumer ping-pong (park on every `Full`), which the
 /// burst-drain rhythm on both sides needs some slack to absorb.
-const MIN_SHARD_BUFFER: usize = 4;
+pub(crate) const MIN_SHARD_BUFFER: usize = 4;
 
 /// Create `shards` independent bounded MPSC channels presenting one logical
 /// fan-in. Each returned sender feeds exactly one shard — **do not `Clone`
@@ -210,6 +210,19 @@ impl<R> ShardSet<R> {
                             sink(item);
                         }
                         continue;
+                    }
+                    // 0-claim on a channel whose senders are still alive is a
+                    // definite Empty — skip the second ring walk through
+                    // `try_recv` (review PERF-7). The shard is
+                    // SPSC-per-consumer: this drain loop is the only
+                    // receiver, so a 0-claim cannot be a lost race against
+                    // another consumer. A disconnected shard still falls
+                    // through: `try_recv`'s final drain reports Closed only
+                    // after delivering any stragglers pushed before the last
+                    // sender dropped (the half-close contract, see
+                    // `claim_poll`).
+                    if !RecvItem::is_disconnected(&self.rxs[i]) {
+                        break;
                     }
                 }
                 // No batchable run: one per-item try_recv resolves the

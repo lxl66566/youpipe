@@ -508,7 +508,8 @@ the #14 hang forensics.
 ### Fix (a)+(b) landed: adaptive pre-anchor spin, fence batch send (2026-09-30)
 
 Both fix candidates above are implemented as **default-off runtime
-knobs** (`builder/typed/stream.rs`, `AnchorSpin` / `fence_batch_send`):
+knobs** (readers in `handoff/mod.rs` with the other data-plane knobs;
+`AnchorSpin` / `fence_batch_send` live in `builder/typed/stream.rs`):
 
 - `YOUPIPE_SPIN_ANCHOR=<µs>` — per-worker spin budget in the three sync
   recv loops (`spawn_stage` / `spawn_expand_stage` / `forward_fenced`).

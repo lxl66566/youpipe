@@ -20,7 +20,7 @@ use super::{
 };
 #[cfg(feature = "tokio-runtime")]
 use crate::handoff::{
-    AsyncReceiver, AsyncRecvItem, MpscAsyncReceiver, MpscAsyncSender, ShardedAsyncReceiver,
+    AsyncReceiver, AsyncRecvItem, AsyncSendItem, MpscAsyncReceiver, ShardedAsyncReceiver,
     WakerSlot, async_channel, mpsc_async_channel, sharded_mpsc_async_channel, sync_async_channel,
 };
 #[cfg(feature = "tokio-runtime")]
@@ -32,7 +32,8 @@ use crate::{
     executor::compute::ComputePool,
     handoff::{
         Claim, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, ShardedReceiver, SyncSender,
-        TrySendError, channel::channel, claim_poll, mpsc_channel, sharded_mpsc_channel,
+        TrySendError, channel::channel, claim_poll, mpsc_channel, sharded::MIN_SHARD_BUFFER,
+        sharded_mpsc_channel,
     },
     pool::Registry,
     runtime::{AsyncRuntime, DefaultRuntime},
@@ -96,68 +97,6 @@ fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
         });
     });
     s_rx
-}
-
-// ── Sharded terminal channel (runtime knob, todo #1) ──
-//
-// `YOUPIPE_SHARDED_TERM=1` swaps the terminal stage's output channel from
-// one shared MPSC ring to one SPSC ring per worker (see `handoff/sharded.rs`
-// for the contention rationale). Runtime knob — not a config field — so A/B
-// benchmarks compare the same binary (recompiles swing tight benchmarks
-// ±30 % through pure code layout). Default off.
-static SHARDED_TERM: OnceLock<bool> = OnceLock::new();
-
-fn sharded_term_enabled() -> bool {
-    *SHARDED_TERM.get_or_init(|| match std::env::var("YOUPIPE_SHARDED_TERM") {
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" || v.is_empty() => false,
-        Ok(other) => {
-            panic!("YOUPIPE_SHARDED_TERM: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
-        },
-        Err(_) => false,
-    })
-}
-
-// ── Convoy fix knobs (todo #4; attribution in docs/src/dev/streaming.md
-// "Convoy collapse forensics") ──
-//
-// `YOUPIPE_SPIN_ANCHOR=<µs>` (unset/"0" = off): adaptive pre-anchor spin in
-// the sync worker recv loops (`spawn_stage` / `spawn_expand_stage` /
-// `forward_fenced`) — see [`AnchorSpin`]. `YOUPIPE_FWD_BATCH=1` (default
-// off): the fence forwarder pushes each released batch with `try_send`,
-// parking at most once per full ring instead of paying a blocking send per
-// item. Runtime knobs rather than config fields so A/B benches compare the
-// same binary (recompiles swing tight benchmarks by tens of percent through
-// pure code layout).
-
-static SPIN_ANCHOR_US: OnceLock<u32> = OnceLock::new();
-
-/// Max pre-anchor spin window in µs; 0 = the anchor is a plain blocking
-/// recv (knob off, every [`AnchorSpin`] inert).
-fn spin_anchor_us() -> u32 {
-    *SPIN_ANCHOR_US.get_or_init(|| match std::env::var("YOUPIPE_SPIN_ANCHOR") {
-        Ok(v) if v == "0" || v.is_empty() => 0,
-        Ok(other) => other.parse().unwrap_or_else(|_| {
-            panic!(
-                "YOUPIPE_SPIN_ANCHOR: invalid value {other:?} (leave unset or use \"0\" or a spin \
-                 window in µs, e.g. \"10\")"
-            )
-        }),
-        Err(_) => 0,
-    })
-}
-
-static FWD_BATCH: OnceLock<bool> = OnceLock::new();
-
-fn fwd_batch_enabled() -> bool {
-    *FWD_BATCH.get_or_init(|| match std::env::var("YOUPIPE_FWD_BATCH") {
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" || v.is_empty() => false,
-        Ok(other) => {
-            panic!("YOUPIPE_FWD_BATCH: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
-        },
-        Err(_) => false,
-    })
 }
 
 /// First panic payload caught inside one run's detached execution contexts
@@ -607,9 +546,11 @@ fn anchor_claim<T: Send + 'static>(
 /// `YOUPIPE_FWD_BATCH`).
 ///
 /// `batched == false`: one blocking `send` per item (baseline).
-/// `batched == true`: `try_send` back-to-back and park only on the rare
-/// `Full` — once per full ring, not per item. The fence-output channel is
-/// the serial-supplier→crowd interface where a per-item blocking send
+/// `batched == true`: `try_send_batch` claims the longest sendable prefix
+/// with one tail CAS per run (falling back to per-item `try_send` on
+/// backings without a native batch op) and parks only on the unsent
+/// remainder — once per full ring, not per item. The fence-output channel
+/// is the serial-supplier→crowd interface where a per-item blocking send
 /// serializes a wake RTT into every item under a crowd of downstream
 /// workers.
 ///
@@ -632,6 +573,15 @@ fn fence_batch_send<T: Send + 'static, Tx: SendItem<T>>(
         }
         return true;
     }
+    // Stage in place: each slot is written by moving out of `batch` and is
+    // either sent (slot moved out) or written back below — `batch` is left
+    // holding exactly the unsent remainder.
+    let mut staged: Vec<std::mem::MaybeUninit<T>> =
+        batch.drain(..).map(std::mem::MaybeUninit::new).collect();
+    let sent = tx.try_send_batch(&mut staged);
+    // SAFETY: only [..sent) was moved out by the batch send; every slot
+    // from `sent` on is still initialized.
+    batch.extend(unsafe { staged[sent..].iter_mut().map(|s| s.assume_init_read()) });
     while let Some(it) = batch.pop() {
         match tx.try_send(it) {
             Ok(()) => {},
@@ -719,7 +669,7 @@ fn spawn_stage_fanout<I, O, Tx, R>(
             let worker_cancel = ctx.cancel.clone();
             move || {
                 // Adaptive pre-anchor spin state (todo #4); plain locals.
-                let mut spin = AnchorSpin::new(spin_anchor_us());
+                let mut spin = AnchorSpin::new(crate::handoff::spin_anchor_us());
                 // Batch claim scratch (YOUPIPE_BATCH_RECV, todo #1 residual
                 // (d)); cap 0 keeps the per-item anchor + burst rhythm.
                 let batch_cap = crate::handoff::batch_recv_cap();
@@ -816,7 +766,7 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
                 let mut buf: Vec<N> = Vec::new();
                 // Adaptive pre-anchor spin state (todo #4); see
                 // `spawn_stage_fanout`.
-                let mut spin = AnchorSpin::new(spin_anchor_us());
+                let mut spin = AnchorSpin::new(crate::handoff::spin_anchor_us());
                 // Expand `item` into the scratch buffer and forward the
                 // outputs. Returns false when the downstream channel closed
                 // mid-group (unforwarded outputs are dropped by the next
@@ -923,8 +873,8 @@ fn forward_fenced<M, Tx>(
         FenceMode::Chunked(_) => FenceBarrier::new(mode),
     };
     // Adaptive pre-anchor spin state (todo #4); see `spawn_stage_fanout`.
-    let mut spin = AnchorSpin::new(spin_anchor_us());
-    let batched = fwd_batch_enabled();
+    let mut spin = AnchorSpin::new(crate::handoff::spin_anchor_us());
+    let batched = crate::handoff::fwd_batch_enabled();
     // Batch claim scratch (see `spawn_stage`).
     let batch_cap = crate::handoff::batch_recv_cap();
     let mut scratch: Vec<(u64, M)> = Vec::with_capacity(batch_cap.max(1));
@@ -2169,13 +2119,13 @@ where
             // YOUPIPE_SHARDED_TERM=1: one SPSC ring per worker instead of one
             // shared ring — removes both the send-side producer CAS
             // contention and the collector's shared cache lines (todo #1).
-            // In-flight hint: the shard set totals ≈ `buffer` (the budget
-            // `sharded_mpsc_channel` splits per worker), already noted by
-            // `stage_buffer`; the note below intentionally over-counts by
-            // ~`parallelism`× — it only pre-sizes the ordered reorder
-            // window, where a high estimate stays bounded by the
-            // `next_pow2(n)` ceiling.
-            ctx.note_in_flight((parallelism - 1) * buffer);
+            // In-flight hint: `stage_buffer` already noted the logical
+            // `buffer`; the shard floor lifts each shard to at least
+            // `MIN_SHARD_BUFFER`, growing the aggregate by up to that floor
+            // per extra shard. The estimate only pre-sizes the ordered
+            // reorder window (`next_pow2(n)` ceiling, grows on demand),
+            // never gates correctness.
+            ctx.note_in_flight((parallelism - 1) * MIN_SHARD_BUFFER);
             let (txs, out_rx) = sharded_mpsc_channel::<(u64, M)>(parallelism, buffer);
             spawn_stage_fanout::<_, _, MpscSender<(u64, M)>, R>(ctx, mid_rx, txs, self.f);
             return FinalRx::SyncSharded(out_rx);
@@ -2241,9 +2191,9 @@ where
         if ctx.sharded_terminal(parallelism) {
             // See `SyncStage::spawn_single` — the feeder being async changes
             // nothing about the terminal fan-in shape.
-            // In-flight hint: intentionally over-counts — see
-            // `SyncStage::spawn_single`.
-            ctx.note_in_flight((parallelism - 1) * buffer);
+            // In-flight hint: shard-floor lift over the noted `buffer`
+            // (see `SyncStage::spawn_single`).
+            ctx.note_in_flight((parallelism - 1) * MIN_SHARD_BUFFER);
             let (txs, out_rx) = sharded_mpsc_channel::<(u64, M)>(parallelism, buffer);
             spawn_stage_fanout::<_, _, MpscSender<(u64, M)>, R>(ctx, mid_rx, txs, self.f);
             return FinalRx::SyncSharded(out_rx);
@@ -2368,9 +2318,9 @@ where
         if ctx.sharded_terminal(parallelism) {
             // See `SyncStage::spawn_single`; expand workers benefit from the
             // same send-side de-contention as plain sync workers.
-            // In-flight hint: intentionally over-counts — see
-            // `SyncStage::spawn_single`.
-            ctx.note_in_flight((parallelism - 1) * buffer);
+            // In-flight hint: shard-floor lift over the noted `buffer`
+            // (see `SyncStage::spawn_single`).
+            ctx.note_in_flight((parallelism - 1) * MIN_SHARD_BUFFER);
             let (txs, out_rx) = sharded_mpsc_channel::<(u64, N)>(parallelism, buffer);
             spawn_expand_stage_fanout::<_, _, MpscSender<(u64, N)>, R>(ctx, mid_rx, txs, self.f);
             return FinalRx::SyncSharded(out_rx);
@@ -2427,9 +2377,9 @@ where
             // with an expand terminal get the same per-worker SPSC fan-in.
             // This arm was missing (review P-9): under the knob the
             // terminal silently degraded to the shared MPSC ring and lost
-            // the per-shard CAS-free sends. In-flight hint: intentionally
-            // over-counts — see `SyncStage::spawn_single`.
-            ctx.note_in_flight((parallelism - 1) * buffer);
+            // the per-shard CAS-free sends. In-flight hint: shard-floor
+            // lift over the noted `buffer` (see `SyncStage::spawn_single`).
+            ctx.note_in_flight((parallelism - 1) * MIN_SHARD_BUFFER);
             let (txs, out_rx) = sharded_mpsc_channel::<(u64, N)>(parallelism, buffer);
             spawn_expand_stage_fanout::<_, _, MpscSender<(u64, N)>, R>(ctx, mid_rx, txs, self.f);
             return FinalRx::SyncSharded(out_rx);
@@ -2757,54 +2707,22 @@ where
     let buffer = ctx.stage_buffer(opts.buffer, concurrency);
     ctx.note_in_flight(concurrency); // one in-flight item per consumer task
     let (a_out_tx, a_out_rx) = async_channel::<(u64, M)>(buffer);
-    let pool = ctx.acquire_async().expect("failed to build async runtime");
-    let f = Arc::new(f);
-    let cancel = ctx.cancel.clone();
-    let fail = ctx.async_panic_slot();
-    for _ in 0..concurrency {
-        let f = f.clone();
-        let rx = a_in_rx.clone();
-        let tx = a_out_tx.clone();
-        let c = cancel.clone();
-        let slot = fail.clone();
-        // Spawn via the runtime-agnostic backend. `pool.spawn` is the explicit
-        // spawn — it does not depend on a TLS current-runtime context, so no
-        // `enter()` guard is needed (a future non-tokio backend's scoped-tls
-        // `enter` would have no RAII guard anyway).
-        pool.spawn(CatchTaskPanic {
-            fut: async move {
-                // Cross-episode waker-node slots (P-4): per task, not per
-                // item — a parked recv/send reuses its node instead of
-                // allocating a fresh one per park episode.
-                let mut rx_slot = WakerSlot::new();
-                let mut tx_slot = WakerSlot::new();
-                loop {
-                    let Ok((seq, item)) = rx.recv_cached(&mut rx_slot).await else {
-                        break;
-                    };
-                    if cancel_active(c.as_ref()) {
-                        break;
-                    }
-                    let out = f(item).await;
-                    if tx.send_cached((seq, out), &mut tx_slot).await.is_err() {
-                        break;
-                    }
-                }
-            },
-            slot,
-        });
-    }
-    drop(a_out_tx);
-    drop(a_in_rx);
+    let mut senders: Vec<_> = (0..concurrency.saturating_sub(1))
+        .map(|_| a_out_tx.clone())
+        .collect();
+    senders.push(a_out_tx);
+    spawn_async_terminal_tasks(f, a_in_rx, ctx, senders);
     a_out_rx
 }
 
 /// Spawn one async consumer task per provided output sender: the task loop
-/// is shared verbatim between the single-channel and sharded terminal shapes
-/// — only the sender set differs (one `MpscAsyncSender` clone per task for
-/// the shared ring vs one shard sender per task group). The sender side
-/// stays async (`send().await`): the producers are runtime tasks, not OS
-/// threads — a blocking send would stall the runtime worker.
+/// is shared verbatim across the async channel shapes — the mid-stage MPMC
+/// channel ([`spawn_async_consumers_body`], one `AsyncSender` clone per
+/// task), the single MPSC terminal ring, and its sharded variant (one
+/// `MpscAsyncSender` per task or task group) — only the sender set
+/// differs. The sender side stays async (`send().await`): the producers
+/// are runtime tasks, not OS threads — a blocking send would stall the
+/// runtime worker.
 #[cfg(feature = "tokio-runtime")]
 #[allow(clippy::needless_pass_by_value)] // `f` is moved into the `Arc` shared
 // across consumer tasks; taking it by value expresses "this is the last stop
@@ -2820,7 +2738,8 @@ fn spawn_async_terminal_tasks<F, In, M, Fut, R, I>(
     In: Send + Unpin + 'static,
     M: Send + Unpin + 'static,
     R: AsyncRuntime,
-    I: IntoIterator<Item = MpscAsyncSender<(u64, M)>>,
+    I: IntoIterator,
+    I::Item: AsyncSendItem<(u64, M)>,
 {
     let pool = ctx.acquire_async().expect("failed to build async runtime");
     let f = Arc::new(f);
@@ -2831,6 +2750,10 @@ fn spawn_async_terminal_tasks<F, In, M, Fut, R, I>(
         let rx = a_in_rx.clone();
         let c = cancel.clone();
         let slot = fail.clone();
+        // Spawn via the runtime-agnostic backend. `pool.spawn` is the explicit
+        // spawn — it does not depend on a TLS current-runtime context, so no
+        // `enter()` guard is needed (a future non-tokio backend's scoped-tls
+        // `enter` would have no RAII guard anyway).
         pool.spawn(CatchTaskPanic {
             fut: async move {
                 // Cross-episode waker-node slots (P-4): per task, not per
@@ -2888,9 +2811,9 @@ where
     ctx.note_in_flight(concurrency); // one in-flight item per consumer task
     let shards = ctx.sharded_async_terminal(concurrency);
     if shards > 0 {
-        // In-flight hint: intentionally over-counts — see
-        // `SyncStage::spawn_single`.
-        ctx.note_in_flight((shards - 1) * buffer);
+        // In-flight hint: shard-floor lift over the noted `buffer`
+        // (see `SyncStage::spawn_single`).
+        ctx.note_in_flight((shards - 1) * MIN_SHARD_BUFFER);
         let (txs, out_rx) = sharded_mpsc_async_channel::<(u64, M)>(shards, buffer);
         // Task i owns shard `i % shards` for its whole life (temporal
         // locality: a task's sends always hit the same ring); tasks beyond
@@ -3710,6 +3633,110 @@ impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<T> for ForEachCollector<F>
     }
 }
 
+/// Reducing terminal — the aggregation terminals' streaming fallback. Folds
+/// each drained item into a [`Reducer`] accumulator in drain order, so no
+/// output `Vec` is materialised (O(1) output memory). The drain is
+/// sequential, so only `fold` is exercised — `combine` stays exclusive to
+/// the fused tree core.
+struct ReducerCollector<R> {
+    reducer: R,
+}
+
+impl<T, R> Terminal<T> for ReducerCollector<R>
+where
+    T: Send + Unpin + 'static,
+    R: Reducer<T>,
+    R::Acc: 'static,
+{
+    type Out = R::Acc;
+
+    fn drain_empty(self) -> R::Acc {
+        self.reducer.identity()
+    }
+
+    fn drain_sync<Rx: RecvItem<(u64, T)>>(
+        self,
+        rx: Rx,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> R::Acc {
+        let Self { reducer } = self;
+        // `Reducer::fold` consumes the accumulator by value, but the sink is
+        // `FnMut` — the `Option` is the move-friendly slot that threads it
+        // across sink calls.
+        let mut acc = Some(reducer.identity());
+        for_each_sync(rx, ordered, window, n, cancel, |item| {
+            acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item));
+        });
+        acc.expect("drain restores the accumulator")
+    }
+
+    fn drain_sync_sharded(
+        self,
+        rx: ShardedReceiver<(u64, T)>,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> R::Acc {
+        let Self { reducer } = self;
+        let mut acc = Some(reducer.identity());
+        for_each_sync_sharded(rx, ordered, window, n, cancel, |item| {
+            acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item));
+        });
+        acc.expect("drain restores the accumulator")
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    async fn drain_async<Rx: AsyncRecvItem<(u64, T)>>(
+        self,
+        rx: Rx,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> R::Acc {
+        let Self { reducer } = self;
+        let mut acc = Some(reducer.identity());
+        for_each_async(rx, ordered, window, n, cancel, |item| {
+            acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item));
+        })
+        .await;
+        acc.expect("drain restores the accumulator")
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    async fn drain_async_sharded(
+        self,
+        mut rx: ShardedAsyncReceiver<(u64, T)>,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> R::Acc {
+        let Self { reducer } = self;
+        let mut acc = Some(reducer.identity());
+        if ordered {
+            drain_ordered_async_sharded(
+                &mut rx,
+                n,
+                window,
+                OrderedAccounting::Validate { cancel },
+                |item| acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item)),
+            )
+            .await;
+        } else {
+            drain_unordered_async_sharded(&mut rx, |item| {
+                acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item));
+            })
+            .await;
+        }
+        acc.expect("drain restores the accumulator")
+    }
+}
+
 /// Sharded counterpart of [`collect_sync`] — same ordered/unordered split
 /// over the shard-aggregating drain loops.
 #[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
@@ -3926,8 +3953,9 @@ where
     }
 
     /// Execute the streaming pipeline and reduce the outputs into a single
-    /// value — no output `Vec` on the fused pass-through path (the
-    /// streaming fallback drains into one before folding).
+    /// value — no output `Vec` is materialised on any path (the fused core
+    /// tree-combines partials; the streaming fallback folds the drain
+    /// sequentially).
     ///
     /// Pure sync chains (no async stage, no cancellation, no pins — the
     /// [`run`](Self::run) pass-through eligibility) take the fused reduce
@@ -3965,15 +3993,15 @@ where
                 Err(items) => self.items = items,
             }
         }
-        self.try_exec(VecCollector)
-            .expect("StreamPipe::reduce: failed to build async runtime (see run/try_run)")
-            .into_iter()
-            .reduce(op)
+        self.try_exec(ReducerCollector {
+            reducer: OptionReducer(&op),
+        })
+        .expect("StreamPipe::reduce: failed to build async runtime (see run/try_run)")
     }
 
     /// Execute the streaming pipeline, folding outputs into an accumulator
-    /// of a **different type** — no output `Vec` on the fused pass-through
-    /// path (see [`reduce`](Self::reduce) and
+    /// of a **different type** — no output `Vec` is materialised on any path
+    /// (see [`reduce`](Self::reduce) and
     /// [`Pipe::fold`](crate::Pipe::fold), the latter for the associativity
     /// contract).
     ///
@@ -4009,19 +4037,19 @@ where
                 Err(items) => self.items = items,
             }
         }
-        let drained = self
-            .try_exec(VecCollector)
-            .expect("StreamPipe::fold: failed to build async runtime (see run/try_run)");
-        let mut acc = init;
-        for o in drained {
-            acc = f(acc, o);
-        }
-        acc
+        self.try_exec(ReducerCollector {
+            reducer: FoldReducer {
+                init,
+                f: &f,
+                combine: &combine,
+            },
+        })
+        .expect("StreamPipe::fold: failed to build async runtime (see run/try_run)")
     }
 
-    /// Execute the streaming pipeline and sum the outputs — the zero-copy
-    /// `.stage(f).sum()` shape (see [`reduce`](Self::reduce)). Empty input
-    /// folds to the additive identity.
+    /// Execute the streaming pipeline and sum the outputs — no output
+    /// `Vec` is materialised on any path (see [`reduce`](Self::reduce)).
+    /// Empty input folds to the additive identity.
     ///
     /// # Panics
     ///
@@ -4047,14 +4075,14 @@ where
                 Err(items) => self.items = items,
             }
         }
-        self.try_exec(VecCollector)
-            .expect("StreamPipe::sum: failed to build async runtime (see run/try_run)")
-            .into_iter()
-            .sum()
+        self.try_exec(ReducerCollector {
+            reducer: SumReducer::<O>(PhantomData),
+        })
+        .expect("StreamPipe::sum: failed to build async runtime (see run/try_run)")
     }
 
     /// Execute the streaming pipeline and count the outputs — no output
-    /// buffer on the fused pass-through path (see [`reduce`](Self::reduce)).
+    /// `Vec` is materialised on any path (see [`reduce`](Self::reduce)).
     ///
     /// # Panics
     ///
@@ -4077,9 +4105,10 @@ where
                 Err(items) => self.items = items,
             }
         }
-        self.try_exec(VecCollector)
-            .expect("StreamPipe::count: failed to build async runtime (see run/try_run)")
-            .len()
+        self.try_exec(ReducerCollector {
+            reducer: CountReducer,
+        })
+        .expect("StreamPipe::count: failed to build async runtime (see run/try_run)")
     }
 
     /// Execute the streaming pipeline and return the minimum output —
@@ -4303,7 +4332,7 @@ where
             n,
             per_stage_parallelism,
             dedicated_threads,
-            sharded_terminal: sharded_term_enabled(),
+            sharded_terminal: crate::handoff::sharded_term_enabled(),
             lease,
             worker_slots_left: Cell::new(worker_slots_left),
             stages_left: Cell::new(stages_left),
