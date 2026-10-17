@@ -211,6 +211,19 @@ impl<R> ShardSet<R> {
                         }
                         continue;
                     }
+                    // 0-claim on a channel whose senders are still alive is a
+                    // definite Empty — skip the second ring walk through
+                    // `try_recv` (review PERF-7). The shard is
+                    // SPSC-per-consumer: this drain loop is the only
+                    // receiver, so a 0-claim cannot be a lost race against
+                    // another consumer. A disconnected shard still falls
+                    // through: `try_recv`'s final drain reports Closed only
+                    // after delivering any stragglers pushed before the last
+                    // sender dropped (the half-close contract, see
+                    // `claim_poll`).
+                    if !RecvItem::is_disconnected(&self.rxs[i]) {
+                        break;
+                    }
                 }
                 // No batchable run: one per-item try_recv resolves the
                 // 0-claim (empty / in-flight / closed).
