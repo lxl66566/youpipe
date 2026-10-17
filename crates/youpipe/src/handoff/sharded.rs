@@ -35,7 +35,7 @@ use super::channel::{
 /// Minimum per-shard capacity. Below this the ring degenerates into a
 /// producer/consumer ping-pong (park on every `Full`), which the
 /// burst-drain rhythm on both sides needs some slack to absorb.
-const MIN_SHARD_BUFFER: usize = 4;
+pub(crate) const MIN_SHARD_BUFFER: usize = 4;
 
 /// Create `shards` independent bounded MPSC channels presenting one logical
 /// fan-in. Each returned sender feeds exactly one shard — **do not `Clone`

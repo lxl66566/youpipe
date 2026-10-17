@@ -32,7 +32,8 @@ use crate::{
     executor::compute::ComputePool,
     handoff::{
         Claim, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, ShardedReceiver, SyncSender,
-        TrySendError, channel::channel, claim_poll, mpsc_channel, sharded_mpsc_channel,
+        TrySendError, channel::channel, claim_poll, mpsc_channel, sharded::MIN_SHARD_BUFFER,
+        sharded_mpsc_channel,
     },
     pool::Registry,
     runtime::{AsyncRuntime, DefaultRuntime},
@@ -2180,13 +2181,13 @@ where
             // YOUPIPE_SHARDED_TERM=1: one SPSC ring per worker instead of one
             // shared ring — removes both the send-side producer CAS
             // contention and the collector's shared cache lines (todo #1).
-            // In-flight hint: the shard set totals ≈ `buffer` (the budget
-            // `sharded_mpsc_channel` splits per worker), already noted by
-            // `stage_buffer`; the note below intentionally over-counts by
-            // ~`parallelism`× — it only pre-sizes the ordered reorder
-            // window, where a high estimate stays bounded by the
-            // `next_pow2(n)` ceiling.
-            ctx.note_in_flight((parallelism - 1) * buffer);
+            // In-flight hint: `stage_buffer` already noted the logical
+            // `buffer`; the shard floor lifts each shard to at least
+            // `MIN_SHARD_BUFFER`, growing the aggregate by up to that floor
+            // per extra shard. The estimate only pre-sizes the ordered
+            // reorder window (`next_pow2(n)` ceiling, grows on demand),
+            // never gates correctness.
+            ctx.note_in_flight((parallelism - 1) * MIN_SHARD_BUFFER);
             let (txs, out_rx) = sharded_mpsc_channel::<(u64, M)>(parallelism, buffer);
             spawn_stage_fanout::<_, _, MpscSender<(u64, M)>, R>(ctx, mid_rx, txs, self.f);
             return FinalRx::SyncSharded(out_rx);
@@ -2252,9 +2253,9 @@ where
         if ctx.sharded_terminal(parallelism) {
             // See `SyncStage::spawn_single` — the feeder being async changes
             // nothing about the terminal fan-in shape.
-            // In-flight hint: intentionally over-counts — see
-            // `SyncStage::spawn_single`.
-            ctx.note_in_flight((parallelism - 1) * buffer);
+            // In-flight hint: shard-floor lift over the noted `buffer`
+            // (see `SyncStage::spawn_single`).
+            ctx.note_in_flight((parallelism - 1) * MIN_SHARD_BUFFER);
             let (txs, out_rx) = sharded_mpsc_channel::<(u64, M)>(parallelism, buffer);
             spawn_stage_fanout::<_, _, MpscSender<(u64, M)>, R>(ctx, mid_rx, txs, self.f);
             return FinalRx::SyncSharded(out_rx);
@@ -2379,9 +2380,9 @@ where
         if ctx.sharded_terminal(parallelism) {
             // See `SyncStage::spawn_single`; expand workers benefit from the
             // same send-side de-contention as plain sync workers.
-            // In-flight hint: intentionally over-counts — see
-            // `SyncStage::spawn_single`.
-            ctx.note_in_flight((parallelism - 1) * buffer);
+            // In-flight hint: shard-floor lift over the noted `buffer`
+            // (see `SyncStage::spawn_single`).
+            ctx.note_in_flight((parallelism - 1) * MIN_SHARD_BUFFER);
             let (txs, out_rx) = sharded_mpsc_channel::<(u64, N)>(parallelism, buffer);
             spawn_expand_stage_fanout::<_, _, MpscSender<(u64, N)>, R>(ctx, mid_rx, txs, self.f);
             return FinalRx::SyncSharded(out_rx);
@@ -2438,9 +2439,9 @@ where
             // with an expand terminal get the same per-worker SPSC fan-in.
             // This arm was missing (review P-9): under the knob the
             // terminal silently degraded to the shared MPSC ring and lost
-            // the per-shard CAS-free sends. In-flight hint: intentionally
-            // over-counts — see `SyncStage::spawn_single`.
-            ctx.note_in_flight((parallelism - 1) * buffer);
+            // the per-shard CAS-free sends. In-flight hint: shard-floor
+            // lift over the noted `buffer` (see `SyncStage::spawn_single`).
+            ctx.note_in_flight((parallelism - 1) * MIN_SHARD_BUFFER);
             let (txs, out_rx) = sharded_mpsc_channel::<(u64, N)>(parallelism, buffer);
             spawn_expand_stage_fanout::<_, _, MpscSender<(u64, N)>, R>(ctx, mid_rx, txs, self.f);
             return FinalRx::SyncSharded(out_rx);
@@ -2899,9 +2900,9 @@ where
     ctx.note_in_flight(concurrency); // one in-flight item per consumer task
     let shards = ctx.sharded_async_terminal(concurrency);
     if shards > 0 {
-        // In-flight hint: intentionally over-counts — see
-        // `SyncStage::spawn_single`.
-        ctx.note_in_flight((shards - 1) * buffer);
+        // In-flight hint: shard-floor lift over the noted `buffer`
+        // (see `SyncStage::spawn_single`).
+        ctx.note_in_flight((shards - 1) * MIN_SHARD_BUFFER);
         let (txs, out_rx) = sharded_mpsc_async_channel::<(u64, M)>(shards, buffer);
         // Task i owns shard `i % shards` for its whole life (temporal
         // locality: a task's sends always hit the same ring); tasks beyond
