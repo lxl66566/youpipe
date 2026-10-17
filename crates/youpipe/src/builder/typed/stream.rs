@@ -3710,6 +3710,110 @@ impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<T> for ForEachCollector<F>
     }
 }
 
+/// Reducing terminal — the aggregation terminals' streaming fallback. Folds
+/// each drained item into a [`Reducer`] accumulator in drain order, so no
+/// output `Vec` is materialised (O(1) output memory). The drain is
+/// sequential, so only `fold` is exercised — `combine` stays exclusive to
+/// the fused tree core.
+struct ReducerCollector<R> {
+    reducer: R,
+}
+
+impl<T, R> Terminal<T> for ReducerCollector<R>
+where
+    T: Send + Unpin + 'static,
+    R: Reducer<T>,
+    R::Acc: 'static,
+{
+    type Out = R::Acc;
+
+    fn drain_empty(self) -> R::Acc {
+        self.reducer.identity()
+    }
+
+    fn drain_sync<Rx: RecvItem<(u64, T)>>(
+        self,
+        rx: Rx,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> R::Acc {
+        let Self { reducer } = self;
+        // `Reducer::fold` consumes the accumulator by value, but the sink is
+        // `FnMut` — the `Option` is the move-friendly slot that threads it
+        // across sink calls.
+        let mut acc = Some(reducer.identity());
+        for_each_sync(rx, ordered, window, n, cancel, |item| {
+            acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item));
+        });
+        acc.expect("drain restores the accumulator")
+    }
+
+    fn drain_sync_sharded(
+        self,
+        rx: ShardedReceiver<(u64, T)>,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> R::Acc {
+        let Self { reducer } = self;
+        let mut acc = Some(reducer.identity());
+        for_each_sync_sharded(rx, ordered, window, n, cancel, |item| {
+            acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item));
+        });
+        acc.expect("drain restores the accumulator")
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    async fn drain_async<Rx: AsyncRecvItem<(u64, T)>>(
+        self,
+        rx: Rx,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> R::Acc {
+        let Self { reducer } = self;
+        let mut acc = Some(reducer.identity());
+        for_each_async(rx, ordered, window, n, cancel, |item| {
+            acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item));
+        })
+        .await;
+        acc.expect("drain restores the accumulator")
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    async fn drain_async_sharded(
+        self,
+        mut rx: ShardedAsyncReceiver<(u64, T)>,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> R::Acc {
+        let Self { reducer } = self;
+        let mut acc = Some(reducer.identity());
+        if ordered {
+            drain_ordered_async_sharded(
+                &mut rx,
+                n,
+                window,
+                OrderedAccounting::Validate { cancel },
+                |item| acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item)),
+            )
+            .await;
+        } else {
+            drain_unordered_async_sharded(&mut rx, |item| {
+                acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item));
+            })
+            .await;
+        }
+        acc.expect("drain restores the accumulator")
+    }
+}
+
 /// Sharded counterpart of [`collect_sync`] — same ordered/unordered split
 /// over the shard-aggregating drain loops.
 #[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
@@ -3926,8 +4030,9 @@ where
     }
 
     /// Execute the streaming pipeline and reduce the outputs into a single
-    /// value — no output `Vec` on the fused pass-through path (the
-    /// streaming fallback drains into one before folding).
+    /// value — no output `Vec` is materialised on any path (the fused core
+    /// tree-combines partials; the streaming fallback folds the drain
+    /// sequentially).
     ///
     /// Pure sync chains (no async stage, no cancellation, no pins — the
     /// [`run`](Self::run) pass-through eligibility) take the fused reduce
@@ -3965,15 +4070,15 @@ where
                 Err(items) => self.items = items,
             }
         }
-        self.try_exec(VecCollector)
-            .expect("StreamPipe::reduce: failed to build async runtime (see run/try_run)")
-            .into_iter()
-            .reduce(op)
+        self.try_exec(ReducerCollector {
+            reducer: OptionReducer(&op),
+        })
+        .expect("StreamPipe::reduce: failed to build async runtime (see run/try_run)")
     }
 
     /// Execute the streaming pipeline, folding outputs into an accumulator
-    /// of a **different type** — no output `Vec` on the fused pass-through
-    /// path (see [`reduce`](Self::reduce) and
+    /// of a **different type** — no output `Vec` is materialised on any path
+    /// (see [`reduce`](Self::reduce) and
     /// [`Pipe::fold`](crate::Pipe::fold), the latter for the associativity
     /// contract).
     ///
@@ -4009,19 +4114,19 @@ where
                 Err(items) => self.items = items,
             }
         }
-        let drained = self
-            .try_exec(VecCollector)
-            .expect("StreamPipe::fold: failed to build async runtime (see run/try_run)");
-        let mut acc = init;
-        for o in drained {
-            acc = f(acc, o);
-        }
-        acc
+        self.try_exec(ReducerCollector {
+            reducer: FoldReducer {
+                init,
+                f: &f,
+                combine: &combine,
+            },
+        })
+        .expect("StreamPipe::fold: failed to build async runtime (see run/try_run)")
     }
 
-    /// Execute the streaming pipeline and sum the outputs — the zero-copy
-    /// `.stage(f).sum()` shape (see [`reduce`](Self::reduce)). Empty input
-    /// folds to the additive identity.
+    /// Execute the streaming pipeline and sum the outputs — no output
+    /// `Vec` is materialised on any path (see [`reduce`](Self::reduce)).
+    /// Empty input folds to the additive identity.
     ///
     /// # Panics
     ///
@@ -4047,14 +4152,14 @@ where
                 Err(items) => self.items = items,
             }
         }
-        self.try_exec(VecCollector)
-            .expect("StreamPipe::sum: failed to build async runtime (see run/try_run)")
-            .into_iter()
-            .sum()
+        self.try_exec(ReducerCollector {
+            reducer: SumReducer::<O>(PhantomData),
+        })
+        .expect("StreamPipe::sum: failed to build async runtime (see run/try_run)")
     }
 
     /// Execute the streaming pipeline and count the outputs — no output
-    /// buffer on the fused pass-through path (see [`reduce`](Self::reduce)).
+    /// `Vec` is materialised on any path (see [`reduce`](Self::reduce)).
     ///
     /// # Panics
     ///
@@ -4077,9 +4182,10 @@ where
                 Err(items) => self.items = items,
             }
         }
-        self.try_exec(VecCollector)
-            .expect("StreamPipe::count: failed to build async runtime (see run/try_run)")
-            .len()
+        self.try_exec(ReducerCollector {
+            reducer: CountReducer,
+        })
+        .expect("StreamPipe::count: failed to build async runtime (see run/try_run)")
     }
 
     /// Execute the streaming pipeline and return the minimum output —
