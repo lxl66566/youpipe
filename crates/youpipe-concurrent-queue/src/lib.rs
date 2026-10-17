@@ -702,34 +702,13 @@ impl<T> fmt::Display for ForcePushError<T> {
 #[cfg(feature = "std")]
 impl<T: fmt::Debug> error::Error for ForcePushError<T> {}
 
-/// Equivalent to `atomic::fence(Ordering::SeqCst)`, but in some cases faster.
+/// Full barrier, equivalent to `atomic::fence(Ordering::SeqCst)`.
+///
+/// No x86 inline-asm fast path: current LLVM lowers the portable fence to a
+/// single `lock orl`, while the classic `lock not` trick pays an extra `mov`
+/// for its memory operand and measured slower on this fork's fence-heavy
+/// `pop` path.
 #[inline]
 fn full_fence() {
-    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), not(miri), not(loom)))]
-    {
-        use core::{arch::asm, cell::UnsafeCell};
-        // HACK(stjepang): On x86 architectures there are two different ways of executing
-        // a `SeqCst` fence.
-        //
-        // 1. `atomic::fence(SeqCst)`, which compiles into a `mfence` instruction.
-        // 2. A `lock <op>` instruction.
-        //
-        // Both instructions have the effect of a full barrier, but empirical benchmarks have shown
-        // that the second one is sometimes a bit faster.
-        let a = UnsafeCell::new(0_usize);
-        // It is common to use `lock or` here, but when using a local variable, `lock not`, which
-        // does not change the flag, should be slightly more efficient.
-        // Refs: https://www.felixcloutier.com/x86/not
-        unsafe {
-            #[cfg(target_pointer_width = "64")]
-            asm!("lock not qword ptr [{0}]", in(reg) a.get(), options(nostack, preserves_flags));
-            #[cfg(target_pointer_width = "32")]
-            asm!("lock not dword ptr [{0:e}]", in(reg) a.get(), options(nostack, preserves_flags));
-        }
-        return;
-    }
-    #[allow(unreachable_code)]
-    {
-        atomic::fence(Ordering::SeqCst);
-    }
+    atomic::fence(Ordering::SeqCst);
 }
