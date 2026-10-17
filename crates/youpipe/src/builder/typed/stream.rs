@@ -2,9 +2,13 @@ use std::{
     cell::Cell,
     marker::PhantomData,
     num::NonZeroUsize,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
+// Only the tokio-runtime ctx fields use OnceLock; the data-plane knob
+// statics moved to `handoff/mod.rs` (their readers live there too).
+#[cfg(feature = "tokio-runtime")]
+use std::sync::OnceLock;
 #[cfg(feature = "tokio-runtime")]
 use std::{
     future::Future,
