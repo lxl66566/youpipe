@@ -63,7 +63,7 @@ their hot paths can be tuned in-tree without waiting on upstream releases:
   benefits identically. The review also records what was tried and rejected —
   e.g. x86 `lock not` SeqCst fences are a
   ~8–10 % pessimization on modern LLVM (it already lowers `fence(SeqCst)` to
-  `lock or`).
+  `lock or`), so the fork's `full_fence` is the plain portable fence.
 
   Why not crossbeam-queue directly: its `SegQueue::push` is a SeqCst CAS with
   block allocation every `LAP − 1` (31) items, and the pool's stream-dispatch
