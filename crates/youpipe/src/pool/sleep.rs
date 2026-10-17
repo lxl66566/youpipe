@@ -58,7 +58,6 @@ fn select_jec(word: usize) -> usize {
 /// `worker_sleep_states` Vec header and the already-padded `sleeping_mask`.
 /// Padding makes that immunity structural against future layout churn,
 /// mirroring `sleeping_mask` (measured +3-5 % when it lacked padding).
-#[allow(dead_code)]
 pub(crate) struct AtomicCounters {
     value: CachePadded<AtomicUsize>,
 }

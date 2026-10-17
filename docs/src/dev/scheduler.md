@@ -498,7 +498,7 @@ so the gate always fires too late (reverted; see the falsified list in
 
 `ComputePool::new_pinned(n)` attacks the same residual without burning
 anything: worker `i` is pinned to the i-th CPU of the process's allowed
-set, so a worker that parks between batches always wakes on its own —
+set (round-robin past the end when the pool exceeds the set), so a worker that parks between batches always wakes on its own —
 idle, cache-warm — core. Same-binary A/B (`YOUPIPE_PIN_WORKERS=1`,
 16C/32T, taskset 1-31, 5 interleaved rounds, rayon columns all noise):
 

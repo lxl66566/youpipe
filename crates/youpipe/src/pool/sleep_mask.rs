@@ -67,15 +67,6 @@ impl SleepMask {
         self.words[word].fetch_and(!bit, Ordering::Release);
     }
 
-    /// `(word_index, 1u64 << bit_within_word)` for `worker_index`.
-    #[inline]
-    fn word_and_bit(worker_index: usize) -> (usize, u64) {
-        (
-            worker_index / BITS_PER_WORD,
-            1u64 << (worker_index % BITS_PER_WORD),
-        )
-    }
-
     /// Scan all set bits, invoking `wake_fn(worker_index)` for each.
     ///
     /// Returns the number of workers for which `wake_fn` returned `true`.

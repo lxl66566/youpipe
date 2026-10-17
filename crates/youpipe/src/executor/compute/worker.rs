@@ -390,6 +390,69 @@ mod tests {
         assert_ne!(a.registry().id(), b.registry().id());
     }
 
+    /// The documented round-robin contract: with `num_workers > allowed.len()`,
+    /// EVERY worker must still be pinned (worker `i` → cpu `i % len`), not
+    /// silently left unpinned past the end of the allowed set — an unpinned
+    /// worker voids the "parks wake on their own idle core" guarantee the
+    /// constructor exists for.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn test_new_pinned_round_robins_past_the_cpu_set() {
+        let allowed = youpipe_sys::allowed_cpus();
+        if allowed.len() < 2 {
+            // Restrictive sandbox; nothing meaningful to pin.
+            return;
+        }
+        let n = allowed.len() + 2;
+        let pool = ComputePool::new_pinned(n);
+        pool.registry().wait_until_primed();
+
+        let mut seen = Vec::new();
+        for status in std::fs::read_dir("/proc/self/task").unwrap() {
+            let status = status.unwrap();
+            let path = status.path().join("status");
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if !text
+                .lines()
+                .any(|l| l.starts_with("Name:") && l.contains("yp-pool-"))
+            {
+                continue;
+            }
+            let Some(list) = text
+                .lines()
+                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            else {
+                continue;
+            };
+            let cpus: Vec<u32> = list
+                .split(',')
+                .flat_map(|part| {
+                    let (a, b) = part.split_once('-').unwrap_or((part, part));
+                    let a: u32 = a.trim().parse().unwrap();
+                    let b: u32 = b.trim().parse().unwrap();
+                    a..=b
+                })
+                .collect();
+            if cpus.len() == 1 && allowed.contains(&cpus[0]) {
+                seen.push(cpus[0]);
+            }
+        }
+        assert!(
+            seen.len() >= n,
+            "all {n} workers must be pinned, saw {} single-CPU workers",
+            seen.len()
+        );
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            allowed.len(),
+            "round-robin must cover the whole allowed set, got {seen:?}"
+        );
+    }
+
     #[cfg(all(target_os = "linux", not(miri)))]
     #[test]
     fn test_new_pinned_workers_have_distinct_single_cpu_affinity() {

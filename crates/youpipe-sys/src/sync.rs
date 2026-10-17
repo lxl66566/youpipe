@@ -2,7 +2,7 @@
 //!
 //! In production this is a zero-cost re-export of `parking_lot::{Mutex,
 //! Condvar}`, which are fairer than their std counterparts and never poison —
-//! so there is no panic path on the (cold) injector lock.
+//! so there is no panic path on the pool's cold park/wake locks.
 //!
 //! Under Miri we instead back the same API with `std::sync::{Mutex, Condvar}`,
 //! because `parking_lot_core` resolves `WaitOnAddress` through

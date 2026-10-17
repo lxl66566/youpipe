@@ -65,7 +65,7 @@ work — measured 10–30 % regression.
 ## Core pinning for tight batch loops (opt-in)
 
 `ComputePool::new_pinned(n)` pins worker `i` to the i-th CPU the process is
-allowed to run on. A worker that parks between back-to-back batches then
+allowed to run on (round-robin past the end when `n` exceeds the CPU count). A worker that parks between back-to-back batches then
 always wakes on its own — idle, cache-warm — core instead of wherever CFS
 places it (measured 7.6 cold-core migrations per iteration unpinned).
 

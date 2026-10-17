@@ -39,7 +39,7 @@ disconnect-while-parked, the close-vs-rearm stale-entry interleaving,
 `park_timeout`, multi-threaded contention), also part of `miri.sh`.
 
 The pool's synchronization cores (`pool/sleep.rs`, `pool/latch.rs`,
-`pool/sleep_mask.rs`, `handoff/notify.rs`) source their atomics, locks, and
+`pool/sleep_mask.rs`) source their atomics, locks, and
 `thread_yield` from `youpipe-sys` — *nothing else in youpipe does* — so under
 `--cfg loom` exactly those primitives become model-checked simulations
 while the rest of the crate keeps real ones. `Registry` spawns real OS

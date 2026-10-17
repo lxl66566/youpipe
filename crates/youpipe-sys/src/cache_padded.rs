@@ -5,8 +5,8 @@
 /// of 64 B lines, so 64 B padding still false-shares at the prefetch-pair
 /// granularity; some aarch64 chips have 128 B lines outright), 64 bytes
 /// elsewhere. This keeps every padded line in the process on the same
-/// strategy — the crossbeam queues vendored under `youpipe-crossfire`
-/// already pad to 128 B.
+/// strategy — the vendored `youpipe-concurrent-queue` and `youpipe-st3`
+/// forks already pad to 128 B through `crossbeam_utils::CachePadded`.
 ///
 /// Under `--cfg loom` the padding is dropped: the model has no cache
 /// lines to alias, and `repr(align)` around loom's simulated types only

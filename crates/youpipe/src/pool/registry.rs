@@ -135,9 +135,12 @@ impl Registry {
             match thread::Builder::new()
                 .name(format!("yp-pool-{index}"))
                 .spawn(move || {
-                    if let Some(&cpu) = pin_targets.get(index) {
-                        // Best-effort: on failure the worker simply stays
-                        // unpinned (see `pin_current_thread_to`).
+                    if !pin_targets.is_empty() {
+                        // Round-robin past the end of the allowed set so every
+                        // worker keeps the "parks wake on their own idle core"
+                        // guarantee. Best-effort: on failure the worker simply
+                        // stays unpinned (see `pin_current_thread_to`).
+                        let cpu = pin_targets[index % pin_targets.len()];
                         let _ = youpipe_sys::pin_current_thread_to(cpu);
                     }
                     unsafe { main_loop(worker, thread_registry, index) };
