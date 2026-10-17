@@ -254,7 +254,11 @@ impl Registry {
         // defers the pop: idle passes rescan, and `Sleep::sleep`'s pre-park
         // true check (fence + `has_injected_jobs`) plus the JEC wake protocol
         // guarantee the job is seen. A hand-maintained length counter remains
-        // rejected — see the `injected_jobs` field doc.
+        // rejected — see the `injected_jobs` field doc. Measured 2026-10-18 in
+        // a double-controlled A/B (solo cherry-pick and main-revert sides
+        // agreeing): the gate costs ~+2.3% on mixed youpipe_stream_cpu/1K and
+        // buys nothing confirmed elsewhere; kept — the earlier −8% "win" was a
+        // layout artifact (benchmarks.md "fifth face of the lottery").
         if self.injected_jobs.is_empty() {
             return None;
         }

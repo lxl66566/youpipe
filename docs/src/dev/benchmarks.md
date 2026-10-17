@@ -1207,6 +1207,27 @@ Practical consequences:
   same flag in THEIR `.cargo/config.toml`, where it covers the whole
   dependency graph.
 
+A fifth face of the lottery (2026-10-18, review-fix campaign): the same
+commit compiled in two independent `bench_ab.sh` materializations swings
+too — cargo's metadata hash is path-dependent, so each materialized
+worktree path yields a differently-laid-out bench binary. The
+cancel/fence/async 1K pair family in `sync_fuse` swung ±2–7 % across
+independent same-commit builds: one session's +4.0 % *stable* 0/9
+"regression" of `cancel_pair_cpu_split/100000` measured −1.2 % in the
+next session's build of the identical commit; the tell was non-monotonic
+(with-shortcut and without-shortcut bins both slow while the merged bin
+is not — impossible for a semantic effect). Verdicts for that family
+need same-commit re-materialization cross-checks, not just interleaved
+rounds.
+
+Settled the same day by double-controlled A/B (solo cherry-pick and
+main-revert sides agreeing): the injector `is_empty()` advisory gate in
+`pop_injected_job` costs ~+2.3 % on `mixed_load/youpipe_stream_cpu/1000`
+and buys nothing measurable elsewhere — the −8 % first attributed to it
+was itself a branch-level layout artifact. Kept for now (within the
+pair-family noise band; the theory of skipping a locked op on idle
+passes still holds); revisit when next tuning the injector path.
+
 
 ## Horizontal cross-library comparison (2026-09)
 
