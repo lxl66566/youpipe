@@ -210,9 +210,10 @@ pub(super) trait RangeTryOp<T>: Sync {
 }
 
 /// `RangeTryOp` wrapper around a `FusedTryStage` chain. Only constructable
-/// when `S::MAY_FILTER == false` — the impl unwraps the `Option` from
-/// `FusedTryStage::try_apply` via `unreachable_unchecked`, keeping the leaf
-/// branch-free.
+/// when `S::MAY_FILTER == false` (the `try_collect` dispatches in fused.rs
+/// decide) — the impl routes through `FusedTryStage::try_apply_pure`, so no
+/// `Option` is ever constructed on this path, keeping the leaf branch-free
+/// (see `try_apply_pure` for the layout-sensitivity caveat).
 pub(super) struct FusedTryOp<S>(pub(super) S);
 
 impl<S, T> RangeTryOp<T> for FusedTryOp<S>
@@ -226,13 +227,7 @@ where
 
     #[inline]
     fn try_apply(&self, item: T) -> Result<S::Output, S::Error> {
-        // SAFETY: `FusedTryOp` is only constructed when `MAY_FILTER == false`,
-        // so `try_apply` always returns `Ok(Some(_))` on success.
-        match S::try_apply(&self.0, item) {
-            Ok(Some(o)) => Ok(o),
-            Ok(None) => unsafe { hint::unreachable_unchecked() },
-            Err(e) => Err(e),
-        }
+        self.0.try_apply_pure(item)
     }
 }
 
@@ -566,6 +561,39 @@ pub trait FusedTryStage<T> {
     /// * `Ok(None)` — item filtered out by an upstream `Filter`.
     /// * `Err(e)` — stage failed; abort the chain.
     fn try_apply(&self, item: T) -> Result<Option<Self::Output>, Self::Error>;
+
+    /// Apply the chain without the `Option` wrapper — the fallible mirror of
+    /// [`FusedStage::apply_pure`].
+    ///
+    /// Each stage threads the value through `prev.try_apply_pure(..)?`
+    /// directly, so no `Result<Option<_>, _>` is constructed or matched per
+    /// level. The no-`Option` guarantee rests on `Self::MAY_FILTER == false`
+    /// for the whole chain — enforced where `FusedTryOp` is constructed (the
+    /// `try_collect` dispatches in fused.rs branch on `MAY_FILTER` first).
+    ///
+    /// This path is codegen-layout sensitive (the `ErasedStrategy` comment in
+    /// fused.rs records +16…30 % regressions from unrelated layout shifts):
+    /// a no-regression verdict needs the same-binary interleaved-recompile
+    /// A/B procedure. The bench suite has no fallible pure-path id yet —
+    /// verification debt, to be covered when one is added.
+    ///
+    /// # Panics
+    ///
+    /// May panic (the try leaf's `LeafCleanup` guard runs the unwind
+    /// cleanup); the first `Err` from the chain propagates as `Err`.
+    #[inline]
+    fn try_apply_pure(&self, item: T) -> Result<Self::Output, Self::Error> {
+        // SAFETY: contract — only call `try_apply_pure` when
+        // `Self::MAY_FILTER` is false throughout the chain; the `FusedTryOp`
+        // construction sites enforce this.
+        match self.try_apply(item) {
+            Ok(Some(v)) => Ok(v),
+            // SAFETY: caller guarantees `MAY_FILTER = false`, so this is
+            // unreachable.
+            Ok(None) => unsafe { hint::unreachable_unchecked() },
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl<T> FusedTryStage<T> for Identity {
@@ -575,6 +603,11 @@ impl<T> FusedTryStage<T> for Identity {
     #[inline]
     fn try_apply(&self, item: T) -> Result<Option<T>, std::convert::Infallible> {
         Ok(Some(item))
+    }
+
+    #[inline]
+    fn try_apply_pure(&self, item: T) -> Result<T, std::convert::Infallible> {
+        Ok(item)
     }
 }
 
@@ -594,6 +627,11 @@ where
             Some(v) => Ok(Some((self.f)(v))),
             None => Ok(None),
         }
+    }
+
+    #[inline]
+    fn try_apply_pure(&self, item: I) -> Result<O, E> {
+        Ok((self.f)(self.prev.try_apply_pure(item)?))
     }
 }
 
@@ -620,6 +658,8 @@ where
             None => Ok(None),
         }
     }
+    // No `try_apply_pure` override: `Filter` always has `MAY_FILTER = true`,
+    // so the pure path is never taken through a `Filter` chain.
 }
 
 impl<Prev, F, I, O, E> FusedTryStage<I> for TryMap<Prev, F>
@@ -641,6 +681,11 @@ where
             },
             None => Ok(None),
         }
+    }
+
+    #[inline]
+    fn try_apply_pure(&self, item: I) -> Result<O, E> {
+        (self.f)(self.prev.try_apply_pure(item)?)
     }
 }
 
@@ -677,6 +722,13 @@ where
         // satisfy the trait's associated type.
         Ok(self.0.apply(item))
     }
+
+    #[inline]
+    fn try_apply_pure(&self, item: T) -> Result<S::Output, E> {
+        // `MAY_FILTER` is inherited from the infallible side, so both pure
+        // paths stand or fall together.
+        Ok(self.0.apply_pure(item))
+    }
 }
 
 /// Error-conversion stage: wraps a fallible chain and maps `E1` to `E2`. Used
@@ -708,6 +760,14 @@ where
     #[inline]
     fn try_apply(&self, item: I) -> Result<Option<Prev::Output>, E2> {
         match self.prev.try_apply(item) {
+            Ok(v) => Ok(v),
+            Err(e) => Err((self.f)(e)),
+        }
+    }
+
+    #[inline]
+    fn try_apply_pure(&self, item: I) -> Result<Prev::Output, E2> {
+        match self.prev.try_apply_pure(item) {
             Ok(v) => Ok(v),
             Err(e) => Err((self.f)(e)),
         }
