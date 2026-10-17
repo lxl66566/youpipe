@@ -43,10 +43,10 @@ pub(crate) fn batch_recv_cap() -> usize {
 
 // Worker-side batch burst helpers (todo #1 residual (d)); crate-internal.
 pub use channel::{
-    AsyncReceiver, AsyncRecvItem, AsyncSender, ChannelError, MpscAsyncReceiver, MpscAsyncSender,
-    MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, Sender, SyncReceiver, SyncSender,
-    TryRecvError, TryRecvItem, TrySendError, WakerSlot, async_channel, channel, mpsc_async_channel,
-    mpsc_channel, sync_async_channel,
+    AsyncReceiver, AsyncRecvItem, AsyncSendItem, AsyncSender, ChannelError, MpscAsyncReceiver,
+    MpscAsyncSender, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, Sender, SyncReceiver,
+    SyncSender, TryRecvError, TryRecvItem, TrySendError, WakerSlot, async_channel, channel,
+    mpsc_async_channel, mpsc_channel, sync_async_channel,
 };
 pub(crate) use channel::{Claim, claim_poll};
 #[cfg(feature = "tokio-runtime")]

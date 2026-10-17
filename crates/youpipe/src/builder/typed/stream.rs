@@ -20,7 +20,7 @@ use super::{
 };
 #[cfg(feature = "tokio-runtime")]
 use crate::handoff::{
-    AsyncReceiver, AsyncRecvItem, MpscAsyncReceiver, MpscAsyncSender, ShardedAsyncReceiver,
+    AsyncReceiver, AsyncRecvItem, AsyncSendItem, MpscAsyncReceiver, ShardedAsyncReceiver,
     WakerSlot, async_channel, mpsc_async_channel, sharded_mpsc_async_channel, sync_async_channel,
 };
 #[cfg(feature = "tokio-runtime")]
@@ -2769,54 +2769,22 @@ where
     let buffer = ctx.stage_buffer(opts.buffer, concurrency);
     ctx.note_in_flight(concurrency); // one in-flight item per consumer task
     let (a_out_tx, a_out_rx) = async_channel::<(u64, M)>(buffer);
-    let pool = ctx.acquire_async().expect("failed to build async runtime");
-    let f = Arc::new(f);
-    let cancel = ctx.cancel.clone();
-    let fail = ctx.async_panic_slot();
-    for _ in 0..concurrency {
-        let f = f.clone();
-        let rx = a_in_rx.clone();
-        let tx = a_out_tx.clone();
-        let c = cancel.clone();
-        let slot = fail.clone();
-        // Spawn via the runtime-agnostic backend. `pool.spawn` is the explicit
-        // spawn — it does not depend on a TLS current-runtime context, so no
-        // `enter()` guard is needed (a future non-tokio backend's scoped-tls
-        // `enter` would have no RAII guard anyway).
-        pool.spawn(CatchTaskPanic {
-            fut: async move {
-                // Cross-episode waker-node slots (P-4): per task, not per
-                // item — a parked recv/send reuses its node instead of
-                // allocating a fresh one per park episode.
-                let mut rx_slot = WakerSlot::new();
-                let mut tx_slot = WakerSlot::new();
-                loop {
-                    let Ok((seq, item)) = rx.recv_cached(&mut rx_slot).await else {
-                        break;
-                    };
-                    if cancel_active(c.as_ref()) {
-                        break;
-                    }
-                    let out = f(item).await;
-                    if tx.send_cached((seq, out), &mut tx_slot).await.is_err() {
-                        break;
-                    }
-                }
-            },
-            slot,
-        });
-    }
-    drop(a_out_tx);
-    drop(a_in_rx);
+    let mut senders: Vec<_> = (0..concurrency.saturating_sub(1))
+        .map(|_| a_out_tx.clone())
+        .collect();
+    senders.push(a_out_tx);
+    spawn_async_terminal_tasks(f, a_in_rx, ctx, senders);
     a_out_rx
 }
 
 /// Spawn one async consumer task per provided output sender: the task loop
-/// is shared verbatim between the single-channel and sharded terminal shapes
-/// — only the sender set differs (one `MpscAsyncSender` clone per task for
-/// the shared ring vs one shard sender per task group). The sender side
-/// stays async (`send().await`): the producers are runtime tasks, not OS
-/// threads — a blocking send would stall the runtime worker.
+/// is shared verbatim across the async channel shapes — the mid-stage MPMC
+/// channel ([`spawn_async_consumers_body`], one `AsyncSender` clone per
+/// task), the single MPSC terminal ring, and its sharded variant (one
+/// `MpscAsyncSender` per task or task group) — only the sender set
+/// differs. The sender side stays async (`send().await`): the producers
+/// are runtime tasks, not OS threads — a blocking send would stall the
+/// runtime worker.
 #[cfg(feature = "tokio-runtime")]
 #[allow(clippy::needless_pass_by_value)] // `f` is moved into the `Arc` shared
 // across consumer tasks; taking it by value expresses "this is the last stop
@@ -2832,7 +2800,8 @@ fn spawn_async_terminal_tasks<F, In, M, Fut, R, I>(
     In: Send + Unpin + 'static,
     M: Send + Unpin + 'static,
     R: AsyncRuntime,
-    I: IntoIterator<Item = MpscAsyncSender<(u64, M)>>,
+    I: IntoIterator,
+    I::Item: AsyncSendItem<(u64, M)>,
 {
     let pool = ctx.acquire_async().expect("failed to build async runtime");
     let f = Arc::new(f);
@@ -2843,6 +2812,10 @@ fn spawn_async_terminal_tasks<F, In, M, Fut, R, I>(
         let rx = a_in_rx.clone();
         let c = cancel.clone();
         let slot = fail.clone();
+        // Spawn via the runtime-agnostic backend. `pool.spawn` is the explicit
+        // spawn — it does not depend on a TLS current-runtime context, so no
+        // `enter()` guard is needed (a future non-tokio backend's scoped-tls
+        // `enter` would have no RAII guard anyway).
         pool.spawn(CatchTaskPanic {
             fut: async move {
                 // Cross-episode waker-node slots (P-4): per task, not per

@@ -695,6 +695,44 @@ pub trait AsyncRecvItem<T> {
     fn try_recv(&self) -> Result<T, TryRecvError>;
 }
 
+/// Async counterpart to [`SendItem`]: the cached-park send used by async
+/// consumer task loops. Both [`AsyncSender`] (MPMC backing) and
+/// [`MpscAsyncSender`] (MPSC backing) implement this so the consumer task
+/// loop is written once for the mid-channel and terminal channel shapes.
+pub trait AsyncSendItem<T>: Clone + Send + 'static {
+    /// Deliver `item`, waiting for space. Resolves to
+    /// `Err(ChannelError::Closed)` once every receiver has been dropped.
+    /// `slot` is the cross-episode waker-node reuse (one per task, see
+    /// [`AsyncRecvItem::recv_cached`]).
+    fn send_cached<'s>(
+        &'s self,
+        item: T,
+        slot: &'s mut WakerSlot,
+    ) -> impl Future<Output = Result<(), ChannelError>> + Send;
+}
+
+impl<T: Send + Unpin + 'static> AsyncSendItem<T> for AsyncSender<T> {
+    #[inline]
+    async fn send_cached<'s>(
+        &'s self,
+        item: T,
+        slot: &'s mut WakerSlot,
+    ) -> Result<(), ChannelError> {
+        AsyncSender::send_cached(self, item, slot).await
+    }
+}
+
+impl<T: Send + Unpin + 'static> AsyncSendItem<T> for MpscAsyncSender<T> {
+    #[inline]
+    async fn send_cached<'s>(
+        &'s self,
+        item: T,
+        slot: &'s mut WakerSlot,
+    ) -> Result<(), ChannelError> {
+        MpscAsyncSender::send_cached(self, item, slot).await
+    }
+}
+
 impl<T: Send + Unpin + 'static> AsyncRecvItem<T> for AsyncReceiver<T> {
     #[inline]
     async fn recv(&self) -> Result<T, ChannelError> {
