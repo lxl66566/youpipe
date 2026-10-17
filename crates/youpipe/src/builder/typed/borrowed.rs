@@ -94,7 +94,7 @@ where
 /// stack-local data without [`scope`](crate::scope) — soundness rests on the
 /// terminal blocking until every worker finishes (same invariant as
 /// [`ScopedPipe`](crate::ScopedPipe)).
-pub struct PipeRef<'a, S = Identity, T = (), O = ()> {
+pub struct PipeRef<'a, S, T, O> {
     items: &'a [T],
     stages: S,
     config: PipelineConfig,
@@ -448,7 +448,7 @@ where
 /// closure bounds.
 ///
 /// The error type `E` must be `'static` (see [`PipeRef::try_map`]).
-pub struct TryPipeRef<'a, S = Identity, T = (), O = (), E = std::convert::Infallible> {
+pub struct TryPipeRef<'a, S, T, O, E = std::convert::Infallible> {
     items: &'a [T],
     stages: S,
     config: PipelineConfig,

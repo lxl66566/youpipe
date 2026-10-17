@@ -3412,7 +3412,7 @@ where
 ///
 /// Separating `I` and `O` is what lets type-changing maps like
 /// `.map(i32 -> String)` then `.map(String -> usize)` type-check end to end.
-pub struct Pipe<S = Identity, I = (), O = ()> {
+pub struct Pipe<S, I, O> {
     items: Vec<I>,
     stages: S,
     config: PipelineConfig,
@@ -4059,7 +4059,7 @@ where
 /// The error type `E` is fixed across the chain — every subsequent `try_map`
 /// must produce the same `E` (use `.map_err()` to convert). `map` and `filter`
 /// are also supported: their effects compose with `Result` via `?`.
-pub struct TryPipe<S = Identity, I = (), O = (), E = std::convert::Infallible> {
+pub struct TryPipe<S, I, O, E = std::convert::Infallible> {
     items: Vec<I>,
     stages: S,
     config: PipelineConfig,
@@ -4235,10 +4235,20 @@ where
         let pool = exec.as_pool();
         let num_threads = pool.num_workers();
         if prefers_serial(n, num_threads) {
+            // Trivial case (n == 1 or single-threaded pool): skip the pool.
+            // Dispatch on `MAY_FILTER` so the pure path matches a
+            // hand-written `iter().map().collect()` — no `Option` wrapper
+            // (mirror of `Pipe::collect`'s serial branch).
             let mut out = Vec::with_capacity(n);
-            for item in items {
-                if let Some(o) = stages.try_apply(item)? {
-                    out.push(o);
+            if S::MAY_FILTER {
+                for item in items {
+                    if let Some(o) = stages.try_apply(item)? {
+                        out.push(o);
+                    }
+                }
+            } else {
+                for item in items {
+                    out.push(stages.try_apply_pure(item)?);
                 }
             }
             return Ok(out);
@@ -6015,10 +6025,18 @@ where
     }
     let num_threads = pool.num_workers();
     if prefers_serial(n, num_threads) {
+        // Dispatch on `MAY_FILTER` so the pure path skips the `Option`
+        // (mirror of `Pipe::collect`'s serial branch).
         let mut out = Vec::with_capacity(n);
-        for item in items {
-            if let Some(o) = stages.try_apply(item)? {
-                out.push(o);
+        if S::MAY_FILTER {
+            for item in items {
+                if let Some(o) = stages.try_apply(item)? {
+                    out.push(o);
+                }
+            }
+        } else {
+            for item in items {
+                out.push(stages.try_apply_pure(item)?);
             }
         }
         return Ok(out);
@@ -6302,10 +6320,18 @@ where
     }
     let num_threads = pool.num_workers();
     if prefers_serial(n, num_threads) {
+        // Dispatch on `MAY_FILTER` so the pure path skips the `Option`
+        // (mirror of `Pipe::collect`'s serial branch).
         let mut out = Vec::with_capacity(n);
-        for item in input {
-            if let Some(o) = stages.try_apply(item)? {
-                out.push(o);
+        if S::MAY_FILTER {
+            for item in input {
+                if let Some(o) = stages.try_apply(item)? {
+                    out.push(o);
+                }
+            }
+        } else {
+            for item in input {
+                out.push(stages.try_apply_pure(item)?);
             }
         }
         return Ok(out);
