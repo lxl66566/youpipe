@@ -285,8 +285,9 @@ Integration points (all behind the one knob, cap clamped 2..=4096, default
 batch claim then a single per-item `try_recv` probe to resolve the
 inconclusive 0-claim into Empty/Closed — the collector is the sole
 consumer, so the probe runs once per burst gap, not under a polling
-crowd), the worker/fence-forwarder burst phase (`claim_poll` →
-`anchor_claim` in `handoff/channel.rs` — batch first, anchor on miss; a
+crowd), the worker/fence-forwarder burst phase (`claim_poll` in
+`handoff/channel.rs`, wrapped by `anchor_claim` in
+`builder/typed/stream.rs` — batch first, anchor on miss; a
 0-claim resolves Empty via one `is_disconnected` tx-count load instead of a
 second ring walk, review P-6: 1.24–1.52x more empty polls/s under 4/8/16
 pollers, `Closed` verdicts still flow through `try_recv`'s final drain),
