@@ -559,6 +559,30 @@ pub trait SendItem<T>: Clone + Send + 'static {
     /// `Err(TrySendError::Closed(item))` when every receiver is gone. Used by
     /// batch senders that park at most once per batch instead of per item.
     fn try_send(&self, item: T) -> Result<(), TrySendError<T>>;
+
+    /// Non-blocking batch send of the longest sendable prefix of `values`;
+    /// returns the count sent (0 = nothing sendable right now — full or
+    /// closed; fall back to per-item `send` to distinguish). Every slot is
+    /// initialized on entry; the sent prefix is moved out and the remainder
+    /// stays initialized. Default: per-item `try_send`, parking never.
+    fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
+        let mut n = 0;
+        while n < values.len() {
+            // SAFETY: only the sent prefix [..n) is ever moved out, so slot
+            // `n` is still initialized.
+            let item = unsafe { values[n].assume_init_read() };
+            match self.try_send(item) {
+                Ok(()) => n += 1,
+                Err(TrySendError::Full(item) | TrySendError::Closed(item)) => {
+                    // SAFETY: the handed-back item re-initializes the slot it
+                    // was read from.
+                    values[n].write(item);
+                    break;
+                },
+            }
+        }
+        n
+    }
 }
 
 impl<T: Send + 'static> SendItem<T> for SyncSender<T> {
@@ -570,6 +594,11 @@ impl<T: Send + 'static> SendItem<T> for SyncSender<T> {
     #[inline]
     fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         SyncSender::try_send(self, item)
+    }
+
+    #[inline]
+    fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
+        SyncSender::try_send_batch(self, values)
     }
 }
 

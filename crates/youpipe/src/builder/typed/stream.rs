@@ -607,9 +607,11 @@ fn anchor_claim<T: Send + 'static>(
 /// `YOUPIPE_FWD_BATCH`).
 ///
 /// `batched == false`: one blocking `send` per item (baseline).
-/// `batched == true`: `try_send` back-to-back and park only on the rare
-/// `Full` — once per full ring, not per item. The fence-output channel is
-/// the serial-supplier→crowd interface where a per-item blocking send
+/// `batched == true`: `try_send_batch` claims the longest sendable prefix
+/// with one tail CAS per run (falling back to per-item `try_send` on
+/// backings without a native batch op) and parks only on the unsent
+/// remainder — once per full ring, not per item. The fence-output channel
+/// is the serial-supplier→crowd interface where a per-item blocking send
 /// serializes a wake RTT into every item under a crowd of downstream
 /// workers.
 ///
@@ -632,6 +634,15 @@ fn fence_batch_send<T: Send + 'static, Tx: SendItem<T>>(
         }
         return true;
     }
+    // Stage in place: each slot is written by moving out of `batch` and is
+    // either sent (slot moved out) or written back below — `batch` is left
+    // holding exactly the unsent remainder.
+    let mut staged: Vec<std::mem::MaybeUninit<T>> =
+        batch.drain(..).map(std::mem::MaybeUninit::new).collect();
+    let sent = tx.try_send_batch(&mut staged);
+    // SAFETY: only [..sent) was moved out by the batch send; every slot
+    // from `sent` on is still initialized.
+    batch.extend(unsafe { staged[sent..].iter_mut().map(|s| s.assume_init_read()) });
     while let Some(it) = batch.pop() {
         match tx.try_send(it) {
             Ok(()) => {},
