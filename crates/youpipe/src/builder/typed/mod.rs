@@ -8,6 +8,8 @@ pub(crate) use self::fused::{
     fused_collect_scoped, fused_fold_scoped, fused_for_each_scoped, fused_reduce_scoped,
     fused_try_collect_scoped, fused_try_fold_scoped, fused_try_reduce_scoped, resolve_exec_pool,
 };
+// Reducer wrappers for the scoped aggregation terminals (see builder/mod.rs).
+pub(crate) use self::traits::{CountReducer, OptionReducer, SumReducer};
 pub use self::{
     borrowed::{PipeRef, TryPipeRef, pipe_ref},
     fused::{Pipe, RangePipe, TryPipe, pipe, pipe_range},

@@ -47,7 +47,8 @@ fn skewed(size: usize) -> Vec<(u64, u32)> {
 fn main() {
     let items = skewed(SIZE);
 
-    // ── youpipe: default Balanced (4× oversplit) ──
+    // ── youpipe: default Balanced (adaptive oversplit: 1× below the
+    // 1024-items-per-worker threshold, 4× above) ──
     let yp_balanced_start = Instant::now();
     let yp_balanced: Vec<u64> = items
         .clone()
@@ -56,7 +57,8 @@ fn main() {
         .collect();
     let yp_balanced_elapsed = yp_balanced_start.elapsed();
 
-    // ── youpipe: Unbalanced (8× oversplit, finer task granularity) ──
+    // ── youpipe: Unbalanced (32× oversplit + extra top-level chunks, finer
+    // task granularity) ──
     let yp_unbal_start = Instant::now();
     let yp_unbal: Vec<u64> = items
         .clone()
@@ -98,9 +100,9 @@ fn main() {
         yp_b[0],
         yp_b[SIZE - 1]
     );
-    println!("  youpipe pipe() Balanced:    {yp_balanced_elapsed:>10.3?}   (4× oversplit)");
+    println!("  youpipe pipe() Balanced:    {yp_balanced_elapsed:>10.3?}   (adaptive oversplit)");
     println!(
-        "  youpipe pipe() Unbalanced:  {yp_unbal_elapsed:>10.3?}   (8× oversplit, finer stealing)"
+        "  youpipe pipe() Unbalanced:  {yp_unbal_elapsed:>10.3?}   (32× oversplit, finer stealing)"
     );
     println!("  rayon   par_iter:           {rn_elapsed:>10.3?}   (work-stealing baseline)");
     println!("  std     iter():             {seq_elapsed:>10.3?}   (single-threaded baseline)");

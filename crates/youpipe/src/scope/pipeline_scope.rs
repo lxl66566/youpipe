@@ -2,10 +2,10 @@ use std::marker::PhantomData;
 
 use crate::{
     builder::{
-        Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, PipelineConfig,
-        StageMarker, SyncMap, TryMap, Workload, fused_collect_scoped, fused_fold_scoped,
-        fused_for_each_scoped, fused_reduce_scoped, fused_try_collect_scoped,
-        fused_try_fold_scoped, fused_try_reduce_scoped,
+        CountReducer, Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr,
+        OptionReducer, PipelineConfig, StageMarker, SumReducer, SyncMap, TryMap, Workload,
+        fused_collect_scoped, fused_fold_scoped, fused_for_each_scoped, fused_reduce_scoped,
+        fused_try_collect_scoped, fused_try_fold_scoped, fused_try_reduce_scoped,
     },
     executor::compute::ComputePool,
 };
@@ -613,7 +613,13 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        fused_reduce_scoped(self.items, self.stages, op, self.config.workload, pool)
+        fused_reduce_scoped(
+            self.items,
+            self.stages,
+            OptionReducer(op),
+            self.config.workload,
+            pool,
+        )
     }
 
     /// Execute the fused pipeline, folding outputs into an accumulator of a
@@ -645,6 +651,83 @@ where
             self.config.workload,
             pool,
         )
+    }
+
+    /// Execute the fused pipeline and sum the outputs — the zero-copy
+    /// `.map(f).sum()` shape (see [`Pipe::sum`](crate::Pipe::sum)). Empty
+    /// input folds to the additive identity ([`Sum`](std::iter::Sum) over an
+    /// empty iterator).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain.
+    pub fn sum(self) -> O
+    where
+        O: std::iter::Sum + Send,
+    {
+        let exec = crate::builder::resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        fused_reduce_scoped(
+            self.items,
+            self.stages,
+            SumReducer(PhantomData),
+            self.config.workload,
+            pool,
+        )
+    }
+
+    /// Execute the fused pipeline and count the outputs (post-filter) — no
+    /// output buffer (see [`Pipe::count`](crate::Pipe::count)). The stage
+    /// chain still runs on every item.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain.
+    pub fn count(self) -> usize {
+        let exec = crate::builder::resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        );
+        let pool = exec.as_pool();
+        fused_reduce_scoped(
+            self.items,
+            self.stages,
+            CountReducer,
+            self.config.workload,
+            pool,
+        )
+    }
+
+    /// Execute the fused pipeline and return the minimum output —
+    /// `reduce(Ord::min)` (see [`reduce`](Self::reduce)). Returns `None` for
+    /// an empty (or fully filtered) input.
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain.
+    pub fn min(self) -> Option<O>
+    where
+        O: Ord,
+    {
+        self.reduce(Ord::min)
+    }
+
+    /// Execute the fused pipeline and return the maximum output —
+    /// `reduce(Ord::max)` (see [`min`](Self::min)).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any panic raised by the stage chain.
+    pub fn max(self) -> Option<O>
+    where
+        O: Ord,
+    {
+        self.reduce(Ord::max)
     }
 }
 
@@ -820,5 +903,58 @@ mod tests {
         });
         let expected: Vec<i32> = (0..1000).map(|x| x * 5).collect();
         assert_eq!(result, expected);
+    }
+
+    /// The aggregation conveniences (`sum`/`count`/`min`/`max`) mirror the
+    /// `PipeRef` surface: parallel path (n > 1, multi-core), filter chains,
+    /// and the serial/empty edges.
+    #[test]
+    fn test_scope_aggregation_conveniences() {
+        let table: Vec<u64> = (1..=100).collect();
+
+        // Parallel no-filter path.
+        let sum: u64 = scope(|s| s.pipe(0..table.len()).map(|i: usize| table[i]).sum());
+        assert_eq!(sum, 5050);
+        let count = scope(|s| s.pipe(0..table.len()).map(|i: usize| table[i]).count());
+        assert_eq!(count, 100);
+        assert_eq!(
+            scope(|s| s.pipe(0..table.len()).map(|i: usize| table[i]).min()),
+            Some(1)
+        );
+        assert_eq!(
+            scope(|s| s.pipe(0..table.len()).map(|i: usize| table[i]).max()),
+            Some(100)
+        );
+
+        // Filter chain: count/min/max honour post-filter survivors.
+        let evens = scope(|s| {
+            s.pipe(table.iter().copied())
+                .filter(|v: &u64| v % 2 == 0)
+                .count()
+        });
+        assert_eq!(evens, 50);
+        let min_even = scope(|s| {
+            s.pipe(table.iter().copied())
+                .filter(|v: &u64| v % 2 == 0)
+                .min()
+        });
+        assert_eq!(min_even, Some(2));
+        let sum_evens: u64 = scope(|s| {
+            s.pipe(table.iter().copied())
+                .filter(|v: &u64| v % 2 == 0)
+                .sum()
+        });
+        assert_eq!(sum_evens, (2..=100).step_by(2).sum::<u64>());
+
+        // Empty input folds to the aggregator identity.
+        let empty: Vec<u64> = vec![];
+        let empty_sum: u64 = scope(|s| s.pipe(empty.iter().copied()).sum());
+        assert_eq!(empty_sum, 0);
+        assert_eq!(scope(|s| s.pipe(empty.iter().copied()).count()), 0);
+        assert_eq!(scope(|s| s.pipe(empty.iter().copied()).min()), None);
+
+        // Single-item batch (serial shortcut path).
+        let one: Vec<u64> = vec![7];
+        assert_eq!(scope(|s| s.pipe(one.iter().copied()).max()), Some(7));
     }
 }

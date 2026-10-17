@@ -552,7 +552,9 @@ where
     // was a wash; hybrid keeps its small/medium-N win (parallel ramp-up) while
     // avoiding its large-N regression (only `num_threads` items through the
     // injector, not `N`). Works for on-pool callers too: the dispatcher picks
-    // a work-stealing `Stealing` latch for them (see `hybrid_dispatch`).
+    // a work-stealing `Stealing` latch for them when `YOUPIPE_ONPOOL_HYBRID`
+    // enables the hybrid path (default: the single tree — see
+    // `hybrid_dispatch` / `onpool_hybrid_mode`).
     let strategy = CollectStrategy {
         output: &output,
         op,
@@ -1479,10 +1481,11 @@ fn hybrid_num_chunks(n: usize, plan: SplitPlan, num_threads: usize) -> usize {
 /// until all complete. The `reserve` tail chunks (small batches only) are
 /// never injected — the driver executes them from its wait loop instead.
 ///
-/// On-pool callers (a worker of this pool) take the hybrid path only for
-/// large batches (`chunk_splits > 0`), waiting through a work-stealing
-/// `Stealing` latch; small batches shortcut to the single tree inside (see
-/// the body for the measured regime split).
+/// On-pool callers (a worker of this pool) take the single tree unless the
+/// `YOUPIPE_ONPOOL_HYBRID` knob enables the hybrid path for large batches
+/// (`chunk_splits > 0`), which then waits through a work-stealing `Stealing`
+/// latch; small batches always shortcut to the single tree inside (see the
+/// body for the measured regime split).
 ///
 /// Returns `Err(first_failure)` if any chunk (driver or pool) failed (after
 /// the strategy has cleaned up the successful chunks' per-chunk resources so
@@ -1599,8 +1602,8 @@ where
     // — the same call the pre-hybrid on-pool path made directly. Panics
     // unwind out of `run_chunk` (leaf guards clean partial state) exactly
     // as they did through the `par_*_rec` calls; op failures return through
-    // the erased boundary, which the call sites already downcast (the
-    // `Op(Box<TryFailure<E>>)` shape is the try strategies' own).
+    // the erased boundary, which the call sites already downcast (`into_erased`
+    // boxes the bare `E`, so every try call site downcasts `Op(Box<E>)`).
     let mode = onpool_hybrid_mode();
     if owner.is_some() && (driver_participates || mode == OnpoolHybrid::Off) {
         return unsafe { (strategy.run_chunk)(strategy.ctx, pool, input, 0, n, plan.depth) };
@@ -1864,7 +1867,8 @@ where
     // the small/medium-N ramp-up win while each chunk recurses via the tree
     // (distributed deques + stealing), avoiding the single-injector MPMC
     // contention that sank pure flat at large N. On-pool callers get the
-    // work-stealing `Stealing` latch (see `hybrid_dispatch`).
+    // work-stealing `Stealing` latch when `YOUPIPE_ONPOOL_HYBRID` enables the
+    // hybrid path (default: the single tree — see `onpool_hybrid_mode`).
     let strategy = SinkStrategy { op };
     let result = hybrid_dispatch(
         pool,
@@ -2757,7 +2761,8 @@ where
 /// Hybrid flat/tree dispatch (shared with `collect` / `for_each` via
 /// [`TryStrategy`]): `num_threads` broad chunks injected in one
 /// `inject_batch`, every worker busy at t≈0 — no fork/join ramp-up. On-pool
-/// callers get the work-stealing `Stealing` latch (see `hybrid_dispatch`).
+/// callers keep the single tree unless `YOUPIPE_ONPOOL_HYBRID` enables the
+/// hybrid path (see `hybrid_dispatch` / `onpool_hybrid_mode`).
 fn par_index_try_collect<T, R, E, OP>(
     items: Vec<T>,
     op: &OP,
@@ -4780,7 +4785,8 @@ where
     let output = Slots::<R>::uninit(n);
 
     // Same hybrid dispatch as the owned path — see `par_index_collect`
-    // (on-pool callers included, via the `Stealing` latch).
+    // (on-pool callers included when `YOUPIPE_ONPOOL_HYBRID` enables the
+    // hybrid path; default: the single tree).
     let strategy = CollectByRefStrategy {
         output: &output,
         op,
@@ -4889,7 +4895,8 @@ where
     let num_threads = pool.num_workers();
 
     // Same hybrid dispatch as the owned path — see `par_for_each` (on-pool
-    // callers included, via the `Stealing` latch).
+    // callers included when `YOUPIPE_ONPOOL_HYBRID` enables the hybrid path;
+    // default: the single tree).
     let strategy = SinkByRefStrategy { op };
     let result = hybrid_dispatch(
         pool,
@@ -5042,7 +5049,8 @@ where
     let output = Slots::<R>::uninit(n);
 
     // Same hybrid dispatch as the owned path — see `par_index_try_collect`
-    // (on-pool callers included, via the `Stealing` latch).
+    // (on-pool callers included when `YOUPIPE_ONPOOL_HYBRID` enables the
+    // hybrid path; default: the single tree).
     let strategy = TryByRefStrategy {
         output: &output,
         op,
@@ -6027,40 +6035,44 @@ where
 /// `pub(crate)` entry point for the scoped reduce terminal — the
 /// [`fused_collect_scoped`] counterpart: same dispatch logic as
 /// `Pipe::reduce` without the `'static` bounds on the stage chain (driven
-/// by `crate::scope::ScopedPipe::reduce`). Soundness rests on the same
-/// `ComputePool::join` invariant as [`fused_collect_scoped`].
-pub(crate) fn fused_reduce_scoped<S, T, F>(
+/// by `crate::scope::ScopedPipe`'s reduce/sum/count terminals). Soundness
+/// rests on the same `ComputePool::join` invariant as
+/// [`fused_collect_scoped`].
+pub(crate) fn fused_reduce_scoped<S, T, R>(
     items: Vec<T>,
     stages: S,
-    op: F,
+    reducer: R,
     workload: Workload,
     pool: &ComputePool,
-) -> Option<S::Output>
+) -> R::Acc
 where
     S: FusedStage<T> + Sync,
     T: Send,
     S::Output: Send,
-    F: Fn(S::Output, S::Output) -> S::Output + Sync,
+    R: Reducer<S::Output>,
 {
     let n = items.len();
     if n == 0 {
-        return None;
+        return reducer.identity();
     }
     let num_threads = pool.num_workers();
     if prefers_serial(n, num_threads) {
+        let mut acc = reducer.identity();
         if S::MAY_FILTER {
-            return items
-                .into_iter()
-                .filter_map(|item| stages.apply(item))
-                .reduce(op);
+            for item in items {
+                if let Some(o) = stages.apply(item) {
+                    acc = reducer.fold(acc, o);
+                }
+            }
+        } else {
+            for item in items {
+                acc = reducer.fold(acc, stages.apply_pure(item));
+            }
         }
-        return items
-            .into_iter()
-            .map(|item| stages.apply_pure(item))
-            .reduce(op);
+        return acc;
     }
     let plan = SplitPlan::new(n, num_threads, workload);
-    let rop = FusedReduce(stages, OptionReducer(op));
+    let rop = FusedReduce(stages, reducer);
     par_reduce(items, &rop, plan, pool)
 }
 

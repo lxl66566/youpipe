@@ -248,40 +248,11 @@ impl<S, I, O> Pipe<S, I, O> {
 
 `.collect()` dispatches on `S::MAY_FILTER`:
 
-- **`MAY_FILTER == false`** — the index-based fast path. Input + output `Slots`
-  are allocated once, then the top-level dispatcher splits `[0, n)` into
-  **`num_threads` contiguous chunks** stored in a single `Box<[ChunkJob]>` (one
-  heap allocation for all chunks, not per-chunk `Box`es) and injects them in a
-  single `inject_batch` (hybrid flat/tree dispatch — see `hybrid_dispatch`).
-  Every pool worker pops a chunk on its first `find_work`, so all workers are
-  busy from t≈0 — no fork/join ramp-up. Each chunk then recurses via
-  `ComputePool::join` (the per-chunk tree uses distributed local deques +
-  stealing, avoiding the single-injector MPMC contention that sank pure flat
-  dispatch). Each leaf receives `&[T]` / `&mut [R]` slice views and runs the
-  `RangeOp` (`FusedOp(stages)`) through `apply_pure` — branch-free and
-  vectorizable. Workload selects the oversplit factor per
-[`Workload`](#workload--per-item-cost-distribution-hint). The hybrid
-[`Workload`](#workload--per-item-cost-distribution-hint). On-pool callers
-  (a worker of the *same* pool — `pool.submit` tasks, stream stage closures,
-  nested `scope`/`run()`) take the same hybrid path for large batches
-  (`chunk_splits > 0`): the dispatcher hands
-  `ComputePool::on_this_pool_owner` to `CountLatch::with_count`, whose
-  `Stealing` variant waits through the work-stealing `wait_until` loop
-  (parking, if at all, via the sleep module's latch protocol) instead of a
-  condvar the caller's own pool would have to service. Small batches keep
-  the single-tree shortcut inside the dispatcher — P concurrent nested
-  small batches would otherwise flood the global injector (+430 % measured;
-  see the regime comment in `hybrid_dispatch`), while a single nested large
-  batch wins −3.5 % (same-binary knob A/B). `YOUPIPE_ONPOOL_HYBRID=0`
-  restores the always-tree behaviour.
-  The dispatcher is generic only over the item type: the per-terminal
-  strategy (`CollectStrategy` / `SinkStrategy` / `TryStrategy`) crosses a
-  type-erased `ErasedStrategy` boundary (three fn pointers + a context
-  pointer). This is deliberate — a per-strategy monomorphized dispatcher
-  measurably regressed the untouched collect path via codegen-layout shifts
-  (+16…30 % at 10k–100k, A/B-measured), while the erased dispatcher compiles
-  once and its ~`num_threads` indirect calls per run are far off the hot
-  path.
+- **`MAY_FILTER == false`** — the index-based fast path. Input + output `Slots` are allocated once, then the top-level dispatcher splits `[0, n)` into **`num_threads` contiguous chunks** stored in a single `Box<[ChunkJob]>` (one heap allocation for all chunks, not per-chunk `Box`es) and injects them in a single `inject_batch` (hybrid flat/tree dispatch — see `hybrid_dispatch`). Every pool worker pops a chunk on its first `find_work`, so all workers are busy from t≈0 — no fork/join ramp-up. Each chunk then recurses via `ComputePool::join` (the per-chunk tree uses distributed local deques + stealing, avoiding the single-injector MPMC contention that sank pure flat dispatch). Each leaf receives `&[T]` / `&mut [R]` slice views and runs the `RangeOp` (`FusedOp(stages)`) through `apply_pure` — branch-free and vectorizable. Workload selects the oversplit factor per [`Workload`](#workload--per-item-cost-distribution-hint).
+
+  On-pool callers (a worker of the *same* pool — `pool.submit` tasks, stream stage closures, nested `scope`/`run()`) keep the single tree for every batch size by default. The hybrid path for large batches (`chunk_splits > 0`) is opt-in via `YOUPIPE_ONPOOL_HYBRID=1` (injector chunks) or `=2` (driver local deque): the dispatcher then hands `ComputePool::on_this_pool_owner` to `CountLatch::with_count`, whose `Stealing` variant waits through the work-stealing `wait_until` loop (parking, if at all, via the sleep module's latch protocol) instead of a condvar the caller's own pool would have to service. Small batches keep the single-tree shortcut even with the knob enabled — P concurrent nested small batches would otherwise flood the global injector (+430 % measured; see the regime comment in `hybrid_dispatch`). Knob A/B (same-binary, 5 interleaved rounds): a single nested large batch wins −3.5 % under level 1 (25/25) and level 2 removes a +2 % saturation lean, but the cross-session margin vs the tree flips sign, so the default stays always-tree (see scheduler.md "on-pool callers").
+
+  The dispatcher is generic only over the item type: the per-terminal strategy (`CollectStrategy` / `SinkStrategy` / `TryStrategy`) crosses a type-erased `ErasedStrategy` boundary (three fn pointers + a context pointer). This is deliberate — a per-strategy monomorphized dispatcher measurably regressed the untouched collect path via codegen-layout shifts (+16…30 % at 10k–100k, A/B-measured), while the erased dispatcher compiles once and its ~`num_threads` indirect calls per run are far off the hot path.
 - **`MAY_FILTER == true`** — `fused_filter_collect` claims disjoint ranges of a
   shared `Slots` input, each leaf filters into a per-leaf `Vec`, results merged
   by `extend`. (Replaced the old `Vec::split_off` tree — one allocation +
@@ -330,8 +301,8 @@ buffer + `n` writes for data nobody reads.
 `HybridStrategy` trait — chunk-layout / inject / `CountLatch::wait_spin` /
 panic-funnel code is written once and shared with `try_collect`'s
 `TryStrategy` too (no vtable cost — see the `ErasedStrategy` note under
-`collect`). On-pool callers take the same path via the `Stealing` latch (see
-`collect` above).
+`collect`). On-pool callers take the single tree unless the
+`YOUPIPE_ONPOOL_HYBRID` knob enables the hybrid path (see `collect` above).
 
 Panic safety is the input-tail mirror of `LeafGuard`: each leaf's
 `ForEachGuard` drops `input[pos+1..]` on unwind (item `pos` was consumed by

@@ -33,7 +33,9 @@ use youpipe::pipe;
 // mutate captured state, so accumulate through atomics (or a Mutex).
 let total = Arc::new(AtomicU64::new(0));
 let t = total.clone();
-pipe(0..1000u64).for_each(move |x| t.fetch_add(x, Ordering::Relaxed));
+pipe(0..1000u64).for_each(move |x| {
+    t.fetch_add(x, Ordering::Relaxed);
+});
 ```
 
 To borrow stack-local data in the closure instead, use

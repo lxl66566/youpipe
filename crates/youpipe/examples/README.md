@@ -73,10 +73,10 @@ chain at compile time, so per-item throughput should be in the same league.
 ### `unbalanced`
 
 ~10 % of items run 1000× slower than the rest. Compares youpipe with
-`Workload::Balanced` (4× oversplit) vs `Workload::Unbalanced` (8× oversplit,
-finer-grained stealing) vs rayon's `par_iter` vs std sequential. Demonstrates
-why recursive `join` + work-stealing beats naive "split into N chunks"
-strategies on skewed loads.
+`Workload::Balanced` (adaptive 1×/4× oversplit) vs `Workload::Unbalanced`
+(32× oversplit, finer-grained stealing) vs rayon's `par_iter` vs std
+sequential. Demonstrates why recursive `join` + work-stealing beats naive
+"split into N chunks" strategies on skewed loads.
 
 ### `scoped_lookup`
 
