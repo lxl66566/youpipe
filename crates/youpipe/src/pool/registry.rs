@@ -19,7 +19,7 @@ use st3::{
 };
 
 use super::{
-    job::{HeapJob, JobRef, StackJob},
+    job::{JobRef, StackJob},
     latch::{AsCoreLatch, CoreLatch, Latch, LatchRef, LockLatch, OnceLatch},
     sleep::Sleep,
     unwind,
@@ -425,16 +425,6 @@ pub(crate) fn global_registry() -> &'static Arc<Registry> {
     })
 }
 
-/// Returns the registry for the current thread's pool, or the global pool.
-pub(crate) fn current_registry() -> Arc<Registry> {
-    let wt = WorkerThread::current();
-    if wt.is_null() {
-        Arc::clone(global_registry())
-    } else {
-        unsafe { Arc::clone((*wt).registry()) }
-    }
-}
-
 // ── WorkerThread ──
 
 pub(crate) struct WorkerThread {
@@ -750,16 +740,6 @@ unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usiz
     let abort_guard = unwind::AbortIfPanic;
     unsafe { worker_thread_ref.wait_until_out_of_work() };
     mem::forget(abort_guard);
-}
-
-/// Submit a `'static` closure as a heap job and inject it into the pool.
-pub(crate) fn spawn_static<F>(f: F)
-where
-    F: FnOnce() + Send + 'static,
-{
-    let job = HeapJob::new(f);
-    let job_ref = job.into_static_job_ref();
-    current_registry().inject(job_ref);
 }
 
 // ── RNG ──

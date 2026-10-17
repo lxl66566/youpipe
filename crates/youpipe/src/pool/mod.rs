@@ -6,8 +6,6 @@
 //! Apache-2.0 terms for that code; see `LICENSE`. Per-file headers note which
 //! upstream module each file derives from.
 
-#![allow(dead_code)] // Scope/spawn infrastructure not yet wired to public API.
-
 pub(crate) mod job;
 pub(crate) mod join;
 pub(crate) mod latch;
