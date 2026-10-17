@@ -111,7 +111,7 @@ input `Vec<I>` inside the builder so the chain reads naturally left-to-right and
 - `O`: The current output type (the input to the next stage)
 
 ```rust
-pub struct Pipe<S = Identity, I = (), O = ()> {
+pub struct Pipe<S, I, O> {
     items: Vec<I>,
     stages: S,
     config: PipelineConfig,
