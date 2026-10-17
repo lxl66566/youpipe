@@ -41,6 +41,68 @@ pub(crate) fn batch_recv_cap() -> usize {
     })
 }
 
+// ── Sharded terminal channel (runtime knob, todo #1) ──
+//
+// `YOUPIPE_SHARDED_TERM=1` swaps the terminal stage's output channel from
+// one shared MPSC ring to one SPSC ring per worker (see `sharded.rs` for
+// the contention rationale). Runtime knob — not a config field — so A/B
+// benchmarks compare the same binary (recompiles swing tight benchmarks
+// ±30 % through pure code layout). Default off.
+static SHARDED_TERM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn sharded_term_enabled() -> bool {
+    *SHARDED_TERM.get_or_init(|| match std::env::var("YOUPIPE_SHARDED_TERM") {
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" || v.is_empty() => false,
+        Ok(other) => {
+            panic!("YOUPIPE_SHARDED_TERM: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
+        },
+        Err(_) => false,
+    })
+}
+
+// ── Convoy fix knobs (todo #4; attribution in docs/src/dev/streaming.md
+// "Convoy collapse forensics") ──
+//
+// `YOUPIPE_SPIN_ANCHOR=<µs>` (unset/"0" = off): adaptive pre-anchor spin in
+// the sync worker recv loops (`spawn_stage` / `spawn_expand_stage` /
+// `forward_fenced`) — see `AnchorSpin`. `YOUPIPE_FWD_BATCH=1` (default
+// off): the fence forwarder pushes each released batch with `try_send`,
+// parking at most once per full ring instead of paying a blocking send per
+// item. Runtime knobs rather than config fields so A/B benches compare the
+// same binary (recompiles swing tight benchmarks by tens of percent through
+// pure code layout).
+
+static SPIN_ANCHOR_US: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// Max pre-anchor spin window in µs; 0 = the anchor is a plain blocking
+/// recv (knob off, every `AnchorSpin` inert).
+pub(crate) fn spin_anchor_us() -> u32 {
+    *SPIN_ANCHOR_US.get_or_init(|| match std::env::var("YOUPIPE_SPIN_ANCHOR") {
+        Ok(v) if v == "0" || v.is_empty() => 0,
+        Ok(other) => other.parse().unwrap_or_else(|_| {
+            panic!(
+                "YOUPIPE_SPIN_ANCHOR: invalid value {other:?} (leave unset or use \"0\" or a spin \
+                 window in µs, e.g. \"10\")"
+            )
+        }),
+        Err(_) => 0,
+    })
+}
+
+static FWD_BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn fwd_batch_enabled() -> bool {
+    *FWD_BATCH.get_or_init(|| match std::env::var("YOUPIPE_FWD_BATCH") {
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" || v.is_empty() => false,
+        Ok(other) => {
+            panic!("YOUPIPE_FWD_BATCH: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
+        },
+        Err(_) => false,
+    })
+}
+
 // Worker-side batch burst helpers (todo #1 residual (d)); crate-internal.
 pub use channel::{
     AsyncReceiver, AsyncRecvItem, AsyncSendItem, AsyncSender, ChannelError, MpscAsyncReceiver,
