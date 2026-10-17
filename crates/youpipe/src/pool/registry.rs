@@ -19,7 +19,7 @@ use st3::{
 };
 
 use super::{
-    job::{HeapJob, JobRef, StackJob},
+    job::{JobRef, StackJob},
     latch::{AsCoreLatch, CoreLatch, Latch, LatchRef, LockLatch, OnceLatch},
     sleep::Sleep,
     unwind,
@@ -53,8 +53,9 @@ pub(crate) struct Registry {
     ///
     /// `concurrent_queue` (not crossbeam): same block-based MPMC algorithm but
     /// without `crossbeam-epoch` (the source of the Miri UB that prompted the
-    /// st3 migration). Its empty `pop` is 2 Acquire loads + a SeqCst fence, no
-    /// CAS — cheap enough on this 99%-empty hot path that a hand-maintained
+    /// st3 migration). Pops are guarded by an advisory `is_empty()` (two plain
+    /// index loads — see `pop_injected_job`); the raw empty `pop` behind it is
+    /// 2 Acquire loads + a SeqCst fence, no CAS. A hand-maintained
     /// `AtomicUsize` length counter is a measured regression (its per-op
     /// `fetch_add`/`fetch_sub` bounces a cache line).
     injected_jobs: concurrent_queue::ConcurrentQueue<JobRef>,
@@ -246,7 +247,17 @@ impl Registry {
     }
 
     fn pop_injected_job(&self) -> Option<JobRef> {
-        // No separate length fast-path needed: see `injected_jobs` doc.
+        // Advisory empty short-circuit: `is_empty()` is two plain index loads,
+        // while an empty `pop` additionally pays the head-block deref and the
+        // SeqCst `full_fence` (a locked op) — and `find_work` hits this on
+        // every idle pass of a mostly-empty injector. A false "empty" only
+        // defers the pop: idle passes rescan, and `Sleep::sleep`'s pre-park
+        // true check (fence + `has_injected_jobs`) plus the JEC wake protocol
+        // guarantee the job is seen. A hand-maintained length counter remains
+        // rejected — see the `injected_jobs` field doc.
+        if self.injected_jobs.is_empty() {
+            return None;
+        }
         self.injected_jobs.pop().ok()
     }
 
@@ -412,16 +423,6 @@ pub(crate) fn global_registry() -> &'static Arc<Registry> {
         registry.wait_until_primed();
         registry
     })
-}
-
-/// Returns the registry for the current thread's pool, or the global pool.
-pub(crate) fn current_registry() -> Arc<Registry> {
-    let wt = WorkerThread::current();
-    if wt.is_null() {
-        Arc::clone(global_registry())
-    } else {
-        unsafe { Arc::clone((*wt).registry()) }
-    }
 }
 
 // ── WorkerThread ──
@@ -739,16 +740,6 @@ unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usiz
     let abort_guard = unwind::AbortIfPanic;
     unsafe { worker_thread_ref.wait_until_out_of_work() };
     mem::forget(abort_guard);
-}
-
-/// Submit a `'static` closure as a heap job and inject it into the pool.
-pub(crate) fn spawn_static<F>(f: F)
-where
-    F: FnOnce() + Send + 'static,
-{
-    let job = HeapJob::new(f);
-    let job_ref = job.into_static_job_ref();
-    current_registry().inject(job_ref);
 }
 
 // ── RNG ──

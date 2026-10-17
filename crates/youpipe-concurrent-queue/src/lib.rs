@@ -703,6 +703,14 @@ impl<T> fmt::Display for ForcePushError<T> {
 impl<T: fmt::Debug> error::Error for ForcePushError<T> {}
 
 /// Equivalent to `atomic::fence(Ordering::SeqCst)`, but in some cases faster.
+///
+/// The portable fence was A/B'd against this asm path on 2026-10-18
+/// (interleaved 4-side criterion on the integrated pool benches): LLVM
+/// lowers it to a single `lock or`, yet it regressed cancel-heavy paths
+/// +3–10 % (0/9..0/25 all-pairs) while injector-pop-heavy paths stayed
+/// flat — contradicting the fork's standalone micro-bench that had
+/// `lock or` ahead ~8–10 %. Micro and integrated disagree; the integrated
+/// measurement wins, the asm stays.
 #[inline]
 fn full_fence() {
     #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), not(miri), not(loom)))]

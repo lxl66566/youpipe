@@ -61,9 +61,13 @@ their hot paths can be tuned in-tree without waiting on upstream releases:
   dispatcher's `num_threads−1 ≤ 31` chunk-job CASes into one per dispatch
   (−0.5…−2.6 % on the cpu_heavy fused path); the streaming `submit_batch`
   benefits identically. The review also records what was tried and rejected —
-  e.g. x86 `lock not` SeqCst fences are a
-  ~8–10 % pessimization on modern LLVM (it already lowers `fence(SeqCst)` to
-  `lock or`).
+  e.g. swapping the x86 `lock not` asm fence for the portable
+  `fence(SeqCst)` was tried twice with opposite verdicts: the fork's
+  standalone micro-bench had `lock or` ahead ~8–10 %, but the interleaved
+  4-side A/B on the integrated pool (2026-10-18) measured the swap
+  regressing cancel-heavy paths +3–10 % (0/25 all-pairs) with
+  injector-pop-heavy paths flat. Micro and integrated disagree; the
+  integrated measurement wins and `full_fence` keeps the asm fast path.
 
   Why not crossbeam-queue directly: its `SegQueue::push` is a SeqCst CAS with
   block allocation every `LAP − 1` (31) items, and the pool's stream-dispatch

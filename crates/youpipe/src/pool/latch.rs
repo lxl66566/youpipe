@@ -392,10 +392,6 @@ impl std::fmt::Debug for CountLatch {
 }
 
 impl CountLatch {
-    pub(crate) fn new(owner: Option<(&Arc<Registry>, usize)>) -> Self {
-        Self::with_count(1, owner)
-    }
-
     pub(crate) fn with_count(count: usize, owner: Option<(&Arc<Registry>, usize)>) -> Self {
         Self {
             counter: AtomicUsize::new(count),
@@ -409,26 +405,6 @@ impl CountLatch {
                     latch: LockLatch::new(),
                 },
             },
-        }
-    }
-
-    #[inline]
-    pub(crate) fn increment(&self) {
-        let old = self.counter.fetch_add(1, Ordering::Relaxed);
-        debug_assert!(old != 0);
-    }
-
-    pub(crate) fn wait(&self) {
-        match &self.kind {
-            CountLatchKind::Stealing {
-                latch,
-                registry,
-                worker_index,
-            } => {
-                debug_assert!(registry.num_threads() > *worker_index);
-                Registry::wait_until_worker(latch);
-            },
-            CountLatchKind::Blocking { latch } => latch.wait(),
         }
     }
 
