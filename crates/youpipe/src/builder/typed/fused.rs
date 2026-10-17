@@ -3412,7 +3412,7 @@ where
 ///
 /// Separating `I` and `O` is what lets type-changing maps like
 /// `.map(i32 -> String)` then `.map(String -> usize)` type-check end to end.
-pub struct Pipe<S = Identity, I = (), O = ()> {
+pub struct Pipe<S, I, O> {
     items: Vec<I>,
     stages: S,
     config: PipelineConfig,
@@ -4059,7 +4059,7 @@ where
 /// The error type `E` is fixed across the chain — every subsequent `try_map`
 /// must produce the same `E` (use `.map_err()` to convert). `map` and `filter`
 /// are also supported: their effects compose with `Result` via `?`.
-pub struct TryPipe<S = Identity, I = (), O = (), E = std::convert::Infallible> {
+pub struct TryPipe<S, I, O, E = std::convert::Infallible> {
     items: Vec<I>,
     stages: S,
     config: PipelineConfig,

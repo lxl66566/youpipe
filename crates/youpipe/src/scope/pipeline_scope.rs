@@ -113,7 +113,7 @@ impl<'env> PipelineScope<'env> {
 /// - fuses `.map`/`.filter` at compile time (lazy chain),
 /// - drives `.collect()` through the same recursive work-stealing `par_index_collect` core as the
 ///   top-level [`crate::Pipe`].
-pub struct ScopedPipe<'env, S = Identity, I = (), O = ()> {
+pub struct ScopedPipe<'env, S, I, O> {
     items: Vec<I>,
     stages: S,
     config: PipelineConfig,
@@ -304,7 +304,7 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
 /// type. In practice fallible closures borrow *inputs* while errors are owned
 /// (`&'static str`, `anyhow::Error`, domain enums), so this is rarely a
 /// constraint.
-pub struct ScopedTryPipe<'env, S = Identity, I = (), O = (), E = std::convert::Infallible> {
+pub struct ScopedTryPipe<'env, S, I, O, E = std::convert::Infallible> {
     items: Vec<I>,
     stages: S,
     config: PipelineConfig,
