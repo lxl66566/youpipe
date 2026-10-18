@@ -18,6 +18,8 @@
 //! the per-episode count. Both phases run sequentially in one test function
 //! (the counters are process globals).
 
+#![cfg(feature = "tokio-runtime")]
+
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::atomic::{AtomicU64, Ordering},
