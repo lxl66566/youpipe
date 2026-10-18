@@ -5343,7 +5343,7 @@ dependencies = [
 
 [[package]]
 name = "youpipe"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "criterion 0.8.2",
  "crossbeam-channel",
@@ -5379,7 +5379,7 @@ dependencies = [
 
 [[package]]
 name = "youpipe-concurrent-queue"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "criterion 0.8.2",
  "crossbeam-utils",
@@ -5392,7 +5392,7 @@ dependencies = [
 
 [[package]]
 name = "youpipe-criterion-perf-counters"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "criterion 0.8.2",
  "perfcnt",
@@ -5400,7 +5400,7 @@ dependencies = [
 
 [[package]]
 name = "youpipe-crossfire"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-std",
  "crossbeam-utils",
@@ -5426,7 +5426,7 @@ dependencies = [
 
 [[package]]
 name = "youpipe-hotpath"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "arc-swap",
  "async-channel 2.5.0",
@@ -5479,7 +5479,7 @@ dependencies = [
 
 [[package]]
 name = "youpipe-st3"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "criterion 0.5.1",
  "crossbeam-deque",
@@ -5491,7 +5491,7 @@ dependencies = [
 
 [[package]]
 name = "youpipe-sys"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "libc 0.2.189",
  "loom",

@@ -64,6 +64,30 @@ LIB_STYLE: dict[str, dict] = {
     "std threads":             {"color": "#94a3b8"},
 }
 
+def _norm(lib: str) -> str:
+    """Map a concrete label onto its LIB_STYLE key: the default blocking-IO
+    pool row is labelled `youpipe (N thr)` with N following the process
+    affinity mask, so it varies between runs/hosts."""
+    if (lib.startswith("youpipe (") and lib.endswith(" thr)")
+            and lib != "youpipe (512 thr)"):
+        return "youpipe (32 thr)"
+    return lib
+
+
+def style(lib: str) -> dict:
+    return LIB_STYLE.get(_norm(lib), {"color": "#888"})
+
+
+def lib_order(data: dict, scenario: str) -> list[str]:
+    libs = {lib for sc, lib, _ in data if sc == scenario}
+    keys = list(LIB_STYLE)
+
+    def rank(lib: str) -> tuple[int, str]:
+        n = _norm(lib)
+        return (keys.index(n), "") if n in LIB_STYLE else (len(keys), lib)
+
+    return sorted(libs, key=rank)
+
 mpl.rcParams.update({
     "svg.fonttype": "none",  # keep text as text: small files, crisp zooming
     "font.family": "sans-serif",
@@ -86,12 +110,6 @@ def load(path: Path) -> tuple[dict, dict[tuple[str, str, int], list[float]]]:
     data = {k: v for r in doc["results"] for k, v in
             [((r["scenario"], r["lib"], r["n"]), r["rounds_ns"])]}
     return doc["meta"], data
-
-
-def lib_order(data: dict, scenario: str) -> list[str]:
-    libs = {lib for sc, lib, _ in data if sc == scenario}
-    ordered = [lib for lib in LIB_STYLE if lib in libs]
-    return ordered + sorted(libs - set(LIB_STYLE))
 
 
 def sizes_of(data: dict, scenario: str) -> list[int]:
@@ -183,7 +201,7 @@ def bar_panel(ax, data: dict, sc: str, title: str, note: str,
 
     top = 0.0
     for i, lib in enumerate(libs):
-        color = LIB_STYLE.get(lib, {"color": "#888"})["color"]
+        color = style(lib)["color"]
         meds, los, his, offs = [], [], [], []
         for gi, n in enumerate(sizes):
             med, lo, hi = _throughputs(data, sc, lib, n, scale)

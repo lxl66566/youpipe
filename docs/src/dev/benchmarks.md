@@ -1228,6 +1228,80 @@ was itself a branch-level layout artifact. Kept for now (within the
 pair-family noise band; the theory of skipping a locked op on idle
 passes still holds); revisit when next tuning the injector path.
 
+### `sharded_term_async` async1 @100K draw band (2026-10-18)
+
+A v0.6.0-vs-0.6.1 full interleaved A/B flagged `async1_cpu/100000` +18.1 %
+and `async1_ordered_cpu/100000` +11.1 % (0/9 dominant), with
+`async0_cheap/100000` +6.6 % weaker and all 1K rows inside ±2 %. The flag
+is a draw artifact of this family (knobs off — the sharded paths are
+inactive), established by elimination plus two measurements:
+
+- **Semantic survey d18f24f..fed26b2**: on the default-knob async1 path
+  only e1fa541 (the injector `is_empty` gate) executes new code. 58ec78b
+  adds terminals the bench never calls; cb4c162/7878716/6445f59 are
+  FWD_BATCH/SHARDED_TERM-gated; 97a7457 moves OnceLock readers; c96870a
+  shares an async consumer loop that is byte-identical after
+  monomorphization; 07902f7+8248d1b net to a comment.
+- **Gate re-check, same binary** (temporary local `YOUPIPE_INJ_EMPTY_GATE`
+  patch, 5 per-id rounds): gate ON is the *faster* side — async1_cpu
+  −6.7 % (21/25), ordered −5.9 % (24/25), both noise-grade. The gate is
+  exonerated and mildly favourable here; the flagging regression cannot be
+  scheduler-semantic.
+- **Three-draw band, same session** (`base=d18f24f`, `h1=h2=fed26b2`, 5
+  per-id rounds; medians of round medians, ms):
+
+  | pair @100K        | async1_cpu | async1_ordered_cpu | dominant |
+  | ----------------- | ---------- | ------------------ | -------- |
+  | base → h1         | +5.9 %     | +8.4 %             | base 21/25, 23/25 (noise) |
+  | base → h2         | −3.4 %     | +3.9 %             | 17/25, 9/25 (noise) |
+  | h1 → h2 (same commit) | −8.8 % | −4.2 %           | h2 22/25, 22/25 (noise) |
+
+  The same-commit pair swings as much as any cross-commit pair, and no
+  pairing approaches +18 %. (h1 sat mid-round-order throughout the
+  3-sided interleave; the cpu id showed a fast-first-position pattern
+  there but ordered showed the reverse, and any middle-position penalty
+  only inflates base→h1 — the one "regression-lean" cell.) Round
+  medians per binary span 31.9–38.3 ms (cpu) and 38.5–49.5 ms (ordered);
+  cross-session, the *same* v0.6.0 commit drew 30.3–31.6 ms in the
+  flagging session and 33.6–36.5 ms in this one.
+
+Verdict: no semantic regression in v0.6.0..0.6.1 on this family; a small
+(+4–8 %) ordered lean seen across both HEAD draws stays inside the
+same-commit swing and has no candidate mechanism (the ordered drain is
+untouched; the window-sizing changes are sharded-gated). Verdicts for
+`sharded_term_async` @100K need ≥5 rounds AND a same-commit
+re-materialization cross-check; single-pair deltas up to ~+18 % sit
+inside the family's draw band.
+
+### v0.6.1 release regression check (2026-10-18)
+
+Full-suite interleaved A/B, `v0.6.0` (d18f24f) vs the 0.6.1 tip: 10
+criterion targets × 3 rounds × 2 sides (filter-chunked for the 10-min
+tool cap; every round interleaves both sides, taskset 1-31). Every flag
+resolved as layout/draw artifact or accepted tradeoff; no semantic
+regression remains:
+
+- `channel_throughput/std_mpsc_bounded/10000` +71.8 %, and the
+  `expand_heavy` rayon rows +6.6…+14.4 % *stable* — control rows on
+  std/rayon code; same-commit re-materialization showed the std row
+  bimodal ±22…143 % and HEAD draws of the rayon rows spanning 1.06→1.13
+  ms. The youpipe `owned_vec` +7.4 % sits inside the same draw band
+  (130.6→144.4 ms across HEAD draws).
+- `sync_fuse` merged/1 K pair family +2…+14 % — the documented swing
+  family; same-commit probe read −5.8…+1.9 % with 7–30 % spreads.
+- `stream_pipeline/multi_stage_2/1000` +3.2 % dominant — same-commit
+  +1.2 % with a 14 % spread on one side.
+- `sharded_term_async/async1_*@100K` +11…18 % — draw artifact (section
+  above).
+- `sync_reduce/youpipe_sum_owned/1000` +3.2 % (+330 ns at the 1 K fixed
+  floor, tight spreads both sides; same-commit ±0.5 %): the profile and
+  magnitude match the injector `is_empty` gate's documented fixed cost
+  (kept; see the registry.rs re-check note). Everything ≥10 K is noise.
+- Real improvements: `sync_filter/youpipe_filter_map` −2…−8 % (dominant),
+  `pool_reuse/transient_*` −3 %, `expand_heavy/push_emit` −3 %,
+  `sync_nested_on_pool` 1 K −2 %.
+
+
 
 ## Horizontal cross-library comparison (2026-09)
 
@@ -1309,45 +1383,49 @@ bar's absolute value is ratio × that number.
   (`taskset -c 1-31`, core 0 left to OS/IRQ housekeeping), 5 rounds ×
   700 ms measurement, ~2-8 % cross-round spread on most cells.
 
-### Results (median ms per iteration, 5 interleaved rounds; 2026-10-06 rerun on the post-review tip with 32 B function alignment)
+### Results (median ms per iteration, 5 interleaved rounds; 2026-10-18 rerun on the 0.6.1 tip)
 
 | Scenario | n | Best | Runner-up | Rest |
 | --- | --- | --- | --- | --- |
-| cpu_balanced | 1K | youpipe 0.009 | rayon 0.038 | std threads 0.560 |
-| cpu_balanced | 10K | youpipe 0.012 | rayon 0.072 | std threads 0.583 |
-| cpu_balanced | 100K | youpipe 0.052 | rayon 0.141 | std threads 0.796 |
-| cpu_balanced | 1M | youpipe 0.492 | rayon 0.501 | std threads 2.843 |
-| cpu_balanced | 2M | youpipe 0.817 | rayon 0.862 | std threads 6.222 |
-| cpu_balanced | 4M | youpipe 1.601 | rayon 1.737 | std threads 12.117 |
-| cpu_unbalanced | 10K | youpipe (default) 0.037 | youpipe (Unbalanced) 0.039 | rayon 0.086, std threads 0.589 |
-| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.195 | youpipe (default) 0.234 | rayon 0.280, std threads 0.883 |
-| io_async | 500 | futures 9.130 | tokio 9.427 | youpipe 9.482 |
-| io_async | 2K | futures 17.602 | youpipe 18.461 | tokio 18.573 |
-| io_async | 5K | futures 34.692 | youpipe 35.205 | tokio 35.355 |
-| io_blocking | 500 | tokio 9.054 | youpipe (512 thr) 9.378 | std threads 19.180, youpipe (32 thr) 53.690 |
-| io_blocking | 2K | tokio 12.871 | youpipe (512 thr) 14.827 | std threads 50.295, youpipe (32 thr) 222.755 |
-| mixed_cpu_io | 500 | futures 9.115 | youpipe 9.555 | tokio 11.112 |
-| mixed_cpu_io | 2K | futures 9.380 | youpipe 11.169 | tokio 14.378 |
-| real_doc | 1K | youpipe 10.787 | tokio 10.872 | rayon 36.982 |
-| real_doc | 4K | youpipe 15.149 | tokio 17.717 | rayon 133.500 |
-| real_web | 500 | youpipe 12.913 | futures 13.703 | tokio 14.339 |
-| real_web | 2K | youpipe 22.619 | tokio 27.492 | futures 29.314 |
+| cpu_balanced | 1K | youpipe 0.009 | rayon 0.037 | std threads 0.547 |
+| cpu_balanced | 10K | youpipe 0.013 | rayon 0.062 | std threads 0.570 |
+| cpu_balanced | 100K | youpipe 0.053 | rayon 0.123 | std threads 0.795 |
+| cpu_balanced | 1M | rayon 0.469 | youpipe 0.486 | std threads 2.834 |
+| cpu_balanced | 2M | youpipe 0.803 | rayon 0.829 | std threads 6.514 |
+| cpu_balanced | 4M | youpipe 1.574 | rayon 1.692 | std threads 12.706 |
+| cpu_unbalanced | 10K | youpipe (default) 0.037 | youpipe (Unbalanced) 0.038 | rayon 0.080, std threads 0.573 |
+| cpu_unbalanced | 100K | youpipe (Unbalanced) 0.200 | youpipe (default) 0.244 | rayon 0.269, std threads 0.858 |
+| io_async | 500 | futures 9.140 | tokio 9.465 | youpipe 9.506 |
+| io_async | 2K | futures 17.695 | tokio 18.459 | youpipe 18.500 |
+| io_async | 5K | futures 34.479 | youpipe 35.266 | tokio 35.843 |
+| io_blocking | 500 | tokio 9.005 | youpipe (512 thr) 9.370 | std threads 19.595, youpipe (31 thr) 55.793 |
+| io_blocking | 2K | tokio 12.917 | youpipe (512 thr) 14.826 | std threads 52.328, youpipe (31 thr) 226.964 |
+| mixed_cpu_io | 500 | futures 9.140 | youpipe 9.570 | tokio 11.037 |
+| mixed_cpu_io | 2K | futures 9.339 | youpipe 11.191 | tokio 14.215 |
+| real_doc | 1K | youpipe 10.895 | tokio 10.968 | rayon 37.895 |
+| real_doc | 4K | youpipe 15.606 | tokio 17.498 | rayon 138.245 |
+| real_web | 500 | youpipe 13.177 | futures 13.923 | tokio 14.522 |
+| real_web | 2K | youpipe 23.332 | tokio 28.120 | futures 29.732 |
 
 ### Reading the results
 
 - **Balanced CPU** (`pipe_ref` vs `par_iter`, both borrowing warm data):
-  youpipe leads at every size — 1K–100K by −63…−83 % (0.009 vs 0.038 ms @
-  1K), and since the 2026-10-06 rerun also the memory-bound ≥1 M regime:
-  −2 % @ 1 M, −5 % @ 2 M, −8 % @ 4 M (the 10-01 rerun still had rayon
-  edging 1 M by +4 %). The ≥2 M regime is memory-bound (≥ 32 MB of R+W
-  buffer traffic, outside the cache-resident range); the 2026-09-25
+  youpipe leads at 1K–100K by −57…−79 % (0.009 vs 0.037 ms @ 1K) and holds
+  the memory-bound 2 M/4 M regime (−3 % @ 2 M, −7 % @ 4 M); @1 M rayon
+  edges ahead by +4 % in this rerun. Session note: rayon's anchor rows
+  measured 6–14 % faster than the 2026-10-06 session (readback rows −17…−20 %)
+  — reproduced across three runs the same day, so it is a stable
+  same-binary/session-level layout drift on the shared bench binary, not
+  youpipe-side movement (youpipe rows reproduced within ±2 %; the 1 M flip
+  sits inside that rayon drift). The ≥2 M regime is memory-bound (≥ 32 MB of
+  R+W buffer traffic, outside the cache-resident range); the 2026-09-25
   attributions (see "NT-store
   attribution" and "Attributing the 2M/4M fused-collect gap" below) pinned
   the then-gap on plain output stores' read-for-ownership + L3 pollution
   (non-temporal leaf stores, `YOUPIPE_NT_STORE`, closed and reversed it:
   2 M 0.82 vs rayon 0.83 ms, 4 M 1.57 vs 1.68 ms) plus a secondary worker
   park/wake occupancy loss (~1-4 pt, causal via the spin-rounds knob). In
-  this rerun the default configuration already holds 2 M/4 M ahead; wall
+  every rerun since, the default configuration holds 2 M/4 M ahead; wall
   clocks are not comparable across sessions, but the ordering matches what
   the NT-store attribution predicted. Before the `num_cpus` cache
   (2026-09-05), rayon won 1K and 1M — the 1K loss was ~50 µs of
@@ -1356,11 +1434,11 @@ bar's absolute value is ratio × that number.
   31 spawns per call, no stealing.
 - **Skewed CPU**: `Workload::Unbalanced` + work stealing beats rayon at
   both sizes (0.038 vs 0.080 @ 10K, dead even with the default workload
-  there; 0.193 vs 0.259 @ 100K) and static chunking is ~4–15× behind,
+  there; 0.200 vs 0.269 @ 100K) and static chunking is ~4–15× behind,
   stranding the 10 % heavy items in whichever chunks they landed in.
 - **Async IO is a near-tie** — the spreads overlap. youpipe
-  multiplexes over the same tokio runtime: within ~1–2 % of tokio (ahead
-  at ≥2K items as channel throughput stops mattering), 2–5 % behind
+  multiplexes over the same tokio runtime: within ~2 % of tokio at every
+  size (ahead at 5 K as channel throughput stops mattering), 2–5 % behind
   `futures::stream`, the lightest async *combinator* stack. futures'
   mixed_cpu_io lead has the same cause: it runs the CPU stage inline on
   runtime workers. That is fine at 100 ns/item CPU, and the reason youpipe
@@ -1369,12 +1447,14 @@ bar's absolute value is ratio × that number.
   rather than futures.
 - **Blocking IO is a configuration story**: correctly oversubscribed,
   youpipe (512 thr) tracks tokio `spawn_blocking` within 4–15 % (same
-  512-thread shape); at the default 31 threads the waits serialize
-  (227 ms @ 2K). The chart keeps that failure visible on purpose —
-  blocking stages must size the pool, not the framework.
+  512-thread shape); at the default pool the waits serialize (227 ms @ 2K).
+  The default-pool row is labelled `youpipe (N thr)` with N following the
+  process affinity mask (31 under `taskset -c 1-31`). The chart keeps that
+  failure visible on purpose — blocking stages must size the pool, not the
+  framework.
 - **Realistic pipelines** are where the streaming engine pays off: 3-stage
   sync+async chains are a near-tie with hand-written tokio channel plumbing
-  at the small batch (real_doc 1K, ±1 %) and pull ahead up to ~17 % at the
+  at the small batch (real_doc 1K, ±1 %) and pull ahead ~11 % at the
   larger batches (fewer tasks, pooled scheduling, mixed-mode channels);
   rayon loses ~9× once IO blocks its workers.
 

@@ -259,6 +259,12 @@ impl Registry {
         // agreeing): the gate costs ~+2.3% on mixed youpipe_stream_cpu/1K and
         // buys nothing confirmed elsewhere; kept — the earlier −8% "win" was a
         // layout artifact (benchmarks.md "fifth face of the lottery").
+        // Same-binary knob re-check on sharded_term_async async1 @100K
+        // (2026-10-18, temporary local env patch): gate ON is mildly
+        // favourable there (−6%/−6% vs disabled, noise-grade) and tightens
+        // the round spread — the async1@100K v0.6.1 regression flag was a
+        // draw artifact, not this gate (benchmarks.md "async1@100K draw
+        // band").
         if self.injected_jobs.is_empty() {
             return None;
         }

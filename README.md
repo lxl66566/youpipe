@@ -85,7 +85,7 @@ for details, Windows specifics, and known findings.
 ## Performance
 
 youpipe is the only library at or near the top in every
-workload class — up to 5× faster than rayon on CPU pipelines, up to 23%
+workload class — up to 5× faster than rayon on CPU pipelines, up to 17%
 ahead of hand-written tokio plumbing on realistic three-stage pipelines,
 and within a few percent of the async ceiling on pure IO.
 

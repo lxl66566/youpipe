@@ -79,7 +79,7 @@ Windows 注意事项与已知发现）。
 
 youpipe 在所有负载类别下都稳居第一梯队——CPU
 pipeline 上最高比 rayon 快 5×，真实三阶段 pipeline 领先手写 tokio channel
-代码最高 23%，纯异步 IO 距 futures 异步天花板仅差几个百分点。
+代码最高 17%，纯异步 IO 距 futures 异步天花板仅差几个百分点。
 
 横向对比（youpipe vs rayon vs tokio vs `futures::stream` vs 手写
 `std::thread` pipeline），覆盖七类负载（均衡/倾斜 CPU、异步/阻塞 IO、混合
