@@ -1303,6 +1303,41 @@ regression remains:
 
 
 
+## Collector 0-claim probe + fence staging reuse (2026-10-20)
+
+Round-7 stream-hygiene pair (streaming.md audit items 1/3): the
+collector's 0-claim probe resolves via one `is_disconnected` tx-count load
+instead of a second `try_recv` ring walk, and `fence_batch_send` reuses a
+forwarder-owned staging scratch instead of `collect()`-ing a fresh `Vec`
+per released chunk. Both changes sit behind default-off knobs, so the A/B
+ran with `YOUPIPE_BATCH_RECV=1 YOUPIPE_FWD_BATCH=1` on **both** sides
+(`bench_ab.sh -a base=main -b wt -r 5 --per-id`, targets `async_vs_tokio`
++ `sharded_term`, env via `-E`); `tokio_spawn_blocking` is the
+off-data-plane layout control:
+
+| id | base (main) | wt | Δ | verdict |
+| --- | --- | --- | --- | --- |
+| `stream_pipeline/single_stage_unordered/1000` | 9.78 µs | 9.54 µs | −2.5 % | improvement, 25/25 dominant |
+| `stream_pipeline/single_stage_unordered/100000` | 112.3 µs | 118.2 µs | +5.3 % | noise — base bimodal 94–118 µs, wt tight 117.5–119.4 µs |
+| `stream_pipeline/single_stage_ordered/1000` | 9.72 µs | 10.76 µs | +10.7 % | noise (10/25, spreads 18 %/12 %) |
+| `stream_pipeline/single_stage_ordered/100000` | 117.7 µs | 117.7 µs | −0.0 % | noise |
+| `stream_pipeline/with_fence/1000` | 717.7 µs | 711.3 µs | −0.9 % | noise |
+| `stream_pipeline/with_fence/100000` | 61.12 ms | 60.41 ms | −1.2 % | noise |
+| `sharded_term/single_unordered_cpu/100000` | 21.37 ms | 21.71 ms | +1.6 % | noise |
+| `sharded_term/multi2_cpu/100000` | 16.57 ms | 16.56 ms | −0.0 % | noise |
+| `sharded_term/workers2_cpu/100000` | 2.63 ms | 2.24 ms | −14.9 % | noise (spreads 17 %/56 %) |
+| `tokio_spawn_blocking/spawn_blocking_cpu/1000` (control) | 2.301 ms | 2.299 ms | −0.1 % | noise |
+
+One dominant improvement — the 1K unordered single stage, the shape with
+the most burst gaps per item (the probe runs once per gap) — and zero
+regressions beyond noise. The predicted magnitude was sub-1 % wall, and
+the staging reuse (with_fence rows) is indeed invisible at criterion
+resolution (one k-sized allocation per k items); the value of the pair is
+consistency across the three batch-claim sites, not throughput. The
+`single_stage_unordered/100000` base side is bimodal across rounds
+(94–118 µs) while the wt side is tight — consistent with dropping the
+extra empty-ring walk, though 5 rounds do not separate that from draw.
+
 ## Horizontal cross-library comparison (2026-09)
 
 `crates/youpipe/benches/horizontal.rs` answers the "what should I pick for my workload?"

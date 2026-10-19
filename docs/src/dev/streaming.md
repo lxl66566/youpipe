@@ -281,12 +281,13 @@ as `YOUPIPE_SHARDED_TERM`; A/B through the runtime knob, same binary):
   streaming latency (not semantically equal).
 
 Integration points (all behind the one knob, cap clamped 2..=4096, default
-64): the collector's burst phase (`drain_unordered/ordered`, batch claim
-then a single per-item `try_recv` probe to resolve the inconclusive
-0-claim into Empty/Closed — the collector is the sole consumer, so the
-probe runs once per burst gap, not under a polling crowd; the sharded
-collector's pass skips that probe on open shards via the same
-`is_disconnected` load as `claim_poll` — PERF-7, commit `6445f59`), the
+64): the collector's burst phase (`drain_unordered/ordered`, batch claim;
+the inconclusive 0-claim resolves Empty via one `is_disconnected` tx-count
+load — the collector is the sole consumer, so the probe runs once per burst
+gap, not under a polling crowd, and only a disconnected channel falls
+through to `try_recv`, whose final drain keeps the half-close contract;
+the sharded collector's pass resolves 0-claims the same way — PERF-7,
+commit `6445f59`), the
 worker/fence-forwarder burst phase (`claim_poll` in
 `handoff/channel.rs`, wrapped by `anchor_claim` in
 `builder/typed/stream.rs` — batch first, anchor on miss; a
@@ -685,7 +686,7 @@ output-channel capacity from `FenceOptions::buffer` (only meaningful knob —
 the forwarder is single-threaded); `fence(mode)` keeps the default
 (`buffer_size` with the `parallelism * 4` floor).
 
-Batch-allocation recycling: `push` hands each full chunk to the forwarder via `mem::take`, which historically dropped the allocation and regrew the next batch from capacity 0 (`log2(k)` reallocs per batch). `FenceBarrier::reuse` lets the forwarder return the drained `Vec`; the next flush swaps it in, so the steady state is zero allocator traffic per batch (−23 % on `stream_pipeline/with_fence/100 K`).
+Batch-allocation recycling: `push` hands each full chunk to the forwarder via `mem::take`, which historically dropped the allocation and regrew the next batch from capacity 0 (`log2(k)` reallocs per batch). `FenceBarrier::reuse` lets the forwarder return the drained `Vec`; the next flush swaps it in, so the steady state is zero allocator traffic per batch (−23 % on `stream_pipeline/with_fence/100 K`). The batched push arm (`YOUPIPE_FWD_BATCH`) keeps a forwarder-owned staging scratch for the same reason (round 7): one allocation per forwarder, `clear`-reused per chunk.
 
 ## Audit 2026-10-20: open items
 
@@ -694,28 +695,20 @@ Round-6 audit of the streaming data plane (`handoff/`, `state/`, `runtime/`,
 Priority-ordered; directions falsified in dead-ends.md are excluded where
 noted.
 
-1. **Collector 0-claim probe: adopt the P-6/PERF-7 `is_disconnected`
-   resolution** (perf, low risk, semantics-neutral).
+1. **Collector 0-claim probe** — **landed 2026-10-20 (round 7)**.
    `drain_unordered_with` / `drain_ordered_with` resolve a 0-count
-   `try_recv_batch` by falling into a per-item `try_recv` — a second ring
-   walk over the stamp/head lines the terminal producers keep writing —
-   before anchoring on the blocking `recv`
-   (`crates/youpipe/src/state/stream.rs:205`, `:310`). The other two
-   batch-claim sites already skip that walk on an open channel with one
-   `is_disconnected()` tx-count load: `claim_poll`
-   (`crates/youpipe/src/handoff/channel.rs:519`, review P-6) and the sharded
-   collector's pass (`crates/youpipe/src/handoff/sharded.rs:216`, PERF-7,
-   commit `6445f59`). The collector is the sole consumer of the terminal
-   channel (debug-asserted in `try_exec`), so the same shortcut is sound;
-   only the `Closed` arm needs `try_recv`'s final drain (stragglers first).
-   Expected magnitude: sub-1 % wall (one walk per burst gap, not per item) —
-   the value is mostly consistency across the three claim sites. Risk: a
-   lost-CAS 0 under an externally *cloned* receiver — reachable only through
-   the public `run_ordered_collect` — delays one item by one retry, the same
-   contract `claim_poll` documents. Verify: gate the new probe under the
-   `YOUPIPE_BATCH_RECV` knob family and A/B same-binary
-   (`bench_ab.sh -B async_vs_tokio`, `stream_pipeline/single_stage_*` rows,
-   control rows to cancel layout noise).
+   `try_recv_batch` on an open channel with one `is_disconnected()` tx-count
+   load — no second ring walk over the stamp/head lines — matching
+   `claim_poll` (P-6) and the sharded `drain_pass_batched` (PERF-7,
+   `6445f59`); only a disconnected channel falls through to `try_recv`,
+   whose final drain keeps the half-close contract (stragglers before
+   Closed). A lost-CAS 0 under an externally cloned receiver (reachable
+   only through the public `run_ordered_collect`) delays one item by one
+   retry — the blocking `recv` pops a ready item without parking — the same
+   contract `claim_poll` documents. Readings: benchmarks.md
+   "Collector 0-claim probe + fence staging reuse" — −2.5 % (25/25
+   dominant) on `stream_pipeline/single_stage_unordered/1K`, the
+   burst-gap-heaviest shape; every other row noise, no regressions.
 
 2. **High-load hang (unlocated, historically ~5–15 % of loaded rounds)** —
    record only, not fixed this round. The youpipe wrapper loops show no
@@ -740,21 +733,16 @@ noted.
    full-suite concurrency (methodology: the 2026-09-25 instrumented
    reproducer in crossfire-waker-designs.md).
 
-3. **`fence_batch_send` allocates its staging buffer per released batch**
-   (hygiene; affects only `YOUPIPE_FWD_BATCH=1`). The batched arm builds
-   `staged` via `batch.drain(..).map(..).collect()` — a fresh `Vec` per
-   released chunk, grown `1→2→…→k` (`log2(k)` reallocs;
-   `crates/youpipe/src/builder/typed/stream.rs:583`). That is exactly the
-   per-batch regrowth `FenceBarrier::reuse` eliminated, so the knob
-   partially reintroduces what it amortizes; contrast the feeder's staging
-   buffer, allocated once and `clear()`-reused across batches
-   (`crates/youpipe/src/builder/typed/stream.rs:249-252`). Fix shape: a
-   forwarder-owned `Vec<MaybeUninit<T>>` scratch (or at least
-   `with_capacity(batch.len())`). Magnitude: tiny (one k-sized alloc per k
-   items; chunk-500 allocations leave the tcache fast path) — consistency,
-   not throughput. Risk: none. Verify: `convoy-probe --shape fence` (park
-   signature must be unchanged) + `bench_ab.sh` on
-   `stream_pipeline/with_fence`.
+3. **`fence_batch_send` staging buffer** — **landed 2026-10-20 (round 7)**.
+   The batched arm (`YOUPIPE_FWD_BATCH=1`) stages through a forwarder-owned
+   `Vec<MaybeUninit<T>>` scratch — allocated once per forwarder (pre-sized
+   to the chunk; Barrier's single final flush grows it once, at run end)
+   and `clear()`-reused across released chunks, the same shape as the
+   feeder's `push_items` staging — instead of `collect()`-ing a fresh `Vec`
+   per chunk (`1→2→…→k` regrowth, exactly the per-batch regrowth
+   `FenceBarrier::reuse` removed). Readings: benchmarks.md
+   "Collector 0-claim probe + fence staging reuse" — with_fence rows
+   −0.9/−1.2 %, noise-level, as predicted (consistency, not throughput).
 
 4. **Knob promotion soak (`YOUPIPE_SPIN_ANCHOR` / `YOUPIPE_SHARDED_TERM` /
    `YOUPIPE_BATCH_RECV`)** (decision item). All three data-plane knobs stay

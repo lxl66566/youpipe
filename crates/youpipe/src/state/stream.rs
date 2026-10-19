@@ -178,8 +178,8 @@ where
         if batch_cap > 0 {
             // Batch burst-drain: claim ready runs with one cursor update
             // per run (YOUPIPE_BATCH_RECV, todo #1 residual (d)). A 0-claim
-            // is inconclusive (empty / first slot in-flight), so the single
-            // `try_recv` below resolves Empty vs Closed before anchoring.
+            // is inconclusive (empty / first slot in-flight) — the probe
+            // below resolves Empty vs Closed before anchoring.
             loop {
                 let n = rx.try_recv_batch(scratch.spare_capacity_mut());
                 if n == 0 {
@@ -202,8 +202,19 @@ where
             }
         }
         // Queue drained but channel may still be open — block for one.
-        // (Batch path: this is also the Empty/Closed probe.)
-        if batch_cap > 0 {
+        // Batch-path 0-claim probe (P-6 / PERF-7): an open channel resolves
+        // the 0-claim as Empty with one `is_disconnected` tx-count load —
+        // no second ring walk through `try_recv` over the stamp/head lines
+        // the terminal producers keep writing. The blocking `recv` below
+        // re-probes and pops a ready item without parking, so the sole
+        // false 0 — a lost head CAS under a receiver cloned through the
+        // public `run_ordered_collect` — delays that item by one retry, the
+        // same contract `claim_poll` documents. Only a disconnected channel
+        // falls through to `try_recv`, whose final drain delivers
+        // stragglers pushed before the last sender dropped before ever
+        // reporting Closed (the half-close contract; same shape as
+        // `drain_pass_batched`).
+        if batch_cap > 0 && rx.is_disconnected() {
             match rx.try_recv() {
                 Ok((_, item)) => {
                     sink(item);
@@ -307,8 +318,8 @@ pub(crate) fn drain_ordered_with<R, O>(
             }
         }
         // Queue drained but channel may still be open — block for one.
-        // (Batch path: this is also the Empty/Closed probe.)
-        if batch_cap > 0 {
+        // Batch-path 0-claim probe — see `drain_unordered_with`.
+        if batch_cap > 0 && rx.is_disconnected() {
             match rx.try_recv() {
                 Ok((seq, item)) => {
                     buffer.insert_into(seq, item, &mut sink);
@@ -757,6 +768,31 @@ mod tests {
         let mut got = Vec::new();
         drain_unordered_with(&rx, 8, |v| got.push(v));
         assert_eq!(got, (0..32).collect::<Vec<_>>());
+    }
+
+    /// Ordered mirror of `drain_unordered_batch_eof_after_close`: the 0-claim
+    /// probe's disconnected fall-through must deliver close-race stragglers
+    /// via `try_recv`'s final drain, then flush the reorder buffer in seq
+    /// order and pass accounting.
+    #[test]
+    fn drain_ordered_batch_eof_after_close() {
+        let (tx, rx) = channel::<(u64, u64)>(32);
+        // Reverse arrival order: whatever the final drain delivers must
+        // re-sequence by seq, not arrival order.
+        for i in (0..16u64).rev() {
+            tx.send((i, i)).unwrap();
+        }
+        drop(tx);
+        let mut out = Vec::new();
+        drain_ordered_with(
+            &rx,
+            16,
+            OrderedWindow::auto(16, 32),
+            OrderedAccounting::Validate { cancel: None },
+            8,
+            |v| out.push(v),
+        );
+        assert_eq!(out, (0..16).collect::<Vec<_>>());
     }
 
     /// P-1 behavior pin: the auto window pre-sizes to the pipeline

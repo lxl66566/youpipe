@@ -564,9 +564,15 @@ fn anchor_claim<T: Send + 'static>(
 /// whole batch before a `Full` can park). Arrival order within a batch was
 /// never a contract — unordered output interleaves workers anyway, ordered
 /// runs re-sequence by `seq` in the collector's `ReorderBuffer`.
+///
+/// `staged` is the forwarder-owned staging scratch for the batched arm
+/// (allocated once per forwarder and `clear`-reused per chunk, like
+/// `push_items`'s staging — a per-chunk `collect()` would regrow
+/// 1→2→…→k); the baseline path ignores it.
 fn fence_batch_send<T: Send + 'static, Tx: SendItem<T>>(
     tx: &Tx,
     batch: &mut Vec<T>,
+    staged: &mut Vec<std::mem::MaybeUninit<T>>,
     batched: bool,
 ) -> bool {
     if !batched {
@@ -577,12 +583,16 @@ fn fence_batch_send<T: Send + 'static, Tx: SendItem<T>>(
         }
         return true;
     }
-    // Stage in place: each slot is written by moving out of `batch` and is
-    // either sent (slot moved out) or written back below — `batch` is left
-    // holding exactly the unsent remainder.
-    let mut staged: Vec<std::mem::MaybeUninit<T>> =
-        batch.drain(..).map(std::mem::MaybeUninit::new).collect();
-    let sent = tx.try_send_batch(&mut staged);
+    // Stage through the caller-owned scratch (one allocation per forwarder,
+    // `clear`-reused across released chunks — the same shape as
+    // `push_items`'s staging): the historical per-chunk `collect()` regrew a
+    // fresh Vec 1→2→…→k, reintroducing exactly the batch-allocation
+    // regrowth `FenceBarrier::reuse` removed. Each slot is written by moving
+    // out of `batch` and is either sent (slot moved out) or written back
+    // below — `batch` is left holding exactly the unsent remainder.
+    staged.clear();
+    staged.extend(batch.drain(..).map(std::mem::MaybeUninit::new));
+    let sent = tx.try_send_batch(staged);
     // SAFETY: only [..sent) was moved out by the batch send; every slot
     // from `sent` on is still initialized.
     batch.extend(unsafe { staged[sent..].iter_mut().map(|s| s.assume_init_read()) });
@@ -854,6 +864,7 @@ fn forward_fenced<M, Tx>(
     fn fwd<M2, Tx2>(
         fence: &mut FenceBarrier<(u64, M2)>,
         fenced_tx: &Tx2,
+        staged: &mut Vec<std::mem::MaybeUninit<(u64, M2)>>,
         item: (u64, M2),
         batched: bool,
     ) -> bool
@@ -865,7 +876,7 @@ fn forward_fenced<M, Tx>(
             // Send in place so the allocation survives and can be recycled
             // by the barrier — steady state is zero allocator traffic per
             // batch (see `FenceBarrier::reuse`).
-            if !fence_batch_send(fenced_tx, &mut batch, batched) {
+            if !fence_batch_send(fenced_tx, &mut batch, staged, batched) {
                 return false;
             }
             fence.reuse(batch);
@@ -882,6 +893,12 @@ fn forward_fenced<M, Tx>(
     // Batch claim scratch (see `spawn_stage`).
     let batch_cap = crate::handoff::batch_recv_cap();
     let mut scratch: Vec<(u64, M)> = Vec::with_capacity(batch_cap.max(1));
+    // Staging scratch for the batched `fence_batch_send` arm: allocated
+    // once per forwarder and `clear`-reused per released chunk (pre-sized
+    // to the chunk so Chunked mode never regrows; Barrier's single final
+    // flush grows it once, at run end).
+    let mut staged: Vec<std::mem::MaybeUninit<(u64, M)>> =
+        Vec::with_capacity(mode.chunk_size().unwrap_or(0));
     loop {
         // Anchor + burst-drain (same shape as the stage workers): the
         // forwarder is the sole consumer, but draining the mid channel while
@@ -896,7 +913,7 @@ fn forward_fenced<M, Tx>(
             if cancel_active(cancel) {
                 return;
             }
-            if !fwd(&mut fence, &fenced_tx, item, batched) {
+            if !fwd(&mut fence, &fenced_tx, &mut staged, item, batched) {
                 return;
             }
         }
@@ -905,7 +922,7 @@ fn forward_fenced<M, Tx>(
     // is only reached on completion — the cancel path returns early above
     // without flushing, dropping in-progress items as expected on abort.
     if let Some(mut remaining) = fence.flush() {
-        fence_batch_send(&fenced_tx, &mut remaining, batched);
+        fence_batch_send(&fenced_tx, &mut remaining, &mut staged, batched);
     }
 }
 
@@ -4704,7 +4721,8 @@ mod tests {
             got
         });
         let mut batch = vec![1, 2, 3, 4, 5];
-        assert!(fence_batch_send(&tx, &mut batch, false));
+        let mut staged: Vec<std::mem::MaybeUninit<u32>> = Vec::new();
+        assert!(fence_batch_send(&tx, &mut batch, &mut staged, false));
         assert_eq!(batch.len(), 0);
         let mut got = drainer.join().unwrap();
         got.sort_unstable();
@@ -4722,7 +4740,8 @@ mod tests {
             got
         });
         let mut batch = vec![6, 7, 8, 9, 10];
-        assert!(fence_batch_send(&tx, &mut batch, true));
+        let mut staged: Vec<std::mem::MaybeUninit<u32>> = Vec::new();
+        assert!(fence_batch_send(&tx, &mut batch, &mut staged, true));
         assert_eq!(batch.len(), 0);
         let mut got = drainer.join().unwrap();
         got.sort_unstable();
@@ -4731,8 +4750,15 @@ mod tests {
         // Closed downstream (batched path): false, remainder dropped.
         let (tx, rx) = channel::<u32>(2);
         drop(rx);
+        let mut staged: Vec<std::mem::MaybeUninit<u32>> = Vec::new();
         let mut batch = vec![1u32, 2, 3];
-        assert!(!fence_batch_send(&tx, &mut batch, true));
+        assert!(!fence_batch_send(&tx, &mut batch, &mut staged, true));
+        // Scratch is reused, not reallocated: a same-size follow-up batch
+        // must not grow the staging buffer.
+        let cap = staged.capacity();
+        let mut batch = vec![4u32, 5, 6];
+        assert!(!fence_batch_send(&tx, &mut batch, &mut staged, true));
+        assert_eq!(staged.capacity(), cap);
     }
 
     /// `StreamStart::spawn_async_feeder_single` bridges the async feeder
