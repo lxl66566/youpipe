@@ -2,12 +2,11 @@ use std::marker::PhantomData;
 
 use crate::{
     builder::{
-        CountReducer, Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr,
-        OptionReducer, PipelineConfig, StageMarker, SumReducer, SyncMap, TryMap, Workload,
+        CountReducer, ExecOptions, Filter, FusedStage, FusedTryStage, Identity, InfallibleChain,
+        MapErr, OptionReducer, StageMarker, SumReducer, SyncMap, TryMap, exec_setters,
         fused_collect_scoped, fused_fold_scoped, fused_for_each_scoped, fused_reduce_scoped,
         fused_try_collect_scoped, fused_try_fold_scoped, fused_try_reduce_scoped,
     },
-    executor::compute::ComputePool,
 };
 
 /// Opens a scoped execution context for non-`'static` closures.
@@ -87,9 +86,7 @@ impl<'env> PipelineScope<'env> {
         ScopedPipe {
             items: items.into_iter().collect(),
             stages: Identity,
-            config: PipelineConfig::default(),
-            compute_pool: None,
-            oversubscribe: None,
+            exec: ExecOptions::default(),
             _marker: PhantomData,
         }
     }
@@ -116,82 +113,40 @@ impl<'env> PipelineScope<'env> {
 pub struct ScopedPipe<'env, S, I, O> {
     items: Vec<I>,
     stages: S,
-    config: PipelineConfig,
-    /// Custom compute pool — see [`crate::Pipe::with_compute_pool`].
-    compute_pool: Option<ComputePool>,
-    /// Oversubscribe factor — see [`crate::Pipe::with_oversubscribe`].
-    oversubscribe: Option<std::num::NonZeroUsize>,
+    /// Execution tuning — see [`crate::Pipe::with_config`].
+    exec: ExecOptions,
     _marker: PhantomData<(&'env (), O)>,
 }
 
 impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
-    /// Override the default [`PipelineConfig`] — wholesale-replace
-    /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
-    #[must_use]
-    pub fn with_config(mut self, config: PipelineConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Tune the workload split factor. Default is [`Workload::Balanced`].
-    #[must_use]
-    pub fn with_workload(mut self, workload: Workload) -> Self {
-        self.config.workload = workload;
-        self
-    }
-
-    /// Set the compute-pool worker budget — see
-    /// [`crate::PipelineConfig::with_compute_workers`]. The fused path reads
-    /// only this and `with_workload`; streaming-only knobs have no effect
-    /// here.
-    #[must_use]
-    pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.set_compute_workers(n);
-        self
-    }
-
-    /// Attach a custom [`ComputePool`] — see
-    /// [`crate::Pipe::with_compute_pool`].
-    ///
-    /// The primary use case inside a [`scope`] is oversubscribing threads for
-    /// blocking-IO sync workloads (e.g. file encryption/decryption) while still
-    /// borrowing stack-local data (key caches, lookup tables) by reference.
-    #[must_use]
-    pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
-        self.compute_pool = Some(pool);
-        self
-    }
-
-    /// Oversubscribe the compute pool — see
-    /// [`crate::Pipe::with_oversubscribe`] for the full guidance. Same
-    /// semantics: creates a transient `factor × num_cpus` thread pool at
-    /// `.collect()` / `.for_each()` time.
-    ///
-    /// Inside a [`scope`] this is the shortest path to oversubscription for a
-    /// blocking-IO workload that borrows stack-local data:
-    ///
-    /// ```rust
-    /// use youpipe::scope;
-    ///
-    /// let key_cache: Vec<u8> = vec![0x42; 32];
-    /// scope(|s| {
-    ///     s.pipe(0..100)
-    ///         .with_oversubscribe(2)
-    ///         .map(|i: i32| i + key_cache[0] as i32)
-    ///         .for_each(|_| { /* blocking IO */ });
-    /// });
-    /// ```
-    ///
-    /// # Panics
-    ///
-    /// Panics if `factor == 0` (see [`crate::Pipe::with_oversubscribe`]).
-    #[must_use]
-    pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = Some(PipelineConfig::require_nonzero(
-            factor,
-            "with_oversubscribe",
-        ));
-        self
+    exec_setters! {
+        with_compute_workers:
+            "The fused path reads only this and `with_workload`; streaming-only"
+            "knobs have no effect here.";
+        with_compute_pool:
+            "The primary use case inside a [`scope`](crate::scope()) is oversubscribing"
+            "threads for blocking-IO sync workloads (e.g. file encryption/decryption)"
+            "while still borrowing stack-local data (key caches, lookup tables) by"
+            "reference.";
+        with_oversubscribe:
+            "Same semantics: creates a transient `factor × num_cpus` thread pool at"
+            "`.collect()` / `.for_each()` time."
+            ""
+            "Inside a [`scope`](crate::scope()) this is the shortest path to"
+            "oversubscription for a blocking-IO workload that borrows stack-local"
+            "data:"
+            ""
+            "```rust"
+            "use youpipe::scope;"
+            ""
+            "let key_cache: Vec<u8> = vec![0x42; 32];"
+            "scope(|s| {"
+            "    s.pipe(0..100)"
+            "        .with_oversubscribe(2)"
+            "        .map(|i: i32| i + key_cache[0] as i32)"
+            "        .for_each(|_| { /* blocking IO */ });"
+            "});"
+            "```";
     }
 
     /// Append a synchronous map stage: `Fn(O) -> N`. The output type changes
@@ -211,9 +166,7 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -232,9 +185,7 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -287,9 +238,7 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
                 prev: InfallibleChain(self.stages, PhantomData),
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -308,60 +257,15 @@ impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
 pub struct ScopedTryPipe<'env, S, I, O, E = std::convert::Infallible> {
     items: Vec<I>,
     stages: S,
-    config: PipelineConfig,
-    /// Custom compute pool — see [`crate::Pipe::with_compute_pool`].
-    compute_pool: Option<ComputePool>,
-    /// Oversubscribe factor — see [`crate::Pipe::with_oversubscribe`].
-    oversubscribe: Option<std::num::NonZeroUsize>,
+    /// Execution tuning — see [`crate::Pipe::with_config`].
+    exec: ExecOptions,
     _marker: PhantomData<(&'env (), O, E)>,
 }
 
 impl<'env, S, I, O, E> ScopedTryPipe<'env, S, I, O, E> {
-    /// Override the default [`PipelineConfig`] — wholesale-replace
-    /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
-    #[must_use]
-    pub fn with_config(mut self, config: PipelineConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Tune the workload split factor. Default is [`Workload::Balanced`].
-    #[must_use]
-    pub fn with_workload(mut self, workload: Workload) -> Self {
-        self.config.workload = workload;
-        self
-    }
-
-    /// Set the compute-pool worker budget — see
-    /// [`crate::PipelineConfig::with_compute_workers`]. Only this and
-    /// `with_workload` affect the fused path.
-    #[must_use]
-    pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.set_compute_workers(n);
-        self
-    }
-
-    /// Attach a custom [`ComputePool`] — see
-    /// [`crate::Pipe::with_compute_pool`].
-    #[must_use]
-    pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
-        self.compute_pool = Some(pool);
-        self
-    }
-
-    /// Oversubscribe the compute pool — see
-    /// [`crate::Pipe::with_oversubscribe`] for the full guidance.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `factor == 0` (see [`crate::Pipe::with_oversubscribe`]).
-    #[must_use]
-    pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = Some(PipelineConfig::require_nonzero(
-            factor,
-            "with_oversubscribe",
-        ));
-        self
+    exec_setters! {
+        with_compute_workers:
+            "Only this and `with_workload` affect the fused path.";
     }
 
     /// Append an infallible map stage. The error type `E` is unchanged.
@@ -380,9 +284,7 @@ impl<'env, S, I, O, E> ScopedTryPipe<'env, S, I, O, E> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -402,9 +304,7 @@ impl<'env, S, I, O, E> ScopedTryPipe<'env, S, I, O, E> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -427,9 +327,7 @@ impl<'env, S, I, O, E> ScopedTryPipe<'env, S, I, O, E> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -449,9 +347,7 @@ impl<'env, S, I, O, E> ScopedTryPipe<'env, S, I, O, E> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -468,13 +364,9 @@ where
     /// error. Drives the same work-stealing core as
     /// [`crate::TryPipe::try_collect`], minus the `'static` bounds.
     pub fn try_collect(self) -> Result<Vec<O>, E> {
-        let exec = crate::builder::resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        fused_try_collect_scoped(self.items, self.stages, self.config.workload, pool)
+        fused_try_collect_scoped(self.items, self.stages, self.exec.config.workload, pool)
     }
 
     /// Execute the fused fallible pipeline and reduce the outputs,
@@ -489,13 +381,9 @@ where
     where
         F: Fn(O, O) -> O + Sync,
     {
-        let exec = crate::builder::resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        fused_try_reduce_scoped(self.items, self.stages, op, self.config.workload, pool)
+        fused_try_reduce_scoped(self.items, self.stages, op, self.exec.config.workload, pool)
     }
 
     /// Execute the fused fallible pipeline, folding outputs into an
@@ -511,11 +399,7 @@ where
         F: Fn(A, O) -> A + Sync,
         C: Fn(A, A) -> A + Sync,
     {
-        let exec = crate::builder::resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
         fused_try_fold_scoped(
             self.items,
@@ -523,7 +407,7 @@ where
             init,
             f,
             combine,
-            self.config.workload,
+            self.exec.config.workload,
             pool,
         )
     }
@@ -541,13 +425,9 @@ where
     /// top-level `Pipe::collect` — no `'static` bound required. When the
     /// stage chain contains a `Filter`, falls back to per-leaf `Vec` merge.
     pub fn collect(self) -> Vec<O> {
-        let exec = crate::builder::resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        fused_collect_scoped(self.items, self.stages, self.config.workload, pool)
+        fused_collect_scoped(self.items, self.stages, self.exec.config.workload, pool)
     }
 
     /// Execute the fused pipeline, applying `f` to each output for its side
@@ -581,13 +461,9 @@ where
     where
         F: Fn(O) + Sync,
     {
-        let exec = crate::builder::resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        fused_for_each_scoped(self.items, self.stages, f, self.config.workload, pool);
+        fused_for_each_scoped(self.items, self.stages, f, self.exec.config.workload, pool);
     }
 
     /// Execute the fused pipeline and reduce the outputs into a single
@@ -609,17 +485,13 @@ where
     where
         F: Fn(O, O) -> O + Sync,
     {
-        let exec = crate::builder::resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
         fused_reduce_scoped(
             self.items,
             self.stages,
             OptionReducer(op),
-            self.config.workload,
+            self.exec.config.workload,
             pool,
         )
     }
@@ -638,11 +510,7 @@ where
         F: Fn(A, O) -> A + Sync,
         C: Fn(A, A) -> A + Sync,
     {
-        let exec = crate::builder::resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
         fused_fold_scoped(
             self.items,
@@ -650,7 +518,7 @@ where
             init,
             f,
             combine,
-            self.config.workload,
+            self.exec.config.workload,
             pool,
         )
     }
@@ -667,17 +535,13 @@ where
     where
         O: std::iter::Sum + Send,
     {
-        let exec = crate::builder::resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
         fused_reduce_scoped(
             self.items,
             self.stages,
             SumReducer(PhantomData),
-            self.config.workload,
+            self.exec.config.workload,
             pool,
         )
     }
@@ -690,17 +554,13 @@ where
     ///
     /// Propagates any panic raised by the stage chain.
     pub fn count(self) -> usize {
-        let exec = crate::builder::resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
         fused_reduce_scoped(
             self.items,
             self.stages,
             CountReducer,
-            self.config.workload,
+            self.exec.config.workload,
             pool,
         )
     }
@@ -736,6 +596,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::compute::ComputePool;
 
     #[test]
     fn test_scope_basic() {

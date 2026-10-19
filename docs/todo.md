@@ -207,14 +207,15 @@ Mpsc/MixedAsync），每 stage 一个泛型 `spawn_into`，五方法变单行委
 收编 `_single` 孪生。回归防护（try_exec 的终端 Single-variant debug_assert）
 重构期作安全网。
 
-### 11. [P1] 六 builder × 五 setter 复制
-
-Pipe/TryPipe/PipeRef/TryPipeRef/ScopedPipe/ScopedTryPipe 各手抄
-`with_config`/`with_workload`/`with_compute_workers`/`with_compute_pool`/
-`with_oversubscribe` + 同构 `map`/`filter` 体重建（~30 份方法拷贝，每方法
-五行字段搬运）；曾因此出过 budget 被静默忽略的漂移 bug（fused.rs 测试注释
-有记录）。抽内部 `ExecOptions { config, compute_pool, oversubscribe }` 被
-move 进各 builder + setter 宏，加字段只改一处。
+<!-- #11 builder setter 复制已完成并移除（2026-10-20，r8）：抽内部
+`ExecOptions { config, compute_pool, oversubscribe }` move 进全部七个 fused
+builder（todo 漏数了 RangePipe），`map`/`filter` 重建变单字段搬运
+`exec: self.exec`；五个 setter 由 `exec_setters!` 宏生成（fused.rs），Pipe
+保留手写规范文档、其余经宏参数附加各自差异行（含 ScopedPipe 的 scope
+示例 doctest，仍执行）。budget 漂移 bug 的回归覆盖仍在：
+`test_resolve_exec_pool_precedence`（resolve 层）+ pool_cache /
+pipeline_integration 的 builder 级 with_compute_workers 测试。编号 11 不再
+使用，后续条目编号不动。 -->
 
 <!-- #12 死代码清理已完成并移除（2026-10-20）：pool 侧四项随 8eb4b67、
 `BoxFuture` 与 `CancellationToken::reset`（含自测）随 r7 d5425c8 删除，

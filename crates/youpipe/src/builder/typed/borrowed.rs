@@ -9,21 +9,18 @@
 //! a `Vec<&T>`, or freed. See the borrowed-core section in `fused.rs` for how
 //! the same hybrid dispatch drives a shared `&[T]`.
 
-use std::{marker::PhantomData, num::NonZeroUsize};
+use std::marker::PhantomData;
 
 use super::{
     Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, StageMarker, SyncMap,
     TryMap,
     fused::{
-        fused_collect_by_ref, fused_for_each_by_ref, fused_reduce_by_ref, fused_try_collect_by_ref,
-        fused_try_reduce_by_ref, resolve_exec_pool,
+        ExecOptions, exec_setters, fused_collect_by_ref, fused_for_each_by_ref,
+        fused_reduce_by_ref, fused_try_collect_by_ref, fused_try_reduce_by_ref,
     },
     traits::{CountReducer, FoldReducer, OptionReducer, SumReducer},
 };
-use crate::{
-    builder::{FilterCollectMode, PipelineConfig, Workload},
-    executor::compute::ComputePool,
-};
+use crate::builder::FilterCollectMode;
 
 /// Borrowed-input entry point. Builds a fused pipeline that reads `items` by
 /// shared reference — the youpipe counterpart of rayon's `slice::par_iter()`.
@@ -79,9 +76,7 @@ where
     PipeRef {
         items,
         stages: Identity,
-        config: PipelineConfig::default(),
-        compute_pool: None,
-        oversubscribe: None,
+        exec: ExecOptions::default(),
         _marker: PhantomData,
     }
 }
@@ -97,60 +92,14 @@ where
 pub struct PipeRef<'a, S, T, O> {
     items: &'a [T],
     stages: S,
-    config: PipelineConfig,
-    /// Custom compute pool — see [`Pipe::with_compute_pool`](crate::Pipe::with_compute_pool).
-    compute_pool: Option<ComputePool>,
-    /// Oversubscribe factor — see [`Pipe::with_oversubscribe`](crate::Pipe::with_oversubscribe).
-    oversubscribe: Option<NonZeroUsize>,
+    /// Execution tuning — see [`ExecOptions`] and
+    /// [`Pipe::with_config`](crate::Pipe::with_config).
+    exec: ExecOptions,
     _marker: PhantomData<(&'a (), O)>,
 }
 
 impl<'a, S, T, O> PipeRef<'a, S, T, O> {
-    /// Override the default [`PipelineConfig`] — wholesale-replace
-    /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
-    #[must_use]
-    pub fn with_config(mut self, config: PipelineConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Tune the workload split factor. Default is [`Workload::Balanced`].
-    #[must_use]
-    pub fn with_workload(mut self, workload: Workload) -> Self {
-        self.config.workload = workload;
-        self
-    }
-
-    /// Set the compute-pool worker budget — see
-    /// [`Pipe::with_compute_workers`](crate::Pipe::with_compute_workers).
-    #[must_use]
-    pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.set_compute_workers(n);
-        self
-    }
-
-    /// Attach a custom [`ComputePool`] — see
-    /// [`Pipe::with_compute_pool`](crate::Pipe::with_compute_pool).
-    #[must_use]
-    pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
-        self.compute_pool = Some(pool);
-        self
-    }
-
-    /// Oversubscribe the compute pool — see
-    /// [`Pipe::with_oversubscribe`](crate::Pipe::with_oversubscribe).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `factor == 0` (see [`Pipe::with_oversubscribe`]).
-    #[must_use]
-    pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = Some(PipelineConfig::require_nonzero(
-            factor,
-            "with_oversubscribe",
-        ));
-        self
-    }
+    exec_setters! {}
 
     /// Set the filter collect implementation for this chain — see
     /// [`FilterCollectMode`] (default [`FilterCollectMode::Auto`]: merge
@@ -160,7 +109,7 @@ impl<'a, S, T, O> PipeRef<'a, S, T, O> {
     /// output is identical across modes.
     #[must_use]
     pub fn with_filter_collect(mut self, mode: FilterCollectMode) -> Self {
-        self.config.filter_collect = mode;
+        self.exec.config.filter_collect = mode;
         self
     }
 
@@ -181,9 +130,7 @@ impl<'a, S, T, O> PipeRef<'a, S, T, O> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -202,9 +149,7 @@ impl<'a, S, T, O> PipeRef<'a, S, T, O> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -242,9 +187,7 @@ impl<'a, S, T, O> PipeRef<'a, S, T, O> {
                 prev: InfallibleChain(self.stages, PhantomData),
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -261,17 +204,13 @@ where
     /// (crate::Pipe::collect); the input slice is only read.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn collect(self) -> Vec<O> {
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
         fused_collect_by_ref(
             self.items,
             self.stages,
-            self.config.workload,
-            self.config.filter_collect,
+            self.exec.config.workload,
+            self.exec.config.filter_collect,
             pool,
         )
     }
@@ -289,13 +228,9 @@ where
     where
         F: Fn(O) + Sync,
     {
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        fused_for_each_by_ref(self.items, self.stages, f, self.config.workload, pool);
+        fused_for_each_by_ref(self.items, self.stages, f, self.exec.config.workload, pool);
     }
 
     /// Execute the fused pipeline and reduce the outputs into a single
@@ -321,17 +256,13 @@ where
     where
         F: Fn(O, O) -> O + Sync,
     {
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
         fused_reduce_by_ref(
             self.items,
             self.stages,
             OptionReducer(op),
-            self.config.workload,
+            self.exec.config.workload,
             pool,
         )
     }
@@ -351,17 +282,13 @@ where
         F: Fn(A, O) -> A + Sync,
         C: Fn(A, A) -> A + Sync,
     {
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
         fused_reduce_by_ref(
             self.items,
             self.stages,
             FoldReducer { init, f, combine },
-            self.config.workload,
+            self.exec.config.workload,
             pool,
         )
     }
@@ -378,17 +305,13 @@ where
     where
         O: std::iter::Sum + Send,
     {
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
         fused_reduce_by_ref(
             self.items,
             self.stages,
             SumReducer(PhantomData),
-            self.config.workload,
+            self.exec.config.workload,
             pool,
         )
     }
@@ -402,17 +325,13 @@ where
     /// Propagates any panic raised by the stage chain.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn count(self) -> usize {
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
         fused_reduce_by_ref(
             self.items,
             self.stages,
             CountReducer,
-            self.config.workload,
+            self.exec.config.workload,
             pool,
         )
     }
@@ -452,60 +371,14 @@ where
 pub struct TryPipeRef<'a, S, T, O, E = std::convert::Infallible> {
     items: &'a [T],
     stages: S,
-    config: PipelineConfig,
-    /// Custom compute pool — see [`Pipe::with_compute_pool`](crate::Pipe::with_compute_pool).
-    compute_pool: Option<ComputePool>,
-    /// Oversubscribe factor — see [`Pipe::with_oversubscribe`](crate::Pipe::with_oversubscribe).
-    oversubscribe: Option<NonZeroUsize>,
+    /// Execution tuning — see [`ExecOptions`] and
+    /// [`Pipe::with_config`](crate::Pipe::with_config).
+    exec: ExecOptions,
     _marker: PhantomData<(&'a (), O, E)>,
 }
 
 impl<'a, S, T, O, E> TryPipeRef<'a, S, T, O, E> {
-    /// Override the default [`PipelineConfig`] — wholesale-replace
-    /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
-    #[must_use]
-    pub fn with_config(mut self, config: PipelineConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Tune the workload split factor. Default is [`Workload::Balanced`].
-    #[must_use]
-    pub fn with_workload(mut self, workload: Workload) -> Self {
-        self.config.workload = workload;
-        self
-    }
-
-    /// Set the compute-pool worker budget — see
-    /// [`Pipe::with_compute_workers`](crate::Pipe::with_compute_workers).
-    #[must_use]
-    pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.set_compute_workers(n);
-        self
-    }
-
-    /// Attach a custom [`ComputePool`] — see
-    /// [`Pipe::with_compute_pool`](crate::Pipe::with_compute_pool).
-    #[must_use]
-    pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
-        self.compute_pool = Some(pool);
-        self
-    }
-
-    /// Oversubscribe the compute pool — see
-    /// [`Pipe::with_oversubscribe`](crate::Pipe::with_oversubscribe).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `factor == 0` (see [`Pipe::with_oversubscribe`]).
-    #[must_use]
-    pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = Some(PipelineConfig::require_nonzero(
-            factor,
-            "with_oversubscribe",
-        ));
-        self
-    }
+    exec_setters! {}
 
     /// Append an infallible map stage. The error type `E` is unchanged.
     pub fn map<N>(
@@ -523,9 +396,7 @@ impl<'a, S, T, O, E> TryPipeRef<'a, S, T, O, E> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -545,9 +416,7 @@ impl<'a, S, T, O, E> TryPipeRef<'a, S, T, O, E> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -570,9 +439,7 @@ impl<'a, S, T, O, E> TryPipeRef<'a, S, T, O, E> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -592,9 +459,7 @@ impl<'a, S, T, O, E> TryPipeRef<'a, S, T, O, E> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -613,13 +478,9 @@ where
     /// is only read.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn try_collect(self) -> Result<Vec<O>, E> {
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        fused_try_collect_by_ref(self.items, self.stages, self.config.workload, pool)
+        fused_try_collect_by_ref(self.items, self.stages, self.exec.config.workload, pool)
     }
 
     /// Execute the fused fallible pipeline and reduce the outputs,
@@ -636,17 +497,13 @@ where
     where
         F: Fn(O, O) -> O + Sync,
     {
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
         fused_try_reduce_by_ref(
             self.items,
             self.stages,
             OptionReducer(op),
-            self.config.workload,
+            self.exec.config.workload,
             pool,
         )
     }
@@ -665,17 +522,13 @@ where
         F: Fn(A, O) -> A + Sync,
         C: Fn(A, A) -> A + Sync,
     {
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
         fused_try_reduce_by_ref(
             self.items,
             self.stages,
             FoldReducer { init, f, combine },
-            self.config.workload,
+            self.exec.config.workload,
             pool,
         )
     }
@@ -686,6 +539,7 @@ mod tests {
     use std::panic::AssertUnwindSafe;
 
     use super::*;
+    use crate::{builder::Workload, executor::compute::ComputePool};
 
     /// Parallel correctness across the hybrid chunk/steal paths: a large
     /// input must produce exactly the sequential result.

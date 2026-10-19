@@ -109,6 +109,121 @@ pub(crate) fn resolve_exec_pool(
     ExecPool::Ref(ComputePool::global())
 }
 
+/// The execution-tuning state every fused builder carries (todo #11: the
+/// `config` / `compute_pool` / `oversubscribe` field triple plus the five
+/// setters were hand-copied per builder and once drifted into a silently
+/// ignored `compute_workers` budget — see
+/// `test_resolve_exec_pool_precedence`). One struct moved through the
+/// typestate chain (`exec: self.exec` in every `map`/`filter` rebuild) plus
+/// the `exec_setters!` macro: adding a knob changes a single site.
+#[derive(Clone, Default)]
+pub(crate) struct ExecOptions {
+    /// Config-resident knobs (`workload`, `compute_workers`, …) — replaced
+    /// wholesale by [`Pipe::with_config`].
+    pub(crate) config: PipelineConfig,
+    /// Custom compute pool — see [`Pipe::with_compute_pool`].
+    pub(crate) compute_pool: Option<ComputePool>,
+    /// Oversubscribe factor — see [`Pipe::with_oversubscribe`].
+    pub(crate) oversubscribe: Option<NonZeroUsize>,
+}
+
+impl ExecOptions {
+    /// Resolve the terminal's pool — [`resolve_exec_pool`] over the three
+    /// fields. The returned [`ExecPool`] owns a transient pool when the
+    /// oversubscribe/budget hints ask for one; keep it alive until the
+    /// terminal returns (dropping it parks the pool in the recycling cache).
+    pub(crate) fn resolve(&self) -> ExecPool<'_> {
+        resolve_exec_pool(
+            self.compute_pool.as_ref(),
+            self.oversubscribe,
+            self.config.compute_workers,
+        )
+    }
+}
+
+/// Implements the five execution-tuning setters on a fused builder that
+/// carries an `exec: ExecOptions` field (todo #11). Invoke in item position
+/// inside the builder's inherent impl:
+///
+/// ```ignore
+/// impl<S, I, O, E> TryPipe<S, I, O, E> {
+///     exec_setters! {
+///         with_oversubscribe:
+///             "Same semantics: transient pool at `.try_collect()` time.";
+///     }
+/// }
+/// ```
+///
+/// Optional `with_config:` / `with_compute_workers:` / `with_compute_pool:` /
+/// `with_oversubscribe:` blocks, in that order, append builder-specific doc
+/// lines — each string literal becomes one doc line, so multi-paragraph
+/// guidance and examples pass through verbatim. `Pipe` keeps hand-written
+/// setters (the canonical docs every base line links to); `with_workload`
+/// has no block because its doc never differed.
+macro_rules! exec_setters {
+    (
+        $( with_config: $($cfg_doc:literal)* ; )?
+        $( with_compute_workers: $($cw_doc:literal)* ; )?
+        $( with_compute_pool: $($cp_doc:literal)* ; )?
+        $( with_oversubscribe: $($os_doc:literal)* ; )?
+    ) => {
+        #[doc = "Override the default [`PipelineConfig`](crate::PipelineConfig) — wholesale-replace semantics, see [`Pipe::with_config`](crate::Pipe::with_config)."]
+        $(
+            $(#[doc = $cfg_doc])*
+        )?
+        #[must_use]
+        pub fn with_config(mut self, config: crate::PipelineConfig) -> Self {
+            self.exec.config = config;
+            self
+        }
+
+        #[doc = "Tune the workload split factor. Default is [`Workload::Balanced`](crate::Workload::Balanced)."]
+        #[must_use]
+        pub fn with_workload(mut self, workload: crate::Workload) -> Self {
+            self.exec.config.workload = workload;
+            self
+        }
+
+        #[doc = "Set the compute-pool worker budget — see [`Pipe::with_compute_workers`](crate::Pipe::with_compute_workers)."]
+        $(
+            $(#[doc = $cw_doc])*
+        )?
+        #[must_use]
+        pub fn with_compute_workers(mut self, n: usize) -> Self {
+            self.exec.config.set_compute_workers(n);
+            self
+        }
+
+        #[doc = "Attach a custom [`ComputePool`](crate::ComputePool) — see [`Pipe::with_compute_pool`](crate::Pipe::with_compute_pool)."]
+        $(
+            $(#[doc = $cp_doc])*
+        )?
+        #[must_use]
+        pub fn with_compute_pool(mut self, pool: crate::ComputePool) -> Self {
+            self.exec.compute_pool = Some(pool);
+            self
+        }
+
+        #[doc = "Oversubscribe the compute pool — see [`Pipe::with_oversubscribe`](crate::Pipe::with_oversubscribe) for the full guidance."]
+        $(
+            $(#[doc = $os_doc])*
+        )?
+        #[doc = ""]
+        #[doc = "# Panics"]
+        #[doc = ""]
+        #[doc = "Panics if `factor == 0` (see [`Pipe::with_oversubscribe`](crate::Pipe::with_oversubscribe))."]
+        #[must_use]
+        pub fn with_oversubscribe(mut self, factor: usize) -> Self {
+            self.exec.oversubscribe = Some(crate::PipelineConfig::require_nonzero(
+                factor,
+                "with_oversubscribe",
+            ));
+            self
+        }
+    };
+}
+pub(crate) use exec_setters;
+
 /// Recursive index-based parallel core — the divide-and-conquer shared by
 /// every fused terminal's chunk driver (the former per-terminal
 /// `par_*_rec` copies). Each leaf claims a disjoint index range
@@ -3483,9 +3598,7 @@ where
     Pipe {
         items: items.into_iter().collect(),
         stages: Identity,
-        config: PipelineConfig::default(),
-        compute_pool: None,
-        oversubscribe: None,
+        exec: ExecOptions::default(),
         _marker: PhantomData,
     }
 }
@@ -3504,17 +3617,10 @@ where
 pub struct Pipe<S, I, O> {
     items: Vec<I>,
     stages: S,
-    config: PipelineConfig,
-    /// Custom compute pool. When `None`, the pipeline runs on
-    /// [`ComputePool::global`] (sized to `num_cpus`). When `Some`, all
-    /// fork-join work is driven through this pool instead — useful for
-    /// oversubscribing threads for blocking-IO sync workloads (e.g.
-    /// `ComputePool::new(num_cpus * 2)` to fill CPU gaps during IO stalls).
-    compute_pool: Option<ComputePool>,
-    /// Oversubscribe factor from [`Pipe::with_oversubscribe`]. Resolved to a
-    /// transient `ComputePool` at execution time. Ignored when `compute_pool`
-    /// is `Some` (explicit pool takes precedence).
-    oversubscribe: Option<NonZeroUsize>,
+    /// Execution tuning (config + pool overrides) — see [`ExecOptions`] and
+    /// the `with_config` / `with_workload` / `with_compute_workers` /
+    /// `with_compute_pool` / `with_oversubscribe` setters.
+    exec: ExecOptions,
     _marker: PhantomData<O>,
 }
 
@@ -3534,14 +3640,14 @@ impl<S, I, O> Pipe<S, I, O> {
     /// the ordering.
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
-        self.config = config;
+        self.exec.config = config;
         self
     }
 
     /// Tune the workload split factor. Default is [`Workload::Balanced`].
     #[must_use]
     pub fn with_workload(mut self, workload: Workload) -> Self {
-        self.config.workload = workload;
+        self.exec.config.workload = workload;
         self
     }
 
@@ -3559,7 +3665,7 @@ impl<S, I, O> Pipe<S, I, O> {
     /// `io_concurrency`, …) have no effect on the fused path.
     #[must_use]
     pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.set_compute_workers(n);
+        self.exec.config.set_compute_workers(n);
         self
     }
 
@@ -3597,7 +3703,7 @@ impl<S, I, O> Pipe<S, I, O> {
     /// ```
     #[must_use]
     pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
-        self.compute_pool = Some(pool);
+        self.exec.compute_pool = Some(pool);
         self
     }
 
@@ -3691,7 +3797,7 @@ impl<S, I, O> Pipe<S, I, O> {
     /// meaningful (see `PipelineConfig::require_nonzero`).
     #[must_use]
     pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = Some(PipelineConfig::require_nonzero(
+        self.exec.oversubscribe = Some(PipelineConfig::require_nonzero(
             factor,
             "with_oversubscribe",
         ));
@@ -3718,9 +3824,7 @@ impl<S, I, O> Pipe<S, I, O> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -3739,9 +3843,7 @@ impl<S, I, O> Pipe<S, I, O> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -3777,9 +3879,7 @@ impl<S, I, O> Pipe<S, I, O> {
                 prev: InfallibleChain(self.stages, PhantomData),
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -3810,13 +3910,9 @@ where
         if n == 0 {
             return Vec::new();
         }
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+        match terminal_plan(n, self.exec.config.workload, pool.num_workers()) {
             // Trivial batch (n == 1 or single-threaded pool): skip the pool
             // entirely. Dispatch on `MAY_FILTER` so the pure path matches a
             // hand-written `iter().map().collect()` — no `Option` wrapper.
@@ -3860,13 +3956,9 @@ where
         if n == 0 {
             return;
         }
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+        match terminal_plan(n, self.exec.config.workload, pool.num_workers()) {
             // Trivial batch (n == 1 or single-threaded pool): run inline, no
             // output buffer. Dispatch on `MAY_FILTER` to keep the pure path
             // branch-free.
@@ -3920,13 +4012,9 @@ where
         if n == 0 {
             return None;
         }
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+        match terminal_plan(n, self.exec.config.workload, pool.num_workers()) {
             // Trivial case: plain sequential reduce, no chunk machinery.
             TerminalPlan::Serial => {
                 if S::MAY_FILTER {
@@ -3987,13 +4075,9 @@ where
         let items = self.items;
         let stages = self.stages;
         let n = items.len();
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+        match terminal_plan(n, self.exec.config.workload, pool.num_workers()) {
             // Serial fold: a single accumulator, no per-leaf `init` clones.
             // The Serial arm covers the empty batch too (`n == 0` folds to
             // `init`).
@@ -4036,13 +4120,9 @@ where
         let items = self.items;
         let stages = self.stages;
         let n = items.len();
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+        match terminal_plan(n, self.exec.config.workload, pool.num_workers()) {
             // The Serial arm covers the empty batch too (Sum over an empty
             // iterator is the additive identity).
             TerminalPlan::Serial => {
@@ -4077,13 +4157,9 @@ where
         if n == 0 {
             return 0;
         }
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+        match terminal_plan(n, self.exec.config.workload, pool.num_workers()) {
             TerminalPlan::Serial => {
                 if S::MAY_FILTER {
                     return items
@@ -4148,58 +4224,16 @@ where
 pub struct TryPipe<S, I, O, E = std::convert::Infallible> {
     items: Vec<I>,
     stages: S,
-    config: PipelineConfig,
-    /// Custom compute pool — see [`Pipe::with_compute_pool`].
-    compute_pool: Option<ComputePool>,
-    /// Oversubscribe factor — see [`Pipe::with_oversubscribe`].
-    oversubscribe: Option<NonZeroUsize>,
+    /// Execution tuning — see [`ExecOptions`] and [`Pipe::with_config`].
+    exec: ExecOptions,
     _marker: PhantomData<(O, E)>,
 }
 
 impl<S, I, O, E> TryPipe<S, I, O, E> {
-    /// Override the default [`PipelineConfig`] — wholesale-replace
-    /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
-    #[must_use]
-    pub fn with_config(mut self, config: PipelineConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Tune the workload split factor. Default is [`Workload::Balanced`].
-    #[must_use]
-    pub fn with_workload(mut self, workload: Workload) -> Self {
-        self.config.workload = workload;
-        self
-    }
-
-    /// Set the compute-pool worker budget — see [`Pipe::with_compute_workers`].
-    #[must_use]
-    pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.set_compute_workers(n);
-        self
-    }
-
-    /// Attach a custom [`ComputePool`] — see [`Pipe::with_compute_pool`].
-    #[must_use]
-    pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
-        self.compute_pool = Some(pool);
-        self
-    }
-
-    /// Oversubscribe the compute pool — see [`Pipe::with_oversubscribe`] for
-    /// the full guidance. Same semantics: creates a transient
-    /// `factor × num_cpus` thread pool at `.try_collect()` time.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `factor == 0` (see [`Pipe::with_oversubscribe`]).
-    #[must_use]
-    pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = Some(PipelineConfig::require_nonzero(
-            factor,
-            "with_oversubscribe",
-        ));
-        self
+    exec_setters! {
+        with_oversubscribe:
+            "Same semantics: creates a transient `factor × num_cpus` thread pool at"
+            "`.try_collect()` time.";
     }
 
     /// Append an infallible map stage. The error type `E` is unchanged.
@@ -4218,9 +4252,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -4240,9 +4272,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -4266,9 +4296,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -4289,9 +4317,7 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -4314,13 +4340,9 @@ where
         if n == 0 {
             return Ok(Vec::new());
         }
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+        match terminal_plan(n, self.exec.config.workload, pool.num_workers()) {
             // Trivial batch (n == 1 or single-threaded pool): skip the pool.
             // `serial_stage_try_collect` dispatches on `MAY_FILTER` so the
             // pure path matches a hand-written `iter().map().collect()` — no
@@ -4368,13 +4390,9 @@ where
         if n == 0 {
             return Ok(None);
         }
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+        match terminal_plan(n, self.exec.config.workload, pool.num_workers()) {
             TerminalPlan::Serial => {
                 let mut acc: Option<O> = None;
                 for item in items {
@@ -4415,13 +4433,9 @@ where
         let items = self.items;
         let stages = self.stages;
         let n = items.len();
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+        match terminal_plan(n, self.exec.config.workload, pool.num_workers()) {
             // Serial fold: a single accumulator, no per-leaf `init` clones.
             // The Serial arm covers the empty batch too (`n == 0` folds to
             // `init`).
@@ -4463,9 +4477,7 @@ pub fn pipe_range(range: Range<usize>) -> RangePipe<Identity, usize> {
     RangePipe {
         range,
         stages: Identity,
-        config: PipelineConfig::default(),
-        compute_pool: None,
-        oversubscribe: None,
+        exec: ExecOptions::default(),
         _marker: PhantomData,
     }
 }
@@ -4480,56 +4492,13 @@ pub fn pipe_range(range: Range<usize>) -> RangePipe<Identity, usize> {
 pub struct RangePipe<S = Identity, O = usize> {
     range: Range<usize>,
     stages: S,
-    config: PipelineConfig,
-    /// Custom compute pool — see [`Pipe::with_compute_pool`].
-    compute_pool: Option<ComputePool>,
-    /// Oversubscribe factor — see [`Pipe::with_oversubscribe`].
-    oversubscribe: Option<NonZeroUsize>,
+    /// Execution tuning — see [`ExecOptions`] and [`Pipe::with_config`].
+    exec: ExecOptions,
     _marker: PhantomData<O>,
 }
 
 impl<S, O> RangePipe<S, O> {
-    /// Override the default [`PipelineConfig`] — see [`Pipe::with_config`].
-    #[must_use]
-    pub fn with_config(mut self, config: PipelineConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Tune the workload split factor — see [`Pipe::with_workload`].
-    #[must_use]
-    pub fn with_workload(mut self, workload: Workload) -> Self {
-        self.config.workload = workload;
-        self
-    }
-
-    /// Set the compute-pool worker budget — see [`Pipe::with_compute_workers`].
-    #[must_use]
-    pub fn with_compute_workers(mut self, n: usize) -> Self {
-        self.config.set_compute_workers(n);
-        self
-    }
-
-    /// Attach a custom [`ComputePool`] — see [`Pipe::with_compute_pool`].
-    #[must_use]
-    pub fn with_compute_pool(mut self, pool: ComputePool) -> Self {
-        self.compute_pool = Some(pool);
-        self
-    }
-
-    /// Oversubscribe the compute pool — see [`Pipe::with_oversubscribe`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if `factor == 0` (see [`Pipe::with_oversubscribe`]).
-    #[must_use]
-    pub fn with_oversubscribe(mut self, factor: usize) -> Self {
-        self.oversubscribe = Some(PipelineConfig::require_nonzero(
-            factor,
-            "with_oversubscribe",
-        ));
-        self
-    }
+    exec_setters! {}
 }
 
 impl<S, O> RangePipe<S, O>
@@ -4552,9 +4521,7 @@ where
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -4572,9 +4539,7 @@ where
                 prev: self.stages,
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -4603,9 +4568,7 @@ where
                 prev: InfallibleChain(self.stages, PhantomData),
                 f,
             },
-            config: self.config,
-            compute_pool: self.compute_pool,
-            oversubscribe: self.oversubscribe,
+            exec: self.exec,
             _marker: PhantomData,
         }
     }
@@ -4630,13 +4593,9 @@ where
         if n == 0 {
             return Vec::new();
         }
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+        match terminal_plan(n, self.exec.config.workload, pool.num_workers()) {
             // Trivial case — mirrors `Pipe::collect`'s serial arm, items
             // generated inline by the range iterator itself.
             TerminalPlan::Serial => serial_stage_collect(self.range, &self.stages),
@@ -4669,13 +4628,9 @@ where
         if n == 0 {
             return;
         }
-        let exec = resolve_exec_pool(
-            self.compute_pool.as_ref(),
-            self.oversubscribe,
-            self.config.compute_workers,
-        );
+        let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+        match terminal_plan(n, self.exec.config.workload, pool.num_workers()) {
             TerminalPlan::Serial => serial_stage_for_each(self.range, &self.stages, f),
             TerminalPlan::Parallel(plan) => {
                 let op = FusedSink(self.stages, f);
