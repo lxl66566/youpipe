@@ -2985,7 +2985,8 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     ///
     /// ```rust
     /// # use youpipe::prelude::*;
-    /// let r: Vec<u64> = (0..1000).stream()
+    /// let r: Vec<u64> = (0..1000)
+    ///     .stream()
     ///     .with_workload(Workload::Unbalanced)
     ///     .stage(|x: u64| x + 1)
     ///     .run();
