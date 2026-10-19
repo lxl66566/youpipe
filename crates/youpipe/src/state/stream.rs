@@ -144,6 +144,87 @@ fn verify_ordered_accounting<T>(
 // collect pushes into a `Vec`, for_each invokes the user's closure. After
 // inlining the sink is free, so all terminals share one code path with zero
 // per-item overhead.
+//
+// The bodies themselves are stamped from one `macro_rules!` template —
+// tokio's idiom for `fn` / `async fn` twins whose loops differ only in the
+// blocking anchor. A burst-drain strategy change (e.g. the batch path's
+// 0-claim probe) lands in the template once instead of drifting across the
+// four copies.
+//
+// Shape: `anchor` blocks for exactly one item (`recv()` on sync, the
+// waker-cached `recv_cached(&mut slot).await` on async); `insert` places one
+// `(seq, item)` (unordered: `sink`; ordered: `ReorderBuffer::insert_into`);
+// `eof` is every closed-channel exit (unordered: plain `return`; ordered:
+// flush + accounting check + `return`); the optional `batch` arm compiles the
+// sync-only batch-claim path (runtime-gated on `batch_cap > 0`).
+macro_rules! drain_loop {
+    (
+        $rx:ident, anchor $anchor:expr,
+        insert($seq:ident, $item:ident) $insert:block,
+        eof $eof:block
+        $(, batch($batch_cap:ident, $scratch:ident))?
+    ) => {
+        loop {
+            $(
+                // Batch burst-drain: claim ready runs with one cursor update
+                // per run (YOUPIPE_BATCH_RECV, todo #1 residual (d)). A 0-claim
+                // is inconclusive (empty / first slot in-flight) — the probe
+                // below resolves Empty vs Closed before anchoring.
+                if $batch_cap > 0 {
+                    loop {
+                        let n = $rx.try_recv_batch($scratch.spare_capacity_mut());
+                        if n == 0 {
+                            break;
+                        }
+                        // SAFETY: try_recv_batch initialized exactly scratch[..n].
+                        unsafe { $scratch.set_len(n) };
+                        for ($seq, $item) in $scratch.drain(..) $insert
+                    }
+                } else
+            )?
+            {
+                // Burst-drain: pop everything already queued without blocking.
+                loop {
+                    match $rx.try_recv() {
+                        Ok(($seq, $item)) => $insert,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Closed) => $eof,
+                    }
+                }
+            }
+            $(
+                // Queue drained but channel may still be open — block for one.
+                // Batch-path 0-claim probe (P-6 / PERF-7): an open channel
+                // resolves the 0-claim as Empty with one `is_disconnected`
+                // tx-count load — no second ring walk through `try_recv` over
+                // the stamp/head lines the terminal producers keep writing.
+                // The blocking anchor below re-probes and pops a ready item
+                // without parking, so the sole false 0 — a lost head CAS
+                // under a receiver cloned through the public
+                // `run_ordered_collect` — delays that item by one retry, the
+                // same contract `claim_poll` documents. Only a disconnected
+                // channel falls through to `try_recv`, whose final drain
+                // delivers stragglers pushed before the last sender dropped
+                // before ever reporting Closed (the half-close contract; same
+                // shape as `drain_pass_batched`).
+                if $batch_cap > 0 && $rx.is_disconnected() {
+                    match $rx.try_recv() {
+                        Ok(($seq, $item)) => {
+                            $insert
+                            continue;
+                        },
+                        Err(TryRecvError::Empty) => (),
+                        Err(TryRecvError::Closed) => $eof,
+                    }
+                }
+            )?
+            match $anchor {
+                Ok(($seq, $item)) => $insert,
+                Err(_) => $eof,
+            }
+        }
+    };
+}
 
 /// Drain `rx` in arrival order, invoking `sink` per item.
 ///
@@ -174,61 +255,10 @@ where
     // Batch scratch, reused across bursts for the whole drain (one
     // allocation per run; capacity 0 = no alloc).
     let mut scratch: Vec<(u64, O)> = Vec::with_capacity(batch_cap);
-    loop {
-        if batch_cap > 0 {
-            // Batch burst-drain: claim ready runs with one cursor update
-            // per run (YOUPIPE_BATCH_RECV, todo #1 residual (d)). A 0-claim
-            // is inconclusive (empty / first slot in-flight) — the probe
-            // below resolves Empty vs Closed before anchoring.
-            loop {
-                let n = rx.try_recv_batch(scratch.spare_capacity_mut());
-                if n == 0 {
-                    break;
-                }
-                // SAFETY: try_recv_batch initialized exactly scratch[..n].
-                unsafe { scratch.set_len(n) };
-                for (_, item) in scratch.drain(..) {
-                    sink(item);
-                }
-            }
-        } else {
-            // Burst-drain: pop everything already queued without blocking.
-            loop {
-                match rx.try_recv() {
-                    Ok((_, item)) => sink(item),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Closed) => return,
-                }
-            }
-        }
-        // Queue drained but channel may still be open — block for one.
-        // Batch-path 0-claim probe (P-6 / PERF-7): an open channel resolves
-        // the 0-claim as Empty with one `is_disconnected` tx-count load —
-        // no second ring walk through `try_recv` over the stamp/head lines
-        // the terminal producers keep writing. The blocking `recv` below
-        // re-probes and pops a ready item without parking, so the sole
-        // false 0 — a lost head CAS under a receiver cloned through the
-        // public `run_ordered_collect` — delays that item by one retry, the
-        // same contract `claim_poll` documents. Only a disconnected channel
-        // falls through to `try_recv`, whose final drain delivers
-        // stragglers pushed before the last sender dropped before ever
-        // reporting Closed (the half-close contract; same shape as
-        // `drain_pass_batched`).
-        if batch_cap > 0 && rx.is_disconnected() {
-            match rx.try_recv() {
-                Ok((_, item)) => {
-                    sink(item);
-                    continue;
-                },
-                Err(TryRecvError::Empty) => (),
-                Err(TryRecvError::Closed) => return,
-            }
-        }
-        match rx.recv() {
-            Ok((_, item)) => sink(item),
-            Err(_) => return,
-        }
-    }
+    drain_loop!(
+        rx, anchor rx.recv(), insert(_seq, item) { sink(item); },
+        eof { return; }, batch(batch_cap, scratch)
+    );
 }
 
 /// Drain `rx` in **input order** (sequence-tagged), invoking `sink` per item.
@@ -286,60 +316,10 @@ pub(crate) fn drain_ordered_with<R, O>(
     };
     // Batch scratch (see `drain_unordered_with`).
     let mut scratch: Vec<(u64, O)> = Vec::with_capacity(batch_cap);
-    loop {
-        if batch_cap > 0 {
-            loop {
-                let n = rx.try_recv_batch(scratch.spare_capacity_mut());
-                if n == 0 {
-                    break;
-                }
-                // SAFETY: try_recv_batch initialized exactly scratch[..n].
-                unsafe { scratch.set_len(n) };
-                for (seq, item) in scratch.drain(..) {
-                    buffer.insert_into(seq, item, &mut sink);
-                }
-            }
-        } else {
-            // Burst-drain: pop everything already queued without blocking.
-            loop {
-                match rx.try_recv() {
-                    Ok((seq, item)) => buffer.insert_into(seq, item, &mut sink),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Closed) => {
-                        for item in buffer.flush_remaining() {
-                            sink(item);
-                        }
-                        if let OrderedAccounting::Validate { cancel } = accounting {
-                            verify_ordered_accounting(&buffer, emitted, expected_items, cancel);
-                        }
-                        return;
-                    },
-                }
-            }
-        }
-        // Queue drained but channel may still be open — block for one.
-        // Batch-path 0-claim probe — see `drain_unordered_with`.
-        if batch_cap > 0 && rx.is_disconnected() {
-            match rx.try_recv() {
-                Ok((seq, item)) => {
-                    buffer.insert_into(seq, item, &mut sink);
-                    continue;
-                },
-                Err(TryRecvError::Empty) => (),
-                Err(TryRecvError::Closed) => {
-                    for item in buffer.flush_remaining() {
-                        sink(item);
-                    }
-                    if let OrderedAccounting::Validate { cancel } = accounting {
-                        verify_ordered_accounting(&buffer, emitted, expected_items, cancel);
-                    }
-                    return;
-                },
-            }
-        }
-        if let Ok((seq, item)) = rx.recv() {
-            buffer.insert_into(seq, item, &mut sink);
-        } else {
+    drain_loop!(
+        rx, anchor rx.recv(),
+        insert(seq, item) { buffer.insert_into(seq, item, &mut sink); },
+        eof {
             for item in buffer.flush_remaining() {
                 sink(item);
             }
@@ -347,8 +327,9 @@ pub(crate) fn drain_ordered_with<R, O>(
                 verify_ordered_accounting(&buffer, emitted, expected_items, cancel);
             }
             return;
-        }
-    }
+        },
+        batch(batch_cap, scratch)
+    );
 }
 
 /// Async counterpart of [`drain_unordered`]: `try_recv` bursts without
@@ -368,25 +349,14 @@ where
     O: Send,
 {
     // One waker-node slot per collector (P-4): the per-burst-gap anchor park
-    // reuses its node instead of allocating a fresh one per gap.
+    // reuses its node instead of allocating a fresh one per gap. The anchor
+    // awaits exactly one item to register a waker; the next iteration's
+    // burst-drain picks up anything that arrived in the meantime.
     let mut slot = WakerSlot::new();
-    loop {
-        // Burst-drain: pop everything already queued without awaiting.
-        loop {
-            match rx.try_recv() {
-                Ok((_, item)) => sink(item),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Closed) => return,
-            }
-        }
-        // Queue is drained but channel may still be open. Await exactly one
-        // item to register a waker; the next iteration's burst-drain picks up
-        // anything that arrived in the meantime.
-        match rx.recv_cached(&mut slot).await {
-            Ok((_, item)) => sink(item),
-            Err(_) => return,
-        }
-    }
+    drain_loop!(
+        rx, anchor rx.recv_cached(&mut slot).await,
+        insert(_seq, item) { sink(item); }, eof { return; }
+    );
 }
 
 /// Async counterpart of [`drain_ordered`]: re-sequences through a
@@ -412,25 +382,10 @@ pub(crate) async fn drain_ordered_async<R, O>(
     };
     // Same per-collector waker-node slot as `drain_unordered_async`.
     let mut slot = WakerSlot::new();
-    loop {
-        loop {
-            match rx.try_recv() {
-                Ok((seq, o)) => buffer.insert_into(seq, o, &mut sink),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Closed) => {
-                    for item in buffer.flush_remaining() {
-                        sink(item);
-                    }
-                    if let OrderedAccounting::Validate { cancel } = accounting {
-                        verify_ordered_accounting(&buffer, emitted, expected_items, cancel);
-                    }
-                    return;
-                },
-            }
-        }
-        if let Ok((seq, o)) = rx.recv_cached(&mut slot).await {
-            buffer.insert_into(seq, o, &mut sink);
-        } else {
+    drain_loop!(
+        rx, anchor rx.recv_cached(&mut slot).await,
+        insert(seq, item) { buffer.insert_into(seq, item, &mut sink); },
+        eof {
             for item in buffer.flush_remaining() {
                 sink(item);
             }
@@ -439,7 +394,7 @@ pub(crate) async fn drain_ordered_async<R, O>(
             }
             return;
         }
-    }
+    );
 }
 
 /// Sharded counterpart of [`drain_unordered`]: same anchor + burst-drain
