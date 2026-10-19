@@ -263,3 +263,20 @@ pool 侧四项（pool/mod.rs 模块级 `#![allow(dead_code)]`、`spawn_static`�
 - 方向：复现时用 `crossfire-trace` + gdb 取证（lost-wakeup 假设优先）；关注
   fence pool-job 化（41e0a6a）后的新交互面。
 - 验证：并行 harness 反复跑 `pipeline_integration`；无确定性复现前不动代码。
+
+### 15. [P2] 2026-10-20 审计遗留项
+
+Round-6 三路审计的完整发现（机制、证据、验证计划）记录在各主题文档的
+`Audit 2026-10-20: open items` 节（scheduler.md / streaming.md / testing.md）；
+此处仅列未安排进紧邻轮次的条目：
+
+- st3 `WorkerThread::push` 的 `is_empty()`+`push()` 对偷取者共享行的 5 次原子
+  读可减为 3 次——先 cargo-show-asm 验证 LLVM 是否已合并相邻 Relaxed 载荷
+  （泛型单态化在同 CGU 可能已消除），未合并再评估 fork API（fork 可 diff
+  约束下代价高，预期收益 <1%）；
+- `try_apply_pure` 无 bench id：该路径对 codegen 布局敏感（ErasedStrategy
+  记录过 ±16–30% 布局回归），布局一变 `try_collect` 快路径可能无声回归；
+- `perfcnt`→`nom v4` future-incompat：upstream 停更，rustc 未来版本会拒绝
+  编译，届时需 vendor/fork 或把计数器移植到 gungraun 的 valgrind 路径；
+- mdbook 无 linkcheck preprocessor，页内相对链接无校验（2026-10-20 一次性
+  脚本扫描为 0 断链，CI 化待做）。
