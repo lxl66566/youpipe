@@ -250,3 +250,63 @@ real close. Async paths were never exposed: their waker nodes are
 per-future, not per-thread. Deterministic regression tests (fork and
 vendored) stamp the shared node Closed from outside mid-episode, on both
 the send and recv sides.
+
+
+## Audit 2026-10-20: open items
+
+Gate run on `r6/audit-infra` @ `0ddc9c2` (worktree `target/wt/d`, 14 GB box,
+`CARGO_BUILD_JOBS=6`):
+
+- `cargo test` (default members) — pass: 331 tests / 25 binaries, 0 failed,
+  slowest binary 6.0 s.
+- `cargo clippy --workspace --all-targets` — pass: 0 warnings in workspace
+  code; the fork `[lints]` holds. One cargo note: `nom v4.2.3` (via
+  `perfcnt v0.8.0`) is future-incompatible (item 2).
+- `cargo check -p youpipe --no-default-features` / `--all-features` — pass.
+- `mdbook build docs` — clean, no warnings.
+- Manual relative-link scan over docs/src (mdbook has no linkcheck
+  preprocessor): 0 broken links, including every `[todo.md](../../todo.md)`
+  pointer — `docs/todo.md` exists on main, so those references are not
+  dangling and there was nothing to clean.
+
+Open items:
+
+1. **Fallible pure path has no bench id (verification debt).**
+   `try_apply_pure` (`2a580c7`) is codegen-layout sensitive and the commit
+   names the debt explicitly, but it is recorded only in the
+   `FusedTryStage` doc comment
+   (`crates/youpipe/src/builder/typed/traits.rs:577`); `docs/todo.md` (the
+   open-items tracker) has no entry. Impact: a later layout shift on the
+   `try_collect` fast paths could move ±16-30 % with nothing flagging the
+   unverified path. Action: add a filterless `try_collect` id to the bench
+   suite, run the same-binary interleaved-recompile A/B, record the verdict
+   in benchmarks.md, track the residual in todo.md.
+
+2. **`perfcnt`/`nom v4` future-incompat (contained, unmaintained
+   upstream).** Clippy flags `nom v4.2.3` via `perfcnt v0.8.0`
+   (`crates/youpipe-criterion-perf-counters/Cargo.toml:41`,
+   `crates/youpipe-bench/Cargo.toml:64`). Contained by design (bench crates
+   only, `publish = false`), but perfcnt sees no upstream releases; a
+   future rustc will reject it. Action when it breaks: vendor/fork perfcnt
+   like st3, or port the counters onto youpipe-gungraun's valgrind path.
+
+3. **mdbook does not validate intra-book links.** `docs/book.toml` sets
+   `create-missing = false` (SUMMARY entries are checked) but plain
+   relative links in page bodies are not; this audit's scan was a one-off
+   script. Action (optional): add mdbook-linkcheck to the build.
+
+4. **Stale path in a perf script comment.** `perf/verify/loom.sh:3` cites
+   `docs/testing.md`; the file is `docs/src/dev/testing.md`. Cosmetic;
+   perf/ was outside this round's write scope.
+
+No-action findings: README/README.zh-CN examples and the guide/advanced
+pages match the current API (terminals, options types, and env knobs
+verified method-by-method against the code; historical knob names appear
+only in dead-ends/benchmarks records that mark them local or temporary);
+benches/tests contain no duplicate or stale harnesses (the
+`stream_reduce`/`stream_reduce_alloc` and `sharded_term`/`sharded_term_async`
+pairs are distinct alloc/event-loop harnesses by design);
+`.gitignore`/`clippy.toml`/`rustfmt.toml` entries all resolve; examples/
+and fuzz targets match the README claims. Fixed this round: the
+`try_apply_pure` paragraph in core-types.md and the terminal enumeration in
+guide/scope.md (e9acfbb).
