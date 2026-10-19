@@ -28,11 +28,7 @@
 //! - [`TokioPool`] (`tokio-runtime`, the default): wraps a `tokio::runtime::Handle`. The runtime's
 //!   M:N work-stealing scheduler multiplexes many tasks over `n` OS threads.
 
-use std::{future::Future, pin::Pin};
-
-/// Owned, sendable future. Kept for backends that must move a future across
-/// threads before spawning it.
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+use std::future::Future;
 
 /// A pluggable async runtime backend for streaming pipelines.
 ///
