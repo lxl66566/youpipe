@@ -138,9 +138,10 @@ pub struct PipelineConfig {
     /// Per-channel buffer capacity (items) between stages. Streaming-only.
     ///
     /// Note: the effective buffer for a given channel is
-    /// `max(buffer_size, downstream_workers * 4)` — a floor that keeps every
-    /// downstream worker able to hold a few items in flight even when the
-    /// configured capacity is smaller than the fan-out. An explicit
+    /// `max(buffer_size, workers * 4)`, where `workers` is the fan-out of
+    /// the stage producing into that channel — a floor that keeps each of
+    /// those workers a few free slots ahead even when the configured
+    /// capacity is smaller than the fan-out. An explicit
     /// [`SyncStageOptions::buffer`](crate::SyncStageOptions::buffer) override
     /// replaces
     /// this logic for that stage's output channel.

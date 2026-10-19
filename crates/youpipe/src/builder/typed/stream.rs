@@ -1062,8 +1062,9 @@ impl SyncStageOptions {
     }
 
     /// Pin this stage's **output** channel capacity, bypassing
-    /// `buffer_size` (and its `downstream_workers * 4` floor). Small buffers
-    /// tighten backpressure (less peak memory); large ones absorb bursts.
+    /// `buffer_size` (and its floor at this stage's own `workers * 4`
+    /// slots). Small buffers tighten backpressure (less peak memory); large
+    /// ones absorb bursts.
     /// Correctness is unaffected — only throughput/memory trade off.
     ///
     /// # Panics
@@ -3986,7 +3987,10 @@ where
     /// [`stream`](crate::stream) before any topology exists).
     ///
     /// Additionally, panics if `.ordered()` is combined with `.expand()`
-    /// (see [`FenceMode`] docs), if the async runtime cannot be constructed
+    /// (expand fan-out shares the parent's sequence number, which the
+    /// reorder buffer cannot re-sequence — detected by the
+    /// `StageSpawn::has_expand` walk), if the async runtime cannot be
+    /// constructed
     /// (e.g. OS thread/resource limits), or if `run()` is invoked inside an
     /// async context on a chain with an async stage (e.g. from a tokio/axum
     /// handler) — the terminal drives its collector via
