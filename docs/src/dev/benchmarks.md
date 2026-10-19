@@ -1704,6 +1704,12 @@ cargo bench -p youpipe-gungraun            # ~1 min, all three bench files
 cargo bench -p youpipe-gungraun -- --save-baseline=main
 ```
 
+Worktree pitfall: in a linked worktree the base commit cannot be checked
+out by branch name (`git switch main` fails — the branch is held by the
+main checkout). Detach instead (`git switch --detach <sha>`), save the
+baseline, then switch back to the branch under test for the comparison
+(r7 round, 2026-10-20).
+
 ## Lab bench crate layout (`crates/youpipe-bench`)
 
 The four former standalone bench crates were consolidated (2026-10) into one
