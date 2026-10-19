@@ -185,14 +185,13 @@ with_async_pool 指引）。编号 8 不再使用，后续条目编号不动。 
 
 ## 代码健康（重构/坏味道）
 
-### 9. [P1] 终端 prologue 十处复制
-
-`n==0` 短路 → `resolve_exec_pool` → `prefers_serial` 串行回退（含
-MAY_FILTER 分派）→ `SplitPlan::new` → MAY_FILTER 两路核心选择——同一序列
-在 fused.rs 十个终端复制（`Pipe::collect`/`for_each`、`TryPipe::try_collect`、
-scoped 三件、by_ref 三件、`fused_pass_collect`）。split 策略或串行语义一动
-就要改十处。抽 `terminal_plan(n, config, pool) -> Plan { Serial, Parallel(
-SplitPlan) }` + 共享串行回退 helper；prologue 每 run 一次，零热路径风险。
+<!-- #9 终端 prologue 复制已完成并移除（2026-10-20，r8）：抽
+`terminal_plan(n, workload, num_threads) -> TerminalPlan { Serial,
+Parallel(SplitPlan) }` + `serial_stage_collect` / `serial_stage_for_each` /
+`serial_stage_try_collect` 串行回退 helper。实际站点数 drifted 到 25 个
+（reduce/fold 家族、RangePipe 两终端与 pass-through 两入口共享同一序列），
+全部收编——`prefers_serial` 与 `SplitPlan::new` 现仅在 terminal_plan 内出现。
+编号 9 不再使用，后续条目编号不动。 -->
 
 ### 10. [P1] StageSpawn 五路 spawn 体 × 四 stage 类型
 

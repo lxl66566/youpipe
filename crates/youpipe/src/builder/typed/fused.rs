@@ -601,14 +601,12 @@ where
     OP: RangeOp<T, Out = R>,
 {
     let n = items.len();
-    let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads) {
+    match terminal_plan(n, workload, pool.num_workers()) {
         // Same trivial path as `Pipe::collect`: plain sequential map, no
         // output-buffer machinery.
-        return items.into_iter().map(|item| op.apply(item)).collect();
+        TerminalPlan::Serial => items.into_iter().map(|item| op.apply(item)).collect(),
+        TerminalPlan::Parallel(plan) => par_index_collect(items, op, plan, pool),
     }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    par_index_collect(items, op, plan, pool)
 }
 
 /// Fused-core entry for the streaming reduce pass-through
@@ -632,19 +630,21 @@ where
     R: Reducer<OP::Out>,
 {
     let n = items.len();
-    let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads) {
+    match terminal_plan(n, workload, pool.num_workers()) {
         // Covers the empty batch too: the reducer's identity IS the fold of
         // zero items.
-        let mut acc = reducer.identity();
-        for item in items {
-            acc = reducer.fold(acc, op.apply(item));
-        }
-        return acc;
+        TerminalPlan::Serial => {
+            let mut acc = reducer.identity();
+            for item in items {
+                acc = reducer.fold(acc, op.apply(item));
+            }
+            acc
+        },
+        TerminalPlan::Parallel(plan) => {
+            let rop = RangeReduce(op, reducer);
+            par_reduce(items, &rop, plan, pool)
+        },
     }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    let rop = RangeReduce(op, reducer);
-    par_reduce(items, &rop, plan, pool)
 }
 
 // ── Hybrid flat/tree top-level dispatch ──
@@ -3097,6 +3097,95 @@ impl SplitPlan {
     }
 }
 
+/// Terminal prologue decision — the [`prefers_serial`] gate and the
+/// [`SplitPlan`] derivation behind one call (todo #9: the sequence used to be
+/// hand-copied in every fused terminal, so a split-policy or serial-gate
+/// change had to be replayed across ~25 sites). Evaluated once per terminal
+/// run, never inside a hot loop.
+enum TerminalPlan {
+    /// Trivial batch (`n <= 1` or a single-threaded pool): the caller runs
+    /// its serial fallback — one of the `serial_stage_*` helpers below, or
+    /// its own inline loop for the reduce family.
+    Serial,
+    /// Fork/join core with the derived split budget.
+    Parallel(SplitPlan),
+}
+
+fn terminal_plan(n: usize, workload: Workload, num_threads: usize) -> TerminalPlan {
+    if prefers_serial(n, num_threads) {
+        TerminalPlan::Serial
+    } else {
+        TerminalPlan::Parallel(SplitPlan::new(n, num_threads, workload))
+    }
+}
+
+/// Shared serial fallback for the infallible collect-shaped terminals
+/// (`Pipe::collect` / `RangePipe::collect` / the scoped and by-ref entries).
+/// The `MAY_FILTER` dispatch keeps the filter-free path branch-free — no
+/// `Option` wrapper, matching a hand-written `iter().map().collect()`.
+fn serial_stage_collect<T, S>(items: impl IntoIterator<Item = T>, stages: &S) -> Vec<S::Output>
+where
+    S: FusedStage<T>,
+{
+    if S::MAY_FILTER {
+        items
+            .into_iter()
+            .filter_map(|item| stages.apply(item))
+            .collect()
+    } else {
+        items
+            .into_iter()
+            .map(|item| stages.apply_pure(item))
+            .collect()
+    }
+}
+
+/// Shared serial fallback for the `for_each`-shaped terminals — same
+/// `MAY_FILTER` dispatch, no output buffer.
+fn serial_stage_for_each<T, S, F>(items: impl IntoIterator<Item = T>, stages: &S, f: F)
+where
+    S: FusedStage<T>,
+    F: Fn(S::Output),
+{
+    if S::MAY_FILTER {
+        for item in items {
+            if let Some(o) = stages.apply(item) {
+                f(o);
+            }
+        }
+    } else {
+        for item in items {
+            let o = stages.apply_pure(item);
+            f(o);
+        }
+    }
+}
+
+/// Shared serial fallback for the fallible collect-shaped terminals. The
+/// pre-allocated `out` short-circuits on the first `Err` (`?`), matching the
+/// parallel core's first-error-wins semantics.
+fn serial_stage_try_collect<T, S>(
+    items: impl ExactSizeIterator<Item = T>,
+    stages: &S,
+) -> Result<Vec<S::Output>, S::Error>
+where
+    S: FusedTryStage<T>,
+{
+    let mut out = Vec::with_capacity(items.len());
+    if S::MAY_FILTER {
+        for item in items {
+            if let Some(o) = stages.try_apply(item)? {
+                out.push(o);
+            }
+        }
+    } else {
+        for item in items {
+            out.push(stages.try_apply_pure(item)?);
+        }
+    }
+    Ok(out)
+}
+
 // ── Filter-chain parallel collect ──
 //
 // Chains containing `Filter` cannot use the index-based core (output
@@ -3727,34 +3816,19 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        let num_threads = pool.num_workers();
-        if prefers_serial(n, num_threads) {
-            // Trivial case (n == 1 or single-threaded pool): skip the pool
+        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+            // Trivial batch (n == 1 or single-threaded pool): skip the pool
             // entirely. Dispatch on `MAY_FILTER` so the pure path matches a
             // hand-written `iter().map().collect()` — no `Option` wrapper.
-            if S::MAY_FILTER {
-                return items
-                    .into_iter()
-                    .filter_map(|item| stages.apply(item))
-                    .collect();
-            }
-            return items
-                .into_iter()
-                .map(|item| stages.apply_pure(item))
-                .collect();
-        }
-
-        // `oversplit` = tasks-per-worker for the fork/join tree. Adaptive:
-        // small batches (≤ `LOW_OVERSPLIT_ITEMS_PER_THREAD` per worker) use
-        // `1` to minimise join-dispatch overhead; larger batches use
-        // `BALANCED_OVERSPLIT` for stealing slack. See `workload_oversplit`.
-        let plan = SplitPlan::new(n, num_threads, self.config.workload);
-
-        if S::MAY_FILTER {
-            fused_filter_collect(items, &stages, plan.depth, pool)
-        } else {
-            let op = FusedOp(stages);
-            par_index_collect(items, &op, plan, pool)
+            TerminalPlan::Serial => serial_stage_collect(items, &stages),
+            TerminalPlan::Parallel(plan) => {
+                if S::MAY_FILTER {
+                    fused_filter_collect(items, &stages, plan.depth, pool)
+                } else {
+                    let op = FusedOp(stages);
+                    par_index_collect(items, &op, plan, pool)
+                }
+            },
         }
     }
 
@@ -3792,29 +3866,16 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        let num_threads = pool.num_workers();
-        if prefers_serial(n, num_threads) {
-            // Trivial case (n == 1 or single-threaded pool): run inline, no
+        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+            // Trivial batch (n == 1 or single-threaded pool): run inline, no
             // output buffer. Dispatch on `MAY_FILTER` to keep the pure path
             // branch-free.
-            if S::MAY_FILTER {
-                for item in items {
-                    if let Some(o) = stages.apply(item) {
-                        f(o);
-                    }
-                }
-            } else {
-                for item in items {
-                    let o = stages.apply_pure(item);
-                    f(o);
-                }
-            }
-            return;
+            TerminalPlan::Serial => serial_stage_for_each(items, &stages, f),
+            TerminalPlan::Parallel(plan) => {
+                let op = FusedSink(stages, f);
+                par_for_each(items, &op, plan, pool);
+            },
         }
-
-        let plan = SplitPlan::new(n, num_threads, self.config.workload);
-        let op = FusedSink(stages, f);
-        par_for_each(items, &op, plan, pool);
     }
 
     /// Execute the fused pipeline and reduce the outputs into a single
@@ -3865,23 +3926,25 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        let num_threads = pool.num_workers();
-        if prefers_serial(n, num_threads) {
+        match terminal_plan(n, self.config.workload, pool.num_workers()) {
             // Trivial case: plain sequential reduce, no chunk machinery.
-            if S::MAY_FILTER {
-                return items
+            TerminalPlan::Serial => {
+                if S::MAY_FILTER {
+                    return items
+                        .into_iter()
+                        .filter_map(|item| stages.apply(item))
+                        .reduce(op);
+                }
+                items
                     .into_iter()
-                    .filter_map(|item| stages.apply(item))
-                    .reduce(op);
-            }
-            return items
-                .into_iter()
-                .map(|item| stages.apply_pure(item))
-                .reduce(op);
+                    .map(|item| stages.apply_pure(item))
+                    .reduce(op)
+            },
+            TerminalPlan::Parallel(plan) => {
+                let rop = FusedReduce(stages, OptionReducer(op));
+                par_reduce(items, &rop, plan, pool)
+            },
         }
-        let plan = SplitPlan::new(n, num_threads, self.config.workload);
-        let rop = FusedReduce(stages, OptionReducer(op));
-        par_reduce(items, &rop, plan, pool)
     }
 
     /// Execute the fused pipeline, folding outputs into an accumulator of a
@@ -3930,26 +3993,30 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        let num_threads = pool.num_workers();
-        if n == 0 || prefers_serial(n, num_threads) {
+        match terminal_plan(n, self.config.workload, pool.num_workers()) {
             // Serial fold: a single accumulator, no per-leaf `init` clones.
-            let mut acc = init;
-            if S::MAY_FILTER {
-                for item in items {
-                    if let Some(o) = stages.apply(item) {
-                        acc = f(acc, o);
+            // The Serial arm covers the empty batch too (`n == 0` folds to
+            // `init`).
+            TerminalPlan::Serial => {
+                let mut acc = init;
+                if S::MAY_FILTER {
+                    for item in items {
+                        if let Some(o) = stages.apply(item) {
+                            acc = f(acc, o);
+                        }
+                    }
+                } else {
+                    for item in items {
+                        acc = f(acc, stages.apply_pure(item));
                     }
                 }
-            } else {
-                for item in items {
-                    acc = f(acc, stages.apply_pure(item));
-                }
-            }
-            return acc;
+                acc
+            },
+            TerminalPlan::Parallel(plan) => {
+                let rop = FusedReduce(stages, FoldReducer { init, f, combine });
+                par_reduce(items, &rop, plan, pool)
+            },
         }
-        let plan = SplitPlan::new(n, num_threads, self.config.workload);
-        let rop = FusedReduce(stages, FoldReducer { init, f, combine });
-        par_reduce(items, &rop, plan, pool)
     }
 
     /// Execute the fused pipeline and sum the outputs — the zero-copy
@@ -3975,19 +4042,24 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        let num_threads = pool.num_workers();
-        if n == 0 || prefers_serial(n, num_threads) {
-            if S::MAY_FILTER {
-                return items
-                    .into_iter()
-                    .filter_map(|item| stages.apply(item))
-                    .sum();
-            }
-            return items.into_iter().map(|item| stages.apply_pure(item)).sum();
+        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+            // The Serial arm covers the empty batch too (Sum over an empty
+            // iterator is the additive identity).
+            TerminalPlan::Serial => {
+                if S::MAY_FILTER {
+                    items
+                        .into_iter()
+                        .filter_map(|item| stages.apply(item))
+                        .sum()
+                } else {
+                    items.into_iter().map(|item| stages.apply_pure(item)).sum()
+                }
+            },
+            TerminalPlan::Parallel(plan) => {
+                let rop = FusedReduce(stages, SumReducer(PhantomData));
+                par_reduce(items, &rop, plan, pool)
+            },
         }
-        let plan = SplitPlan::new(n, num_threads, self.config.workload);
-        let rop = FusedReduce(stages, SumReducer(PhantomData));
-        par_reduce(items, &rop, plan, pool)
     }
 
     /// Execute the fused pipeline and count the outputs (post-filter) — no
@@ -4011,27 +4083,29 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        let num_threads = pool.num_workers();
-        if prefers_serial(n, num_threads) {
-            if S::MAY_FILTER {
-                return items
-                    .into_iter()
-                    .filter_map(|item| stages.apply(item))
-                    .count();
-            }
-            // The chain still runs on every item (side-effecting maps);
-            // `map(..).count()` would draw a clippy flag for ignoring the
-            // mapped values, so spell the loop out.
-            let mut c = 0usize;
-            for item in items {
-                let _ = stages.apply_pure(item);
-                c += 1;
-            }
-            return c;
+        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+            TerminalPlan::Serial => {
+                if S::MAY_FILTER {
+                    return items
+                        .into_iter()
+                        .filter_map(|item| stages.apply(item))
+                        .count();
+                }
+                // The chain still runs on every item (side-effecting maps);
+                // `map(..).count()` would draw a clippy flag for ignoring the
+                // mapped values, so spell the loop out.
+                let mut c = 0usize;
+                for item in items {
+                    let _ = stages.apply_pure(item);
+                    c += 1;
+                }
+                c
+            },
+            TerminalPlan::Parallel(plan) => {
+                let rop = FusedReduce(stages, CountReducer);
+                par_reduce(items, &rop, plan, pool)
+            },
         }
-        let plan = SplitPlan::new(n, num_threads, self.config.workload);
-        let rop = FusedReduce(stages, CountReducer);
-        par_reduce(items, &rop, plan, pool)
     }
 
     /// Execute the fused pipeline and return the minimum output —
@@ -4246,37 +4320,24 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        let num_threads = pool.num_workers();
-        if prefers_serial(n, num_threads) {
-            // Trivial case (n == 1 or single-threaded pool): skip the pool.
-            // Dispatch on `MAY_FILTER` so the pure path matches a
-            // hand-written `iter().map().collect()` — no `Option` wrapper
-            // (mirror of `Pipe::collect`'s serial branch).
-            let mut out = Vec::with_capacity(n);
-            if S::MAY_FILTER {
-                for item in items {
-                    if let Some(o) = stages.try_apply(item)? {
-                        out.push(o);
-                    }
+        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+            // Trivial batch (n == 1 or single-threaded pool): skip the pool.
+            // `serial_stage_try_collect` dispatches on `MAY_FILTER` so the
+            // pure path matches a hand-written `iter().map().collect()` — no
+            // `Option` wrapper (mirror of `Pipe::collect`'s serial branch).
+            TerminalPlan::Serial => serial_stage_try_collect(items.into_iter(), &stages),
+            TerminalPlan::Parallel(plan) => {
+                if S::MAY_FILTER {
+                    fused_try_filter_collect(items, &stages, plan.depth, pool)
+                } else {
+                    // Fast path: no filter → output cardinality == input
+                    // cardinality. Pre-allocate the output buffer and write at
+                    // known indices, avoiding the per-split `Vec::split_off`
+                    // allocations of the merge path.
+                    let op = FusedTryOp(stages);
+                    par_index_try_collect(items, &op, plan, pool)
                 }
-            } else {
-                for item in items {
-                    out.push(stages.try_apply_pure(item)?);
-                }
-            }
-            return Ok(out);
-        }
-
-        let plan = SplitPlan::new(n, num_threads, self.config.workload);
-        if S::MAY_FILTER {
-            fused_try_filter_collect(items, &stages, plan.depth, pool)
-        } else {
-            // Fast path: no filter → output cardinality == input cardinality.
-            // Pre-allocate the output buffer and write at known indices,
-            // avoiding the per-split `Vec::split_off` allocations of the
-            // merge path.
-            let op = FusedTryOp(stages);
-            par_index_try_collect(items, &op, plan, pool)
+            },
         }
     }
 
@@ -4313,22 +4374,24 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        let num_threads = pool.num_workers();
-        if prefers_serial(n, num_threads) {
-            let mut acc: Option<O> = None;
-            for item in items {
-                if let Some(o) = stages.try_apply(item)? {
-                    acc = Some(match acc {
-                        Some(a) => op(a, o),
-                        None => o,
-                    });
+        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+            TerminalPlan::Serial => {
+                let mut acc: Option<O> = None;
+                for item in items {
+                    if let Some(o) = stages.try_apply(item)? {
+                        acc = Some(match acc {
+                            Some(a) => op(a, o),
+                            None => o,
+                        });
+                    }
                 }
-            }
-            return Ok(acc);
+                Ok(acc)
+            },
+            TerminalPlan::Parallel(plan) => {
+                let rop = FusedTryReduce(stages, OptionReducer(op));
+                par_reduce_try(items, &rop, plan, pool)
+            },
         }
-        let plan = SplitPlan::new(n, num_threads, self.config.workload);
-        let rop = FusedTryReduce(stages, OptionReducer(op));
-        par_reduce_try(items, &rop, plan, pool)
     }
 
     /// Execute the fused fallible pipeline, folding outputs into an
@@ -4358,20 +4421,24 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        let num_threads = pool.num_workers();
-        if n == 0 || prefers_serial(n, num_threads) {
+        match terminal_plan(n, self.config.workload, pool.num_workers()) {
             // Serial fold: a single accumulator, no per-leaf `init` clones.
-            let mut acc = init;
-            for item in items {
-                if let Some(o) = stages.try_apply(item)? {
-                    acc = f(acc, o);
+            // The Serial arm covers the empty batch too (`n == 0` folds to
+            // `init`).
+            TerminalPlan::Serial => {
+                let mut acc = init;
+                for item in items {
+                    if let Some(o) = stages.try_apply(item)? {
+                        acc = f(acc, o);
+                    }
                 }
-            }
-            return Ok(acc);
+                Ok(acc)
+            },
+            TerminalPlan::Parallel(plan) => {
+                let rop = FusedTryReduce(stages, FoldReducer { init, f, combine });
+                par_reduce_try(items, &rop, plan, pool)
+            },
         }
-        let plan = SplitPlan::new(n, num_threads, self.config.workload);
-        let rop = FusedTryReduce(stages, FoldReducer { init, f, combine });
-        par_reduce_try(items, &rop, plan, pool)
     }
 }
 
@@ -4569,23 +4636,21 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        let num_threads = pool.num_workers();
-        if prefers_serial(n, num_threads) {
+        match terminal_plan(n, self.config.workload, pool.num_workers()) {
             // Trivial case — mirrors `Pipe::collect`'s serial arm, items
             // generated inline by the range iterator itself.
-            if S::MAY_FILTER {
-                return self.range.filter_map(|i| self.stages.apply(i)).collect();
-            }
-            return self.range.map(|i| self.stages.apply_pure(i)).collect();
-        }
-        let plan = SplitPlan::new(n, num_threads, self.config.workload);
-        if S::MAY_FILTER {
-            // Filters change output cardinality (the range-tree path needs
-            // materialized items): fill once, then the shared filter core.
-            fused_filter_collect(self.range.collect(), &self.stages, plan.depth, pool)
-        } else {
-            let op = FusedOp(self.stages);
-            par_range_gen_collect(self.range, &op, plan, pool)
+            TerminalPlan::Serial => serial_stage_collect(self.range, &self.stages),
+            TerminalPlan::Parallel(plan) => {
+                if S::MAY_FILTER {
+                    // Filters change output cardinality (the range-tree path
+                    // needs materialized items): fill once, then the shared
+                    // filter core.
+                    fused_filter_collect(self.range.collect(), &self.stages, plan.depth, pool)
+                } else {
+                    let op = FusedOp(self.stages);
+                    par_range_gen_collect(self.range, &op, plan, pool)
+                }
+            },
         }
     }
 
@@ -4610,30 +4675,19 @@ where
             self.config.compute_workers,
         );
         let pool = exec.as_pool();
-        let num_threads = pool.num_workers();
-        if prefers_serial(n, num_threads) {
-            if S::MAY_FILTER {
-                for i in self.range {
-                    if let Some(o) = self.stages.apply(i) {
-                        f(o);
-                    }
+        match terminal_plan(n, self.config.workload, pool.num_workers()) {
+            TerminalPlan::Serial => serial_stage_for_each(self.range, &self.stages, f),
+            TerminalPlan::Parallel(plan) => {
+                let op = FusedSink(self.stages, f);
+                if S::MAY_FILTER {
+                    // `FusedSink::consume` honours filters, but the sink
+                    // generation core has no input buffer to read items
+                    // from — materialize.
+                    par_for_each(self.range.collect(), &op, plan, pool);
+                } else {
+                    par_range_gen_for_each(self.range, &op, plan, pool);
                 }
-            } else {
-                for i in self.range {
-                    let o = self.stages.apply_pure(i);
-                    f(o);
-                }
-            }
-            return;
-        }
-        let plan = SplitPlan::new(n, num_threads, self.config.workload);
-        let op = FusedSink(self.stages, f);
-        if S::MAY_FILTER {
-            // `FusedSink::consume` honours filters, but the sink generation
-            // core has no input buffer to read items from — materialize.
-            par_for_each(self.range.collect(), &op, plan, pool);
-        } else {
-            par_range_gen_for_each(self.range, &op, plan, pool);
+            },
         }
     }
 }
@@ -5940,25 +5994,16 @@ where
     if n == 0 {
         return Vec::new();
     }
-    let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads) {
-        if S::MAY_FILTER {
-            return items
-                .into_iter()
-                .filter_map(|item| stages.apply(item))
-                .collect();
-        }
-        return items
-            .into_iter()
-            .map(|item| stages.apply_pure(item))
-            .collect();
-    }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    if S::MAY_FILTER {
-        fused_filter_collect(items, &stages, plan.depth, pool)
-    } else {
-        let op = FusedOp(stages);
-        par_index_collect(items, &op, plan, pool)
+    match terminal_plan(n, workload, pool.num_workers()) {
+        TerminalPlan::Serial => serial_stage_collect(items, &stages),
+        TerminalPlan::Parallel(plan) => {
+            if S::MAY_FILTER {
+                fused_filter_collect(items, &stages, plan.depth, pool)
+            } else {
+                let op = FusedOp(stages);
+                par_index_collect(items, &op, plan, pool)
+            }
+        },
     }
 }
 
@@ -5987,25 +6032,13 @@ pub(crate) fn fused_for_each_scoped<S, T, F>(
     if n == 0 {
         return;
     }
-    let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads) {
-        if S::MAY_FILTER {
-            for item in items {
-                if let Some(o) = stages.apply(item) {
-                    f(o);
-                }
-            }
-        } else {
-            for item in items {
-                let o = stages.apply_pure(item);
-                f(o);
-            }
-        }
-        return;
+    match terminal_plan(n, workload, pool.num_workers()) {
+        TerminalPlan::Serial => serial_stage_for_each(items, &stages, f),
+        TerminalPlan::Parallel(plan) => {
+            let op = FusedSink(stages, f);
+            par_for_each(items, &op, plan, pool);
+        },
     }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    let op = FusedSink(stages, f);
-    par_for_each(items, &op, plan, pool);
 }
 
 /// `pub(crate)` entry point for the scoped fallible terminal
@@ -6036,30 +6069,19 @@ where
     if n == 0 {
         return Ok(Vec::new());
     }
-    let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads) {
-        // Dispatch on `MAY_FILTER` so the pure path skips the `Option`
-        // (mirror of `Pipe::collect`'s serial branch).
-        let mut out = Vec::with_capacity(n);
-        if S::MAY_FILTER {
-            for item in items {
-                if let Some(o) = stages.try_apply(item)? {
-                    out.push(o);
-                }
+    match terminal_plan(n, workload, pool.num_workers()) {
+        // `serial_stage_try_collect` dispatches on `MAY_FILTER` so the pure
+        // path skips the `Option` (mirror of `Pipe::collect`'s serial
+        // branch).
+        TerminalPlan::Serial => serial_stage_try_collect(items.into_iter(), &stages),
+        TerminalPlan::Parallel(plan) => {
+            if S::MAY_FILTER {
+                fused_try_filter_collect(items, &stages, plan.depth, pool)
+            } else {
+                let op = FusedTryOp(stages);
+                par_index_try_collect(items, &op, plan, pool)
             }
-        } else {
-            for item in items {
-                out.push(stages.try_apply_pure(item)?);
-            }
-        }
-        return Ok(out);
-    }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    if S::MAY_FILTER {
-        fused_try_filter_collect(items, &stages, plan.depth, pool)
-    } else {
-        let op = FusedTryOp(stages);
-        par_index_try_collect(items, &op, plan, pool)
+        },
     }
 }
 
@@ -6086,25 +6108,27 @@ where
     if n == 0 {
         return reducer.identity();
     }
-    let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads) {
-        let mut acc = reducer.identity();
-        if S::MAY_FILTER {
-            for item in items {
-                if let Some(o) = stages.apply(item) {
-                    acc = reducer.fold(acc, o);
+    match terminal_plan(n, workload, pool.num_workers()) {
+        TerminalPlan::Serial => {
+            let mut acc = reducer.identity();
+            if S::MAY_FILTER {
+                for item in items {
+                    if let Some(o) = stages.apply(item) {
+                        acc = reducer.fold(acc, o);
+                    }
+                }
+            } else {
+                for item in items {
+                    acc = reducer.fold(acc, stages.apply_pure(item));
                 }
             }
-        } else {
-            for item in items {
-                acc = reducer.fold(acc, stages.apply_pure(item));
-            }
-        }
-        return acc;
+            acc
+        },
+        TerminalPlan::Parallel(plan) => {
+            let rop = FusedReduce(stages, reducer);
+            par_reduce(items, &rop, plan, pool)
+        },
     }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    let rop = FusedReduce(stages, reducer);
-    par_reduce(items, &rop, plan, pool)
 }
 
 /// `pub(crate)` entry point for the scoped fold terminal — the
@@ -6128,19 +6152,23 @@ where
     C: Fn(A, A) -> A + Sync,
 {
     let n = items.len();
-    let num_threads = pool.num_workers();
-    if n == 0 || prefers_serial(n, num_threads) {
-        let mut acc = init;
-        for item in items {
-            if let Some(o) = stages.apply(item) {
-                acc = f(acc, o);
+    match terminal_plan(n, workload, pool.num_workers()) {
+        // The Serial arm covers the empty batch too (`n == 0` folds to
+        // `init`).
+        TerminalPlan::Serial => {
+            let mut acc = init;
+            for item in items {
+                if let Some(o) = stages.apply(item) {
+                    acc = f(acc, o);
+                }
             }
-        }
-        return acc;
+            acc
+        },
+        TerminalPlan::Parallel(plan) => {
+            let rop = FusedReduce(stages, FoldReducer { init, f, combine });
+            par_reduce(items, &rop, plan, pool)
+        },
     }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    let rop = FusedReduce(stages, FoldReducer { init, f, combine });
-    par_reduce(items, &rop, plan, pool)
 }
 
 /// `pub(crate)` entry point for the scoped fallible reduce terminal
@@ -6167,22 +6195,24 @@ where
     if n == 0 {
         return Ok(None);
     }
-    let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads) {
-        let mut acc: Option<S::Output> = None;
-        for item in items {
-            if let Some(o) = stages.try_apply(item)? {
-                acc = Some(match acc {
-                    Some(a) => op(a, o),
-                    None => o,
-                });
+    match terminal_plan(n, workload, pool.num_workers()) {
+        TerminalPlan::Serial => {
+            let mut acc: Option<S::Output> = None;
+            for item in items {
+                if let Some(o) = stages.try_apply(item)? {
+                    acc = Some(match acc {
+                        Some(a) => op(a, o),
+                        None => o,
+                    });
+                }
             }
-        }
-        return Ok(acc);
+            Ok(acc)
+        },
+        TerminalPlan::Parallel(plan) => {
+            let rop = FusedTryReduce(stages, OptionReducer(op));
+            par_reduce_try(items, &rop, plan, pool)
+        },
     }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    let rop = FusedTryReduce(stages, OptionReducer(op));
-    par_reduce_try(items, &rop, plan, pool)
 }
 
 /// `pub(crate)` entry point for the scoped fallible fold terminal
@@ -6206,19 +6236,23 @@ where
     C: Fn(A, A) -> A + Sync,
 {
     let n = items.len();
-    let num_threads = pool.num_workers();
-    if n == 0 || prefers_serial(n, num_threads) {
-        let mut acc = init;
-        for item in items {
-            if let Some(o) = stages.try_apply(item)? {
-                acc = f(acc, o);
+    match terminal_plan(n, workload, pool.num_workers()) {
+        // The Serial arm covers the empty batch too (`n == 0` folds to
+        // `init`).
+        TerminalPlan::Serial => {
+            let mut acc = init;
+            for item in items {
+                if let Some(o) = stages.try_apply(item)? {
+                    acc = f(acc, o);
+                }
             }
-        }
-        return Ok(acc);
+            Ok(acc)
+        },
+        TerminalPlan::Parallel(plan) => {
+            let rop = FusedTryReduce(stages, FoldReducer { init, f, combine });
+            par_reduce_try(items, &rop, plan, pool)
+        },
     }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    let rop = FusedTryReduce(stages, FoldReducer { init, f, combine });
-    par_reduce_try(items, &rop, plan, pool)
 }
 
 // ── pub(super) borrowed-input entry points ──
@@ -6246,29 +6280,26 @@ where
     if n == 0 {
         return Vec::new();
     }
-    let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads) {
-        if S::MAY_FILTER {
-            return input.iter().filter_map(|item| stages.apply(item)).collect();
-        }
-        return input.iter().map(|item| stages.apply_pure(item)).collect();
+    match terminal_plan(n, workload, pool.num_workers()) {
+        TerminalPlan::Serial => serial_stage_collect(input.iter(), &stages),
+        TerminalPlan::Parallel(plan) => {
+            if S::MAY_FILTER {
+                return match resolve_filter_collect_variant(mode, n) {
+                    FilterCollectVariant::Merge => {
+                        join_fused_collect_by_ref(pool, input, &stages, 0, n, plan.depth)
+                    },
+                    FilterCollectVariant::Ctp => {
+                        fused_filter_collect_by_ref_ctp(pool, input, &stages, plan.depth)
+                    },
+                    FilterCollectVariant::Wtc => {
+                        fused_filter_collect_by_ref_wtc(pool, input, &stages, plan.depth)
+                    },
+                };
+            }
+            let op = FusedOp(stages);
+            par_index_collect_by_ref(input, &op, plan, pool)
+        },
     }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    if S::MAY_FILTER {
-        return match resolve_filter_collect_variant(mode, n) {
-            FilterCollectVariant::Merge => {
-                join_fused_collect_by_ref(pool, input, &stages, 0, n, plan.depth)
-            },
-            FilterCollectVariant::Ctp => {
-                fused_filter_collect_by_ref_ctp(pool, input, &stages, plan.depth)
-            },
-            FilterCollectVariant::Wtc => {
-                fused_filter_collect_by_ref_wtc(pool, input, &stages, plan.depth)
-            },
-        };
-    }
-    let op = FusedOp(stages);
-    par_index_collect_by_ref(input, &op, plan, pool)
 }
 
 /// Entry point for the borrowed-input `.for_each()`.
@@ -6289,25 +6320,13 @@ pub(super) fn fused_for_each_by_ref<'i, S, E, F>(
     if n == 0 {
         return;
     }
-    let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads) {
-        if S::MAY_FILTER {
-            for item in input {
-                if let Some(o) = stages.apply(item) {
-                    f(o);
-                }
-            }
-        } else {
-            for item in input {
-                let o = stages.apply_pure(item);
-                f(o);
-            }
-        }
-        return;
+    match terminal_plan(n, workload, pool.num_workers()) {
+        TerminalPlan::Serial => serial_stage_for_each(input.iter(), &stages, f),
+        TerminalPlan::Parallel(plan) => {
+            let op = FusedSink(stages, f);
+            par_for_each_by_ref(input, &op, plan, pool);
+        },
     }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    let op = FusedSink(stages, f);
-    par_for_each_by_ref(input, &op, plan, pool);
 }
 
 /// Entry point for the borrowed-input `.try_collect()`. `E` (the error type)
@@ -6331,30 +6350,19 @@ where
     if n == 0 {
         return Ok(Vec::new());
     }
-    let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads) {
-        // Dispatch on `MAY_FILTER` so the pure path skips the `Option`
-        // (mirror of `Pipe::collect`'s serial branch).
-        let mut out = Vec::with_capacity(n);
-        if S::MAY_FILTER {
-            for item in input {
-                if let Some(o) = stages.try_apply(item)? {
-                    out.push(o);
-                }
+    match terminal_plan(n, workload, pool.num_workers()) {
+        // `serial_stage_try_collect` dispatches on `MAY_FILTER` so the pure
+        // path skips the `Option` (mirror of `Pipe::collect`'s serial
+        // branch).
+        TerminalPlan::Serial => serial_stage_try_collect(input.iter(), &stages),
+        TerminalPlan::Parallel(plan) => {
+            if S::MAY_FILTER {
+                join_fused_try_collect_by_ref(pool, input, &stages, 0, n, plan.depth)
+            } else {
+                let op = FusedTryOp(stages);
+                par_index_try_collect_by_ref(input, &op, plan, pool)
             }
-        } else {
-            for item in input {
-                out.push(stages.try_apply_pure(item)?);
-            }
-        }
-        return Ok(out);
-    }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    if S::MAY_FILTER {
-        join_fused_try_collect_by_ref(pool, input, &stages, 0, n, plan.depth)
-    } else {
-        let op = FusedTryOp(stages);
-        par_index_try_collect_by_ref(input, &op, plan, pool)
+        },
     }
 }
 
@@ -6378,25 +6386,27 @@ where
     if n == 0 {
         return reducer.identity();
     }
-    let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads) {
-        let mut acc = reducer.identity();
-        if S::MAY_FILTER {
-            for item in input {
-                if let Some(o) = stages.apply(item) {
-                    acc = reducer.fold(acc, o);
+    match terminal_plan(n, workload, pool.num_workers()) {
+        TerminalPlan::Serial => {
+            let mut acc = reducer.identity();
+            if S::MAY_FILTER {
+                for item in input {
+                    if let Some(o) = stages.apply(item) {
+                        acc = reducer.fold(acc, o);
+                    }
+                }
+            } else {
+                for item in input {
+                    acc = reducer.fold(acc, stages.apply_pure(item));
                 }
             }
-        } else {
-            for item in input {
-                acc = reducer.fold(acc, stages.apply_pure(item));
-            }
-        }
-        return acc;
+            acc
+        },
+        TerminalPlan::Parallel(plan) => {
+            let rop = FusedReduce(stages, reducer);
+            par_reduce_by_ref(input, &rop, plan, pool)
+        },
     }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    let rop = FusedReduce(stages, reducer);
-    par_reduce_by_ref(input, &rop, plan, pool)
 }
 
 /// Entry point for the borrowed-input fallible reduce terminals
@@ -6421,19 +6431,21 @@ where
     if n == 0 {
         return Ok(reducer.identity());
     }
-    let num_threads = pool.num_workers();
-    if prefers_serial(n, num_threads) {
-        let mut acc = reducer.identity();
-        for item in input {
-            if let Some(o) = stages.try_apply(item)? {
-                acc = reducer.fold(acc, o);
+    match terminal_plan(n, workload, pool.num_workers()) {
+        TerminalPlan::Serial => {
+            let mut acc = reducer.identity();
+            for item in input {
+                if let Some(o) = stages.try_apply(item)? {
+                    acc = reducer.fold(acc, o);
+                }
             }
-        }
-        return Ok(acc);
+            Ok(acc)
+        },
+        TerminalPlan::Parallel(plan) => {
+            let rop = FusedTryReduce(stages, reducer);
+            par_reduce_try_by_ref(input, &rop, plan, pool)
+        },
     }
-    let plan = SplitPlan::new(n, num_threads, workload);
-    let rop = FusedTryReduce(stages, reducer);
-    par_reduce_try_by_ref(input, &rop, plan, pool)
 }
 
 #[cfg(test)]
