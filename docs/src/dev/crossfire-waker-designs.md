@@ -381,7 +381,7 @@ notify_one:      if waiters > 0 { epoch += 1; futex_wake(&epoch, 1) }
 - **F. registry 持 strong、owner 不持**：episode 结束节点仍在队列里，晚到的 fire 会 unpark 一个已回到用户代码的线程——unpark token 串进**用户的** park（仍合法，F11），但队列里堆满已死 episode 的 strong 引用，且 owner 读自己状态需要 weak。不解决任何问题，纯劣化。
 - **G. per-thread 的 WakerCache**：即"TL 槽里放一个单槽缓存"——缓存协议照旧、门照旧，只是把槽从 handle 挪到线程。相比 C 多此一举（C 的节点不死，根本不需要缓存协议），是 A→C 的过渡形态，无独立价值。
 - **youpipe 侧注入 API**（`send_with_waker(&mut Option<ArcWaker>)`）：把节点生命周期交给 youpipe（per-worker 常驻）。能消灭分配，但 crossfire 要暴露 `WakerCache`-ish 公共类型、youpipe 每个 send 调用点要穿透一层——为回避 C 的 10 行 TLS 引入公共 API 面，不划算。
-- **不修 upstream 的替代路径**（考古 §6）：批量 payload（摊薄 park 次数，40B 流量同比例下降，见 [todo.md](../../todo.md)）、collector 换 `std sync_channel`（已证伪）、fork 到 `crates/youpipe-crossfire`。与本文方案正交，可叠加。
+- **不修 upstream 的替代路径**（考古 §6）：批量收/发路径（`YOUPIPE_BATCH_RECV` 的 `pop_batch`/`try_push_batch`，摊薄 park 次数、40B 流量同比例下降，见 [streaming.md](streaming.md)）、collector 换 `std sync_channel`（已证伪）、fork 到 `crates/youpipe-crossfire`。与本文方案正交，可叠加。
 
 ---
 
@@ -498,7 +498,7 @@ C 的 40B 档在稳态**结构性归零**（总量 104 次/run，对 73,728 个 
 
 §11.6 的"绝不 Closed"只对 fire 成立。close 变体（锁内 pop 陈旧 entry → `upgrade_live` 读 seq → `close_wake` CAS）与重臂同样无 hb 边：读到旧戳时 Closed 盖到现役 episode 上，`commit_waiting` 以 Closed 失败，blocking send/recv 直接返回虚假 `Disconnected`（youpipe fuzz 实锤：无序 expand 链整组丢失；artifact/corpus 重放不可复现，种子驱动 fuzz ~33 万次执行时复现）。registry 层不可根治（seq 校验与 CAS 之间固有 TOCTOU），修复在判定点：fork `waker-tl` @ `2894038`（vendored 已同步）——Closed stamp 仅作提示，blocking 判定点以对端计数器复核（`close_rx`/`close_tx` **先减计数后关 registry**，计数 > 0 即证 stamp 外来），虚假则重臂重试。判定发生在重新注册之后 + close 协议先减计数，两重保证重试不会睡穿真实 close。async 轨节点按 future 独立创建、无跨 registry 复用，不受影响。回归测试为确定性构造：从外部对现役 episode 的共享节点直接 `close_wake()`，send/recv 双向断言不得虚假断连（fork + vendored 各一份）。
 
-**youpipe 层不新增 loom 模型的理由**：`handoff/channel.rs` (~890 lines) keeps no synchronization state machine of its own (error-enum mapping + type wrappers + clone forwarding + the composed `claim_poll` probe; every atomic lives inside the vendored crate), so there is nothing to interleave; protocol-level interleavings are covered by the vendored crate's 5 loom models, observable youpipe-side behavior by `handoff_channel.rs` on real threads + miri; youpipe files that do own synchronization primitives (e.g. `pool/sleep_mask.rs`) have their own models (testing.md).
+**youpipe 层不新增 loom 模型的理由**：`handoff/channel.rs` (~950 lines) keeps no synchronization state machine of its own (error-enum mapping + type wrappers + clone forwarding + the composed `claim_poll` probe; every atomic lives inside the vendored crate), so there is nothing to interleave; protocol-level interleavings are covered by the vendored crate's 5 loom models, observable youpipe-side behavior by `handoff_channel.rs` on real threads + miri; youpipe files that do own synchronization primitives (e.g. `pool/sleep_mask.rs`) have their own models (testing.md).
 
 **Windows 可移植性接缝**（详见 testing.md）：vendored 的 `reg_lock` 接缝在 `cfg(miri)` 下切 `std::sync::Mutex`（parking_lot 的 Windows futex 路径 miri 不可解释，同 youpipe-sys 的 shim 理由）；`captains-log` dev-dep（unix libc 假设）已从 fork 与 vendored 双侧移除——fork 由此恢复 Windows 本机全量可测。
 - upstream PR：C 形态（2 文件、调用方零改动、无新协议）即本分支；A 分支保留为 fallback。

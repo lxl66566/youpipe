@@ -235,14 +235,14 @@ impl WakerCache {
 
 **待验证（可能才是主收益）**：
 
-- 尾延迟与方差：40B 计数的双峰抖动（17/387/2）与调度抖动同现。去掉分配流量本身不改变 park 次数（那是批量 payload 待办的活，见 [todo.md](../../todo.md)），但消除了"分配器工作嵌在 park 关键路径上"这一扰动源，streaming bench 的 p99 稳定性是否改善需要 A/B；
+- 尾延迟与方差：40B 计数的双峰抖动（17/387/2）与调度抖动同现。去掉分配流量本身不改变 park 次数（那是批量收/发路径的活，已落地为 `YOUPIPE_BATCH_RECV`，见 [streaming.md](streaming.md)），但消除了"分配器工作嵌在 park 关键路径上"这一扰动源，streaming bench 的 p99 稳定性是否改善需要 A/B；
 - 分配器全局压力：tcache/arena 的额外流量减少，对同进程里用户态分配（scratch 倍增、用户 stage 内分配）的干扰降低。
 
 **不会变的**：fast path（本就零分配零 waker）、park 次数、futex 系统调用成本、调度行为。若 A/B 显示墙钟无显著变化，该 patch 的价值仍然是"卫生 + 可测性 + 消除一个可疑的尾部扰动源"，且代价极小（30 行、每 episode 一次 CAS）。
 
 ## 6. 备选路径
 
-- **不修 upstream**：与批量 payload 待办（channel 携带 `(seq, Vec<N>)`，见 [todo.md](../../todo.md)）合流，每 hop 的 park 次数按批大小摊薄，40B 流量同比例下降；
+- **不修 upstream**：与批量收/发路径（`YOUPIPE_BATCH_RECV`，见 [streaming.md](streaming.md)）合流，每 hop 的 park 次数按批大小摊薄，40B 流量同比例下降；
 - **collector 侧换 `std sync_channel`**：已证伪（burst 边界 park 往返回退，见 [dead-ends.md](dead-ends.md)）；
 - upstream 拒收 patch 则 fork 到 `crates/youpipe-crossfire`（与 `youpipe-concurrent-queue` 同策略，保持可 diff 维护）。
 

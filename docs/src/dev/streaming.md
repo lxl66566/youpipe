@@ -281,11 +281,13 @@ as `YOUPIPE_SHARDED_TERM`; A/B through the runtime knob, same binary):
   streaming latency (not semantically equal).
 
 Integration points (all behind the one knob, cap clamped 2..=4096, default
-64): the collector's burst phase (`drain_unordered/ordered[_sharded]`,
-batch claim then a single per-item `try_recv` probe to resolve the
-inconclusive 0-claim into Empty/Closed — the collector is the sole
-consumer, so the probe runs once per burst gap, not under a polling
-crowd), the worker/fence-forwarder burst phase (`claim_poll` in
+64): the collector's burst phase (`drain_unordered/ordered`, batch claim
+then a single per-item `try_recv` probe to resolve the inconclusive
+0-claim into Empty/Closed — the collector is the sole consumer, so the
+probe runs once per burst gap, not under a polling crowd; the sharded
+collector's pass skips that probe on open shards via the same
+`is_disconnected` load as `claim_poll` — PERF-7, commit `6445f59`), the
+worker/fence-forwarder burst phase (`claim_poll` in
 `handoff/channel.rs`, wrapped by `anchor_claim` in
 `builder/typed/stream.rs` — batch first, anchor on miss; a
 0-claim resolves Empty via one `is_disconnected` tx-count load instead of a
