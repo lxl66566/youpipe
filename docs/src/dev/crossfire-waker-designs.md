@@ -381,7 +381,7 @@ notify_one:      if waiters > 0 { epoch += 1; futex_wake(&epoch, 1) }
 - **F. registry 持 strong、owner 不持**：episode 结束节点仍在队列里，晚到的 fire 会 unpark 一个已回到用户代码的线程——unpark token 串进**用户的** park（仍合法，F11），但队列里堆满已死 episode 的 strong 引用，且 owner 读自己状态需要 weak。不解决任何问题，纯劣化。
 - **G. per-thread 的 WakerCache**：即"TL 槽里放一个单槽缓存"——缓存协议照旧、门照旧，只是把槽从 handle 挪到线程。相比 C 多此一举（C 的节点不死，根本不需要缓存协议），是 A→C 的过渡形态，无独立价值。
 - **youpipe 侧注入 API**（`send_with_waker(&mut Option<ArcWaker>)`）：把节点生命周期交给 youpipe（per-worker 常驻）。能消灭分配，但 crossfire 要暴露 `WakerCache`-ish 公共类型、youpipe 每个 send 调用点要穿透一层——为回避 C 的 10 行 TLS 引入公共 API 面，不划算。
-- **不修 upstream 的替代路径**（考古 §6）：批量收/发路径（`YOUPIPE_BATCH_RECV` 的 `pop_batch`/`try_push_batch`，摊薄 park 次数、40B 流量同比例下降，见 [streaming.md](streaming.md)）、collector 换 `std sync_channel`（已证伪）、fork 到 `crates/youpipe-crossfire`。与本文方案正交，可叠加。
+- **不修 upstream 的替代路径**（考古 §6）：批量 payload（摊薄 park 次数，40B 流量同比例下降，见 [todo.md](../../todo.md)）、collector 换 `std sync_channel`（已证伪）、fork 到 `crates/youpipe-crossfire`。与本文方案正交，可叠加。
 
 ---
 

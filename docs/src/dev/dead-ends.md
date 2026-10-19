@@ -3,7 +3,7 @@
 跨主题的失败实验索引：每项均已实现并实测为负/危险后回退。详细数据与机制
 记录在 [scheduler.md](scheduler.md)、[benchmarks.md](benchmarks.md)、
 [crossfire-waker-designs.md](crossfire-waker-designs.md) 与对应代码注释。
-新想法先对照本清单；开放中的工作项见各主题文档（如 [streaming.md](streaming.md) 的 Audit open items 节）。
+新想法先对照本清单；开放中的工作项见 [todo.md](../../todo.md)。
 
 - **driver 偷已注入 chunk** 的三个变体（claim-flag / pop-any / pop-requeue）：
   破坏 injector FIFO（stream 正确性的隐式全局依赖）或 `counter==0 ⇒ JobRef
@@ -77,7 +77,7 @@
   30–100µs，净收益抵消至 ~1 pt，与全局 2048 的 1–4 pt 因果上界一致。
   旁证（不作结论）：外部 bench 挤占 20+ 核的争载下同 A/B 一致 −8~−13%，
   提示泊车频率被放大时窗口才有净收益。「下一批将至」的显式提示（caller
-  侧声明、非时间推断）与尾部 straggler 细化仍开放。
+  侧声明、非时间推断）与尾部 straggler 细化仍开放（todo.md）。
 - **quiescence 门控保温自旋**（2026-09-26，实现后 A/B 前回退）：机制——
   worker 在 spin→yield 相位边界检查 `counters.inactive == num_threads`
   （全池静默 = 没有在执行的工人 = 批间 gap 而非 ramp-down），静默期间以
