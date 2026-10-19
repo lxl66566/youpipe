@@ -281,12 +281,13 @@ as `YOUPIPE_SHARDED_TERM`; A/B through the runtime knob, same binary):
   streaming latency (not semantically equal).
 
 Integration points (all behind the one knob, cap clamped 2..=4096, default
-64): the collector's burst phase (`drain_unordered/ordered`, batch claim
-then a single per-item `try_recv` probe to resolve the inconclusive
-0-claim into Empty/Closed — the collector is the sole consumer, so the
-probe runs once per burst gap, not under a polling crowd; the sharded
-collector's pass skips that probe on open shards via the same
-`is_disconnected` load as `claim_poll` — PERF-7, commit `6445f59`), the
+64): the collector's burst phase (`drain_unordered/ordered`, batch claim;
+the inconclusive 0-claim resolves Empty via one `is_disconnected` tx-count
+load — the collector is the sole consumer, so the probe runs once per burst
+gap, not under a polling crowd, and only a disconnected channel falls
+through to `try_recv`, whose final drain keeps the half-close contract;
+the sharded collector's pass resolves 0-claims the same way — PERF-7,
+commit `6445f59`), the
 worker/fence-forwarder burst phase (`claim_poll` in
 `handoff/channel.rs`, wrapped by `anchor_claim` in
 `builder/typed/stream.rs` — batch first, anchor on miss; a
@@ -694,28 +695,18 @@ Round-6 audit of the streaming data plane (`handoff/`, `state/`, `runtime/`,
 Priority-ordered; directions falsified in dead-ends.md are excluded where
 noted.
 
-1. **Collector 0-claim probe: adopt the P-6/PERF-7 `is_disconnected`
-   resolution** (perf, low risk, semantics-neutral).
+1. **Collector 0-claim probe** — **landed 2026-10-20 (round 7)**.
    `drain_unordered_with` / `drain_ordered_with` resolve a 0-count
-   `try_recv_batch` by falling into a per-item `try_recv` — a second ring
-   walk over the stamp/head lines the terminal producers keep writing —
-   before anchoring on the blocking `recv`
-   (`crates/youpipe/src/state/stream.rs:205`, `:310`). The other two
-   batch-claim sites already skip that walk on an open channel with one
-   `is_disconnected()` tx-count load: `claim_poll`
-   (`crates/youpipe/src/handoff/channel.rs:519`, review P-6) and the sharded
-   collector's pass (`crates/youpipe/src/handoff/sharded.rs:216`, PERF-7,
-   commit `6445f59`). The collector is the sole consumer of the terminal
-   channel (debug-asserted in `try_exec`), so the same shortcut is sound;
-   only the `Closed` arm needs `try_recv`'s final drain (stragglers first).
-   Expected magnitude: sub-1 % wall (one walk per burst gap, not per item) —
-   the value is mostly consistency across the three claim sites. Risk: a
-   lost-CAS 0 under an externally *cloned* receiver — reachable only through
-   the public `run_ordered_collect` — delays one item by one retry, the same
-   contract `claim_poll` documents. Verify: gate the new probe under the
-   `YOUPIPE_BATCH_RECV` knob family and A/B same-binary
-   (`bench_ab.sh -B async_vs_tokio`, `stream_pipeline/single_stage_*` rows,
-   control rows to cancel layout noise).
+   `try_recv_batch` on an open channel with one `is_disconnected()` tx-count
+   load — no second ring walk over the stamp/head lines — matching
+   `claim_poll` (P-6) and the sharded `drain_pass_batched` (PERF-7,
+   `6445f59`); only a disconnected channel falls through to `try_recv`,
+   whose final drain keeps the half-close contract (stragglers before
+   Closed). A lost-CAS 0 under an externally cloned receiver (reachable
+   only through the public `run_ordered_collect`) delays one item by one
+   retry — the blocking `recv` pops a ready item without parking — the same
+   contract `claim_poll` documents. Readings: benchmarks.md
+   "Collector 0-claim probe + fence staging reuse".
 
 2. **High-load hang (unlocated, historically ~5–15 % of loaded rounds)** —
    record only, not fixed this round. The youpipe wrapper loops show no
