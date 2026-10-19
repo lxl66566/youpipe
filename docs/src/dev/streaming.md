@@ -706,7 +706,9 @@ noted.
    only through the public `run_ordered_collect`) delays one item by one
    retry — the blocking `recv` pops a ready item without parking — the same
    contract `claim_poll` documents. Readings: benchmarks.md
-   "Collector 0-claim probe + fence staging reuse".
+   "Collector 0-claim probe + fence staging reuse" — −2.5 % (25/25
+   dominant) on `stream_pipeline/single_stage_unordered/1K`, the
+   burst-gap-heaviest shape; every other row noise, no regressions.
 
 2. **High-load hang (unlocated, historically ~5–15 % of loaded rounds)** —
    record only, not fixed this round. The youpipe wrapper loops show no
@@ -739,7 +741,8 @@ noted.
    feeder's `push_items` staging — instead of `collect()`-ing a fresh `Vec`
    per chunk (`1→2→…→k` regrowth, exactly the per-batch regrowth
    `FenceBarrier::reuse` removed). Readings: benchmarks.md
-   "Collector 0-claim probe + fence staging reuse".
+   "Collector 0-claim probe + fence staging reuse" — with_fence rows
+   −0.9/−1.2 %, noise-level, as predicted (consistency, not throughput).
 
 4. **Knob promotion soak (`YOUPIPE_SPIN_ANCHOR` / `YOUPIPE_SHARDED_TERM` /
    `YOUPIPE_BATCH_RECV`)** (decision item). All three data-plane knobs stay
