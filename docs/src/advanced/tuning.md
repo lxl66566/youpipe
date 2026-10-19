@@ -206,9 +206,10 @@ disk stage ~16 — via
 ## `buffer_size`: backpressure depth (streaming)
 
 Per-channel capacity between stages, default 256. The effective capacity is
-`max(buffer_size, downstream_workers * 4)` — a floor so every downstream
-worker can hold items in flight; an explicit `SyncStageOptions::buffer(n)`
-replaces that logic for that stage's output channel. Small buffers tighten
+`max(buffer_size, workers * 4)`, where `workers` is the fan-out of the stage
+producing into that channel — a floor so each of those workers has a few free
+slots ahead; an explicit `SyncStageOptions::buffer(n)` replaces that logic
+for that stage's output channel. Small buffers tighten
 backpressure (less peak memory); large ones absorb bursts.
 
 ## Ordering and fences

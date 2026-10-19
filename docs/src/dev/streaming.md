@@ -686,7 +686,7 @@ output-channel capacity from `FenceOptions::buffer` (only meaningful knob —
 the forwarder is single-threaded); `fence(mode)` keeps the default
 (`buffer_size` with the `parallelism * 4` floor).
 
-Batch-allocation recycling: `push` hands each full chunk to the forwarder via `mem::take`, which historically dropped the allocation and regrew the next batch from capacity 0 (`log2(k)` reallocs per batch). `FenceBarrier::reuse` lets the forwarder return the drained `Vec`; the next flush swaps it in, so the steady state is zero allocator traffic per batch (−23 % on `stream_pipeline/with_fence/100 K`). The batched push arm (`YOUPIPE_FWD_BATCH`) keeps a forwarder-owned staging scratch for the same reason (round 7): one allocation per forwarder, `clear`-reused per chunk.
+Batch-allocation recycling: `push` hands each full chunk to the forwarder via `mem::take`, which historically dropped the allocation and regrew the next batch from capacity 0 (`log2(k)` reallocs per batch). `FenceBarrier::reuse` lets the forwarder return the drained `Vec`; the next flush swaps it in, so the steady state is zero allocator traffic per batch (−23 % on `stream_pipeline/with_fence/100 K`). Since r8 `reuse` is total: a non-empty batch (caller misuse) is appended back to the pending buffer instead of debug-asserting — release builds no longer silently drop the items. The batched push arm (`YOUPIPE_FWD_BATCH`) keeps a forwarder-owned staging scratch for the same reason (round 7): one allocation per forwarder, `clear`-reused per chunk.
 
 ## Audit 2026-10-20: open items
 
