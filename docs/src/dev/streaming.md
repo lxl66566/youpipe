@@ -684,3 +684,128 @@ the forwarder is single-threaded); `fence(mode)` keeps the default
 (`buffer_size` with the `parallelism * 4` floor).
 
 Batch-allocation recycling: `push` hands each full chunk to the forwarder via `mem::take`, which historically dropped the allocation and regrew the next batch from capacity 0 (`log2(k)` reallocs per batch). `FenceBarrier::reuse` lets the forwarder return the drained `Vec`; the next flush swaps it in, so the steady state is zero allocator traffic per batch (−23 % on `stream_pipeline/with_fence/100 K`).
+
+## Audit 2026-10-20: open items
+
+Round-6 audit of the streaming data plane (`handoff/`, `state/`, `runtime/`,
+`builder/typed/stream.rs`, and the `crates/youpipe-crossfire` wrapper seam).
+Priority-ordered; directions falsified in dead-ends.md are excluded where
+noted.
+
+1. **Collector 0-claim probe: adopt the P-6/PERF-7 `is_disconnected`
+   resolution** (perf, low risk, semantics-neutral).
+   `drain_unordered_with` / `drain_ordered_with` resolve a 0-count
+   `try_recv_batch` by falling into a per-item `try_recv` — a second ring
+   walk over the stamp/head lines the terminal producers keep writing —
+   before anchoring on the blocking `recv`
+   (`crates/youpipe/src/state/stream.rs:205`, `:310`). The other two
+   batch-claim sites already skip that walk on an open channel with one
+   `is_disconnected()` tx-count load: `claim_poll`
+   (`crates/youpipe/src/handoff/channel.rs:519`, review P-6) and the sharded
+   collector's pass (`crates/youpipe/src/handoff/sharded.rs:216`, PERF-7,
+   commit `6445f59`). The collector is the sole consumer of the terminal
+   channel (debug-asserted in `try_exec`), so the same shortcut is sound;
+   only the `Closed` arm needs `try_recv`'s final drain (stragglers first).
+   Expected magnitude: sub-1 % wall (one walk per burst gap, not per item) —
+   the value is mostly consistency across the three claim sites. Risk: a
+   lost-CAS 0 under an externally *cloned* receiver — reachable only through
+   the public `run_ordered_collect` — delays one item by one retry, the same
+   contract `claim_poll` documents. Verify: gate the new probe under the
+   `YOUPIPE_BATCH_RECV` knob family and A/B same-binary
+   (`bench_ab.sh -B async_vs_tokio`, `stream_pipeline/single_stage_*` rows,
+   control rows to cancel layout noise).
+
+2. **High-load hang (unlocated, historically ~5–15 % of loaded rounds)** —
+   record only, not fixed this round. The youpipe wrapper loops show no
+   lost-wake on inspection: every anchor (worker `anchor_claim`, fence
+   forwarder, sharded `recv_anchor`, async `recv_cached` anchors) re-probes
+   after each park; cancel paths break out; every `Closed` verdict flows
+   through `try_recv`'s final drain. Remaining suspects are fork-side:
+   (a) `RegistryMulti` cross-registry stale-entry fire theft
+   (crossfire-waker-designs.md §11.6 — "recovers within one event" assumes a
+   later event; on the terminal channel the stolen fire can be the last
+   pre-quiescence one, though the eventual `close()` sweep wakes every
+   current-seq entry, which closes that specific window); (b) the §11.5
+   unreproduced multi-thread stall under concurrent full-suite load.
+   Forensics variable to keep in view: crossfire's `Tx::send` `return_ok!`
+   yields (`std::thread::yield_now()`,
+   `crates/youpipe-crossfire/src/blocking_tx.rs:131`) after every send that
+   leaves the ring full — sustained backpressure produces ~16 `sched_yield`
+   per item, the same scheduler-churn fingerprint the hang reproducers saw;
+   fork source is unmodifiable, so treat it as a noise source when
+   instrumenting. Next step: debuginfo build + `crossfire-trace` per-waker
+   seq reproducer on the terminal MPSC ring and one mid MPMC ring under
+   full-suite concurrency (methodology: the 2026-09-25 instrumented
+   reproducer in crossfire-waker-designs.md).
+
+3. **`fence_batch_send` allocates its staging buffer per released batch**
+   (hygiene; affects only `YOUPIPE_FWD_BATCH=1`). The batched arm builds
+   `staged` via `batch.drain(..).map(..).collect()` — a fresh `Vec` per
+   released chunk, grown `1→2→…→k` (`log2(k)` reallocs;
+   `crates/youpipe/src/builder/typed/stream.rs:583`). That is exactly the
+   per-batch regrowth `FenceBarrier::reuse` eliminated, so the knob
+   partially reintroduces what it amortizes; contrast the feeder's staging
+   buffer, allocated once and `clear()`-reused across batches
+   (`crates/youpipe/src/builder/typed/stream.rs:249-252`). Fix shape: a
+   forwarder-owned `Vec<MaybeUninit<T>>` scratch (or at least
+   `with_capacity(batch.len())`). Magnitude: tiny (one k-sized alloc per k
+   items; chunk-500 allocations leave the tcache fast path) — consistency,
+   not throughput. Risk: none. Verify: `convoy-probe --shape fence` (park
+   signature must be unchanged) + `bench_ab.sh` on
+   `stream_pipeline/with_fence`.
+
+4. **Knob promotion soak (`YOUPIPE_SPIN_ANCHOR` / `YOUPIPE_SHARDED_TERM` /
+   `YOUPIPE_BATCH_RECV`)** (decision item). All three data-plane knobs stay
+   default-off pending broader soak, and each has measured wins in its
+   target regime (convoy catastrophic-mode elimination; sharded terminal
+   −8…−58 % on its bench; batch recv per-site wins). A knob nobody sets is
+   a perf feature nobody gets: run the multi-process soak matrix
+   (fence/convoy shapes × the full test suite × N processes, the
+   "Convoy collapse forensics" methodology) and promote the survivors to
+   default-on. The async sharded flavour stays falsified (benchmarks.md
+   "Async sharded-terminal A/B") and is excluded. Verify: same-binary knob
+   A/B per knob (`sharded_term` / `sharded_term_async` benches,
+   `bench_ab.sh -B sharded_term -B async_vs_tokio`), plus the soak.
+
+5. **Async-family convoy remains open (crossfire-level, candidate (c))**.
+   The async shape's slow face (15-worker crowd sending into the mixed-mode
+   channel + collector park stream) is out of `YOUPIPE_SPIN_ANCHOR`'s reach
+   (see "Fix (a)+(b) landed"). The remaining lever is crossfire's
+   `RegistryMulti` wake policy — wake-one among the queued crowd rather
+   than fire fan-out — which is fork surgery; the youpipe-side alternatives
+   (async sharded terminal, burst-drain in async consumers) are both
+   falsified (dead-ends.md, benchmarks.md). Effort high, expected gain
+   large for the async family (slow mode runs ~7–10× the fast mode). No
+   youpipe-only bench applies until the fork change exists; then
+   `async_vs_tokio` + convoy-probe async shapes.
+
+6. **Smells (no perf claim).**
+   - `StageSpawn::spawn_for_async`'s default impl
+     (`crates/youpipe/src/builder/typed/stream.rs:1532`) is unreachable
+     through `run()`: every concrete stage overrides it except `StreamStart`,
+     and an `AsyncStage` directly over `StreamStart` always routes to the
+     async-feeder branch (`first_consumer_is_async() == Some(true)` ⇒
+     `spawn_async_feeder_single`); the default's `FinalRx::Async` arm
+     additionally cannot occur (`StreamStart::spawn` returns `Sync`). Mirror
+     the "Unreachable through run() today" rationale comment that
+     `StreamStart::spawn_async_feeder_single` already carries, or make the
+     method required.
+   - `RecvItem::try_recv_batch`'s default body
+     (`crates/youpipe/src/handoff/channel.rs:613`) is dead — both real impls
+     override it. Unlike `SendItem::try_send_batch` (live: `MpscSender`
+     relies on the fallback inside `fence_batch_send`), a silent per-item
+     fallback here would be a performance trap for a future backing; remove
+     the default or debug-assert native support.
+   - Root `AGENTS.md` still describes `handoff/channel.rs` as "约 400 行包装层";
+     it is 956 lines and the layer spans `channel.rs` + `sharded.rs` + the
+     knob readers in `mod.rs`. Not fixable in this docs-only round — flagged
+     for the next code round.
+
+7. **Excluded / uncertain.** A seq-less unordered channel flavor (dropping
+   the `(u64, T)` tag — `spawn_stage`'s rationale at
+   `crates/youpipe/src/builder/typed/stream.rs:611`) would halve per-item
+   slot bytes for `u64` payloads but splits every spawn path per ordering;
+   the unification is the documented rationale and the expected win is
+   single-digit % at best on cache-bound shapes. Only worth a throwaway
+   prototype after items 1–3 land. Adjacent-sync-stage fusion, boundary
+   parking, and constant spin windows remain falsified (dead-ends.md).
