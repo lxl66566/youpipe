@@ -2967,10 +2967,33 @@ where
 // ── StreamPipe builder methods ──
 
 impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
-    /// Override the default [`PipelineConfig`].
+    /// Override the default [`PipelineConfig`] — wholesale-replace
+    /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Tune the workload split factor. Default is [`Workload::Balanced`].
+    ///
+    /// Read only by the fused cores a pure sync chain can take — the
+    /// [`run`](Self::run) pass-through and the fused
+    /// [`reduce`](Self::reduce)/[`fold`](Self::fold) cores. The channel
+    /// topology ignores `Workload`: per-stage worker counts size the
+    /// parallelism, and the channels load-balance cost skew per item.
+    ///
+    /// ```rust
+    /// # use youpipe::prelude::*;
+    /// let r: Vec<u64> = (0..1000).stream()
+    ///     .with_workload(Workload::Unbalanced)
+    ///     .stage(|x: u64| x + 1)
+    ///     .run();
+    /// assert_eq!(r.len(), 1000);
+    /// ```
+    #[must_use]
+    pub fn with_workload(mut self, workload: Workload) -> Self {
+        self.config.workload = workload;
         self
     }
 
@@ -3917,6 +3940,19 @@ where
             "StreamPipe::run: failed to build async runtime (OS resource limit? pass a custom \
              backend via with_async_pool, or use try_run to handle the failure)",
         )
+    }
+
+    /// Alias for [`run`](Self::run): the collecting terminal under the same
+    /// name as [`Pipe::collect`](crate::Pipe::collect), so switching engines
+    /// keeps the terminal spelled the same.
+    ///
+    /// ```rust
+    /// # use youpipe::stream;
+    /// let r: Vec<u64> = stream(0..100).stage(|x: u64| x + 1).collect();
+    /// assert_eq!(r.len(), 100);
+    /// ```
+    pub fn collect(self) -> Vec<O> {
+        self.run()
     }
 
     /// Execute the streaming pipeline, applying `f` to each output item for

@@ -3431,6 +3431,18 @@ pub struct Pipe<S, I, O> {
 
 impl<S, I, O> Pipe<S, I, O> {
     /// Override the default [`PipelineConfig`].
+    ///
+    /// Replaces the config **wholesale**: every field previously set by a
+    /// config-resident setter ([`with_workload`](Self::with_workload),
+    /// [`with_compute_workers`](Self::with_compute_workers), …) silently
+    /// takes `config`'s value. Call `with_config` before the field setters,
+    /// or set the fields directly on the [`PipelineConfig`] you pass.
+    /// (No field merge on purpose: a diff-against-default merge cannot
+    /// distinguish "unset" from "deliberately reset to default".) Setters
+    /// that live outside
+    /// `PipelineConfig` ([`with_compute_pool`](Self::with_compute_pool),
+    /// [`with_oversubscribe`](Self::with_oversubscribe)) are unaffected by
+    /// the ordering.
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
         self.config = config;
@@ -4071,7 +4083,8 @@ pub struct TryPipe<S, I, O, E = std::convert::Infallible> {
 }
 
 impl<S, I, O, E> TryPipe<S, I, O, E> {
-    /// Override the default [`PipelineConfig`].
+    /// Override the default [`PipelineConfig`] — wholesale-replace
+    /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
         self.config = config;

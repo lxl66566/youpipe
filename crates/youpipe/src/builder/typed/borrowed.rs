@@ -106,7 +106,8 @@ pub struct PipeRef<'a, S, T, O> {
 }
 
 impl<'a, S, T, O> PipeRef<'a, S, T, O> {
-    /// Override the default [`PipelineConfig`].
+    /// Override the default [`PipelineConfig`] — wholesale-replace
+    /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
         self.config = config;
@@ -460,7 +461,8 @@ pub struct TryPipeRef<'a, S, T, O, E = std::convert::Infallible> {
 }
 
 impl<'a, S, T, O, E> TryPipeRef<'a, S, T, O, E> {
-    /// Override the default [`PipelineConfig`].
+    /// Override the default [`PipelineConfig`] — wholesale-replace
+    /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
         self.config = config;

@@ -125,7 +125,8 @@ pub struct ScopedPipe<'env, S, I, O> {
 }
 
 impl<'env, S, I, O> ScopedPipe<'env, S, I, O> {
-    /// Override the default [`PipelineConfig`].
+    /// Override the default [`PipelineConfig`] — wholesale-replace
+    /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
         self.config = config;
@@ -316,7 +317,8 @@ pub struct ScopedTryPipe<'env, S, I, O, E = std::convert::Infallible> {
 }
 
 impl<'env, S, I, O, E> ScopedTryPipe<'env, S, I, O, E> {
-    /// Override the default [`PipelineConfig`].
+    /// Override the default [`PipelineConfig`] — wholesale-replace
+    /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
         self.config = config;

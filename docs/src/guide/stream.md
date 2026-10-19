@@ -26,7 +26,8 @@ oversized pool instead ([pools](../advanced/pools.md)).
 
 ## Terminals and ordering
 
-`.run()` returns a `Vec` in **completion order**; `.ordered()` restores input
+`.run()` (alias `.collect()`, matching [`pipe()`](pipe.md) chains) returns a
+`Vec` in **completion order**; `.ordered()` restores input
 order via a reorder pass. The reorder window pre-sizes to the pipeline's
 in-flight occupancy and grows on demand up to `next_pow2(n)` — correct for
 any per-item latency skew, with memory proportional to the observed reorder
