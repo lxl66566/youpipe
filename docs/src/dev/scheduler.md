@@ -632,3 +632,95 @@ Design decisions:
   (`yp-pool-<i>`, unpinned for `new`); under the `YOUPIPE_PIN_WORKERS=1`
   benchmark knob recycling therefore preserves affinity — benign, the knob
   pins every pool in the process anyway.
+
+## Audit 2026-10-20: open items
+
+Round-6 audit of the CPU pool / dispatch surface (`pool/`, `executor/`,
+`sync/`, `scope/`, `youpipe-sys`, plus the usage surface of the two vendored
+forks — fork sources themselves untouchable). Items ordered by expected
+value; each was checked against [dead-ends.md](dead-ends.md) and none
+collides with a falsified direction (no adaptive chunking / cost-EMA, no
+spin-window widening, no bounded steal probes, no pinning-by-default). The
+two documentation drifts found are fixed in this audit's companion commit;
+code-comment and cleanup items stay for the next code round. Verification
+benches are all `perf/bench-suite/bench_ab.sh` interleaved A/B (usage in
+its header comment).
+
+1. **Graceful-shutdown doc drift (fixed alongside this audit).** The
+   "Graceful Shutdown" section claimed dropping the last handle "waits for
+   every submitted job" unconditionally. Since pool recycling landed, the
+   last *external* drop of a `ComputePool::new` pool parks it instead (the
+   cache holds a handle, `terminate_count` never reaches 0); only
+   eviction, `clear_cached_pools()`, `new_pinned`, or global-registry
+   teardown actually join. Corrected in this file. A parked pool's workers
+   stay in the idle loop and still execute every submitted job — only the
+   blocking wait is deferred.
+
+2. **`StackJob::run_inline` comment contradicts the live code (next
+   round, comment-only).** `pool/job.rs`, immediately above the method,
+   states "`run_inline` was removed with join's self-pop switch to
+   `JobRef::execute`" — but the method exists and is the hot A-ok self-pop
+   path of `join_on_captured` (whose one deliberate live-unwind escape is
+   documented in `join.rs`). The comment records a past state and now
+   misleads; rewrite it to state the current contract: no
+   `halt_unwinding` here *by design* (a catch re-add cost +33 % on
+   `sync_cpu_heavy/100K`), callers must tolerate the escaping unwind.
+
+3. **`inject_batch` capacity comment stale under slack (next round,
+   comment-only).** `registry.rs` claims the batch is
+   "`num_threads−1 ≤ BLOCK_CAP` jobs, so this is a single CAS" — false on
+   the Unbalanced wide tier (32-thread pool: `num_threads + 16` chunks
+   minus the driver chunk = 47 > 31) and on any pool above 32 threads
+   (Balanced included). Behavior is correct — `push_n` reserves per
+   segment — only the comment needs rewording to "one CAS per ≤31-slot
+   segment".
+
+4. **st3 push/emptiness double read (micro; verify before building).**
+   `WorkerThread::push` reads `worker.is_empty()` (two Relaxed loads:
+   `push_count`, `pop_count_and_head` — the latter shared with stealers)
+   and `Worker::push` then re-loads both plus `head`: five loads where
+   three suffice. `push_batch` pays the pair once per batch; `join` pays
+   it per join node. First step is disassembly, not a fork change:
+   `Worker<JobRef>` is generic, both calls monomorphize into youpipe's
+   CGU, and LLVM *may* already merge the adjacent Relaxed loads — check
+   with cargo-show-asm; if unmerged, add a fork-side API returning
+   pushed-and-was-empty in one pass. Expected gain is one shared-line
+   load per join push under active stealing — likely <1 % on join-heavy
+   families; opportunistic only. Bench: `bench_ab.sh` on `sync_cpu_heavy`
+   and the `sync_nested_on_pool` family (per-id isolated rounds).
+
+5. **Fence-skip on the inject path — analyzed, rejected (recorded to
+   prevent re-derivation).** Idea: `Sleep::new_injected_jobs`'s
+   unconditional `fence(SeqCst)` could be skipped when the counters
+   already show `sleeping == 0 && awake_but_idle == 0`, saving one locked
+   op per `inject` on the stream-dispatch path. Unsound as stated: the
+   no-lost-wake guarantee rests on the poster-fence/sleeper-fence SeqCst
+   pair ordering *across variables* (queue indexes vs the packed
+   counters); a same-variable SeqCst counter load cannot substitute, and
+   a thread that enters `start_looking` after the poster's check can
+   reach the pre-park queue probe with no happens-before edge to the
+   push. Any future variant must keep a full fence unless the counters
+   can *prove* no sleeper is racing — which this protocol never can.
+
+6. **Pool-side fence flavor: not worth a round.** `sleep.rs` fences via
+   std (`mfence` on x86) while the concurrent-queue fork uses the
+   `lock not` asm fence; the fork's own four-side A/B (micro favored the
+   asm, integrated verdict kept it) bounds the difference at
+   single-digit nanoseconds, and the inject path already contains a
+   SeqCst RMW that is itself a full barrier on x86. Expected ≈ 0; skip
+   unless the injector path is reopened for other reasons.
+
+7. **Test dedup (cleanup).** The two pinned-affinity tests in
+   `executor/compute/worker.rs` (`test_new_pinned_round_robins_past_the_cpu_set`,
+   `test_new_pinned_workers_have_distinct_single_cpu_affinity`) duplicate
+   the ~45-line `/proc/self/task` scan; one helper returning the list of
+   single-CPU `yp-pool-*` workers covers both.
+
+8. **Already tracked elsewhere, not new:** the ten-fold
+   `resolve_exec_pool` + terminal prologue duplication is todo #9
+   (re-checked, still accurate — fused.rs alone has 16 call sites); the
+   injector `is_empty` pop gate's ~+2.3 % cost on
+   `mixed_load/youpipe_stream_cpu/1000` is recorded in `registry.rs` /
+   benchmarks.md with a standing "revisit when next tuning the injector
+   path" note — this audit concurs with keeping it (the theory of
+   skipping a locked op on idle passes still holds).
