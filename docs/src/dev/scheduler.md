@@ -173,7 +173,7 @@ net −361 lines: full test suite + miri (tree-borrows, drop-accounting)
 green; interleaved A/B over the `sync_vs_rayon` families (per-id isolated,
 3 rounds) — every id graded noise — worst youpipe delta +0.8 % (the one leaning id, sync_lightweight 10 K borrowed, confirmed noise by 2 extra rounds: dom 13/25, spreads 11–14 %), tightest family (sync_lightweight 1 M borrowed) −0.1 % at ±0.4 % spread, rayon anchors within ±1 %.
 
-The reduction terminals (todo perf #3) landed on a sibling core, *not*
+The reduction terminals landed on a sibling core, *not*
 `par_tree_rec`: `par_reduce_rec` is a value-carrying recursion (`join`
 returns both child partials, the node combines them), so there is no
 shared-buffer sibling-drop path at all — panic safety is structural (every
@@ -587,7 +587,13 @@ then drains its remaining local-deque work **and the injector** (a `JobRef` owns
 its heap box — an unexecuted job is a leak, and a revived pool would run it at a
 random later point), sets its `stopped` latch, and exits; `Registry::Drop` blocks
 on every spawned worker's `stopped` before returning. Dropping the last handle
-therefore waits for every submitted job, not just the running ones. Note a
+therefore waits for every submitted job, not just the running ones — whenever
+the drop actually joins: pools built through `ComputePool::new` are *parked*
+in the recycling cache on the last external drop instead (see "Transient pool
+recycling" below; the cache holds a handle, so `terminate_count` never reaches
+0), and only eviction, `clear_cached_pools()`, `new_pinned`, or global-registry
+teardown run this path. A parked pool's workers stay in the idle loop and
+still execute every submitted job; only the blocking wait is deferred. Note a
 submit-job closure that panics aborts the process wherever it executes
 (`HeapJob::execute`'s `AbortIfPanic` — rayon `spawn` semantics).
 

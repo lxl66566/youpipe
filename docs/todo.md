@@ -216,13 +216,13 @@ move 进各 builder + setter 宏，加字段只改一处。
 
 ### 12. [P2] 死代码清理
 
-pool/mod.rs 模块级 `#![allow(dead_code)]`（"Scope/spawn infrastructure not
-yet wired"）已掩盖真死代码（repo 内零调用者，2026-09 核实）：`spawn_static`
-（pool/registry.rs）、`CountLatch::increment`/`wait`（pool/latch.rs，fused
-只用 `wait_spin` 系）、`word_and_bit`（pool/sleep_mask.rs，`split_index`
-的完全重复）；另有 `BoxFuture` 类型别名（runtime/mod.rs，零引用）、
-`CancellationToken::reset`（sync/cancel.rs，仅自测调用；复活 token 对在飞
-worker 是脚枪）。删项后摘掉模块级 allow，让编译器重新把关。
+pool 侧四项（pool/mod.rs 模块级 `#![allow(dead_code)]`、`spawn_static`、
+`CountLatch::increment`/`wait`、`word_and_bit`）已随 8eb4b67 删除（2026-10-20
+审计复核：全 repo 零残留；`LockLatch::wait` 是另一方法且在用）。仍开放：
+
+- `BoxFuture` 类型别名（runtime/mod.rs，全 repo 零引用）；
+- `CancellationToken::reset`（sync/cancel.rs，仅自测调用；复活 token 对在飞
+  worker 是脚枪）。
 
 ### 13. [P2] 正确性相邻与杂项
 
