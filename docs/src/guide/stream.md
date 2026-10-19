@@ -122,8 +122,11 @@ assert_eq!(words.len(), 3);
 ```
 
 `.with_cancel(token)` checks a [`CancellationToken`] in the feeder, every
-stage worker, and every bridge, once per iteration. In-flight items drain to
-completion; no new items are accepted after `token.cancel()`:
+stage worker, and every bridge, once per iteration. The item a worker is
+currently processing completes; no new items are accepted after
+`token.cancel()`. The terminal then returns a **silently truncated** output —
+the items that had crossed the channels, indistinguishable from a run over a
+shorter input. Check the token yourself after the run if truncation matters:
 
 ```rust
 use youpipe::prelude::*;

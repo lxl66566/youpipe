@@ -3001,6 +3001,11 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// stage workers, and bridges all check the token per iteration. A
     /// cancelled-or-not token always opts the chain out of the fused
     /// pass-through (see [`run`](Self::run)).
+    ///
+    /// A cancelled run produces a silently truncated output — only the
+    /// items that crossed the channels before the workers stopped, which is
+    /// indistinguishable from a run over a shorter input (see
+    /// [`run`](Self::run)'s Cancellation contract).
     #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
@@ -3902,6 +3907,18 @@ where
     /// core cannot honour); [`for_each`](Self::for_each) never takes the
     /// pass-through (its drain runs on the calling thread).
     ///
+    /// # Cancellation
+    ///
+    /// When a token attached via [`with_cancel`](Self::with_cancel) fires
+    /// mid-run, the feeder stops feeding, every stage worker stops once its
+    /// current item is done, and the collector drains what already crossed
+    /// the channels. The output is silently truncated: a cancelled run is
+    /// indistinguishable from a run whose input was simply shorter (with
+    /// `.ordered()` the result is still in input order — a prefix of
+    /// unknown length). If truncation matters, check the token yourself
+    /// after the run. Every terminal shares this contract
+    /// ([`for_each`](Self::for_each), [`reduce`](Self::reduce), …).
+    ///
     /// # Panics
     ///
     /// How a panicking stage closure is transported depends on the topology
@@ -3971,6 +3988,10 @@ where
     ///
     /// `f` runs on the calling thread, so it needs no `Send`/`'static`
     /// bounds — accumulate into local state directly, no atomics required.
+    ///
+    /// On cancellation `f` has been applied only to the items that crossed
+    /// the channels before the workers stopped — same silent-truncation
+    /// contract as [`run`](Self::run) (see its Cancellation section).
     ///
     /// ```rust
     /// # use youpipe::stream;
