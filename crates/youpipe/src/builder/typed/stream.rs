@@ -1765,9 +1765,32 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     _marker: PhantomData<R>,
 }
 
+/// Effective capacity of a stage's output channel: the configured
+/// `buffer_size` floored at `parallelism * 4` slots, so the producing
+/// stage's workers always have a few free slots to push into even when the
+/// configured capacity is smaller than the fan-out.
+///
+/// # Interlock — feeder-slot prediction (`try_exec`)
+///
+/// `try_exec` predicts "will the feeder be a pool job" as
+/// `n > floored_channel_capacity(buffer_size, 1)` — the minimum capacity
+/// over every per-stage parallelism the run may resolve — to cover (never
+/// miss) the real condition `n > floored_channel_capacity(buffer_size, p)`
+/// for whatever `p >= 1` the run resolves. The covering implication holds
+/// because this floor is monotonic in `parallelism`; changing the floor
+/// rule (different multiplier, additive term, `max(parallelism, k)` shape)
+/// without updating the prediction under-reserves the parking lease — the
+/// feeder job is queued while every worker hosts a parked job and the run
+/// deadlocks. No test pins this shape (it depends on run/pool sizing), so
+/// the two call sites must move together.
+#[inline]
+fn floored_channel_capacity(buffer_size: usize, parallelism: usize) -> usize {
+    buffer_size.max(parallelism * 4)
+}
+
 impl<R: AsyncRuntime> StreamCtx<'_, R> {
     pub fn buffer_size(&self, parallelism: usize) -> usize {
-        self.config.buffer_size.max(parallelism * 4)
+        floored_channel_capacity(self.config.buffer_size, parallelism)
     }
 
     /// Accumulate one term of the run's in-flight occupancy estimate (see
@@ -1873,9 +1896,11 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
 
     /// Resolve a stage's output-channel capacity: the stage's explicit
     /// buffer pin (used verbatim — the caller opted into this exact
-    /// backpressure), or the config value with the
-    /// `downstream_workers * 4` floor. Takes the buffer field because every
-    /// options kind ([`SyncStageOptions`] / [`AsyncStageOptions`] /
+    /// backpressure), or the config value floored at the producing stage's
+    /// `parallelism * 4` slots (`floored_channel_capacity` — `parallelism`
+    /// is the producing stage's own worker/concurrency count, not the
+    /// downstream stage's). Takes the buffer field because every options
+    /// kind ([`SyncStageOptions`] / [`AsyncStageOptions`] /
     /// [`FenceOptions`]) carries it.
     pub fn stage_buffer(&self, buffer: Option<NonZeroUsize>, parallelism: usize) -> usize {
         let buffer = buffer.map_or_else(|| self.buffer_size(parallelism), NonZeroUsize::get);
@@ -4354,11 +4379,11 @@ where
         // Feeder-slot prediction must cover (never miss) the pool-job case.
         // The feeder is a job iff `n > buffer_actual = max(buffer_size,
         // per_stage_actual * 4)`; `per_stage_actual ≥ 1`, so predicting with
-        // the *smallest* possible buffer (`max(buffer_size, 4)`) reserves a
-        // slot in every case the feeder could be a job — the converse
-        // (reserved but inline) merely over-reserves by one slot, returned
-        // by the lease's drop.
-        let feeder_slot = usize::from(n > config.buffer_size.max(4));
+        // the *smallest* possible buffer (the floor at parallelism 1)
+        // reserves a slot in every case the feeder could be a job — the
+        // converse (reserved but inline) merely over-reserves by one slot,
+        // returned by the lease's drop. Interlock: `floored_channel_capacity`.
+        let feeder_slot = usize::from(n > floored_channel_capacity(config.buffer_size, 1));
         let (lease, dedicated_threads, per_stage_parallelism, run_live_slots) = if pool
             .is_on_this_pool()
         {
