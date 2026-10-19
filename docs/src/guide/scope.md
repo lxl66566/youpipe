@@ -52,7 +52,7 @@ indices (`0..table.len()`) avoids even that.
 ## Fallible and side-effect variants
 
 Both forms support the full terminal set: `.filter`, `.try_map(...).try_collect()`,
-`.for_each`, `.collect`, `.reduce`/`.fold` (and the `sum`/`count`
-conveniences), plus the config knobs from
-[tuning](../advanced/tuning.md) (`with_workload`, `with_compute_pool`,
-`with_oversubscribe`).
+`.for_each`, `.collect`, `.reduce`/`.fold` (plus the `sum`/`count`/`min`/`max`
+conveniences and `try_reduce`/`try_fold` on fallible chains), and the config
+knobs from [tuning](../advanced/tuning.md) (`with_workload`,
+`with_compute_pool`, `with_oversubscribe`).

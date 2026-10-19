@@ -232,6 +232,13 @@ constructs an `Option`.
 the `.try_map()` boundary, and `MapErr` converts the error type. Driven by
 `fused_try_filter_collect` when the chain filters (fallible + filtering can't
 assume fixed cardinality), or the index-based fast path otherwise.
+`try_apply_pure` is the fallible mirror of `apply_pure`: each stage threads
+`Result` through `prev.try_apply_pure(..)?` directly, so filterless chains
+(the `try_collect` fast paths) never construct or match `Result<Option<_>, _>`
+per level. Sound only while `MAY_FILTER == false` throughout — the `FusedTryOp`
+construction sites gate it. The path is codegen-layout sensitive (the
+`ErasedStrategy` note under `collect` applies), and the bench suite has no
+fallible pure-path id yet, so a no-regression verdict is still open.
 
 ### `Pipe::collect()` / `TryPipe::try_collect()` — Execution
 
