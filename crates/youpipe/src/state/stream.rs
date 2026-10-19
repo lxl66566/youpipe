@@ -157,7 +157,7 @@ fn verify_ordered_accounting<T>(
 pub(crate) fn drain_unordered<R, O>(rx: &R, sink: impl FnMut(O))
 where
     R: RecvItem<(u64, O)>,
-    O: Send + 'static,
+    O: Send,
 {
     drain_unordered_with(rx, crate::handoff::batch_recv_cap(), sink);
 }
@@ -169,7 +169,7 @@ where
 pub(crate) fn drain_unordered_with<R, O>(rx: &R, batch_cap: usize, mut sink: impl FnMut(O))
 where
     R: RecvItem<(u64, O)>,
-    O: Send + 'static,
+    O: Send,
 {
     // Batch scratch, reused across bursts for the whole drain (one
     // allocation per run; capacity 0 = no alloc).
@@ -248,7 +248,7 @@ pub(crate) fn drain_ordered<R, O>(
     sink: impl FnMut(O),
 ) where
     R: RecvItem<(u64, O)>,
-    O: Send + 'static,
+    O: Send,
 {
     drain_ordered_with(
         rx,
@@ -274,7 +274,7 @@ pub(crate) fn drain_ordered_with<R, O>(
     mut sink: impl FnMut(O),
 ) where
     R: RecvItem<(u64, O)>,
-    O: Send + 'static,
+    O: Send,
 {
     let mut buffer = ReorderBuffer::with_max(window.initial, window.max);
     // Count emissions for the post-drain accounting check; the counter folds
@@ -365,7 +365,7 @@ pub(crate) fn drain_ordered_with<R, O>(
 pub(crate) async fn drain_unordered_async<R, O>(rx: &R, mut sink: impl FnMut(O))
 where
     R: AsyncRecvItem<(u64, O)>,
-    O: Send + 'static,
+    O: Send,
 {
     // One waker-node slot per collector (P-4): the per-burst-gap anchor park
     // reuses its node instead of allocating a fresh one per gap.
@@ -401,7 +401,7 @@ pub(crate) async fn drain_ordered_async<R, O>(
     mut sink: impl FnMut(O),
 ) where
     R: AsyncRecvItem<(u64, O)>,
-    O: Send + 'static,
+    O: Send,
 {
     let mut buffer = ReorderBuffer::with_max(window.initial, window.max);
     // See `drain_ordered` for the accounting counter.
@@ -455,7 +455,7 @@ pub(crate) fn drain_unordered_sharded<O, S: FnMut(O)>(
     rx: &mut ShardedReceiver<(u64, O)>,
     mut sink: S,
 ) where
-    O: Send + 'static,
+    O: Send,
 {
     loop {
         let mut tagged_sink = |(_, item): (u64, O)| sink(item);
@@ -482,7 +482,7 @@ pub(crate) fn drain_ordered_sharded<O, S: FnMut(O)>(
     accounting: OrderedAccounting<'_>,
     mut sink: S,
 ) where
-    O: Send + 'static,
+    O: Send,
 {
     let mut buffer = ReorderBuffer::with_max(window.initial, window.max);
     // See `drain_ordered` for the accounting counter.
@@ -521,7 +521,7 @@ pub(crate) async fn drain_unordered_async_sharded<O, S: FnMut(O)>(
     rx: &mut ShardedAsyncReceiver<(u64, O)>,
     mut sink: S,
 ) where
-    O: Send + Unpin + 'static,
+    O: Send + Unpin,
 {
     loop {
         let mut tagged_sink = |(_, item): (u64, O)| sink(item);
@@ -550,7 +550,7 @@ pub(crate) async fn drain_ordered_async_sharded<O, S: FnMut(O)>(
     accounting: OrderedAccounting<'_>,
     mut sink: S,
 ) where
-    O: Send + Unpin + 'static,
+    O: Send + Unpin,
 {
     let mut buffer = ReorderBuffer::with_max(window.initial, window.max);
     // See `drain_ordered` for the accounting counter.
@@ -587,11 +587,17 @@ pub(crate) async fn drain_ordered_async_sharded<O, S: FnMut(O)>(
 ///
 /// Generic over the receiver type so it works with both MPMC (`Receiver`) and
 /// MPSC (`MpscReceiver`) channels.
+///
+/// `O` needs only `Send` — the drain loops neither spawn nor store items
+/// beyond the [`ReorderBuffer`]. Non-`'static` items therefore work through
+/// a custom [`RecvItem`] implementation; the built-in channels still require
+/// `T: Send + 'static` because their endpoints are captured by spawned
+/// workers.
 #[must_use]
 pub fn run_ordered_collect<R, O>(input_rx: &R, expected_items: usize) -> Vec<O>
 where
     R: RecvItem<(u64, O)>,
-    O: Send + 'static,
+    O: Send,
 {
     let mut results = Vec::with_capacity(expected_items);
     drain_ordered(
@@ -607,7 +613,48 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handoff::channel;
+    use crate::handoff::{ChannelError, channel};
+
+    /// The drain family only needs `O: Send` (todo #8 lifetime item): the
+    /// loops neither spawn nor store beyond the `ReorderBuffer`. Prove it
+    /// end-to-end with a non-`'static` item type (`&'local i32`) delivered
+    /// through a custom `RecvItem` — the built-in channels cannot carry it
+    /// (their endpoints are captured by spawned workers, hence
+    /// `T: Send + 'static`), so this is the only route the relaxed bound
+    /// unlocks. Arrival is out of order so the `ReorderBuffer` runs too.
+    #[test]
+    fn run_ordered_collect_accepts_borrowed_items() {
+        struct DequeRecv<'q, 'd> {
+            queue: std::cell::RefCell<&'q mut std::collections::VecDeque<(u64, &'d i32)>>,
+        }
+        impl<'d> RecvItem<(u64, &'d i32)> for DequeRecv<'_, 'd> {
+            fn recv(&self) -> Result<(u64, &'d i32), ChannelError> {
+                self.queue
+                    .borrow_mut()
+                    .pop_front()
+                    .ok_or(ChannelError::Closed)
+            }
+
+            fn try_recv(&self) -> Result<(u64, &'d i32), TryRecvError> {
+                self.recv().map_err(|_| TryRecvError::Closed)
+            }
+
+            fn is_disconnected(&self) -> bool {
+                self.queue.borrow().is_empty()
+            }
+        }
+
+        let owned = [10, 20, 30];
+        let items: Vec<(u64, &i32)> = vec![(2, &owned[2]), (0, &owned[0]), (1, &owned[1])];
+        let mut queue: std::collections::VecDeque<(u64, &i32)> = items.into();
+        let rx = DequeRecv {
+            queue: std::cell::RefCell::new(&mut queue),
+        };
+        let out: Vec<&i32> = run_ordered_collect(&rx, 3);
+        assert_eq!(out.iter().map(|r| **r).collect::<Vec<_>>(), vec![
+            10, 20, 30
+        ]);
+    }
 
     /// Pinned-window overflow through the real drain loop (the
     /// `with_reorder_window` / `ReorderBuffer::with_max` semantics): with a

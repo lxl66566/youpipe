@@ -26,7 +26,8 @@ oversized pool instead ([pools](../advanced/pools.md)).
 
 ## Terminals and ordering
 
-`.run()` returns a `Vec` in **completion order**; `.ordered()` restores input
+`.run()` (alias `.collect()`, matching [`pipe()`](pipe.md) chains) returns a
+`Vec` in **completion order**; `.ordered()` restores input
 order via a reorder pass. The reorder window pre-sizes to the pipeline's
 in-flight occupancy and grows on demand up to `next_pow2(n)` — correct for
 any per-item latency skew, with memory proportional to the observed reorder
@@ -121,8 +122,11 @@ assert_eq!(words.len(), 3);
 ```
 
 `.with_cancel(token)` checks a [`CancellationToken`] in the feeder, every
-stage worker, and every bridge, once per iteration. In-flight items drain to
-completion; no new items are accepted after `token.cancel()`:
+stage worker, and every bridge, once per iteration. The item a worker is
+currently processing completes; no new items are accepted after
+`token.cancel()`. The terminal then returns a **silently truncated** output —
+the items that had crossed the channels, indistinguishable from a run over a
+shorter input. Check the token yourself after the run if truncation matters:
 
 ```rust
 use youpipe::prelude::*;

@@ -2984,10 +2984,34 @@ where
 // ── StreamPipe builder methods ──
 
 impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
-    /// Override the default [`PipelineConfig`].
+    /// Override the default [`PipelineConfig`] — wholesale-replace
+    /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Tune the workload split factor. Default is [`Workload::Balanced`].
+    ///
+    /// Read only by the fused cores a pure sync chain can take — the
+    /// [`run`](Self::run) pass-through and the fused
+    /// [`reduce`](Self::reduce)/[`fold`](Self::fold) cores. The channel
+    /// topology ignores `Workload`: per-stage worker counts size the
+    /// parallelism, and the channels load-balance cost skew per item.
+    ///
+    /// ```rust
+    /// # use youpipe::prelude::*;
+    /// let r: Vec<u64> = (0..1000)
+    ///     .stream()
+    ///     .with_workload(Workload::Unbalanced)
+    ///     .stage(|x: u64| x + 1)
+    ///     .run();
+    /// assert_eq!(r.len(), 1000);
+    /// ```
+    #[must_use]
+    pub fn with_workload(mut self, workload: Workload) -> Self {
+        self.config.workload = workload;
         self
     }
 
@@ -2995,6 +3019,11 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// stage workers, and bridges all check the token per iteration. A
     /// cancelled-or-not token always opts the chain out of the fused
     /// pass-through (see [`run`](Self::run)).
+    ///
+    /// A cancelled run produces a silently truncated output — only the
+    /// items that crossed the channels before the workers stopped, which is
+    /// indistinguishable from a run over a shorter input (see
+    /// [`run`](Self::run)'s Cancellation contract).
     #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
@@ -3896,6 +3925,18 @@ where
     /// core cannot honour); [`for_each`](Self::for_each) never takes the
     /// pass-through (its drain runs on the calling thread).
     ///
+    /// # Cancellation
+    ///
+    /// When a token attached via [`with_cancel`](Self::with_cancel) fires
+    /// mid-run, the feeder stops feeding, every stage worker stops once its
+    /// current item is done, and the collector drains what already crossed
+    /// the channels. The output is silently truncated: a cancelled run is
+    /// indistinguishable from a run whose input was simply shorter (with
+    /// `.ordered()` the result is still in input order — a prefix of
+    /// unknown length). If truncation matters, check the token yourself
+    /// after the run. Every terminal shares this contract
+    /// ([`for_each`](Self::for_each), [`reduce`](Self::reduce), …).
+    ///
     /// # Panics
     ///
     /// How a panicking stage closure is transported depends on the topology
@@ -3936,6 +3977,19 @@ where
         )
     }
 
+    /// Alias for [`run`](Self::run): the collecting terminal under the same
+    /// name as [`Pipe::collect`](crate::Pipe::collect), so switching engines
+    /// keeps the terminal spelled the same.
+    ///
+    /// ```rust
+    /// # use youpipe::stream;
+    /// let r: Vec<u64> = stream(0..100).stage(|x: u64| x + 1).collect();
+    /// assert_eq!(r.len(), 100);
+    /// ```
+    pub fn collect(self) -> Vec<O> {
+        self.run()
+    }
+
     /// Execute the streaming pipeline, applying `f` to each output item for
     /// its side effect — **no output `Vec` is materialised**.
     ///
@@ -3952,6 +4006,10 @@ where
     ///
     /// `f` runs on the calling thread, so it needs no `Send`/`'static`
     /// bounds — accumulate into local state directly, no atomics required.
+    ///
+    /// On cancellation `f` has been applied only to the items that crossed
+    /// the channels before the workers stopped — same silent-truncation
+    /// contract as [`run`](Self::run) (see its Cancellation section).
     ///
     /// ```rust
     /// # use youpipe::stream;

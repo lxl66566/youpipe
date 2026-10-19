@@ -155,30 +155,33 @@
 顺带收益：与 crossfire per-thread waker（设计 C，dev/crossfire-waker-designs.md
 §11）叠加后每组的 channel hop 数减少。
 
-### 7. [P1] 取消的部分输出语义
+### 7. [P1] 取消的部分输出语义（残余：RunOutcome 报告）
 
-取消时 feeder/worker break，collector 排干通道即返回——中途取消产出静默
-截断的 `Vec`，与正常短 run 不可区分；`run()` / `for_each` / `with_cancel`
-均未文档化。至少补文档；更优：`RunOutcome` 或 `try_run_checked` 报告
-`Cancelled { emitted }`（collector 排干后查 token 即可）。
+- 文档契约已补（2026-10-20，r7）：`run()` 新增 Cancellation 节，
+  `for_each`/`with_cancel` 内联说明，guide/stream.md 同步——取消产出静默
+  截断的输出，与正常短 run 不可区分。顺带修正 guide 旧措辞：worker 只
+  完成当前条目即停（逐条目查 token），并非 "in-flight items drain to
+  completion"。
+- 残余方向：`RunOutcome` 或 `try_run_checked` 报告
+  `Cancelled { emitted }`（collector 排干后查 token 即可）。
 
-### 8. [P2] API 小项包
+<!-- #8 API 小项包已处理并关闭（2026-10-20，r7）。落地：StreamPipe
+补 with_workload（fused pass-through/reduce/fold 读 config.workload，
+channel 拓扑忽略）；StreamPipe::collect() 别名；with_config 整体替换语义
+在全部 8 个 builder 的 rustdoc 写明（不合并字段：diff-against-default
+无法区分「未设置」与「显式恢复默认」，且每个字段已有专属 setter）；
+drain 家族（state/stream.rs drain_* / run_ordered_collect）'static 放宽为
+Send——对公开的 run_ordered_collect 有实际意义（RecvItem 为开放 trait，
+自定义 receiver 可携带借用条目；内置通道仍因 endpoint 被 spawn 的 worker
+捕获而要求 T: Send + 'static），回归测试
+run_ordered_collect_accepts_borrowed_items。
 
-- `StreamPipe` 缺 `with_workload`：纯 sync 链 pass-through 到 fused 路径
-  时会读 `config.workload`，目前唯一入口 `with_config` 是整体替换；
-- `Pipe::filter` 缺 `map` 有的 `O: Send + 'static` bound——非 Send 输出
-  能穿过任意级 stage，到终端才爆一墙 trait-solver 错误；
-- `MpscSender` 无 `try_send`（其余三种 sender 均有，不对称）；
-- 收集终端命名：`StreamPipe::run()` vs 其余 builder 的 `collect()`——加
-  alias 或统一；
-- `with_config` 整体替换 config，先前 `with_*` 静默丢失（顺序敏感）——
-  文档写明或改为字段合并；
-- drain 家族 unjustified `'static`（state/stream.rs `drain_*` /
-  `run_ordered_collect`，循环内不 spawn 不存储，`Send` 即可）——放宽容许
-  借用数据出流；
-- `run()` 在 async runtime 构建失败处 `.expect("failed to build async
-  runtime")` panic（线程配额耗尽的用户即触发），`try_run` 却正常传播——
-  把失败前移到 `.stage_async()` 构建期，或 rustdoc 指向 `try_run`。
+复核时前提已不成立而跳过：Pipe::filter 的 O bound——pipe()/map()/try_map()
+构造期已对 I/N 施加 Send + 'static，filter 永远见不到非 Send 的 O，补上
+是无法触发的死约束（probe 实证：非 Send 输出在产生它的调用处以单条
+E0277 报错）；MpscSender::try_send——已存在且与其余三种 sender 语义一致；
+run() runtime 构建失败 rustdoc——main 已覆盖（Panics 节 + try_run/
+with_async_pool 指引）。编号 8 不再使用，后续条目编号不动。 -->
 
 ## 代码健康（重构/坏味道）
 
