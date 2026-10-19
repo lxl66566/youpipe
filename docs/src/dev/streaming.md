@@ -615,6 +615,17 @@ completion via a drop guard (unwind-safe), and the lease's own drop returns
 the never-spawned remainder (`reserved − spawned`), so a run that granted
 fewer workers than reserved (small `n` clamping) still drains fully.
 
+The per-run stage-worker grant budget (`worker_slots_left`) is initialised
+from the **reservation's** stage-worker portion (`need − feeder_slot −
+fences`), never from the pre-CAS snapshot: that snapshot can be stale-high
+(concurrent runs' jobs release slots between the load and the CAS), and
+budgeting grants against it underflowed `worker_slots_left` once the ≥ 1
+grant floor fired (miri flake 2026-10-20, `stream_reduce
+empty_and_single` — a 1-item run racing the previous run's unreturned
+lease). The snapshot keeps only its advisory role: `per_stage` is still
+derived from it, and staleness can only under-promise worker counts, never
+over-admit (the CAS revalidates).
+
 Invariant restored: whenever a parking job is still queued, at least one
 worker is free of parking jobs and eventually pops it (regular jobs are
 finite by the pool's basic contract). Bench impact is one CAS per run plus

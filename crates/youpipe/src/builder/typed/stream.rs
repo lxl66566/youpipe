@@ -1759,10 +1759,10 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// submitted for this run is wrapped through [`ParkingLease::wrap_job`].
     pub(crate) lease: Option<ParkingLease>,
     /// Pool-mode liveness budget: worker slots still grantable to
-    /// not-yet-spawned sync stages. Initialised to `pool_threads - reserved`
-    /// (the feeder job reserves one slot when it is not inline) and decremented
-    /// by [`Self::stage_workers`] as the spawn walk grants workers upstream
-    /// first. Invariant: `worker_slots_left ≥ stages_left` holds at every
+    /// not-yet-spawned sync stages. Initialised to the parking lease's
+    /// stage-worker portion (`need - feeder - fences`, see `try_exec`) and
+    /// decremented by [`Self::stage_workers`] as the spawn walk grants
+    /// workers upstream first. Invariant: `worker_slots_left ≥ stages_left` holds at every
     /// grant, so every stage keeps ≥ 1 resident worker and the total number
     /// of blocking pool jobs never exceeds the pool — the "stage 1 fills the
     /// pool, stage 2 starves, deadlock" failure mode.
@@ -1891,11 +1891,15 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
         let slots = self.worker_slots_left.get();
         let after = self.stages_left.get() - 1;
         self.stages_left.set(after);
-        // `slots ≥ after + 1` holds by construction (try_exec picks pool mode
-        // only when the budget covers every sync stage), so `granted ≥ 1`
-        // never breaks the invariant — the `max(1)` is just the type-level
-        // floor.
+        // `slots ≥ after + 1` holds by construction (`worker_slots_left` is
+        // initialised from the lease's stage-worker portion, which covers
+        // every stage's >= 1 grant), so `granted ≥ 1` never breaks the
+        // invariant — the `max(1)` is just the type-level floor.
         let granted = requested.min(slots.saturating_sub(after)).max(1);
+        debug_assert!(
+            granted <= slots,
+            "pool admission must reserve every stage's >=1 worker grant              (see the reservation-backed `worker_budget` init in `try_exec`)"
+        );
         self.worker_slots_left.set(slots - granted);
         // In-flight estimate: each granted worker holds at most one claim
         // batch (`batch_recv_cap()` items, or the single anchored item with
@@ -4527,7 +4531,7 @@ where
         // converse (reserved but inline) merely over-reserves by one slot,
         // returned by the lease's drop. Interlock: `floored_channel_capacity`.
         let feeder_slot = usize::from(n > floored_channel_capacity(config.buffer_size, 1));
-        let (lease, dedicated_threads, per_stage_parallelism, run_live_slots) = if pool
+        let (lease, dedicated_threads, per_stage_parallelism, worker_budget) = if pool
             .is_on_this_pool()
         {
             (None, true, budget.default_workers(workers_budget), 0)
@@ -4550,6 +4554,10 @@ where
             // Upper bound of granted workers: pins are additionally clamped
             // to `n` by `stage_workers`, so this never under-reserves.
             let unpinned = budget.stages.saturating_sub(budget.explicit_stages);
+            // `per_stage >= 1` (`default_workers` floors the division)
+            // and `n >= 1` (the zero-item early return), so the unpinned
+            // term alone covers every unpinned stage's >= 1 grant —
+            // admission's promise of a resident worker per sync stage.
             let need = feeder_slot + fences + budget.explicit_workers + unpinned * per_stage.min(n);
             if need <= pool_threads && pool.registry().try_reserve_parking(need) {
                 let lease = ParkingLease {
@@ -4557,20 +4565,35 @@ where
                     reserved: need,
                     spawned: Cell::new(0),
                 };
-                (Some(lease), false, per_stage, live_slots)
+                // The stage-grant budget comes from the RESERVATION, not the
+                // pre-CAS snapshot: `live_slots` can be stale-high (other
+                // runs' jobs release slots between the snapshot and the CAS —
+                // worker jobs outlive the collector's return), so a lease can
+                // be admitted against just-freed capacity while `live_slots`
+                // still reads 0 — `stage_workers`'s >= 1 grant floor then
+                // underflowed `worker_slots_left` (`0 - 1`; debug panics,
+                // release wraps). Reproduced as a miri flake (2026-10-20,
+                // stream_reduce `empty_and_single`: a 1-item run racing the
+                // previous run's unreturned lease). The reservation's own
+                // arithmetic covers every grant: `explicit_workers >=
+                // explicit_stages` (pins are NonZero) and the unpinned term
+                // >= one per unpinned stage.
+                let worker_budget = need - feeder_slot - fences;
+                (Some(lease), false, per_stage, worker_budget)
             } else {
                 (None, true, budget.default_workers(workers_budget), 0)
             }
         };
-        // Per-run worker budget in pool mode: the leased capacity minus the
-        // feeder slot. `unpinned * per_stage ≤ live_slots - explicit` by the
-        // `default_workers` division, so `stage_workers`' clamping grants
-        // every stage its full request — the lease bound stays an upper
-        // bound and the unspent remainder returns via the lease's drop.
+        // Per-run worker budget in pool mode: the lease's stage-worker
+        // portion (see the `worker_budget` comment above), which the
+        // reservation guarantees covers every stage's grant — including the
+        // stale-snapshot case where the pre-CAS `live_slots` read is lower
+        // than what the CAS actually admitted. Unspent remainder returns via
+        // the lease's drop.
         let (worker_slots_left, stages_left) = if dedicated_threads {
             (0, 0)
         } else {
-            (run_live_slots, budget.stages)
+            (worker_budget, budget.stages)
         };
 
         let ctx: StreamCtx<'_, R> = StreamCtx {
