@@ -117,11 +117,16 @@ where
         unsafe { JobRef::new(self) }
     }
 
-    // `run_inline` was removed with join's self-pop switch to
-    // `JobRef::execute`: it bypassed the job's `halt_unwinding`, so a self-run
-    // B's panic escaped as a live unwind instead of a value (and re-adding a
-    // catch at the call site cost +33 % on sync_cpu_heavy/100K — see
-    // `join_on_captured`).
+    // The hot A-ok self-pop path of `join_on_captured`: run B's closure
+    // bare, with NO `halt_unwinding`. A panicking B therefore escapes the
+    // join as a LIVE unwind — the one deliberate live unwind on the pool
+    // side; the caller (the fused tree recursion) parks a sibling-cleanup
+    // guard at the join call that knows A completed, so the unwind is
+    // contained one level up (full story in `join_on_captured`'s self-pop
+    // comment). The A-failed branch takes `run_captured` instead. Re-adding
+    // a catch here — even isolated in a cold helper — regressed
+    // sync_cpu_heavy/100K by +33 % in same-session A/B vs a rayon control;
+    // this call site is layout-sensitive.
 
     /// # Safety
     ///
