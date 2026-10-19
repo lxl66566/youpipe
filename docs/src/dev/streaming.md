@@ -110,9 +110,13 @@ terminal path — covering sync stages, fence links, expand, and
 `spawn_single` bridges the MPMC feeder receiver into an MPSC ring on a
 dedicated OS thread (the standard cross-mode bridge shape and lease
 exemption) — without the override the terminal-channel debug_assert
-rejected the identity chain's MPMC receiver. Intermediate stage channels
-remain MPMC (their receivers are shared across multiple worker threads via
-`clone`).
+rejected the identity chain's MPMC receiver. The four channel-shape
+dispatch methods (`spawn` / `spawn_single` / `spawn_for_async` /
+`spawn_async_feeder` / `spawn_async_feeder_single`) are **required** trait
+methods (todo #13, 2026-10-20): the former delegating defaults masked
+missing overrides — the zero-stage gap above shipped exactly that way.
+Intermediate stage channels remain MPMC (their receivers are shared across
+multiple worker threads via `clone`).
 
 The collector itself is generic over a `RecvItem` (sync) or `AsyncRecvItem`
 (async) trait, so `collect_sync` / `collect_async` drain either the MPMC or
@@ -189,7 +193,7 @@ under todo #4.
 
 #### Async terminal flavour (per-task-group async shards)
 
-The async terminal (`spawn_async_consumers_body_single` — both feeder
+The async terminal (`spawn_async_consumers_terminal` — both feeder
 flavours funnel there, 2026-10) is the same fan-in shape with runtime
 tasks as producers: `io_concurrency` tasks all `send().await` on one
 shared `MpscAsyncSender` clone set, so every send CASes the same sender
@@ -358,14 +362,14 @@ awaited analogue — one `recv().await` per burst, `try_recv` in between —
 because tokio's coarse timer wheel batch-completes same-duration timeouts, so
 one wake often finds several items already queued.
 
-The async **stage consumers** (`spawn_async_consumers_body`) deliberately keep
+The async **stage consumers** (`spawn_async_consumers_into`) deliberately keep
 the plain per-item `rx.recv().await` loop: porting the burst shape there
 measured a pure wash (±0.5 %, spreads <1 %, `io_async_pure`/`io_async_mixed`
 at 200/500/2000, 5 interleaved rounds). Mechanism: crossfire's
 `MAsyncRx::recv` polls `try_recv` first and only registers a waker (after a
 bounded spin) when the queue is empty, so an awaited recv on a non-empty queue
 never pays the waker round-trip the burst loop would amortize — see the
-`NOTE(perf)` on `spawn_async_consumers_body`.
+`NOTE(perf)` on `spawn_async_consumers_into`.
 
 The burst phase is what keeps multi-worker stages civil on the MPMC ring:
 when `k` workers contend on one input channel, the burst winners drain the
@@ -631,6 +635,36 @@ fallback it keeps the pre-conversion shape (one OS thread per fence).
 
 ---
 
+## Spawn dispatch: channel factories (todo #10, 2026-10-20)
+
+The five spawn bodies each stage type hand-wrote (`spawn` / `spawn_single` /
+`spawn_for_async` / `spawn_async_feeder` / `spawn_async_feeder_single`) —
+fifteen near-identical bodies across `SyncStage` / `ExpandStage` /
+`FenceLink` plus the async consumer twins — differed only in three points:
+which `prev` method recursed into, which channel constructor built the
+output, and how the receiver was wrapped. The constructors and wrapping now
+live in two internal factory traits:
+
+- `OutChannel<M>` (sync side): `Mpmc` (`channel`, `FinalRx::Sync`),
+  `Mpsc` (`mpsc_channel`, `SyncSingle`), `Mixed` (`sync_async_channel`,
+  bare `AsyncReceiver` for the `spawn_for_async` handoff), `ShardedMpsc`
+  (`sharded_mpsc_channel`, `SyncSharded` + the shard-floor in-flight hint).
+- `AsyncOutChannel<M>` (async side): `AsyncMpmc` / `AsyncMpsc` /
+  `AsyncSharded` — the same trio typed over `AsyncSendItem`.
+
+Each factory's `make(ctx, buffer, workers)` builds one sender per consumer
+(shared-ring factories clone the single constructor sender; the sharded
+factories hand out distinct per-shard senders) and `wrap` produces the
+caller's handoff. The per-stage cores are `spawn_stage_into` /
+`spawn_expand_stage_into` / `spawn_fence_into` (factory-generic) plus the
+`spawn_*_terminal` selectors (the runtime `YOUPIPE_SHARDED_TERM` branch
+between the Mpsc and Sharded factories); the dispatch methods shrink to
+prev-recursion + one core call. Regression net during the refactor and
+after: `try_exec`'s terminal Single-variant `debug_assert` plus the
+fence-terminal and fence-prefix-async-chain tests
+(`test_stream_fence_terminal_stage`,
+`test_stream_fence_prefix_async_chain_sync_feeder`).
+
 ## Ordered Output (`state/reorder.rs`)
 
 `ReorderBuffer<T>` restores original element order after parallel processing. It is a fixed-size array of `2^k` slots addressed by bitmask: `seq & mask` maps a sequence number to its slot.
@@ -770,16 +804,14 @@ noted.
    `async_vs_tokio` + convoy-probe async shapes.
 
 6. **Smells (no perf claim).**
-   - `StageSpawn::spawn_for_async`'s default impl
-     (`crates/youpipe/src/builder/typed/stream.rs:1532`) is unreachable
-     through `run()`: every concrete stage overrides it except `StreamStart`,
-     and an `AsyncStage` directly over `StreamStart` always routes to the
-     async-feeder branch (`first_consumer_is_async() == Some(true)` ⇒
-     `spawn_async_feeder_single`); the default's `FinalRx::Async` arm
-     additionally cannot occur (`StreamStart::spawn` returns `Sync`). Mirror
-     the "Unreachable through run() today" rationale comment that
-     `StreamStart::spawn_async_feeder_single` already carries, or make the
-     method required.
+   - ~~`StageSpawn::spawn_for_async`'s default impl is unreachable through
+     `run()`~~ — **resolved 2026-10-20 (round 8)**: the method is now
+     required (no default), and `StreamStart` carries the former default's
+     Sync arm as an explicit override (reachable via
+     `stream(..).fence(..).stage_async(a).stage(s)`, covered by
+     `test_stream_fence_prefix_async_chain_sync_feeder`); the dead
+     `FinalRx::Async` arm is gone with it. See
+     [Spawn dispatch: channel factories](#spawn-dispatch-channel-factories-todo-10-2026-10-20).
    - `RecvItem::try_recv_batch`'s default body
      (`crates/youpipe/src/handoff/channel.rs:613`) is dead — both real impls
      override it. Unlike `SendItem::try_send_batch` (live: `MpscSender`

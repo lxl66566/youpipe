@@ -414,7 +414,10 @@ stream(items)                       // StreamPipe<StreamStart, I, I>
 
 The stage chain is a typestate (`SyncStage<FenceLink<SyncStage<StreamStart,…>>>`)
 walked by the `StageSpawn` trait — `spawn` recurses inside-out (older stages
-first) so the data-flow direction matches. `stage_budget()` reports the number
+first) so the data-flow direction matches. The five channel-shape dispatch
+methods are required (no defaults); each delegates to a factory-generic
+core with an `OutChannel` / `AsyncOutChannel` choice (see streaming.md
+"Spawn dispatch: channel factories"). `stage_budget()` reports the number
 of compute-pool stages plus any `SyncStageOptions::workers` pins. `.run()`
 then
 enforces the liveness invariant `feeder(≤1) + Σ stage workers ≤ pool_threads`:
@@ -482,13 +485,14 @@ Bridge threads survive only at **mode-conversion points** on the
 `spawn_async_feeder` path (chains whose *first* stage is async), and each
 conversion costs exactly one thread regardless of chain length:
 
-- async → sync (`bridge_async_to_sync`, reached via `finalize_prev_rx`): every
-  built-in stage overrides `spawn_async_feeder` to recurse through
+- async → sync (`bridge_async_to_sync`, reached via `finalize_prev_rx`):
+  every built-in stage's required `spawn_async_feeder` recurses through
   `prev.spawn_async_feeder(..)`, so the feeder's async channel stays async
   until the first stage that actually needs a sync receiver — `.stage_async(a)
-  .stage(s).stage(t)` pays one bridge thread, not one per level. (The default
-  trait impl — bridge up front, then plain `spawn` — previously stacked 3
-  bridge threads + an async→sync→async round-trip on that shape.)
+  .stage(s).stage(t)` pays one bridge thread, not one per level. (A
+  bridge-up-front-then-`spawn` shape would stack 3 bridge threads + an
+  async→sync→async round-trip on that shape; the method is required rather
+  than defaulted precisely so an impl cannot silently fall back to it.)
 - sync → async (`bridge_final_rx_to_async`, the `FinalRx::Sync` arm): a
   trailing async stage fed by a sync stage, e.g. `..stage_async(f1).stage(f2)
   .stage_async(f3)`.

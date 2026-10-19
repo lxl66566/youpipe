@@ -193,19 +193,17 @@ Parallel(SplitPlan) }` + `serial_stage_collect` / `serial_stage_for_each` /
 全部收编——`prefers_serial` 与 `SplitPlan::new` 现仅在 terminal_plan 内出现。
 编号 9 不再使用，后续条目编号不动。 -->
 
-### 10. [P1] StageSpawn 五路 spawn 体 × 四 stage 类型
-
-每 stage 类型手写 `spawn`/`spawn_single`/`spawn_for_async`/
-`spawn_async_feeder`/`spawn_async_feeder_single`，~15 个近同体（stream.rs
-SyncStage/ExpandStage/FenceLink + 两个 async consumer body），差异仅三点：
-调哪个 prev 方法、channel 构造器（`channel`/`mpsc_channel`/
-`sync_async_channel`）、`FinalRx` 包装；`spawn_async_consumers_body` 与
-`_single` 45 行只差一个构造调用。引 channel-factory trait（`OutChannel {
-type Tx; type Rx; fn make(buffer); fn wrap(rx) -> FinalRx }` 三实现 Mpmc/
-Mpsc/MixedAsync），每 stage 一个泛型 `spawn_into`，五方法变单行委托；async
-侧补 `AsyncSendItem` trait（对齐既有 `AsyncRecvItem`，handoff/channel.rs）
-收编 `_single` 孪生。回归防护（try_exec 的终端 Single-variant debug_assert）
-重构期作安全网。
+<!-- #10 StageSpawn 五路 spawn 体去重已完成并移除（2026-10-20，r8）。
+落地：OutChannel（Mpmc/Mpsc/Mixed/ShardedMpsc）+ AsyncOutChannel
+（AsyncMpmc/AsyncMpsc/AsyncSharded）工厂 trait，make/wrap 收编构造与
+FinalRx 包装（含 sharded in-flight hint 归位到构造点）；spawn_stage_into /
+spawn_expand_stage_into / spawn_fence_into + spawn_*_terminal 选择器，
+15 个 dispatch 体缩为 prev 递归 + 单行核心调用，clone 包装 spawn_stage /
+spawn_expand_stage 与 async 三函数（body/_single/consumers）删除。
+AsyncSendItem 已由 r7 c96870a 先行落地（spawn_async_terminal_tasks 共享
+任务循环）。安全网：try_exec 终端 Single-variant debug_assert + 新增
+fence 终端 / fence→async→sync 链测试。架构记录 streaming.md
+"Spawn dispatch: channel factories"。编号 10 不再使用，后续条目编号不动。 -->
 
 <!-- #11 builder setter 复制已完成并移除（2026-10-20，r8）：抽内部
 `ExecOptions { config, compute_pool, oversubscribe }` move 进全部七个 fused
@@ -245,10 +243,13 @@ reorder window 魔法数一项核实不成立：`next_power_of_two().clamp(1<<10
 - `try_exec` ~257 行混四职责（admission/lease 解析、StreamCtx 构建、
   feeder 通道选路、终端 drain）→ 拆 `resolve_admission`，让不变量注释贴着
   维护它的代码；
-- StageSpawn 默认实现删除改必选（默认体掩盖漏覆盖，且空链
-  `stream(0..n).with_cancel(t).run()` 在 fused pass-through 拒绝后走到
-  终端 MPSC debug_assert，debug 构建必 panic——顺带修该 panic 或特判空链）
-  ——r8/spawn-dedup 分支承接。
+- ~~StageSpawn 默认实现删除改必选~~ 已完成（2026-10-20，r8）：五个
+  channel-shape dispatch 方法必选（删 delegating/bridge 默认体），
+  StreamStart 补 spawn_for_async 覆盖（原默认体 Sync 臂，经
+  `fence→stage_async→stage` 可达，测试
+  test_stream_fence_prefix_async_chain_sync_feeder）；空链 panic 部分经查
+  已在 main 由 3d2d435 修复（StreamStart::spawn_single 桥接 MPSC +
+  pipeline_integration 测试），以代码为准不重做；
 
 ### 14. [P1] `pipeline_integration` 间歇性 hang 残余
 
