@@ -686,7 +686,7 @@ output-channel capacity from `FenceOptions::buffer` (only meaningful knob —
 the forwarder is single-threaded); `fence(mode)` keeps the default
 (`buffer_size` with the `parallelism * 4` floor).
 
-Batch-allocation recycling: `push` hands each full chunk to the forwarder via `mem::take`, which historically dropped the allocation and regrew the next batch from capacity 0 (`log2(k)` reallocs per batch). `FenceBarrier::reuse` lets the forwarder return the drained `Vec`; the next flush swaps it in, so the steady state is zero allocator traffic per batch (−23 % on `stream_pipeline/with_fence/100 K`).
+Batch-allocation recycling: `push` hands each full chunk to the forwarder via `mem::take`, which historically dropped the allocation and regrew the next batch from capacity 0 (`log2(k)` reallocs per batch). `FenceBarrier::reuse` lets the forwarder return the drained `Vec`; the next flush swaps it in, so the steady state is zero allocator traffic per batch (−23 % on `stream_pipeline/with_fence/100 K`). The batched push arm (`YOUPIPE_FWD_BATCH`) keeps a forwarder-owned staging scratch for the same reason (round 7): one allocation per forwarder, `clear`-reused per chunk.
 
 ## Audit 2026-10-20: open items
 
@@ -731,21 +731,15 @@ noted.
    full-suite concurrency (methodology: the 2026-09-25 instrumented
    reproducer in crossfire-waker-designs.md).
 
-3. **`fence_batch_send` allocates its staging buffer per released batch**
-   (hygiene; affects only `YOUPIPE_FWD_BATCH=1`). The batched arm builds
-   `staged` via `batch.drain(..).map(..).collect()` — a fresh `Vec` per
-   released chunk, grown `1→2→…→k` (`log2(k)` reallocs;
-   `crates/youpipe/src/builder/typed/stream.rs:583`). That is exactly the
-   per-batch regrowth `FenceBarrier::reuse` eliminated, so the knob
-   partially reintroduces what it amortizes; contrast the feeder's staging
-   buffer, allocated once and `clear()`-reused across batches
-   (`crates/youpipe/src/builder/typed/stream.rs:249-252`). Fix shape: a
-   forwarder-owned `Vec<MaybeUninit<T>>` scratch (or at least
-   `with_capacity(batch.len())`). Magnitude: tiny (one k-sized alloc per k
-   items; chunk-500 allocations leave the tcache fast path) — consistency,
-   not throughput. Risk: none. Verify: `convoy-probe --shape fence` (park
-   signature must be unchanged) + `bench_ab.sh` on
-   `stream_pipeline/with_fence`.
+3. **`fence_batch_send` staging buffer** — **landed 2026-10-20 (round 7)**.
+   The batched arm (`YOUPIPE_FWD_BATCH=1`) stages through a forwarder-owned
+   `Vec<MaybeUninit<T>>` scratch — allocated once per forwarder (pre-sized
+   to the chunk; Barrier's single final flush grows it once, at run end)
+   and `clear()`-reused across released chunks, the same shape as the
+   feeder's `push_items` staging — instead of `collect()`-ing a fresh `Vec`
+   per chunk (`1→2→…→k` regrowth, exactly the per-batch regrowth
+   `FenceBarrier::reuse` removed). Readings: benchmarks.md
+   "Collector 0-claim probe + fence staging reuse".
 
 4. **Knob promotion soak (`YOUPIPE_SPIN_ANCHOR` / `YOUPIPE_SHARDED_TERM` /
    `YOUPIPE_BATCH_RECV`)** (decision item). All three data-plane knobs stay
