@@ -395,18 +395,15 @@ mod tests {
     /// silently left unpinned past the end of the allowed set — an unpinned
     /// worker voids the "parks wake on their own idle core" guarantee the
     /// constructor exists for.
+    /// Scan `/proc/self/task` and return the CPU id of every `yp-pool-*`
+    /// worker thread affine to exactly one CPU of `allowed` — the read-back
+    /// half of the pinned-affinity tests below, no mocks. Worker threads are
+    /// named `yp-pool-<i>` (≤ 15 chars in /proc); unpinned pools from other
+    /// tests in this binary share the name, which is why only single-CPU
+    /// entries inside `allowed` count. Values are NOT deduplicated: by the
+    /// round-robin contract several workers may share one CPU.
     #[cfg(all(target_os = "linux", not(miri)))]
-    #[test]
-    fn test_new_pinned_round_robins_past_the_cpu_set() {
-        let allowed = youpipe_sys::allowed_cpus();
-        if allowed.len() < 2 {
-            // Restrictive sandbox; nothing meaningful to pin.
-            return;
-        }
-        let n = allowed.len() + 2;
-        let pool = ComputePool::new_pinned(n);
-        pool.registry().wait_until_primed();
-
+    fn single_cpu_pool_workers(allowed: &[u32]) -> Vec<u32> {
         let mut seen = Vec::new();
         for status in std::fs::read_dir("/proc/self/task").unwrap() {
             let status = status.unwrap();
@@ -439,17 +436,34 @@ mod tests {
                 seen.push(cpus[0]);
             }
         }
+        seen
+    }
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn test_new_pinned_round_robins_past_the_cpu_set() {
+        let allowed = youpipe_sys::allowed_cpus();
+        if allowed.len() < 2 {
+            // Restrictive sandbox; nothing meaningful to pin.
+            return;
+        }
+        let n = allowed.len() + 2;
+        let pool = ComputePool::new_pinned(n);
+        pool.registry().wait_until_primed();
+
+        let seen = single_cpu_pool_workers(&allowed);
         assert!(
             seen.len() >= n,
             "all {n} workers must be pinned, saw {} single-CPU workers",
             seen.len()
         );
-        seen.sort_unstable();
-        seen.dedup();
+        let mut distinct = seen;
+        distinct.sort_unstable();
+        distinct.dedup();
         assert_eq!(
-            seen.len(),
+            distinct.len(),
             allowed.len(),
-            "round-robin must cover the whole allowed set, got {seen:?}"
+            "round-robin must cover the whole allowed set, got {distinct:?}"
         );
     }
 
@@ -466,48 +480,16 @@ mod tests {
         // Force the workers to exist before scanning /proc.
         pool.registry().wait_until_primed();
 
-        let mut seen = Vec::new();
-        for status in std::fs::read_dir("/proc/self/task").unwrap() {
-            let status = status.unwrap();
-            let path = status.path().join("status");
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            // Worker threads are named `yp-pool-<i>` (≤ 15 chars in /proc).
-            if !text
-                .lines()
-                .any(|l| l.starts_with("Name:") && l.contains("yp-pool-"))
-            {
-                continue;
-            }
-            let Some(list) = text
-                .lines()
-                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
-            else {
-                continue;
-            };
-            let cpus: Vec<u32> = list
-                .split(',')
-                .flat_map(|part| {
-                    let (a, b) = part.split_once('-').unwrap_or((part, part));
-                    let a: u32 = a.trim().parse().unwrap();
-                    let b: u32 = b.trim().parse().unwrap();
-                    a..=b
-                })
-                .collect();
-            if cpus.len() == 1 && allowed.contains(&cpus[0]) {
-                seen.push(cpus[0]);
-            }
-        }
+        let mut distinct = single_cpu_pool_workers(&allowed);
         assert!(
-            seen.len() >= n,
-            "expected ≥{n} single-CPU workers, saw {seen:?}"
+            distinct.len() >= n,
+            "expected ≥{n} single-CPU workers, saw {distinct:?}"
         );
-        seen.sort_unstable();
-        seen.dedup();
+        distinct.sort_unstable();
+        distinct.dedup();
         assert!(
-            seen.len() >= n,
-            "workers must sit on distinct CPUs, got {seen:?}"
+            distinct.len() >= n,
+            "workers must sit on distinct CPUs, got {distinct:?}"
         );
     }
 }

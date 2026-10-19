@@ -648,7 +648,8 @@ value; each was checked against [dead-ends.md](dead-ends.md) and none
 collides with a falsified direction (no adaptive chunking / cost-EMA, no
 spin-window widening, no bounded steal probes, no pinning-by-default). The
 two documentation drifts found are fixed in this audit's companion commit;
-code-comment and cleanup items stay for the next code round. Verification
+code-comment and cleanup items stayed for the next code round — round 7
+(2026-10-20) resolved items 2, 3, and 7. Verification
 benches are all `perf/bench-suite/bench_ab.sh` interleaved A/B (usage in
 its header comment).
 
@@ -662,24 +663,24 @@ its header comment).
    stay in the idle loop and still execute every submitted job — only the
    blocking wait is deferred.
 
-2. **`StackJob::run_inline` comment contradicts the live code (next
-   round, comment-only).** `pool/job.rs`, immediately above the method,
-   states "`run_inline` was removed with join's self-pop switch to
+2. **`StackJob::run_inline` comment contradicted the live code (fixed in
+   round 7).** `pool/job.rs`, immediately above the method, stated
+   "`run_inline` was removed with join's self-pop switch to
    `JobRef::execute`" — but the method exists and is the hot A-ok self-pop
    path of `join_on_captured` (whose one deliberate live-unwind escape is
-   documented in `join.rs`). The comment records a past state and now
-   misleads; rewrite it to state the current contract: no
-   `halt_unwinding` here *by design* (a catch re-add cost +33 % on
+   documented in `join.rs`). Rewritten in place to the current contract:
+   no `halt_unwinding` here *by design* (a catch re-add cost +33 % on
    `sync_cpu_heavy/100K`), callers must tolerate the escaping unwind.
 
-3. **`inject_batch` capacity comment stale under slack (next round,
-   comment-only).** `registry.rs` claims the batch is
-   "`num_threads−1 ≤ BLOCK_CAP` jobs, so this is a single CAS" — false on
-   the Unbalanced wide tier (32-thread pool: `num_threads + 16` chunks
-   minus the driver chunk = 47 > 31) and on any pool above 32 threads
-   (Balanced included). Behavior is correct — `push_n` reserves per
-   segment — only the comment needs rewording to "one CAS per ≤31-slot
-   segment".
+3. **`inject_batch` capacity comment stale under slack (fixed in round
+   7).** `registry.rs` claimed the batch is "`num_threads−1 ≤ BLOCK_CAP`
+   jobs, so this is a single CAS" — false on the Unbalanced wide tier
+   (32-thread pool: `num_threads + 16` chunks minus the driver chunk =
+   47 > 31), on any pool above 32 threads (Balanced included), and for
+   the public `submit_batch` (arbitrary size). Behavior is correct —
+   `push_n` reserves per segment; the comment now states the domain
+   split: one CAS per ≤31-slot segment, single CAS only while the batch
+   fits one segment.
 
 4. **st3 push/emptiness double read (micro; verify before building).**
    `WorkerThread::push` reads `worker.is_empty()` (two Relaxed loads:
@@ -716,11 +717,14 @@ its header comment).
    SeqCst RMW that is itself a full barrier on x86. Expected ≈ 0; skip
    unless the injector path is reopened for other reasons.
 
-7. **Test dedup (cleanup).** The two pinned-affinity tests in
-   `executor/compute/worker.rs` (`test_new_pinned_round_robins_past_the_cpu_set`,
-   `test_new_pinned_workers_have_distinct_single_cpu_affinity`) duplicate
-   the ~45-line `/proc/self/task` scan; one helper returning the list of
-   single-CPU `yp-pool-*` workers covers both.
+7. **Test dedup (cleanup; done in round 7).** The two pinned-affinity
+   tests in `executor/compute/worker.rs`
+   (`test_new_pinned_round_robins_past_the_cpu_set`,
+   `test_new_pinned_workers_have_distinct_single_cpu_affinity`) duplicated
+   the ~45-line `/proc/self/task` scan; extracted the
+   `single_cpu_pool_workers` helper (single-CPU `yp-pool-*` workers of the
+   allowed set, not deduplicated), both tests keep their original
+   pre-/post-dedup assertions.
 
 8. **Already tracked elsewhere, not new:** the ten-fold
    `resolve_exec_pool` + terminal prologue duplication is todo #9

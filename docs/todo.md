@@ -214,15 +214,9 @@ Pipe/TryPipe/PipeRef/TryPipeRef/ScopedPipe/ScopedTryPipe 各手抄
 有记录）。抽内部 `ExecOptions { config, compute_pool, oversubscribe }` 被
 move 进各 builder + setter 宏，加字段只改一处。
 
-### 12. [P2] 死代码清理
-
-pool 侧四项（pool/mod.rs 模块级 `#![allow(dead_code)]`、`spawn_static`、
-`CountLatch::increment`/`wait`、`word_and_bit`）已随 8eb4b67 删除（2026-10-20
-审计复核：全 repo 零残留；`LockLatch::wait` 是另一方法且在用）。仍开放：
-
-- `BoxFuture` 类型别名（runtime/mod.rs，全 repo 零引用）；
-- `CancellationToken::reset`（sync/cancel.rs，仅自测调用；复活 token 对在飞
-  worker 是脚枪）。
+<!-- #12 死代码清理已完成并移除（2026-10-20）：pool 侧四项随 8eb4b67、
+`BoxFuture` 与 `CancellationToken::reset`（含自测）随 r7 d5425c8 删除，
+全 repo 零引用复核通过。编号 12 不再使用，后续条目编号不动。 -->
 
 ### 13. [P2] 正确性相邻与杂项
 

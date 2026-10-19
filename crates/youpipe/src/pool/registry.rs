@@ -230,9 +230,12 @@ impl Registry {
     pub(crate) fn inject_batch(&self, job_refs: impl ExactSizeIterator<Item = JobRef>) {
         let queue_was_empty = self.injected_jobs.is_empty();
         // `push_n` reserves the whole batch with one tail CAS per block
-        // segment (≤ 31 slots) instead of one contended CAS per job — the
-        // batch is `num_threads-1 ≤ BLOCK_CAP` jobs, so this is a single CAS
-        // in the common case.
+        // segment (≤ BLOCK_CAP = 31 slots) instead of one contended CAS per
+        // job. Single CAS only while the batch fits one segment: the
+        // unbalanced wide tier injects `num_threads + 16` chunks minus the
+        // driver's (47 on a 32-thread pool), pools above 32 threads exceed
+        // BLOCK_CAP even without slack, and the public `submit_batch` takes
+        // any size — larger batches just pay one CAS per extra segment.
         let count = self.injected_jobs.push_n(job_refs);
         if count > 0 {
             // The batch is bounded by the chunk-job count (num_threads), so
