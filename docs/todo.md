@@ -237,9 +237,9 @@ reorder window 魔法数一项核实不成立：`next_power_of_two().clamp(1<<10
 1<<20)` 现仅 `OrderedWindow::open` 一处（`auto` 的 `(1<<10).max(in_flight)`
 是不同形状的 floor 表达式），无重复可抽，关闭。 -->
 
-- crossfire 错误映射七份手抄（handoff/channel.rs 各 try_send/try_recv
-  包装内的同构 match）→ `map_send_err`/`map_recv_err`（r8 轮次因
-  channel.rs 归 spawn-dedup 分支改写而让路，留后续轮）；
+- ~~crossfire 错误映射七份手抄~~ 已完成（2026-10-20，r8 收尾）：
+  `map_send_err`/`map_recv_err` 单点映射收编全部包装（实为八处：四个
+  try_send + 四个 try_recv），均为错误冷路径、零热路径抽象；
 - `try_exec` ~257 行混四职责（admission/lease 解析、StreamCtx 构建、
   feeder 通道选路、终端 drain）→ 拆 `resolve_admission`，让不变量注释贴着
   维护它的代码；

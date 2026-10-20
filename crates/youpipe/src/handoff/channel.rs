@@ -24,6 +24,29 @@ macro_rules! trace_ch {
 // - the trait impls (SendItem/RecvItem/AsyncRecvItem) delegate to these inherent methods, so every
 //   call funnels through exactly one probe.
 
+// ── crossfire error mapping (todo #13) ──
+//
+// Every try_send / try_recv wrapper below maps crossfire's enums onto ours
+// one-for-one; these two helpers hold that mapping once instead of one
+// hand-copied match per wrapper (eight copies before).
+
+/// Map crossfire's non-blocking send error onto [`TrySendError`] (item
+/// handed back in both variants).
+fn map_send_err<T>(e: crossfire::TrySendError<T>) -> TrySendError<T> {
+    match e {
+        crossfire::TrySendError::Full(v) => TrySendError::Full(v),
+        crossfire::TrySendError::Disconnected(v) => TrySendError::Closed(v),
+    }
+}
+
+/// Map crossfire's non-blocking recv error onto [`TryRecvError`].
+fn map_recv_err(e: crossfire::TryRecvError) -> TryRecvError {
+    match e {
+        crossfire::TryRecvError::Empty => TryRecvError::Empty,
+        crossfire::TryRecvError::Disconnected => TryRecvError::Closed,
+    }
+}
+
 /// Blocking MPMC sender.
 pub struct SyncSender<T: Send + 'static> {
     tx: crossfire::MTx<mpmc::Array<T>>,
@@ -56,10 +79,7 @@ impl<T: Send + 'static> SyncSender<T> {
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SyncSender"))]
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
-        self.tx.try_send(item).map_err(|e| match e {
-            crossfire::TrySendError::Full(v) => TrySendError::Full(v),
-            crossfire::TrySendError::Disconnected(v) => TrySendError::Closed(v),
-        })
+        self.tx.try_send(item).map_err(map_send_err)
     }
 
     /// Non-blocking batch send of the longest free prefix of `buf`; returns
@@ -95,10 +115,7 @@ impl<T: Send + 'static> SyncReceiver<T> {
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SyncReceiver"))]
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        self.rx.try_recv().map_err(|e| match e {
-            crossfire::TryRecvError::Empty => TryRecvError::Empty,
-            crossfire::TryRecvError::Disconnected => TryRecvError::Closed,
-        })
+        self.rx.try_recv().map_err(map_recv_err)
     }
 
     /// Non-blocking batch claim of the ready run into `buf` (a typed Vec's
@@ -197,10 +214,7 @@ impl<T: Send + Unpin + 'static> AsyncSender<T> {
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncSender"))]
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
-        self.tx.try_send(item).map_err(|e| match e {
-            crossfire::TrySendError::Full(v) => TrySendError::Full(v),
-            crossfire::TrySendError::Disconnected(v) => TrySendError::Closed(v),
-        })
+        self.tx.try_send(item).map_err(map_send_err)
     }
 }
 
@@ -231,10 +245,7 @@ impl<T: Send + Unpin + 'static> AsyncReceiver<T> {
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncReceiver"))]
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        self.rx.try_recv().map_err(|e| match e {
-            crossfire::TryRecvError::Empty => TryRecvError::Empty,
-            crossfire::TryRecvError::Disconnected => TryRecvError::Closed,
-        })
+        self.rx.try_recv().map_err(map_recv_err)
     }
 }
 
@@ -290,10 +301,7 @@ impl<T: Send + 'static> MpscSender<T> {
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscSender"))]
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
-        self.tx.try_send(item).map_err(|e| match e {
-            crossfire::TrySendError::Full(v) => TrySendError::Full(v),
-            crossfire::TrySendError::Disconnected(v) => TrySendError::Closed(v),
-        })
+        self.tx.try_send(item).map_err(map_send_err)
     }
 }
 
@@ -327,10 +335,7 @@ impl<T: Send + 'static> MpscReceiver<T> {
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscReceiver"))]
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        self.rx.try_recv().map_err(|e| match e {
-            crossfire::TryRecvError::Empty => TryRecvError::Empty,
-            crossfire::TryRecvError::Disconnected => TryRecvError::Closed,
-        })
+        self.rx.try_recv().map_err(map_recv_err)
     }
 
     /// Non-blocking batch claim of the ready run into `buf` (a typed Vec's
@@ -410,10 +415,7 @@ impl<T: Send + Unpin + 'static> MpscAsyncSender<T> {
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncSender"))]
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
-        self.tx.try_send(item).map_err(|e| match e {
-            crossfire::TrySendError::Full(v) => TrySendError::Full(v),
-            crossfire::TrySendError::Disconnected(v) => TrySendError::Closed(v),
-        })
+        self.tx.try_send(item).map_err(map_send_err)
     }
 }
 
@@ -457,10 +459,7 @@ impl<T: Send + Unpin + 'static> MpscAsyncReceiver<T> {
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncReceiver"))]
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        self.rx.try_recv().map_err(|e| match e {
-            crossfire::TryRecvError::Empty => TryRecvError::Empty,
-            crossfire::TryRecvError::Disconnected => TryRecvError::Closed,
-        })
+        self.rx.try_recv().map_err(map_recv_err)
     }
 }
 
