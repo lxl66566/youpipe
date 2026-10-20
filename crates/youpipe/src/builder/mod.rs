@@ -10,12 +10,12 @@ pub use typed::{
 };
 // `pub(crate)` re-export so `crate::scope::ScopedPipe` can drive the same
 // `fused_collect_scoped` machinery as `Pipe::collect`, but with `'env`
-// (non-`'static`) closure bounds. Also re-exports `resolve_exec_pool` /
-// `ExecPool` so `ScopedPipe` can resolve the oversubscribe / custom-pool
-// hint identically to `Pipe`, and the reducer wrappers so the scoped
-// reduce/sum/count terminals mirror `Pipe`'s.
+// (non-`'static`) closure bounds. Also re-exports `ExecOptions` /
+// `exec_setters!` (the shared exec-tuning field + setter macro every fused
+// builder carries) and the reducer wrappers so the scoped reduce/sum/count
+// terminals mirror `Pipe`'s.
 pub(crate) use typed::{
-    CountReducer, OptionReducer, SumReducer, fused_collect_scoped, fused_fold_scoped,
-    fused_for_each_scoped, fused_reduce_scoped, fused_try_collect_scoped, fused_try_fold_scoped,
-    fused_try_reduce_scoped, resolve_exec_pool,
+    CountReducer, ExecOptions, OptionReducer, SumReducer, exec_setters, fused_collect_scoped,
+    fused_fold_scoped, fused_for_each_scoped, fused_reduce_scoped, fused_try_collect_scoped,
+    fused_try_fold_scoped, fused_try_reduce_scoped,
 };

@@ -5,8 +5,9 @@ mod stream;
 mod traits;
 
 pub(crate) use self::fused::{
-    fused_collect_scoped, fused_fold_scoped, fused_for_each_scoped, fused_reduce_scoped,
-    fused_try_collect_scoped, fused_try_fold_scoped, fused_try_reduce_scoped, resolve_exec_pool,
+    ExecOptions, exec_setters, fused_collect_scoped, fused_fold_scoped, fused_for_each_scoped,
+    fused_reduce_scoped, fused_try_collect_scoped, fused_try_fold_scoped,
+    fused_try_reduce_scoped,
 };
 // Reducer wrappers for the scoped aggregation terminals (see builder/mod.rs).
 pub(crate) use self::traits::{CountReducer, OptionReducer, SumReducer};

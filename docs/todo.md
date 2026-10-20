@@ -185,14 +185,13 @@ with_async_pool 指引）。编号 8 不再使用，后续条目编号不动。 
 
 ## 代码健康（重构/坏味道）
 
-### 9. [P1] 终端 prologue 十处复制
-
-`n==0` 短路 → `resolve_exec_pool` → `prefers_serial` 串行回退（含
-MAY_FILTER 分派）→ `SplitPlan::new` → MAY_FILTER 两路核心选择——同一序列
-在 fused.rs 十个终端复制（`Pipe::collect`/`for_each`、`TryPipe::try_collect`、
-scoped 三件、by_ref 三件、`fused_pass_collect`）。split 策略或串行语义一动
-就要改十处。抽 `terminal_plan(n, config, pool) -> Plan { Serial, Parallel(
-SplitPlan) }` + 共享串行回退 helper；prologue 每 run 一次，零热路径风险。
+<!-- #9 终端 prologue 复制已完成并移除（2026-10-20，r8）：抽
+`terminal_plan(n, workload, num_threads) -> TerminalPlan { Serial,
+Parallel(SplitPlan) }` + `serial_stage_collect` / `serial_stage_for_each` /
+`serial_stage_try_collect` 串行回退 helper。实际站点数 drifted 到 25 个
+（reduce/fold 家族、RangePipe 两终端与 pass-through 两入口共享同一序列），
+全部收编——`prefers_serial` 与 `SplitPlan::new` 现仅在 terminal_plan 内出现。
+编号 9 不再使用，后续条目编号不动。 -->
 
 ### 10. [P1] StageSpawn 五路 spawn 体 × 四 stage 类型
 
@@ -208,14 +207,15 @@ Mpsc/MixedAsync），每 stage 一个泛型 `spawn_into`，五方法变单行委
 收编 `_single` 孪生。回归防护（try_exec 的终端 Single-variant debug_assert）
 重构期作安全网。
 
-### 11. [P1] 六 builder × 五 setter 复制
-
-Pipe/TryPipe/PipeRef/TryPipeRef/ScopedPipe/ScopedTryPipe 各手抄
-`with_config`/`with_workload`/`with_compute_workers`/`with_compute_pool`/
-`with_oversubscribe` + 同构 `map`/`filter` 体重建（~30 份方法拷贝，每方法
-五行字段搬运）；曾因此出过 budget 被静默忽略的漂移 bug（fused.rs 测试注释
-有记录）。抽内部 `ExecOptions { config, compute_pool, oversubscribe }` 被
-move 进各 builder + setter 宏，加字段只改一处。
+<!-- #11 builder setter 复制已完成并移除（2026-10-20，r8）：抽内部
+`ExecOptions { config, compute_pool, oversubscribe }` move 进全部七个 fused
+builder（todo 漏数了 RangePipe），`map`/`filter` 重建变单字段搬运
+`exec: self.exec`；五个 setter 由 `exec_setters!` 宏生成（fused.rs），Pipe
+保留手写规范文档、其余经宏参数附加各自差异行（含 ScopedPipe 的 scope
+示例 doctest，仍执行）。budget 漂移 bug 的回归覆盖仍在：
+`test_resolve_exec_pool_precedence`（resolve 层）+ pool_cache /
+pipeline_integration 的 builder 级 with_compute_workers 测试。编号 11 不再
+使用，后续条目编号不动。 -->
 
 <!-- #12 死代码清理已完成并移除（2026-10-20）：pool 侧四项随 8eb4b67、
 `BoxFuture` 与 `CancellationToken::reset`（含自测）随 r7 d5425c8 删除，
