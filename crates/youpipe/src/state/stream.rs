@@ -594,6 +594,26 @@ mod tests {
                 self.recv().map_err(|_| TryRecvError::Closed)
             }
 
+            // Test backing over a plain VecDeque: no native batch op, so
+            // the per-item fallback is spelled out (`RecvItem` does not
+            // default it).
+            fn try_recv_batch(
+                &self,
+                buf: &mut [std::mem::MaybeUninit<(u64, &'d i32)>],
+            ) -> usize {
+                let mut n = 0;
+                while n < buf.len() {
+                    match self.try_recv() {
+                        Ok(v) => {
+                            buf[n].write(v);
+                            n += 1;
+                        },
+                        Err(_) => break,
+                    }
+                }
+                n
+            }
+
             fn is_disconnected(&self) -> bool {
                 self.queue.borrow().is_empty()
             }

@@ -854,16 +854,18 @@ noted.
      `test_stream_fence_prefix_async_chain_sync_feeder`); the dead
      `FinalRx::Async` arm is gone with it. See
      [Spawn dispatch: channel factories](#spawn-dispatch-channel-factories-todo-10-2026-10-20).
-   - `RecvItem::try_recv_batch`'s default body
-     (`crates/youpipe/src/handoff/channel.rs:613`) is dead — both real impls
-     override it. Unlike `SendItem::try_send_batch` (live: `MpscSender`
-     relies on the fallback inside `fence_batch_send`), a silent per-item
-     fallback here would be a performance trap for a future backing; remove
-     the default or debug-assert native support.
-   - Root `AGENTS.md` still describes `handoff/channel.rs` as "约 400 行包装层";
-     it is 956 lines and the layer spans `channel.rs` + `sharded.rs` + the
-     knob readers in `mod.rs`. Not fixable in this docs-only round — flagged
-     for the next code round.
+   - ~~`RecvItem::try_recv_batch`'s default body~~ — **resolved 2026-10-20
+     (r9)**: the method is required now (no default). The audit's "both
+     real impls override it" held, but a test backing
+     (`run_ordered_collect_accepts_borrowed_items`' `DequeRecv`) was
+     silently riding the per-item fallback — it spells the fallback out
+     explicitly; a future backing must now make the same choice visibly
+     (a silent fallback on the default-on batched paths would be a
+     performance trap).
+   - ~~Root `AGENTS.md`'s "约 400 行包装层" wording~~ — **resolved
+     2026-10-20 (r9)**: rewritten to name the actual layer
+     (`channel.rs` + `sharded.rs` + the `mod.rs` knob readers, fork batch
+     extensions included) without line counts.
 
 7. **Excluded / uncertain.** A seq-less unordered channel flavor (dropping
    the `(u64, T)` tag — `spawn_stage`'s rationale at

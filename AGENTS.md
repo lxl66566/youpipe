@@ -40,7 +40,7 @@ temperature: 0
 - concurrent-queue：全局 injector 队列（调度面），无界 MPMC FIFO（`SegQueue`），接收两类任务——池外 pool.submit 的注入、worker 本地 deque 满后的溢出。worker 找活的顺序是 本地 deque → injector → 偷同伴。（registry.rs）
   - 不希望引入 crossbeam_deque 库，因为 crossbeam-epoch 不兼容 miri。
   - crossbeam-queue 在当前项目架构下性能略差于 vendor 调优后的 concurrent-queue（经过实测）。
-- crossfire：stage 之间的数据通道（数据面），整个 crates/youpipe/src/handoff/channel.rs（约 400 行包装层）都建立在它上面。这是 pipeline 里 item 实际流动的 channel，和前两者的“任务调度”完全正交。
+- crossfire：stage 之间的数据通道（数据面），youpipe 侧的包装层在 `crates/youpipe/src/handoff/`（channel.rs 统一 API + sharded.rs 分片终端 + mod.rs 数据面运行时旋钮，含 fork 扩展 pop_batch/try_push_batch 的接入）。这是 pipeline 里 item 实际流动的 channel，和前两者的“任务调度”完全正交。
 
 ### 开发提示
 

@@ -609,21 +609,12 @@ pub trait RecvItem<T> {
     fn try_recv(&self) -> Result<T, TryRecvError>;
     /// Non-blocking batch claim of the ready prefix into `buf`; returns the
     /// count. 0 = nothing ready right now — NOT an Empty/Closed verdict
-    /// (call [`Self::try_recv`] to distinguish). Default: per-item fallback
-    /// for backings without a native batch op.
-    fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
-        let mut n = 0;
-        while n < buf.len() {
-            match self.try_recv() {
-                Ok(v) => {
-                    buf[n].write(v);
-                    n += 1;
-                },
-                Err(_) => break,
-            }
-        }
-        n
-    }
+    /// (call [`Self::try_recv`] to distinguish). Required, not defaulted:
+    /// every real backing has a native batch op, and a silent per-item
+    /// fallback here would be a performance trap for a future backing on
+    /// the default-on batched paths (a test-only backing may spell its own
+    /// per-item fallback out).
+    fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize;
 
     /// Whether every sender has been dropped — one load of the tx-count
     /// line, no ring walk (see [`SyncReceiver::is_disconnected`]). Lets a
