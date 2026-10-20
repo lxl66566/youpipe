@@ -518,82 +518,6 @@ impl RegistryMulti {
         }
     }
 
-    /// If trigger all selector while not empty.
-    /// return Some((waker, again))
-    /// if there's more waker after pop_first, again=true
-    #[inline(always)]
-    fn pop_first(&self) -> Option<(ArcWaker, Option<u64>)> {
-        // This is a snapshot, it's safe to ignore the new situation after acquire lock
-        let flag = self.state.load(Ordering::SeqCst);
-        if flag == MULTI_EMPTY {
-            return None;
-        }
-        {
-            let mut guard = reg_lock(&self.inner);
-            if flag & MULTI_HAS_SELECT > 0 {
-                for select in &guard.selectors {
-                    select.wake();
-                }
-            }
-            if flag & MULTI_HAS_WAKER > 0 {
-                let mut has_pop = false;
-                loop {
-                    if let Some(entry) = guard.queue.pop_front() {
-                        has_pop = true;
-                        if let Some(inner) = entry.upgrade_live() {
-                            if guard.queue.is_empty() {
-                                self.state.store(guard.check_select(), Ordering::SeqCst);
-                                return Some((ArcWaker::from_arc(inner), None));
-                            } else {
-                                return Some((ArcWaker::from_arc(inner), Some(guard.seq)));
-                            }
-                        }
-                    } else {
-                        if has_pop {
-                            // might upgrade encounter weak previous loop
-                            self.state.store(guard.check_select(), Ordering::SeqCst);
-                        }
-                        return None;
-                    }
-                }
-            }
-            // nothing changed, don't need to touch the state
-            None
-        }
-    }
-
-    /// ignore the selectors (since triggered in pop_first())
-    /// return the flags
-    #[inline(always)]
-    fn pop_again(&self) -> Option<ArcWaker> {
-        // This is a snapshot, it's safe to ignore the new situation after acquire lock
-        let flag = self.state.load(Ordering::Acquire);
-        if flag == MULTI_EMPTY {
-            return None;
-        }
-        {
-            let mut guard = reg_lock(&self.inner);
-            let mut has_pop = false;
-            loop {
-                if let Some(entry) = guard.queue.pop_front() {
-                    has_pop = true;
-                    if let Some(inner) = entry.upgrade_live() {
-                        if guard.queue.is_empty() {
-                            self.state.store(guard.check_select(), Ordering::SeqCst);
-                        }
-                        return Some(ArcWaker::from_arc(inner));
-                    }
-                } else {
-                    if has_pop {
-                        // might upgrade encounter weak previous loop
-                        self.state.store(guard.check_select(), Ordering::SeqCst);
-                    }
-                    return None;
-                }
-            }
-        }
-    }
-
     /// Call when waker is cancelled
     #[inline(always)]
     fn _clear_wakers(&self, old_waker: &ArcWaker, oneshot: bool) {
@@ -682,7 +606,7 @@ impl RegistryMulti {
     /// (Waiting-state) waiter, and Init-state / stale-live entries met on
     /// the way are woken as well — exactly what the per-item fire() loop
     /// does with its Next/Skip results. The registry mutex is taken once
-    /// per collection round instead of once per waiter (P-3, review
+    /// per collection round instead of once per waiter (youpipe P-3, review
     /// 2026-10-06: a 64-item backpressured batch used to pay 64
     /// lock+pop+unpark round trips on the same mutex producers register
     /// on).
@@ -692,15 +616,20 @@ impl RegistryMulti {
     /// per-item fire() loop needs — to stop re-waking a waiter that just
     /// re-armed inside the same fire — cannot be crossed here: re-arms
     /// happen only after our wakes, outside this critical section.
+    ///
+    /// Returns whether at least one committed wake landed (false: no
+    /// Waiting-state waiter was woken — the queue held only Init/stale
+    /// entries or was empty).
     #[inline]
-    fn _fire_n(&self, n: usize) {
+    fn _fire_n(&self, n: usize) -> bool {
         let mut remaining = n;
+        let mut landed = false;
         while remaining > 0 {
             // Snapshot fast path, same contract as pop_first(): EMPTY here
             // means no registration was visible at this load.
             let flag = self.state.load(Ordering::SeqCst);
             if flag == MULTI_EMPTY {
-                return;
+                return landed;
             }
             // (waker, consumed_event): `consumed_event` mirrors the per-item
             // accounting — only a Waiting read at collection time spends an
@@ -742,7 +671,7 @@ impl RegistryMulti {
                     }
                 } else {
                     // Only selectors under this flag snapshot; done with them.
-                    return;
+                    return landed;
                 }
             }
             // Wake outside the critical section, like the per-item fire().
@@ -757,15 +686,18 @@ impl RegistryMulti {
                     // loop collects another waiter — the batched mirror of
                     // the per-item fire() continuing past a Skip.
                     wasted += 1;
+                } else if *committed {
+                    landed = true;
                 }
             }
             remaining += wasted;
             if exhausted {
                 // No more waiters to hand events to; same as per-item fire
                 // running its pop loop dry.
-                return;
+                return landed;
             }
         }
+        landed
     }
 }
 
@@ -871,36 +803,25 @@ impl Registry for RegistryMulti {
 
     #[inline(always)]
     fn fire(&self) -> WakeResult {
-        if let Some((waker, _last_seq)) = self.pop_first() {
-            let r = waker.wake();
-            trace_log!("wake {} {:?} {:?}", self._tag, waker, r);
-            if r.is_done() {
-                return r;
-            }
-            drop(waker);
-            if let Some(mut last_seq) = _last_seq {
-                last_seq = last_seq.wrapping_sub(1);
-                while let Some(_waker) = self.pop_again() {
-                    let r = _waker.wake();
-                    trace_log!("wake {} {:?} {:?}", self._tag, _waker, r);
-                    if r.is_done() {
-                        return r;
-                    }
-                    // seq >= last_seq: pushed after the pop_first snapshot (the woken waker
-                    // re-armed in this loop); stop to avoid spinning on always-Init wakers.
-                    if _waker.get_seq() >= last_seq {
-                        trace_log!("wake {} stop at {}", self._tag, last_seq);
-                        return WakeResult::Next;
-                    }
-                }
-            }
+        // One event, one committed wake — the accounting `on_send`/`on_recv`
+        // document ("wake up one rx/tx"): Init-state and stale-live entries
+        // met on the way are woken but do not consume the event; a committed
+        // wake that lands as Skip hands the event back for another
+        // collection round. The legacy body woke the queue front and, when
+        // that front was Init/Skip (stream/sink wakers stay Init forever,
+        // upstream comment), walked toward the first committed wake with one
+        // lock acquisition per entry; `_fire_n(1)` collects the same set in
+        // one pass.
+        if self._fire_n(1) {
+            WakeResult::Woken
+        } else {
+            WakeResult::Next
         }
-        WakeResult::Next
     }
 
     #[inline(always)]
     fn fire_n(&self, n: usize) {
-        self._fire_n(n)
+        let _ = self._fire_n(n);
     }
 
     //    #[inline(always)]
@@ -1168,38 +1089,6 @@ mod tests {
         use std::mem::size_of;
         println!("RegistryMulti size {}", size_of::<RegistryMulti>());
         println!("RegistrySingle size {}", size_of::<RegistrySingle>());
-    }
-
-    #[test]
-    fn test_registry_multi_pop() {
-        let reg = <RegistryMulti as RegistryRecv>::new();
-
-        // test push
-        let waker1 = ArcWaker::new_blocking();
-        assert_eq!(reg.len(), 0);
-        reg.reg_waker(&waker1);
-        assert_eq!(waker1.get_state(), WakerState::Init as u8);
-        assert!(waker1.get_seq() > 0);
-        assert_eq!(reg.len(), 1);
-
-        let waker2 = ArcWaker::new_blocking();
-        reg.reg_waker(&waker2);
-        waker2.commit_waiting();
-        assert_eq!(reg.len(), 2);
-        assert!(waker2.get_seq() > waker1.get_seq());
-        assert_eq!(waker2.get_state(), WakerState::Waiting as u8);
-
-        if let Some((w, seq)) = reg.pop_first() {
-            assert!(w.wake() == WakeResult::Next);
-            assert!(seq.is_some());
-        }
-        assert_eq!(waker1.get_state(), WakerState::Woken as u8);
-        assert_eq!(reg.len(), 1);
-        if let Some(w) = reg.pop_again() {
-            assert!(w.wake() == WakeResult::Woken);
-        }
-        assert_eq!(waker2.get_state(), WakerState::Woken as u8);
-        assert_eq!(reg.len(), 0);
     }
 
     // Regression (youpipe intermittent-hang forensics, 2026-09): fire() pops
@@ -1577,6 +1466,50 @@ mod tests {
         assert_eq!(reg.len(), 1);
     }
 
+    // Wake-one contract (youpipe fork, todo #4 (c)): one fire() delivers one
+    // event — exactly one committed waiter wakes; later events wake the rest.
+    #[test]
+    fn test_registry_multi_fire_wakes_exactly_one_waiter() {
+        let reg = <RegistryMulti as RegistryRecv>::new();
+        const N: usize = 3;
+        let mut waiters = Vec::new();
+        for _ in 0..N {
+            let w = ArcWaker::new_blocking();
+            reg.reg_waker(&w);
+            w.commit_waiting();
+            waiters.push(w);
+        }
+        assert_eq!(reg.fire(), WakeResult::Woken);
+        let woken = waiters.iter().filter(|w| w.get_state() == WakerState::Woken as u8).count();
+        assert_eq!(woken, 1);
+        assert_eq!(reg.len(), N - 1);
+        reg.fire();
+        reg.fire();
+        let woken = waiters.iter().filter(|w| w.get_state() == WakerState::Woken as u8).count();
+        assert_eq!(woken, N);
+        assert_eq!(reg.len(), 0);
+        // No waiters left: further events are no-ops.
+        assert_eq!(reg.fire(), WakeResult::Next);
+    }
+
+    // fire() must not spend its event on an Init-state entry (a waiter still
+    // in its registration double-check): the Init entry is woken AND one
+    // committed waiter behind it gets the event — the per-event analogue of
+    // test_registry_multi_fire_n_wakes_past_init_entries.
+    #[test]
+    fn test_registry_multi_fire_wakes_past_init_entries() {
+        let reg = <RegistryMulti as RegistryRecv>::new();
+        let init_w = ArcWaker::new_blocking();
+        reg.reg_waker(&init_w); // stays Init
+        let committed_w = ArcWaker::new_blocking();
+        reg.reg_waker(&committed_w);
+        committed_w.commit_waiting();
+        assert_eq!(reg.fire(), WakeResult::Woken);
+        assert_eq!(init_w.get_state(), WakerState::Woken as u8, "Init entry ripped through");
+        assert_eq!(committed_w.get_state(), WakerState::Woken as u8, "committed waiter woken");
+        assert_eq!(reg.len(), 0);
+    }
+
     // Regression: residue left behind an earlier live waiter must turn stale
     // after a re-arm, even on RegistrySingle, which never stamps the node.
     #[test]
@@ -1919,6 +1852,35 @@ mod loom_tests {
             let o_waker = t.join().unwrap();
             assert_eq!(o_waker.as_ref().unwrap().get_state(), WakerState::Woken as u8);
             assert_eq!(reg.len(), 0);
+        });
+    }
+
+    // Wake-one liveness under interleaving (youpipe fork, todo #4 (c)): one
+    // event wakes exactly one committed waiter — with the legacy fan-out both
+    // would flip Woken here and the count assertion fails. The second event
+    // must wake the remaining waiter: an event is never lost to the crowd.
+    #[test]
+    fn loom_fire_one_event_wakes_one_committed_waiter() {
+        loom::model(|| {
+            let reg = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let a = ArcWaker::new_blocking();
+            let b = ArcWaker::new_blocking();
+            reg.reg_waker(&a);
+            a.commit_waiting();
+            reg.reg_waker(&b);
+            b.commit_waiting();
+
+            assert_eq!(reg.fire(), WakeResult::Woken);
+            let woken = usize::from(a.get_state() == WakerState::Woken as u8)
+                + usize::from(b.get_state() == WakerState::Woken as u8);
+            assert_eq!(woken, 1, "one event wakes exactly one committed waiter");
+            assert_eq!(reg.len(), 1);
+
+            assert_eq!(reg.fire(), WakeResult::Woken);
+            assert_eq!(a.get_state(), WakerState::Woken as u8);
+            assert_eq!(b.get_state(), WakerState::Woken as u8);
+            assert_eq!(reg.len(), 0);
+            assert_eq!(reg.fire(), WakeResult::Next);
         });
     }
 }

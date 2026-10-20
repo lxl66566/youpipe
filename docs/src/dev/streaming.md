@@ -487,9 +487,11 @@ async family (`stage(f1).stage(f2).stage_async(g)`): collapses from a
 smaller total than the fence family — 4+4 bimodal 26↔175 across processes,
 8+8 ≈ 200, auto 15+15 ≈ 230, and **every asymmetry stays slow** (15/1 =
 151, 1/8 = 228, 8/2 = 118): both the feeder→stage1 crowd and the
-mixed-mode channel's async waker fan-out contribute (`io_concurrency` = 128
-tasks register in one `RegistryMulti`; a `fire()` wake fans out to the
-whole queued crowd), and the async terminal adds a collector-side park
+mixed-mode channel's async waker registration crowd contribute
+(`io_concurrency` = 128 tasks register in one `RegistryMulti` — see the
+2026-10-21 correction below: fire() was already wake-one on committed
+queues, so the crowd's cost is 128 registrations parked per gap, not a
+fire fan-out), and the async terminal adds a collector-side park
 stream (main ≈ 2.2 parks/item in slow runs — the todo #1 signature). The
 immune references: single sync prefix `.stage(f).stage_async(g)` = 26 ms,
 async-only = 79 ms (feeder-paced), and pure sync 15→15 (`sync2` anchor) =
@@ -523,11 +525,13 @@ attacks both interfaces of the fence shape and the worker side of the async
 shape; (b) **forwarder batch-send**: let the fence forwarder push a
 released chunk with `try_send` and park at most once per chunk boundary,
 removing the fence-output interface's per-item send parks; (c)
-crossfire-level: a larger pre-park spin for blocking recv or a wake-one
-(not wake-all-queued) `fire()` policy in `RegistryMulti` — the fork is
-in-repo, but global backoff widening is a falsified pattern in the pool
-context (dead-ends.md), so any widening must be activity-gated rather than
-a constant.
+crossfire-level wake policy — **falsified 2026-10-21 by code reading + A/B**
+(see "Async face re-attribution (2026-10-21)"): `RegistryMulti::fire()`
+was already wake-one on committed queues (upstream's pop_again fan-out
+only rips through Init-state fronts and stops at the first committed
+wake), so there is no fan-out to remove; `fire()` is now expressed as
+`_fire_n(1)` for accounting uniformity (crossfire-waker-designs.md §15),
+behaviorally neutral on youpipe shapes.
 
 Same-root notes: todo #1 (terminal fan-in) is the collector-side face of
 the same serial-endpoint × crowd park/wake economy — the 2.2
@@ -592,10 +596,11 @@ collapse (236 ms off, 226 ms spin-on) while `w1=1` is fast both ways — the
 slow face is the 15-worker crowd **sending into** the mixed-mode channel
 plus the terminal drain: per-run ctx-switches in slow runs are 2.3
 voluntary parks/item on the collector (`main`) and 1.2/item on `yp-pool`
-(send-side `Full` parks) — not recv-anchor parks. Fixing it needs the
-crossfire `RegistryMulti` wake policy (candidate (c)) and/or the async
-terminal fan-in (todo #1 (c) closed as falsified, so the async terminal
-stays a single MPSC). `async2/15-1` therefore remains open under #4.
+(send-side `Full` parks) — not recv-anchor parks. Candidate (c) is closed
+as falsified (see "Async face re-attribution (2026-10-21)" below); the
+async terminal stays a single MPSC (its sharded flavour falsified, todo
+#1 (c)). `async2/15-1` therefore remains open under #4 with a re-anchored
+attribution.
 
 `YOUPIPE_FWD_BATCH` standalone shows no independent rescue (fence auto med
 205/165 with only the knob on): removing the forwarder's per-item send
@@ -608,6 +613,43 @@ Default policy: **both knobs stay off** (opt-in). The spin is a large win
 exactly when the convoy pathology is present (serial supplier → worker
 crowd ≥ ~10) and a measurable cost in the lucky fast regime; user guidance
 lives in tuning.md.
+
+### Async face re-attribution (2026-10-21)
+
+Post-r9 re-probing of the surviving async2 slow mode (convoy-probe,
+fresh-process interleaved cells, `--n 100000`, default r9 knobs; slow
+runs 128–290 ms vs fast 18–31 ms, both modes appearing on every side of
+every knob below):
+
+- **Wake policy (candidate (c)) — falsified by code reading, A/B
+  neutral.** `RegistryMulti::fire()` was already wake-one on committed
+  queues; see crossfire-waker-designs.md §15. A same-binary A/B of the
+  legacy body vs `_fire_n(1)` (temporary `YOUPIPE_FIRE_ALL` knob) showed
+  bistable medians flipping within noise on both sides.
+- **Collector-side anchor spin — falsified (prototyped and reverted).**
+  An async twin of `AnchorSpin` in the async terminal drains (knob
+  `YOUPIPE_SPIN_ANCHOR_ASYNC=<µs>`): with the spin armed the FAST mode's
+  collector parks collapse ~10–25× (main v 0.9–2.5 K/run → 47–200), but
+  the wall is unchanged and the slow mode persists — in collapsed runs the
+  collector still parks ~2×/item because the terminal's arrivals are
+  clumpy (gaps beyond the activity gate's window quarter the budget to
+  pure parking). The collector is not the pacemaker of the surviving slow
+  mode.
+- **Both spins combined (`SPIN_ANCHOR=30` + `SPIN_ANCHOR_ASYNC=30`) — no
+  rescue.** Slow runs (165–225 ms) still appear; medians improve in some
+  cells, within the bistability noise.
+- **`--buffer n` (every channel cap = n) — full rescue**, 8/8 runs
+  24–31 ms, matching the fence family's boundary matrix: the slow mode is
+  a backpressure-driven per-item wake chain across the full chain
+  (collector + workers + the io tasks' `send_cached` parks into the full
+  terminal ring — the one face no anchor spin can reach), and capacity
+  decouples it.
+
+Remaining direction for #4: capacity-side decoupling of the async
+terminal (auto-sizing the last channel to the run's in-flight bound
+instead of `buffer_size`) or a batched task→terminal handoff; the
+worker/collector anchor surfaces are exhausted. The wake-one `fire()`
+cleanup itself landed (behaviorally neutral, accounting-uniform).
 
 ## Pool-wide parking lease (deadlock freedom across concurrent runs)
 
@@ -833,17 +875,19 @@ noted.
    doubled as the decoupling leak check: the sync knob left the async
    terminal untouched (off/on medians 236.7/239.6 ms pre-flip tree).
 
-5. **Async-family convoy remains open (crossfire-level, candidate (c))**.
-   The async shape's slow face (15-worker crowd sending into the mixed-mode
-   channel + collector park stream) is out of `YOUPIPE_SPIN_ANCHOR`'s reach
-   (see "Fix (a)+(b) landed"). The remaining lever is crossfire's
-   `RegistryMulti` wake policy — wake-one among the queued crowd rather
-   than fire fan-out — which is fork surgery; the youpipe-side alternatives
-   (async sharded terminal, burst-drain in async consumers) are both
-   falsified (dead-ends.md, benchmarks.md). Effort high, expected gain
-   large for the async family (slow mode runs ~7–10× the fast mode). No
-   youpipe-only bench applies until the fork change exists; then
-   `async_vs_tokio` + convoy-probe async shapes.
+5. **Async-family convoy: candidate (c) closed as falsified (2026-10-21)**.
+   The proposed crossfire `RegistryMulti` wake-one policy rests on a
+   misreading: `fire()` already wakes exactly one committed waiter per
+   event (the pop_again fan-out only engages Init-state fronts and stops
+   at the first committed wake; see crossfire-waker-designs.md §15).
+   `fire()` is now `_fire_n(1)` for accounting uniformity — same-binary
+   A/B neutral on the async shapes. The collector-side anchor spin
+   prototype (the other un-probed surface) collapses fast-mode collector
+   parks ~10–25× but is wall-neutral and does not remove the slow mode;
+   reverted. What survives: `buffer = n` fully rescues async2 (capacity
+   decoupling), and the io tasks' `send_cached` parks into a full
+   terminal ring remain the un-spinnable face. Re-anchored attribution and
+   the remaining direction: "Async face re-attribution (2026-10-21)" above.
 
 6. **Smells (no perf claim).**
    - ~~`StageSpawn::spawn_for_async`'s default impl is unreachable through

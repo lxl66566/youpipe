@@ -8,11 +8,13 @@
 # unified QueueEntry stale check", 541e0fc "waker: Per-thread immortal
 # blocking waker with seq-tagged queue entries"). On top of that commit
 # this copy carries youpipe-local extensions: the try_send_batch /
-# try_recv_batch fast paths, the RegistrySingle retry-on-Skip +
+# try_recv_batch fast paths with fire_n, the RegistrySingle retry-on-Skip +
 # node-state get_waker_state fixes (2026-09 intermittent-hang forensics),
-# and their tests. The `async_std` timer methods additionally gate on
-# `not(feature = "tokio")` (tokio wins) — upstream compiles duplicate
-# definitions when both features are on.
+# the async WakerSlot cross-episode reuse (P-4), RegistryMulti::fire()
+# expressed as _fire_n(1) (one event = one committed wake; the legacy
+# pop_first/pop_again body is deleted), and their tests. The `async_std`
+# timer methods additionally gate on `not(feature = "tokio")` (tokio wins)
+# — upstream compiles duplicate definitions when both features are on.
 #
 # Design C: the blocking wake target is thread::current(), which never
 # changes, so the waker node lives in a thread_local and is only re-armed

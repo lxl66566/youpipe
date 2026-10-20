@@ -139,3 +139,24 @@
   移入 sealed-marker-bounded 固有 impl，两块固有 impl 不重叠、解析命中
   融合版），如未来病态修复后重开此方向可复用该设计（注意 E0592：两个
   无界的同名固有方法 impl 不允许）。
+- **crossfire `RegistryMulti` wake-one 唤醒策略**（2026-10-21，todo #4
+  候选 (c)，代码判读 + 临时旋钮 `YOUPIPE_FIRE_ALL` 同 binary A/B）：
+  前提不成立——"fire() 把整个人群全部唤醒"是对 `pop_again` 循环的误读。
+  upstream `fire()` 弹出队头唤醒，committed（Waiting→Woken）落地即
+  `is_done` 早退，**committed 队列上一次 fire 本来就只唤醒一个 waiter**；
+  `pop_again` 扇出仅在队头为 Init/Skip 时触发（stream/sink 常驻 Init 的
+  waker），且同样停在首个 committed 唤醒。A/B（convoy-probe async1/
+  async2）两侧双稳同分布、中位差 < 噪声。`fire()` 已改写为 `_fire_n(1)`
+  统一唤醒会计（语义同集，非 perf 变化），机制记录见
+  crossfire-waker-designs.md §15。
+- **async collector 侧 pre-anchor 自旋**（2026-10-21，原型 `AnchorSpin`
+  async 孪生 + 旋钮 `YOUPIPE_SPIN_ANCHOR_ASYNC`，实现后 A/B 回退）：
+  async 终端 drain 的 anchor await 前按活动门控预算自旋 `try_recv`。
+  快档下 collector parks 塌缩 ~10–25×（main v 0.9–2.5 K/run → 47–200），
+  但墙钟不变；慢档照旧（~2 parks/item）——塌缩态下 terminal 到达是
+  clumpy 的（间隙超过门控窗口，预算被 quarter 回纯泊车），collector 不是
+  残余慢档的节拍器。与 worker 侧 `YOUPIPE_SPIN_ANCHOR=30` 同开亦无救援
+  （165–225 ms 慢 run 仍现）。`--buffer n` 全量解救（8/8 run 24–31 ms）
+  证实残余慢档是全链背压驱动的逐项唤醒链，节拍在 anchor 自旋不可达的
+  面（io task `send_cached` 停进满 terminal ring）。方向关闭，读数与
+  再归因见 streaming.md「Async face re-attribution (2026-10-21)」。

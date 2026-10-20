@@ -740,3 +740,43 @@ weak 升级失败，一次 fire 就能把全部死条目在单次锁内清完，
 - **`block_on` 根循环**：见 §14.2-2，退化正确、无收益。
 - youpipe 侧 `bridge_async_to_sync` 的 `Handle::block_on` 循环实测复用
   正常（multi-thread handle 的根 waker 稳定），但该形态无独立断言。
+
+## 15. fire() 唤醒会计的证伪与统一（2026-10，todo #4 (c) 收束）
+
+> 结论先行：**"fire() 把整个人群全部唤醒"的机制在 committed 队列上从未存在**
+> ——upstream `fire()` 弹出队头并唤醒，若该唤醒以 committed（Waiting→Woken）
+> 落地即 `is_done` 早退，**一次 fire 本来就只唤醒一个 committed waiter**。
+> streaming.md convoy 取证里 "a fire() wake fans out to the whole queued
+> crowd" 的措辞是对 `pop_again` 循环的误读（与本次实现者的第一遍阅读犯的是
+> 同一个错）。`pop_again` 扇出只在队头是 Init/Skip 时触发（stream/sink 类
+> 常驻 Init 的 waker，upstream 注释原话），且同样在首个 committed 唤醒处
+> 停止。todo #4 遗留的"候选 (c)：RegistryMulti wake-one 策略"因此不成立：
+> 策略已经是 wake-one，async 家族的塌缩另有节拍器（见 streaming.md
+> 2026-10-21 复测）。
+
+落地形态：`RegistryMulti::fire()` = `_fire_n(1)`，与 P-3 的批量唤醒会计
+严格一致（一个事件 = 一个 committed 唤醒；途中遇到的 Init / stale-live
+条目照常唤醒但不消耗事件；committed 唤醒落地为 Skip 时把事件还回、再收集
+一轮）。legacy 的 `pop_first`/`pop_again` 双函数体删除（连同其单测）；
+Init-front 场景从"每条目一次锁"变为单锁收集——语义同集、机械上更省。
+
+验证：
+
+- fork 单测：新增 wake-one 契约三件（N committed 恰醒一个、逐事件推进、
+  Init-front 不吃事件）；既有 stale-entry/重臂/close 测试全数不改通过
+  （它们断言的本来就是"一次 fire 唤醒一个"）。
+- loom：新增 `loom_fire_one_event_wakes_one_committed_waiter`（wake-all
+  形态下该模型会在计数断言处失败）；既有 5 模型不动全绿——
+  `loom_fire_vs_rearm_race_recovers_within_one_event` 的"下一个事件内恢复"
+  契约在 wake-one 下语义不变：legacy 在被盗唤醒后同一 fire 里顺带唤醒队列
+  中下一个 waiter，wake-one 把这次补偿推迟到下一事件，恰是模型第二跳
+  fire 断言覆盖的路径。
+- 同 binary A/B（临时旋钮 `YOUPIPE_FIRE_ALL`，bench_ab.sh `-E`，2026-10-21）：
+  convoy-probe async1/async2 形状两侧双稳态同分布、中位差 < 噪声——与代码
+  判读一致（committed 队列上行为恒等）。criterion 家族读数见
+  benchmarks.md。旋钮在 A/B 完成后随 legacy 路径一并删除。
+
+对 §11.6 契约的影响：无实质变化。被盗 fire（陈旧项 seq 竞态偷走一次唤醒）
+在有 ≥2 个 waiter 时，legacy 同 fire 内补偿、wake-one 顺延一个事件；
+单 waiter 场景两者恒等（本来就只能等下一事件）。loom 模型的突变验证
+覆盖面不变。

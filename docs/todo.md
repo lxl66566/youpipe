@@ -72,23 +72,24 @@ p90 +20% lean（均值/p50 改善）记录在 soak 表，不单独跟踪。 -->
   疑似 anchor+burst recv 的 convoy 双稳（recv-loop 注释记录过 8-worker
   形态）。async-only 链 83 ms 另受 feeder 单线程推送率限制（15–32 个
   sync 生产者并发推送时无此限制）。
-- 方向：**修复已落地**（2026-09-30，候选 (a)+(b)，`AnchorSpin`/
+- 方向：**fence 家族已修**（2026-09-30，候选 (a)+(b)，`AnchorSpin`/
   `fence_batch_send`，旋钮 `YOUPIPE_SPIN_ANCHOR`/`YOUPIPE_FWD_BATCH` 默认
-  off）：fence 家族場缩已消（14/14 auto 180–254 ms → 27–57 ms、1/15
-  90–127 → 24–33、9/9 收敛 ~25；soak 100K×10 无 ≥180 ms run、parks
-  90–197K/run → 0.3–2.6K；轮询退避尾部 `MAX_POLL_PAUSES=64` 低于此会在
-  人群场景回归）。读数与机制见 dev/streaming.md 「Fix (a)+(b) landed」。
-  **async 家族不在此旋钮射程内**：async1/15 单前缀复现慢 mode（off 236 /
-  spin 226 ms），慢 run 的停车在 collector（2.3/item，todo #1 面）与
-  send 侧 `Full`（1.2/item）而非 recv anchor——需 crossfire
-  `RegistryMulti` 唤醒策略（候选 (c)）或 async 终端扇入（#1 (c) 已证伪
-  关闭，async 终端仍是单 MPSC）。两旋钮默认 off（快 mode 有 2–4× 自旋
-  开销 + 活跃稀疏期烧 CPU），opt-in 指南见 advanced/tuning.md。
-- 遗余：async 形状（async2/15-1 等）場缩未修，归因已明确（上段），
-  待候选 (c)；快 mode 下自旋开销的进一步收窄（预算上限/退避曲线）
-  未探索。r9 缓解记录：pair 默认（SHARDED+BATCH）对 async2 soak 均值
-  230→109 ms、p50 242→29 ms（sync 前缀的 batch claim 改善停车面），但
-  p90 291 ms 的慢 mode 仍在——候选 (c) 依旧是正解。
+  off）。读数与机制见 dev/streaming.md 「Fix (a)+(b) landed」。
+- **候选 (c) 已证伪并关闭（2026-10-21）**："wake-one（非 wake-all）
+  fire() 策略"的前提是误读——upstream `fire()` 在 committed 队列上本来就
+  只唤醒一个 waiter（`pop_again` 扇出仅穿透 Init-front 且停在首个
+  committed 唤醒）；同 binary A/B 中性。`fire()` 已改写为 `_fire_n(1)`
+  统一唤醒会计（语义清理，非 perf）。async collector 侧 anchor 自旋原型
+  亦证伪回退（快档 collector parks −10–25× 但墙钟不变，慢档照旧——
+  terminal 到达 clumpy，门控衰减回纯泊车）。两项均记入 dead-ends.md；
+  再归因见 streaming.md「Async face re-attribution (2026-10-21)」。
+- 遗余：async 形状（async2 等）塌缩未修，但归因已再锚定——残余慢档是
+  全链背压驱动的逐项唤醒链（`--buffer n` 全量解救，8/8 run 24–31 ms），
+  节拍在 anchor 自旋不可达的面（io task `send_cached` 停进满 terminal
+  ring）。下一步方向：terminal 通道容量解耦（末级通道容量自动取 run 的
+  in-flight 上界而非 `buffer_size`）或 task→terminal 批量交接；worker/
+  collector anchor 自旋面已穷尽。r9 缓解记录：pair 默认（SHARDED+BATCH）
+  对 async2 soak 均值 230→109 ms、p50 242→29 ms，p90 291 ms 慢档仍在。
 - 验证：`sync_fuse` 家族（canary `fence_infra` + async/fence/cancel 形状）。
 - 合并后复测（与 #1 (d) 合入同一 main 后）：fence_infra canary 100K
   off 188.3 ms（169–222 双峰）/ SPIN=30 45.5 ms（27.9–60.3，−75.9 %，

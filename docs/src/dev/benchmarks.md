@@ -1420,6 +1420,28 @@ consistency across the three batch-claim sites, not throughput. The
 (94–118 µs) while the wt side is tight — consistent with dropping the
 extra empty-ring walk, though 5 rounds do not separate that from draw.
 
+## fire() wake-one accounting (2026-10-21)
+
+`RegistryMulti::fire()` expressed as `_fire_n(1)` (one event = one
+committed wake; crossfire-waker-designs.md §15). Code reading says the
+legacy body was already wake-one on committed queues, so the expected
+verdict is neutral; the A/B is the release gate. Same-binary env A/B
+(temporary `YOUPIPE_FIRE_ALL` knob, deleted with the legacy body after
+the decision): `bench_ab.sh -a legacy=wt -b wakeone=wt -E … -B
+channel_bench -B mixed_load -B io_async -B async_vs_tokio -B expand -r 3`
+(`target/bench-ab/fire-wakeone`).
+
+Zero regressions across all 40+ ids; every crossfire-mediated family
+(`youpipe_mpsc`/`youpipe_mpmc`, `stream_pipeline`, `io_async`,
+`expand_heavy`, `mixed_load` youpipe rows) verdicts noise, |Δ| ≤ 6 % with
+bistable spreads. The only two improvement rows are controls that never
+touch crossfire (`channel_throughput/crossbeam_bounded/100000` −8.0 %,
+`mixed_load/tokio_spawn_blocking_cpu/1000` −2.7 %) — the session leaned
+slightly toward the wakeone side, which the drift-detection controls
+exist to expose. Convoy shapes separately: async1/async2 bistable with
+medians flipping within noise on both sides (streaming.md "Async face
+re-attribution (2026-10-21)").
+
 ## Horizontal cross-library comparison (2026-09)
 
 `crates/youpipe/benches/horizontal.rs` answers the "what should I pick for my workload?"
