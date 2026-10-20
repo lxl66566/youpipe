@@ -93,12 +93,17 @@ impl<T> FenceBarrier<T> {
     /// The caller drains the `Vec` returned from [`push`](Self::push) (e.g.
     /// `batch.drain(..)`) and gives the empty-but-capacity-retained `Vec`
     /// back; the next flush swaps it in instead of starting from capacity 0.
-    /// Passing a non-empty batch is a contract violation (debug-asserted).
-    pub fn reuse(&mut self, batch: Vec<T>) {
-        debug_assert!(
-            batch.is_empty(),
-            "reused batch must be drained before returning"
-        );
+    ///
+    /// Total API: a non-empty batch is caller misuse, but its items are
+    /// appended back to the pending buffer instead of being silently
+    /// dropped — the next [`push`](Self::push) or [`flush`](Self::flush)
+    /// releases them under the regular chunk rules (order relative to items
+    /// pushed in the meantime is not recoverable). The allocation is
+    /// recycled either way.
+    pub fn reuse(&mut self, mut batch: Vec<T>) {
+        if !batch.is_empty() {
+            self.buffer.append(&mut batch);
+        }
         if self
             .spare
             .as_ref()
@@ -211,5 +216,24 @@ mod tests {
         assert_eq!(b2.len(), 2);
         b2.drain(..);
         assert!(fence.buffer.capacity() >= big_cap);
+    }
+
+    /// Total API: a batch returned via `reuse` **without** being drained must
+    /// not lose its items — they are appended back to the pending buffer and
+    /// released by the next push (or flush) under the regular chunk rules.
+    #[test]
+    fn test_reuse_nonempty_appends_back() {
+        let mut fence = FenceBarrier::<i32>::new(chunked(4));
+        fence.push(1);
+        fence.push(2);
+        fence.push(3);
+        let batch = fence.push(4).unwrap();
+        assert_eq!(batch, vec![1, 2, 3, 4]);
+        // Misuse: hand the batch back without draining it.
+        fence.reuse(batch);
+        // The pending buffer holds the returned items; the next push crosses
+        // the chunk threshold and flushes all five out, in order.
+        assert_eq!(fence.push(5), Some(vec![1, 2, 3, 4, 5]));
+        assert_eq!(fence.flush(), None);
     }
 }

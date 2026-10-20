@@ -249,13 +249,11 @@ impl ComputePool {
     /// `join`/`SpinLatch` uses, so an on-pool nested terminal can never
     /// deadlock its pool.
     pub(crate) fn on_this_pool_owner(&self) -> Option<(&Arc<Registry>, usize)> {
-        let wt = pool::registry::WorkerThread::current();
-        if wt.is_null() {
-            return None;
-        }
-        // SAFETY: `wt` is non-null — set by a pool worker's `main_loop`.
-        let wt = unsafe { &*wt };
-        (wt.registry_id() == self.registry.id()).then(|| (wt.registry(), wt.index()))
+        // TLS + same-registry identity check: `current_worker_of` (the
+        // single place the pointer deref is argued safe).
+        self.registry
+            .current_worker_of()
+            .map(|wt| (wt.registry(), wt.index()))
     }
 }
 

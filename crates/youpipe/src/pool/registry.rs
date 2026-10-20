@@ -180,14 +180,42 @@ impl Registry {
 
     /// Push from a worker thread's local deque, or inject from outside. Checks
     /// TLS to determine whether the caller is a pool worker.
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(crate) fn inject_or_push(&self, job_ref: JobRef) {
+    /// The calling thread's [`WorkerThread`] iff it is a worker of *this*
+    /// registry — the shared "am I on this pool?" check behind
+    /// [`Self::inject_or_push`], [`Self::push_local_batch`],
+    /// [`Self::in_worker`], and `ComputePool::on_this_pool_owner`.
+    ///
+    /// # SAFETY argument (concentrated here)
+    ///
+    /// `WorkerThread::current()` returns the TLS pointer that the worker's
+    /// own `main_loop` set to its stack-allocated `WorkerThread` (and that
+    /// `WorkerThread::drop` nulls before that frame goes away), so on the
+    /// calling thread a non-null pointer is dereferenceable for the duration
+    /// of the borrow. The `registry_id` re-check rejects a *foreign*
+    /// registry's worker: pool threads regularly call into another pool's
+    /// methods (a streaming run driving a nested pool), and only a
+    /// same-registry worker may take the local-deque fast paths. The
+    /// returned reference is `!Send` (`WorkerThread` holds a `Cell` RNG) and
+    /// borrows `self`, so callers cannot smuggle it off the calling thread
+    /// or past the registry's lifetime.
+    #[inline]
+    pub(crate) fn current_worker_of(&self) -> Option<&WorkerThread> {
         let wt = WorkerThread::current();
         if !wt.is_null() && unsafe { (*wt).registry_id() } == self.id() {
-            // SAFETY: wt is the current thread's WorkerThread.
-            unsafe { (*wt).push(job_ref) };
+            // SAFETY: see the doc comment above.
+            Some(unsafe { &*wt })
         } else {
-            self.inject(job_ref);
+            None
+        }
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(crate) fn inject_or_push(&self, job_ref: JobRef) {
+        match self.current_worker_of() {
+            // SAFETY: `wt` is the calling thread's own WorkerThread (the
+            // SPSC local-deque contract of `push`).
+            Some(wt) => unsafe { wt.push(job_ref) },
+            None => self.inject(job_ref),
         }
     }
 
@@ -203,12 +231,11 @@ impl Registry {
     /// job) — the convergence the local-deque dispatch exists to remove.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(crate) fn push_local_batch(&self, jobs: impl ExactSizeIterator<Item = JobRef>) {
-        let wt = WorkerThread::current();
-        if !wt.is_null() && unsafe { (*wt).registry_id() } == self.id() {
-            // SAFETY: wt is the current thread's WorkerThread of this registry.
-            unsafe { (*wt).push_batch(jobs) };
-        } else {
-            self.inject_batch(jobs);
+        match self.current_worker_of() {
+            // SAFETY: `wt` is the calling thread's own WorkerThread (the
+            // SPSC local-deque contract of `push_batch`).
+            Some(wt) => unsafe { wt.push_batch(jobs) },
+            None => self.inject_batch(jobs),
         }
     }
 
@@ -296,11 +323,9 @@ impl Registry {
         OP: FnOnce(&WorkerThread, bool) -> R + Send,
         R: Send,
     {
-        let wt = WorkerThread::current();
-        if !wt.is_null() && unsafe { (*wt).registry_id() == self.id() } {
-            op(unsafe { &*wt }, false)
-        } else {
-            self.in_worker_cold(op)
+        match self.current_worker_of() {
+            Some(wt) => op(wt, false),
+            None => self.in_worker_cold(op),
         }
     }
 

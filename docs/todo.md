@@ -223,33 +223,32 @@ pipeline_integration 的 builder 级 with_compute_workers 测试。编号 11 不
 
 ### 13. [P2] 正确性相邻与杂项
 
-- `FenceBarrier::reuse` 对非空批仅 debug_assert，release 静默丢弃——改
-  total API（非空时 append 回 buffer）消灭契约；
-- feeder-slot 预测 `n > buffer_size.max(4)` 手抄了 buffer floor
-  `max(parallelism * 4)` 的最小值（stream.rs `try_exec` vs `stage_buffer`）
-  ——floor 规则一改 parking lease 欠预留、死锁回归且无测试兜底；抽共享
-  常量/函数并注释互锁；
-- drain 四体复制（`drain_ordered`/`drain_ordered_async` × unordered，
-  state/stream.rs，~70 行只差 recv vs recv().await 与 ReorderBuffer 插入）
-  → `macro_rules!` 模板（tokio 的 sync/async 孪生惯用法），防止 burst-drain
-  策略改动四处漂移；
-- TLS worker 指针 + registry_id 校验在 pool/registry.rs 三处 + worker.rs
-  一处手写（核心安全前置，各自独立 unsafe 块）→ 单一
-  `Registry::current_worker_of` helper 集中 SAFETY 论证；
+<!-- r8（2026-10-20）落地并移除六项：`FenceBarrier::reuse` 改 total API
+（非空批 append 回 pending buffer——数据不丢、容量照常回收，消灭
+debug_assert 契约）；feeder-slot 预测与 stage_buffer floor 收敛到
+`floored_channel_capacity` 单点（doc 记录单调性互锁：floor 规则改动不同步
+预测 = parking lease 欠预留死锁，无测试兜底）；drain 四体
+（unordered/ordered × sync/async）收敛为 state/stream.rs 的 `drain_loop!`
+宏模板（tokio sync/async 孪生惯用法），R7 的 0-claim probe 手工双改即其
+动机；TLS worker + registry_id 四处独立 unsafe 收敛为
+`Registry::current_worker_of` 单点 SAFETY 论证；文档 bug 修正（run()
+Panics 节 ordered+expand 链接改指 `StageSpawn::has_expand`；floor 措辞
+"downstream_workers * 4" 改为 producing stage 自身 worker 数——实为三处，
+config.rs 的 `PipelineConfig::buffer_size` 字段 doc 同错，核实后顺带修）。
+reorder window 魔法数一项核实不成立：`next_power_of_two().clamp(1<<10,
+1<<20)` 现仅 `OrderedWindow::open` 一处（`auto` 的 `(1<<10).max(in_flight)`
+是不同形状的 floor 表达式），无重复可抽，关闭。 -->
+
 - crossfire 错误映射七份手抄（handoff/channel.rs 各 try_send/try_recv
-  包装内的同构 match）→ `map_send_err`/`map_recv_err`；
+  包装内的同构 match）→ `map_send_err`/`map_recv_err`（r8 轮次因
+  channel.rs 归 spawn-dedup 分支改写而让路，留后续轮）；
 - `try_exec` ~257 行混四职责（admission/lease 解析、StreamCtx 构建、
   feeder 通道选路、终端 drain）→ 拆 `resolve_admission`，让不变量注释贴着
   维护它的代码；
 - StageSpawn 默认实现删除改必选（默认体掩盖漏覆盖，且空链
   `stream(0..n).with_cancel(t).run()` 在 fused pass-through 拒绝后走到
-  终端 MPSC debug_assert，debug 构建必 panic——顺带修该 panic 或特判空链）；
-- reorder window 魔法数 `next_power_of_two().clamp(1<<10, 1<<20)` 两处
-  重复（state/stream.rs）抽 helper；
-- 文档 bug：`run()` Panics 节把 ordered+expand 的说明链到 `FenceMode`
-  （应为 `StageSpawn::has_expand`）；`stage_buffer` floor 措辞
-  "downstream_workers * 4" 与调用点传本 stage 自身 worker 数不符
-  （stream.rs 两处）。
+  终端 MPSC debug_assert，debug 构建必 panic——顺带修该 panic 或特判空链）
+  ——r8/spawn-dedup 分支承接。
 
 ### 14. [P1] `pipeline_integration` 间歇性 hang 残余
 

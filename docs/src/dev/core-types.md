@@ -427,8 +427,8 @@ fit, or `run()` executes on a worker of the same pool (nested pipelines park
 that worker in the collector for the whole run), the run switches to
 dedicated-thread mode: stage workers and the feeder are plain OS threads and
 the pool is left untouched. Per-stage `buffer` / `io_concurrency` pins
-replace the global `buffer_size` (and its `downstream_workers × 4` floor) /
-`io_concurrency` for that stage only.
+replace the global `buffer_size` (and its floor at the producing stage's
+`workers × 4` slots) / `io_concurrency` for that stage only.
 
 #### Options types split by stage kind (2026-10, ex-todo #6)
 
