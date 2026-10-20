@@ -792,6 +792,52 @@ fn test_stream_fence_with_options_buffer() {
     }
 }
 
+/// A fence as the terminal stage (`.fence(mode).run()`): exercises
+/// `FenceLink::spawn_single`, the terminal-contract path the mid-chain
+/// fence tests never touch — the forwarder writes an MPSC ring the sole
+/// collector drains (todo #10 regression net: the terminal factory
+/// selection now lives in one dispatch line per stage type).
+#[test]
+fn test_stream_fence_terminal_stage() {
+    for mode in [
+        FenceMode::Barrier,
+        FenceMode::Chunked(NonZeroUsize::new(7).unwrap()),
+    ] {
+        let mut r: Vec<u64> = stream(0..300u64).stage(|x| x + 1).fence(mode).run();
+        r.sort_unstable();
+        assert_eq!(r, (1..=300u64).collect::<Vec<_>>(), "{mode:?}");
+
+        // Ordered flavour: the fence forwards seq-tagged items, so the
+        // ordered drain's accounting must hold exactly.
+        let r: Vec<u64> = stream(0..300u64)
+            .stage(|x| x + 1)
+            .fence(mode)
+            .ordered()
+            .run();
+        assert_eq!(r, (1..=300u64).collect::<Vec<_>>(), "{mode:?}");
+    }
+}
+
+/// A fence prefix in front of an async-first chain forces the sync-feeder
+/// path (`first_consumer_is_async` defers through the transparent fence to
+/// `StreamStart`'s `None`), so the terminal `stage` recurses via
+/// `AsyncStage::spawn` -> `prev.spawn_for_async` down to `StreamStart` —
+/// the only reachable route through the zero-stage `spawn_for_async`
+/// (sync feeder receiver bridged into the mixed-mode channel on a forward
+/// thread). Covers that override now that the trait method is required
+/// rather than defaulted (todo #13).
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_stream_fence_prefix_async_chain_sync_feeder() {
+    let r: Vec<u64> = stream(0..100u64)
+        .fence(FenceMode::Chunked(NonZeroUsize::new(10).unwrap()))
+        .stage_async(|x| async move { x + 1 })
+        .stage(|x| x * 3)
+        .ordered()
+        .run();
+    assert_eq!(r, (0..100u64).map(|x| (x + 1) * 3).collect::<Vec<_>>());
+}
+
 #[test]
 fn test_stream_with_fence_full_barrier() {
     let items: Vec<i32> = (0..50).collect();
