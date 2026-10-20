@@ -1,7 +1,8 @@
-//! End-to-end semantics of the async flavour of `YOUPIPE_SHARDED_TERM=1`:
-//! the async terminal's consumer tasks fan out into one async shard ring per
-//! task group instead of one shared MPSC async ring, and the collector
-//! aggregates the shards (todo #1 residual (c)).
+//! End-to-end semantics of the async flavour of
+//! `YOUPIPE_SHARDED_TERM_ASYNC=1`: the async terminal's consumer tasks fan
+//! out into one async shard ring per task group instead of one shared MPSC
+//! async ring, and the collector aggregates the shards (todo #1 residual
+//! (c)).
 //!
 //! Own test binary (not a block inside `sharded_terminal.rs`): the knob is
 //! read through a process-wide `OnceLock`, so the env var must be set before
@@ -42,7 +43,7 @@ fn sharded_async_terminal_semantics() {
     // SAFETY: this fn is the only test in this binary and no worker threads
     // exist yet — the first `run()` (which initializes the knob's OnceLock)
     // happens after this line.
-    unsafe { std::env::set_var("YOUPIPE_SHARDED_TERM", "1") };
+    unsafe { std::env::set_var("YOUPIPE_SHARDED_TERM_ASYNC", "1") };
 
     // ── Unordered mixed chain (sync feeder path → `spawn_single`): the
     //    terminal shards must deliver the exact multiset ──

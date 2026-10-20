@@ -43,11 +43,12 @@ pub(crate) fn batch_recv_cap() -> usize {
 
 // ── Sharded terminal channel (runtime knob, todo #1) ──
 //
-// `YOUPIPE_SHARDED_TERM=1` swaps the terminal stage's output channel from
-// one shared MPSC ring to one SPSC ring per worker (see `sharded.rs` for
-// the contention rationale). Runtime knob — not a config field — so A/B
-// benchmarks compare the same binary (recompiles swing tight benchmarks
-// ±30 % through pure code layout). Default off.
+// `YOUPIPE_SHARDED_TERM=1` swaps a multi-worker sync/expand terminal
+// stage's output channel from one shared MPSC ring to one SPSC ring per
+// worker (see `sharded.rs` for the contention rationale). Runtime knob —
+// not a config field — so A/B benchmarks compare the same binary
+// (recompiles swing tight benchmarks ±30 % through pure code layout).
+// Default off.
 static SHARDED_TERM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 pub(crate) fn sharded_term_enabled() -> bool {
@@ -56,7 +57,26 @@ pub(crate) fn sharded_term_enabled() -> bool {
         Ok(v) if v == "0" || v.is_empty() => false,
         Ok(other) => {
             panic!("YOUPIPE_SHARDED_TERM: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
-        },
+        }
+        Err(_) => false,
+    })
+}
+
+// `YOUPIPE_SHARDED_TERM_ASYNC=1` is the async-terminal flavour of the same
+// channel swap (one async shard ring per task group). Deliberately a
+// separate knob: the async flavour measured +42…+51 % on sync-fed async
+// terminals (the one-shard anchor's waker asymmetry) and only wins the
+// async-only feeder-saturated corner, so it must not ride along with the
+// sync knob (benchmarks.md "Async sharded-terminal A/B"). Default off.
+static SHARDED_TERM_ASYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn sharded_term_async_enabled() -> bool {
+    *SHARDED_TERM_ASYNC.get_or_init(|| match std::env::var("YOUPIPE_SHARDED_TERM_ASYNC") {
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" || v.is_empty() => false,
+        Ok(other) => panic!(
+            "YOUPIPE_SHARDED_TERM_ASYNC: invalid value {other:?} (leave unset or use \"0\"/\"1\")"
+        ),
         Err(_) => false,
     })
 }

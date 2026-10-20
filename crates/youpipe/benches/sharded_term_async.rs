@@ -1,14 +1,15 @@
 //! Async sharded terminal fan-in A/B (evidence bench for todo #1 residual
 //! (c)): the async terminal's `io_concurrency` consumer tasks → one output
-//! channel → the sole async collector. `YOUPIPE_SHARDED_TERM=0/1` selects
-//! the channel shape (one shared MPSC async ring vs one async shard ring
-//! per task group, shards capped at the runtime's worker threads) inside
-//! the SAME binary — drive verdicts with the runtime-knob A/B so recompile
-//! layout noise cannot leak in:
+//! channel → the sole async collector. `YOUPIPE_SHARDED_TERM_ASYNC=0/1`
+//! selects the channel shape (one shared MPSC async ring vs one async shard
+//! ring per task group, shards capped at the runtime's worker threads)
+//! inside the SAME binary — drive verdicts with the runtime-knob A/B so
+//! recompile layout noise cannot leak in:
 //!
 //! ```sh
 //! perf/bench-suite/bench_ab.sh -a off=wt -b on=wt \
-//!     -E off=YOUPIPE_SHARDED_TERM=0 -E on=YOUPIPE_SHARDED_TERM=1 \
+//!     -E off=YOUPIPE_SHARDED_TERM_ASYNC=0 \
+//!     -E on=YOUPIPE_SHARDED_TERM_ASYNC=1 \
 //!     -B sharded_term_async -r 5 --per-id \
 //!     sharded_term_async/async0_cheap sharded_term_async/async1_cheap \
 //!     sharded_term_async/async1_cpu sharded_term_async/async1_ordered_cpu

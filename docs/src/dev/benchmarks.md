@@ -696,14 +696,14 @@ terminal does not pay this asymmetry because its producers are OS threads
 progress) and the sync anchor's blocking `recv` has no waker
 registration cost either.
 
-Consequences: the async flavour stays opt-in under the same
-`YOUPIPE_SHARDED_TERM` knob (default off either way) and **todo #1 (c) is
-recommended closed as falsified** — the profitable async0 shape is a
-feeder-saturated corner, not the target workload, and a mixed pipeline
-(sync terminal + async terminal) turning the knob on for the sync win
-pays +42…+51 % on the async side. If the sync default is ever flipped
-(post-#4 soak), the async side must first be decoupled from the knob or
-given an any-of-N anchor that does not pay per-shard waker allocations.
+Consequences: **todo #1 (c) is closed as falsified** — the profitable
+async0 shape is a feeder-saturated corner, not the target workload, and a
+mixed pipeline (sync terminal + async terminal) turning the knob on for
+the sync win pays +42…+51 % on the async side. The async flavour
+therefore moved to its own `YOUPIPE_SHARDED_TERM_ASYNC` knob (2026-10-20,
+r9), removing that coupling — `YOUPIPE_SHARDED_TERM` now governs
+sync/expand terminals only, and a future sync-default flip no longer
+needs an async-side decoupling step.
 
 ### Batched ring ops four-combo A/B (`sharded_term` × `batch_recv`, 2026-09-30)
 

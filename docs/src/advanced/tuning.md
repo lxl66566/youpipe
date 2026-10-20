@@ -14,7 +14,8 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `.fence(mode)` / `.fence_with(FenceOptions, mode)` | isolation at one stage boundary (`buffer` pin) | streaming | downstream must not see partial upstream |
 | `SyncStageOptions` / `AsyncStageOptions` | per-stage workers (sync) / io_concurrency (async) / buffer (both) | streaming | stages have unequal costs |
 | `ComputePool::new_pinned(n)` | workers pinned 1:1 to allowed CPUs | pools | tight loops of large saturated fused batches (**not** streaming — see [pools](pools.md)) |
-| `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker / per-task-group SPSC shards | streaming | multi-worker (sync) or high-fanout (async) terminal stage is the bottleneck (see [dev/streaming](../dev/streaming.md)) |
+| `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker SPSC shards | streaming (sync/expand terminals) | multi-worker terminal stage is the bottleneck (see [dev/streaming](../dev/streaming.md)) |
+| `YOUPIPE_SHARDED_TERM_ASYNC` | async terminal channel = per-task-group async shards | streaming (async terminals) | async-only chain whose feeder saturates the single output ring (niche; a measured loss on sync-fed async terminals) |
 | `YOUPIPE_SPIN_ANCHOR` | adaptive pre-anchor `try_recv` spin window (µs) in sync worker recv loops | streaming | convoy collapse: serial supplier (feeder/fence) feeding ≥ ~10 workers, run times ~items × 2 µs (see [dev/streaming](../dev/streaming.md)) |
 | `YOUPIPE_FWD_BATCH` | fence forwarder pushes released batches via `try_send` | streaming | rarely useful alone; pairs with `YOUPIPE_SPIN_ANCHOR` on fence-heavy chains |
 | `YOUPIPE_BATCH_RECV` | batched ring claims on the streaming data plane | streaming | channel handoff dominates and bursts arrive in runs (see [dev/streaming](../dev/streaming.md)) |
@@ -131,18 +132,24 @@ benchmarks notes ("NT-store attribution").
 
 Terminal-stage channel shape: unset/`"0"` = one shared MPSC terminal ring
 (default), `"1"` = one SPSC ring per terminal worker (sync/expand
-terminals) or per task group (async terminals, shards capped at
-`async_workers`), round-robin burst-drained by the collector. Removes the
+terminals), round-robin burst-drained by the collector. Removes the
 send-side CAS contention and the shared-ring cache lines of the terminal
 fan-in; sync shapes measured −5…−58 % with zero regressions (2026-09-29).
-The async flavour is a measured **loss** on sync-fed async terminals
-(+42…+51 % @100K: the one-shard anchor's waker asymmetry paces the whole
-fan-in; async-only feeder-saturated chains are the sole winner at
-−57.5 % — see [dev/benchmarks](../dev/benchmarks.md)), so mixed CPU/IO
-pipelines should leave the knob off unless the sync terminal dominates.
 Channel shape only — worker count, backpressure budget, ordering and
 cancellation semantics are unchanged. Default stays off pending the
 post-convoy-fix soak.
+
+## `YOUPIPE_SHARDED_TERM_ASYNC`: async terminal sharding (streaming)
+
+The async-terminal flavour of the same channel swap (one async shard ring
+per task group, shards capped at `async_workers`): unset/`"0"` = one
+shared MPSC async ring (default), `"1"` = sharded. A separate knob on
+purpose — the async flavour is a measured **loss** on sync-fed async
+terminals (+42…+51 % @100K: the one-shard anchor's waker asymmetry paces
+the whole fan-in), so it must not ride along with `YOUPIPE_SHARDED_TERM`.
+Its sole measured winner is the async-only feeder-saturated chain at
+−57.5 % (readings: [dev/benchmarks](../dev/benchmarks.md)); reach for it
+only on that shape.
 
 ## Worker budget across stages (streaming)
 

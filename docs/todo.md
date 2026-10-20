@@ -46,8 +46,10 @@
   +42…+51% @100K（0/100）——one-shard anchor 的 waker 不对称把全局节拍拖到
   锚定环（生产者是 runtime task，满环 park 等空间而 collector 在等锚定环的
   item）；仅 async-only feeder 饱和链受益 −57.5%。代码保留 opt-in（该形状
-  有真实收益），混合链开旋钮会伤 async 侧——翻转 sync 默认前必须先解耦
-  async 侧。读数 benchmarks.md "Async sharded-terminal A/B"、机制
+  有真实收益），混合链开旋钮会伤 async 侧——**已于 2026-10-20（r9）解耦**：
+  async 终端分片独立为 `YOUPIPE_SHARDED_TERM_ASYNC` 旋钮（bench/测试同步
+  更名），`YOUPIPE_SHARDED_TERM` 只管 sync/expand 终端，sync 默认翻转不再
+  需要 async 侧前置。读数 benchmarks.md "Async sharded-terminal A/B"、机制
   streaming.md "Async terminal flavour"。(d) ~~crossfire 批量 recv 接口~~
   已落地（2026-09-30，fork `pop_batch`/
   `try_push_batch` + wrapper + 全接入点，运行时旋钮 `YOUPIPE_BATCH_RECV`，

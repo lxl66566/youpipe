@@ -176,8 +176,10 @@ fence mid-chain, for_each, cancel, small-worker shapes).
 Per-shard capacity is `max(4, buffer / workers)`: the aggregate stays at
 the single-channel backpressure point while each ring keeps enough slack
 for the burst rhythm. Scope: sync and expand terminals (both feeder
-flavours) and the async terminal (see the async flavour subsection below);
-a single-worker terminal never shards (one SPSC ring already is the plain
+flavours); the async terminal has its own `YOUPIPE_SHARDED_TERM_ASYNC`
+knob (below) — since 2026-10-20 the two are independent, so enabling the
+sync knob never drags async terminals onto the shard rings; a
+single-worker terminal never shards (one SPSC ring already is the plain
 channel).
 
 A/B (`sharded_term` evidence bench, 5-round isolated interleaved same-binary
@@ -197,7 +199,9 @@ The async terminal (`spawn_async_consumers_terminal` — both feeder
 flavours funnel there, 2026-10) is the same fan-in shape with runtime
 tasks as producers: `io_concurrency` tasks all `send().await` on one
 shared `MpscAsyncSender` clone set, so every send CASes the same sender
-cursor. Under the same `YOUPIPE_SHARDED_TERM` knob,
+cursor. Under the `YOUPIPE_SHARDED_TERM_ASYNC` knob (its own knob since
+2026-10-20 — the measured async verdict is opposite the sync one, so the
+flavour must not ride along with `YOUPIPE_SHARDED_TERM`),
 `sharded_mpsc_async_channel` swaps it for one async shard ring per
 **task group**: the shard count is `min(io_concurrency, async_workers)` —
 only `async_workers` tasks can sit inside `send` concurrently (they run on
@@ -246,7 +250,9 @@ the collector's next burst pass releases — while the collector waits on
 the anchored shard's next item — so global pacing collapses onto the
 anchor ring's rhythm; with the single shared ring every send wakes the
 collector directly. Producers as runtime tasks (not OS threads) are what
-makes the asymmetry bite. The flavour stays opt-in under the same knob;
+makes the asymmetry bite. The flavour stays opt-in under its own
+`YOUPIPE_SHARDED_TERM_ASYNC` knob (decoupled from `YOUPIPE_SHARDED_TERM`
+2026-10-20, r9 — the prerequisite the sync-default flip was waiting on);
 (c) closed as falsified — readings and the mixed-pipeline warning in
 benchmarks.md "Async sharded-terminal A/B".
 

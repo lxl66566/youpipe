@@ -1520,8 +1520,8 @@ pub enum FinalRx<T: Send + Unpin + 'static> {
     /// Per-shard async variant — the async terminal's consumer tasks fan
     /// their output into one async shard ring per task group and the
     /// collector aggregates them (the async flavour of
-    /// `YOUPIPE_SHARDED_TERM=1`, todo #1 residual (c)). Produced by the
-    /// `AsyncSharded` factory of the async terminal selector.
+    /// `YOUPIPE_SHARDED_TERM_ASYNC=1`, todo #1 residual (c)). Produced by
+    /// the `AsyncSharded` factory of the async terminal selector.
     #[cfg(feature = "tokio-runtime")]
     AsyncSharded(ShardedAsyncReceiver<(u64, T)>),
 }
@@ -1754,6 +1754,13 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// (see `handoff/sharded.rs`). Channel shape only — worker count, the
     /// parking lease budget, and every semantic contract are unchanged.
     sharded_terminal: bool,
+    /// Runtime knob `YOUPIPE_SHARDED_TERM_ASYNC` (read once per run in
+    /// [`StreamPipe::try_exec`]): the async-terminal flavour of the same
+    /// channel swap — one async shard ring per task group. A separate knob
+    /// because the async flavour's verdict is opposite on sync-fed async
+    /// terminals (see `handoff/mod.rs`).
+    #[cfg(feature = "tokio-runtime")]
+    sharded_async_terminal: bool,
     /// The pool-capacity lease backing pool mode (`dedicated_threads ==
     /// false`); `None` in dedicated mode. Every channel-parking job
     /// submitted for this run is wrapped through [`ParkingLease::wrap_job`].
@@ -1853,16 +1860,16 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     }
 
     /// Shard count for an async terminal whose consumer fan-out is
-    /// `concurrency` tasks (`0` = keep the single channel). Same knob as the
-    /// sync side; the shard count is additionally capped at the async
-    /// runtime's worker-thread count: only that many tasks can be inside
-    /// `send` concurrently, so shards beyond it cannot reduce producer
-    /// contention and only add collector pass cost and per-run channel
-    /// construction (a small-`n` run would otherwise build
+    /// `concurrency` tasks (`0` = keep the single channel). Gated on the
+    /// `YOUPIPE_SHARDED_TERM_ASYNC` knob; the shard count is additionally
+    /// capped at the async runtime's worker-thread count: only that many
+    /// tasks can be inside `send` concurrently, so shards beyond it cannot
+    /// reduce producer contention and only add collector pass cost and
+    /// per-run channel construction (a small-`n` run would otherwise build
     /// `io_concurrency` rings up front — up to 512).
     #[cfg(feature = "tokio-runtime")]
     fn sharded_async_terminal(&self, concurrency: usize) -> usize {
-        if !self.sharded_terminal || concurrency <= 1 {
+        if !self.sharded_async_terminal || concurrency <= 1 {
             return 0;
         }
         concurrency.min(self.config.async_workers.max(1))
@@ -2706,8 +2713,8 @@ where
     ) -> FinalRx<M> {
         // Terminal async stage: the collector is the sole consumer of the
         // output, so use the lighter MPSC async channel (store-based dequeue,
-        // no `lock cmpxchg`) — or, under `YOUPIPE_SHARDED_TERM=1`, one async
-        // shard ring per task group. Input channel stays MPMC
+        // no `lock cmpxchg`) — or, under `YOUPIPE_SHARDED_TERM_ASYNC=1`, one
+        // async shard ring per task group. Input channel stays MPMC
         // (`prev.spawn_for_async`) — multiple async consumer tasks share the
         // input via clone.
         let a_in_rx = self.prev.spawn_for_async::<R>(rx, ctx);
@@ -2757,8 +2764,8 @@ where
         // Terminal async stage on the async-feeder path: same bridging as
         // `spawn_async_feeder`, but the consumer fan-out writes a
         // single-consumer terminal (shared MPSC ring, or per-task-group
-        // shards under `YOUPIPE_SHARDED_TERM=1`), mirroring `spawn_single`
-        // vs `spawn`.
+        // shards under `YOUPIPE_SHARDED_TERM_ASYNC=1`), mirroring
+        // `spawn_single` vs `spawn`.
         let prev_rx = self.prev.spawn_async_feeder::<R>(rx, ctx);
         let buffer = ctx.stage_buffer(self.opts.buffer, ctx.stage_io_concurrency(&self.opts));
         let a_in_rx = bridge_final_rx_to_async::<Prev::Out, R>(prev_rx, buffer, ctx);
@@ -2883,9 +2890,9 @@ impl<M: Send + Unpin + 'static> AsyncOutChannel<M> for AsyncMpsc {
 }
 
 /// Per-task-group async shard rings ([`sharded_mpsc_async_channel`]) — the
-/// `YOUPIPE_SHARDED_TERM=1` flavour of the async terminal (todo #1 residual
-/// (c); see `handoff/sharded.rs` for the contention rationale and the waker
-/// semantics of the one-shard anchor). Selected by the runtime
+/// `YOUPIPE_SHARDED_TERM_ASYNC=1` flavour of the async terminal (todo #1
+/// residual (c); see `handoff/sharded.rs` for the contention rationale and
+/// the waker semantics of the one-shard anchor). Selected by the runtime
 /// `sharded_async_terminal` branch, never constructed otherwise.
 #[cfg(feature = "tokio-runtime")]
 struct AsyncSharded;
@@ -2968,9 +2975,9 @@ where
 }
 
 /// Terminal flavour of [`spawn_async_consumers_into`]: the single MPSC async
-/// ring, or — under `YOUPIPE_SHARDED_TERM=1` — the per-task-group shard
-/// rings. Every terminal entry point of the async stage funnels here, so
-/// the knob covers both feeder flavours.
+/// ring, or — under `YOUPIPE_SHARDED_TERM_ASYNC=1` — the per-task-group
+/// shard rings. Every terminal entry point of the async stage funnels here,
+/// so the knob covers both feeder flavours.
 #[cfg(feature = "tokio-runtime")]
 fn spawn_async_consumers_terminal<In, M, Fut, F, R>(
     f: F,
@@ -3698,7 +3705,7 @@ trait Terminal<T: Send + Unpin + 'static>: Sized {
     ) -> impl Future<Output = Self::Out>;
     /// Async sharded-terminal counterpart of [`Self::drain_async`] — the
     /// collector aggregates the async terminal's shard rings (the
-    /// `YOUPIPE_SHARDED_TERM=1` async path).
+    /// `YOUPIPE_SHARDED_TERM_ASYNC=1` async path).
     #[cfg(feature = "tokio-runtime")]
     fn drain_async_sharded(
         self,
@@ -4603,6 +4610,8 @@ where
             per_stage_parallelism,
             dedicated_threads,
             sharded_terminal: crate::handoff::sharded_term_enabled(),
+            #[cfg(feature = "tokio-runtime")]
+            sharded_async_terminal: crate::handoff::sharded_term_async_enabled(),
             lease,
             worker_slots_left: Cell::new(worker_slots_left),
             stages_left: Cell::new(stages_left),
@@ -4886,6 +4895,48 @@ where
 mod tests {
     use super::*;
 
+    /// The sync and async sharded-terminal flags are independent inputs
+    /// (`YOUPIPE_SHARDED_TERM` / `YOUPIPE_SHARDED_TERM_ASYNC`): the async
+    /// selector reads only its own flag, so enabling the sync knob must not
+    /// drag async terminals onto the shard rings (a measured +42…+51 %
+    /// regression on sync-fed async terminals) and vice versa.
+    #[cfg(all(test, feature = "tokio-runtime"))]
+    #[test]
+    fn sharded_terminal_flags_are_independent() {
+        use crate::runtime::TokioPool;
+
+        let cfg = PipelineConfig::default().with_async_workers(4);
+        let pool = TokioPool::build(1).expect("build test runtime");
+        let ctx = |sync: bool, async_: bool| {
+            StreamCtx::<TokioPool> {
+                config: &cfg,
+                cancel: None,
+                n: 4,
+                per_stage_parallelism: 1,
+                dedicated_threads: false,
+                sharded_terminal: sync,
+                sharded_async_terminal: async_,
+                lease: None,
+                worker_slots_left: Cell::new(0),
+                stages_left: Cell::new(0),
+                in_flight: Cell::new(0),
+                compute_pool: None,
+                async_pool: Some(pool.clone()),
+                cached_pool: OnceLock::new(),
+                async_panic: OnceLock::new(),
+                _marker: PhantomData,
+            }
+        };
+        // Sync knob alone: the async terminal stays on the single ring.
+        assert_eq!(ctx(true, false).sharded_async_terminal(128), 0);
+        // Async knob alone: shards form regardless of the sync flag, capped
+        // at async_workers.
+        assert_eq!(ctx(false, true).sharded_async_terminal(128), 4);
+        assert_eq!(ctx(true, true).sharded_async_terminal(128), 4);
+        // Concurrency floor: one task is already a single SPSC ring.
+        assert_eq!(ctx(true, true).sharded_async_terminal(1), 0);
+    }
+
     /// `Feeder::finish` re-raises the caught feeder-job payload (the
     /// panic-propagation contract inherited from the old feeder thread's
     /// `join`) and is a no-op for the inline variant.
@@ -5030,6 +5081,8 @@ mod tests {
             per_stage_parallelism: 1,
             dedicated_threads: false,
             sharded_terminal: false,
+            #[cfg(feature = "tokio-runtime")]
+            sharded_async_terminal: false,
             lease: None,
             worker_slots_left: Cell::new(0),
             stages_left: Cell::new(0),
