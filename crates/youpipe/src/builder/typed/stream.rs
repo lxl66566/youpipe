@@ -652,6 +652,17 @@ fn spawn_stage_fanout<I, O, Tx, R>(
     R: AsyncRuntime,
 {
     let stage = Arc::new(stage);
+    // Multi-consumer ring: the workers below share `rx`, so each claim is
+    // capped at a per-worker share of the batch cap — one head CAS must not
+    // monopolize a whole ready burst that the stage's other workers should
+    // split. Sole-consumer sites (collector, feeder, fence forwarder) keep
+    // the full cap; there a big claim starves nobody. Found when the pair
+    // became the default: a 40-item burst with 2 workers and 5 ms items
+    // serialized onto one worker (max concurrency 1,
+    // `test_stage_options_workers_pins_parallelism`).
+    let workers = txs.len().max(1);
+    let batch_cap = crate::handoff::batch_recv_cap();
+    let claim_cap = if batch_cap == 0 { 0 } else { (batch_cap / workers).max(1) };
     // Collect all worker closures and submit as a single batch. This reduces
     // injector-queue notification overhead from N SeqCst fences + N JEC
     // increments (one per `submit`) down to 1 (one `submit_batch`), which
@@ -667,9 +678,9 @@ fn spawn_stage_fanout<I, O, Tx, R>(
                 // Adaptive pre-anchor spin state (todo #4); plain locals.
                 let mut spin = AnchorSpin::new(crate::handoff::spin_anchor_us());
                 // Batch claim scratch (YOUPIPE_BATCH_RECV, todo #1 residual
-                // (d)); cap 0 keeps the per-item anchor + burst rhythm.
-                let batch_cap = crate::handoff::batch_recv_cap();
-                let mut scratch: Vec<(u64, I)> = Vec::with_capacity(batch_cap.max(1));
+                // (d)); cap 0 keeps the per-item anchor + burst rhythm. The
+                // claim cap is the per-worker share (see `claim_cap` above).
+                let mut scratch: Vec<(u64, I)> = Vec::with_capacity(claim_cap.max(1));
                 'outer: loop {
                     // Anchor + burst-drain via `anchor_claim`: absorb
                     // already-queued items while the channel's cache lines are
@@ -679,10 +690,11 @@ fn spawn_stage_fanout<I, O, Tx, R>(
                     // while the burst winners drain the backlog — the
                     // contending population thins itself
                     // instead of every worker hammering the ring per item.
-                    // With batching on, the burst claims whole ready runs with
-                    // one head CAS per run; with the spin knob on, the anchor
-                    // rides out empty micro-gaps before parking.
-                    let claimed = anchor_claim(&mut spin, &rx, &mut scratch, batch_cap);
+                    // With batching on, the burst claims ready runs (≤ the
+                    // per-worker share) with one head CAS per run; with the
+                    // spin knob on, the anchor rides out empty micro-gaps
+                    // before parking.
+                    let claimed = anchor_claim(&mut spin, &rx, &mut scratch, claim_cap);
                     if claimed == 0 {
                         break;
                     }
@@ -728,6 +740,12 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
     R: AsyncRuntime,
 {
     let expand = Arc::new(expand);
+    // Per-worker claim share — see `spawn_stage_fanout` (an expand worker
+    // turns one input into many outputs, so a monopolized burst costs even
+    // more wall time than on a plain stage).
+    let workers = txs.len().max(1);
+    let batch_cap = crate::handoff::batch_recv_cap();
+    let claim_cap = if batch_cap == 0 { 0 } else { (batch_cap / workers).max(1) };
     let jobs: Vec<_> = txs
         .into_iter()
         .map(|tx| {
@@ -758,13 +776,13 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
                     }
                     open
                 };
-                // Batch claim scratch (see `spawn_stage`).
-                let batch_cap = crate::handoff::batch_recv_cap();
-                let mut scratch: Vec<(u64, I)> = Vec::with_capacity(batch_cap.max(1));
+                // Batch claim scratch (see `spawn_stage`); the claim cap is
+                // the per-worker share (see `claim_cap` above).
+                let mut scratch: Vec<(u64, I)> = Vec::with_capacity(claim_cap.max(1));
                 'outer: loop {
                     // Anchor + burst-drain, same shape as `spawn_stage`
                     // (batched + spin-gated via `anchor_claim` there too).
-                    let claimed = anchor_claim(&mut spin, &rx, &mut scratch, batch_cap);
+                    let claimed = anchor_claim(&mut spin, &rx, &mut scratch, claim_cap);
                     if claimed == 0 {
                         break;
                     }
@@ -1749,7 +1767,7 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// `thread::spawn` per worker.
     pub dedicated_threads: bool,
     /// Runtime knob `YOUPIPE_SHARDED_TERM` (read once per run in
-    /// [`StreamPipe::try_exec`]): when set, a multi-worker terminal sync /
+    /// [`StreamPipe::try_exec`]; default on): a multi-worker terminal sync /
     /// expand stage fans its output channel into per-worker SPSC shards
     /// (see `handoff/sharded.rs`). Channel shape only — worker count, the
     /// parking lease budget, and every semantic contract are unchanged.

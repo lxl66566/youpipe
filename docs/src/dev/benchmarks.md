@@ -576,11 +576,13 @@ No id regressed; every cross-side round pair favoured the ON side
 threshold, so the knob ships without an auto gate. Mechanism: the send-side
 `compare_exchange` contention and the shared-ring cache lines vanish; the
 collector pays a round-robin pass over k rings instead (k−1 failed
-`try_recv` per pass, amortised over the burst). Default remains off
+`try_recv` per pass, amortised over the burst). Default remained off
 pending soak of fence/convoy interactions (todo #4): during smoke the OFF
 side entered the known long-run convoy burn (26 cores spinning, collector
 parked inside crossfire `_read`'s stamp wait) while the ON side ran clean
-— suggestive, not a verdict (single observation, no multi-seed).
+— suggestive, not a verdict (single observation, no multi-seed). The
+soak later promoted the knob (paired with batching) to the default — see
+"Default-policy soak + pair promotion".
 
 Control runs: `mixed_load/youpipe_stream_cpu` (fused pass-through — no
 terminal channel) off vs on is noise (+0.6 %/−0.1 %, 3 rounds), confirming
@@ -640,10 +642,11 @@ Readings:
   (the async0 drift asymmetry is inside the noise band); peak RSS ON ≤ OFF
   by 1–7 % (32 shards do not register against the ~5.5 MB baseline).
 
-Verdict: default stays **off**. The soak supports opt-in for
-contention-shaped terminals (`single`/fence families) but shows a real
-regression face on back-to-back sync2; the decision must be re-made after
-the convoy fix lands (#4) — this table is the pre-fix baseline.
+Verdict at the time: default stays **off**. The soak supported opt-in for
+contention-shaped terminals (`single`/fence families) but showed a real
+regression face on back-to-back sync2. The re-made decision (post-#4-fix,
+r9) promoted the pair to the default and dissolved this table's
+counter-evidence — see "Default-policy soak + pair promotion".
 
 
 ### Async sharded-terminal A/B (`sharded_term_async`, 2026-09-29)
@@ -758,11 +761,90 @@ Readings:
   round (10.8 ms) in 3, on settled slow-mode throughout (122–131 ms) —
   inconclusive at n=3 given the pathology; re-measure after #4 lands.
 
-Default policy: `YOUPIPE_BATCH_RECV` stays opt-in (default off). Pairing
-advice goes in the knob docs: enable together with `YOUPIPE_SHARDED_TERM`
+Default policy at landing: `YOUPIPE_BATCH_RECV` stayed opt-in. Pairing
+advice went in the knob docs: enable together with `YOUPIPE_SHARDED_TERM`
 for fan-in shapes (dominant 25/25 wins) and where the sharded terminal
 shows round-to-round bimodality; keep it off for 1K expand-shaped short
-runs and do not enable it alone on a shared terminal ring.
+runs and do not enable it alone on a shared terminal ring. Superseded
+2026-10-20: the pair is now the default (see "Default-policy soak + pair
+promotion" below).
+
+### Default-policy soak + pair promotion (2026-10-20, r9)
+
+The post-convoy-fix re-run of the sharded-terminal default soak (the
+pre-fix baseline is the section above; both #4 fix branches are merged
+now), on the r9 tree with the async flavour already decoupled into
+`YOUPIPE_SHARDED_TERM_ASYNC`. Harness: `convoy-probe`, one shape × knob
+set per fresh process, **12 processes × 12 runs per cell** (`taskset -c
+1-31`, `--threads`, `--delay-ms` 0/300 alternating per process pair, side
+order flipped per pair). Sides: off = `YOUPIPE_SHARDED_TERM=0
+YOUPIPE_BATCH_RECV=0`, sharded = terminal knob alone, pair = both on (the
+async cells' "sharded" side additionally verified the decoupling leak
+check — the sync knob does not touch the async terminal).
+
+First finding — **sharded alone is not promotable** (pre-share-cap tree,
+144 runs/cell): on `single` the median wins (20.9 vs 31.1 ms) but the
+convoy slow mode returns in ~30 % of runs regardless of cadence
+(delay-0: 25/72, delay-300: 19/72 runs >40 ms; p90 80–100 ms, mean 37.3
+vs off 35.4) — OFF holds a stable 30 ms contention floor with a tight
+p90 (36.5). The pre-fix soak's counter-evidence (sync2's 8.9 ms
+back-to-back fast mode that sharded never reached) **dissolved on the
+merged tree**: OFF now floors at 21.5 ms and both sides sit at ~28 ms.
+
+Second finding — **the pair dominates every cell** (share-cap tree, see
+below; means in ms, 144 runs/cell, async2 48):
+
+| shape @100K | off | batch alone | pair | pair vs off |
+| ----------- | --- | ----------- | ---- | ----------- |
+| single      | 35.7 (p90 36.5, max 138) | 27.9 | **13.4 (p90 15.5, max 18.2)** | −62 % |
+| sync2       | 29.5 | 22.3 | 24.0 | −19 % |
+| fence       | 157.6 | 99.1 | 98.4 | −37 % |
+| async2      | 230.1 | 139.5 | 109.0 (p50 28.9 vs off 242.4) | −53 % |
+
+At 1K (144 runs/cell): single 571→403 µs mean (p50 421→292), sync2
+547→461 µs mean (p50 426→334; p90 653→786 — the one lean-anywhere tail,
+mean and p50 clearly better). The pair's single-cell tail is *tighter
+than the old default's*: max 18.2 ms vs off's 138 ms — batched claiming
+removes the sharded-alone bimodality under back-to-back cadence too, not
+just under criterion rounds. Batch ALONE measured tight and better-than-
+off everywhere in this session (the four-combo's pre-merge bimodality
+did not reproduce post-merge); sync2 even prefers it over the pair, but
+`single`/`expand` want the sharded ring for the send side.
+
+**Parallelism fix riding along (the share cap):** promoting the pair
+exposed what the cheap-item benches never could — `claim_poll`'s whole-
+run batch claim lets ONE worker monopolize a small burst its idle peers
+should split (`test_stage_options_workers_pins_parallelism`: a 40-item
+burst, 2-worker pin, 5 ms items → max concurrency 1). The stage/expand
+worker loops now cap each claim at `max(1, batch_cap / workers)` — a
+per-worker share of the ring; sole-consumer sites (collector, feeder,
+fence forwarder) keep the full cap, where a big claim starves nobody.
+The soak above was re-run on the share-cap tree (the numbers in the
+table); the pair's wins survive it (trickle-fed rings claim 1–3 items
+either way, so the share only binds on bursts).
+
+Criterion confirmation on the final binary (`bench_ab.sh -E`, old
+defaults `=0/=0` vs new default unset, 3 per-id isolated rounds; the
+flip changes only the readers' defaults, so this re-measures the
+four-combo on the promotion tree): every `sharded_term` id won 9/9 —
+@100K single_unordered 29.9→11.9 ms, single_ordered 53.1→12.3 ms (old
+side bimodal, 75 % spread), workers2 4.46→1.14 ms, expand 47.3→21.7 ms,
+multi2 23.2→18.3 ms; @1K −21…−47 %; `sync_fuse/fence_infra/100000`
+152.6→111.1 ms (old side in the documented collapsed mode); the fused
+control `mixed_load/youpipe_stream_cpu/1000` −0.5 % noise (the 100K
+control read +14.6 % with 19 % spread and 2/9 dominance — the same
+control measured ±0.5 % in the four-combo, and the knobs cannot touch
+the fused path, which has no channels; treat it as draw wobble).
+
+Decision: **the pair is the default** — `YOUPIPE_SHARDED_TERM` and
+`YOUPIPE_BATCH_RECV` unset = on (cap 64); `"0"` on either recovers the
+shared-ring / per-item configuration. `YOUPIPE_SHARDED_TERM_ASYNC` stays
+off (falsified on sync-fed async terminals), and `YOUPIPE_SPIN_ANCHOR` /
+`YOUPIPE_FWD_BATCH` stay opt-in (their cost faces are load-shape-local:
+the spin's 2–4× lucky-fast-seed cost and idle burn). Note for
+deterministic-Ir baselines: the flip changes the streaming paths'
+instruction counts by design — re-save gungraun baselines after this
+commit.
 
 ### Adjacent-sync fusion A/B (`sync_fuse`, 2026-09-29)
 

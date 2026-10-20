@@ -14,7 +14,8 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `.fence(mode)` / `.fence_with(FenceOptions, mode)` | isolation at one stage boundary (`buffer` pin) | streaming | downstream must not see partial upstream |
 | `SyncStageOptions` / `AsyncStageOptions` | per-stage workers (sync) / io_concurrency (async) / buffer (both) | streaming | stages have unequal costs |
 | `ComputePool::new_pinned(n)` | workers pinned 1:1 to allowed CPUs | pools | tight loops of large saturated fused batches (**not** streaming — see [pools](pools.md)) |
-| `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker SPSC shards | streaming (sync/expand terminals) | multi-worker terminal stage is the bottleneck (see [dev/streaming](../dev/streaming.md)) |
+| `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker SPSC shards (default on; `"0"` = shared ring) | streaming (sync/expand terminals) | leave on for multi-worker terminals; the shared ring only wins single-worker terminals, which never shard anyway |
+| `YOUPIPE_BATCH_RECV` | batched ring claims on the streaming data plane (default on, cap 64; `"0"` = per-item) | streaming | leave on; pairs with `YOUPIPE_SHARDED_TERM` — the two share the default |
 | `YOUPIPE_SHARDED_TERM_ASYNC` | async terminal channel = per-task-group async shards | streaming (async terminals) | async-only chain whose feeder saturates the single output ring (niche; a measured loss on sync-fed async terminals) |
 | `YOUPIPE_SPIN_ANCHOR` | adaptive pre-anchor `try_recv` spin window (µs) in sync worker recv loops | streaming | convoy collapse: serial supplier (feeder/fence) feeding ≥ ~10 workers, run times ~items × 2 µs (see [dev/streaming](../dev/streaming.md)) |
 | `YOUPIPE_FWD_BATCH` | fence forwarder pushes released batches via `try_send` | streaming | rarely useful alone; pairs with `YOUPIPE_SPIN_ANCHOR` on fence-heavy chains |
@@ -100,22 +101,24 @@ back-to-back `try_send`, parking at most once per full ring. Measured no
 independent win while downstream workers still park per item on recv; keep
 for chains that already run `YOUPIPE_SPIN_ANCHOR`.
 
-`YOUPIPE_BATCH_RECV`: unset/`"0"` = off (default), `"1"` = on with the
-default cap 64, `"N"` (2..=4096) = on with cap N. Batches the streaming
-data plane's cursor updates: the collector's terminal drain, the stage /
-expand / fence-forwarder burst phase and the feeder push loop claim runs
-of consecutive ring slots with one atomic cursor update per run instead
-of one per item (fork extension — mechanism and the four-combo
-`sharded_term` × `batch_recv` verdict in [dev/streaming](../dev/streaming.md)
-and [dev/benchmarks](../dev/benchmarks.md)). Backpressure granularity,
-item order, capacity and cancellation semantics are unchanged; async
-terminals keep per-item recv. Default off: on a shared terminal ring
-batching alone is bimodal at 100K (convoy mode, todo #4) and regresses
-short 1K runs; the recommended pairing is with
-`YOUPIPE_SHARDED_TERM=1`, where it takes dominant fan-in wins
-(`workers2` −69 %, `single_unordered_cpu` −34 %, `multi2` −15 %) and
-removes the sharded terminal's round-to-round bimodality (readings:
-[dev/benchmarks](../dev/benchmarks.md) "Batched ring ops four-combo").
+`YOUPIPE_BATCH_RECV`: default on with cap 64 (unset or `"1"`); `"0"` =
+the per-item loops; `"N"` (2..=4096) = on with cap N. Batches the
+streaming data plane's cursor updates: the collector's terminal drain,
+the stage / expand / fence-forwarder burst phase and the feeder push loop
+claim runs of consecutive ring slots with one atomic cursor update per
+run instead of one per item (fork extension — mechanism in
+[dev/streaming](../dev/streaming.md), verdicts in
+[dev/benchmarks](../dev/benchmarks.md)). Backpressure granularity, item
+order, capacity and cancellation semantics are unchanged; async terminals
+keep per-item recv. Stage/expand workers claim at most `cap / workers`
+items per claim (a whole-run claim would let one worker monopolize a
+small burst its idle peers should split). Default on since 2026-10-20,
+promoted together with `YOUPIPE_SHARDED_TERM`: the pair measured −19…−62 %
+mean on every multi-process soak cell with the sharded-alone bimodality
+removed, and `"0"` on both knobs is the documented escape hatch to the
+shared-ring per-item configuration (readings:
+[dev/benchmarks](../dev/benchmarks.md) "Default-policy soak + pair
+promotion").
 
 Why auto is safe for consumers that read the output right after collect
 (the feared DRAM round-trip): measured on the reference machine
@@ -130,14 +133,19 @@ knob on (100 K items measured +9–11 %). Data in the developer guide's
 benchmarks notes ("NT-store attribution").
 ## `YOUPIPE_SHARDED_TERM`: terminal fan-in sharding (streaming)
 
-Terminal-stage channel shape: unset/`"0"` = one shared MPSC terminal ring
-(default), `"1"` = one SPSC ring per terminal worker (sync/expand
-terminals), round-robin burst-drained by the collector. Removes the
-send-side CAS contention and the shared-ring cache lines of the terminal
-fan-in; sync shapes measured −5…−58 % with zero regressions (2026-09-29).
-Channel shape only — worker count, backpressure budget, ordering and
-cancellation semantics are unchanged. Default stays off pending the
-post-convoy-fix soak.
+Terminal-stage channel shape: default (unset or `"1"`) = one SPSC ring
+per terminal worker (sync/expand terminals), round-robin burst-drained
+by the collector; `"0"` = one shared MPSC terminal ring. Sharding
+removes the send-side CAS contention and the shared-ring cache lines of
+the terminal fan-in (−5…−58 % on every measured shape, zero
+regressions). Channel shape only — worker count, backpressure budget,
+ordering and cancellation semantics are unchanged. Default on since
+2026-10-20, promoted together with `YOUPIPE_BATCH_RECV`: sharded alone
+is bimodal on single-stage fan-in shapes (median wins, convoy slow mode
+in ~30 % of back-to-back runs), while the pair with batched claiming is
+tight and wins every soak cell — turning either knob off should turn
+both off (readings: [dev/benchmarks](../dev/benchmarks.md)
+"Default-policy soak + pair promotion").
 
 ## `YOUPIPE_SHARDED_TERM_ASYNC`: async terminal sharding (streaming)
 

@@ -12,11 +12,18 @@ pub(crate) mod sharded;
 // and the feeder's push loop claim/send runs of consecutive ring slots
 // with one atomic cursor update instead of one per item. Runtime knob (not
 // a config field) so A/B benchmarks compare the same binary — recompile
-// layout noise swings tight benches by tens of percent. Default off.
+// layout noise swings tight benches by tens of percent.
 //
-// Values: unset or "0" = off; "1" = on with the default batch cap;
-// "N" (>=2) = on with cap N, clamped to 4096 (the cap bounds both the
-// claim size and the per-consumer scratch buffer).
+// Default ON (cap = `DEFAULT_BATCH_RECV_CAP`), promoted 2026-10-20 with
+// `YOUPIPE_SHARDED_TERM`: batched claiming is what removes the sharded
+// terminal's bimodal slow mode (the pair measured tight tails and mean
+// wins on every soak cell; batch ALONE on a shared terminal ring is
+// bimodal — see docs benchmarks.md "Default-policy soak"). Set "0" to
+// recover the per-item loops.
+//
+// Values: unset = on with the default batch cap; "0" = off; "1" = on with
+// the default cap; "N" (>=2) = on with cap N, clamped to 4096 (the cap
+// bounds both the claim size and the per-consumer scratch buffer).
 
 /// Default batch cap: comfortably above the observed terminal burst sizes
 /// (p50 burst ~3, ordered ~24) while keeping the scratch buffer in one or
@@ -28,8 +35,8 @@ static BATCH_RECV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 /// Batch cap for the streaming data plane; 0 = batching off.
 pub(crate) fn batch_recv_cap() -> usize {
     *BATCH_RECV.get_or_init(|| match std::env::var("YOUPIPE_BATCH_RECV") {
-        Ok(v) if v == "1" => DEFAULT_BATCH_RECV_CAP,
-        Ok(v) if v == "0" || v.is_empty() => 0,
+        Ok(v) if v == "1" || v.is_empty() => DEFAULT_BATCH_RECV_CAP,
+        Ok(v) if v == "0" => 0,
         Ok(v) => match v.parse::<usize>() {
             Ok(n) if (2..=4096).contains(&n) => n,
             _ => panic!(
@@ -37,7 +44,8 @@ pub(crate) fn batch_recv_cap() -> usize {
                  in 2..=4096)"
             ),
         },
-        Err(_) => 0,
+        // Unset = the default-on policy (see the knob comment above).
+        Err(_) => DEFAULT_BATCH_RECV_CAP,
     })
 }
 
@@ -48,17 +56,23 @@ pub(crate) fn batch_recv_cap() -> usize {
 // worker (see `sharded.rs` for the contention rationale). Runtime knob —
 // not a config field — so A/B benchmarks compare the same binary
 // (recompiles swing tight benchmarks ±30 % through pure code layout).
-// Default off.
+//
+// Default ON (promoted 2026-10-20 together with `YOUPIPE_BATCH_RECV`):
+// sharded alone is bimodal on single-stage fan-in shapes (median wins but
+// the convoy slow mode returns in ~30 % of back-to-back runs); the pair
+// with batched claiming is tight and wins every soak cell. "0" recovers
+// the shared ring. See docs benchmarks.md "Default-policy soak".
 static SHARDED_TERM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 pub(crate) fn sharded_term_enabled() -> bool {
     *SHARDED_TERM.get_or_init(|| match std::env::var("YOUPIPE_SHARDED_TERM") {
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" || v.is_empty() => false,
+        Ok(v) if v == "1" || v.is_empty() => true,
+        Ok(v) if v == "0" => false,
         Ok(other) => {
             panic!("YOUPIPE_SHARDED_TERM: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
         }
-        Err(_) => false,
+        // Unset = the default-on policy (see the knob comment above).
+        Err(_) => true,
     })
 }
 

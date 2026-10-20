@@ -136,7 +136,10 @@ cache lines — the hotpath audit (todo #1, 2026-09-28) found the engine paced
 by exactly this collector-side data plane (~365 ns/item, ~20x the channel's
 bare capacity).
 
-`YOUPIPE_SHARDED_TERM=1` (opt-in, default off) swaps the terminal channel
+`YOUPIPE_SHARDED_TERM` (default **on** since 2026-10-20, promoted
+together with `YOUPIPE_BATCH_RECV` — sharded alone is bimodal on
+single-stage fan-in shapes, the pair is tight; `"0"` recovers the shared
+ring) swaps the terminal channel
 for **one SPSC ring per worker** (`handoff/sharded.rs`):
 
 ```
@@ -187,11 +190,15 @@ knob runs, 32 cores): **no regression anywhere**, all 12 ids dominant or
 stable improvements — 100K: single cheap −31.7 %, single cpu −29.1 %,
 ordered −29.6 %, expand cheap −58.5 %, workers2 −23.2 %, multi2 −8.0 %;
 1K: −4.9 % … −42.5 % (workers2 included, so no auto threshold is needed).
-Full table in benchmarks.md. Default stays off pending broader soak (fence
-/ convoy interactions, todo #4); the pathological long-run convoy seen on
+Full table in benchmarks.md. The default stayed off until the
+post-convoy-fix soak; the pathological long-run convoy seen on
 the OFF side during smoke (26-core burn, collector spinning inside
 crossfire `_read`'s stamp wait) did not reproduce on the ON side — tracked
-under todo #4.
+under todo #4. The 2026-10-20 soak then promoted the pair
+(`YOUPIPE_SHARDED_TERM` + `YOUPIPE_BATCH_RECV`) to the default — sharded
+ALONE is bimodal on the single-stage shape (median wins, convoy slow mode
+in ~30 % of runs); batched claiming removes that mode. Readings:
+benchmarks.md "Default-policy soak + pair promotion".
 
 #### Async terminal flavour (per-task-group async shards)
 
@@ -263,8 +270,10 @@ the collector's `try_recv` pays one `recv` SeqCst store per item on lines the
 senders keep invalidating (hotpath: p50 551 ns/item, 31-sender ping-pong),
 and the single feeder pays one tail CAS per item into the 31-consumer input
 ring (901 ns/item avg, 94 % of feeder wall — see benchmarks.md
-"true-streaming"). `YOUPIPE_BATCH_RECV` (unset = off) amortizes the cursor
-updates over runs of consecutive slots (fork extension, same opt-in family
+"true-streaming"). `YOUPIPE_BATCH_RECV` (default **on** at cap 64 since
+2026-10-20, promoted with `YOUPIPE_SHARDED_TERM`; `"0"` = the per-item
+loops) amortizes the cursor
+updates over runs of consecutive slots (fork extension, same knob family
 as `YOUPIPE_SHARDED_TERM`; A/B through the runtime knob, same binary):
 
 - **MPSC `pop_batch`** (`array_queue_mpsc`, the terminal rings): one `recv`
@@ -308,6 +317,18 @@ and the feeder push loop (`push_items`: stage a batch, send the free
 prefix, per-item send the tail). Cap 0 = the historical per-item loops
 byte-for-byte. Async terminals keep per-item `try_recv` (p50 ≈ 20 ns,
 nothing to amortize).
+
+**Per-worker claim share** (2026-10-20, rode along with the default
+promotion): the stage/expand worker loops cap each claim at
+`max(1, cap / stage_workers)` — a whole-run batch claim otherwise lets
+ONE worker monopolize a small burst its parked peers should split (a
+40-item burst on a 2-worker pin with 5 ms items ran at max concurrency 1;
+found by `test_stage_options_workers_pins_parallelism` the moment the
+pair became the default — cheap-item benches cannot see it, the claim
+finishes before the second worker wakes). Sole-consumer sites (collector,
+feeder, fence forwarder) keep the full cap — a big claim there starves
+nobody. Trickle-fed rings claim 1–3 items either way, so the share only
+binds on bursts; the promotion soak confirmed the pair's wins survive it.
 
 Correctness notes: the batch claims exactly-once runs (stamp-walk + single
 CAS protocol, fork unit tests + `tests/batch_recv.rs` exactly-once suites
@@ -796,17 +817,21 @@ noted.
    −0.9/−1.2 %, noise-level, as predicted (consistency, not throughput).
 
 4. **Knob promotion soak (`YOUPIPE_SPIN_ANCHOR` / `YOUPIPE_SHARDED_TERM` /
-   `YOUPIPE_BATCH_RECV`)** (decision item). All three data-plane knobs stay
-   default-off pending broader soak, and each has measured wins in its
-   target regime (convoy catastrophic-mode elimination; sharded terminal
-   −8…−58 % on its bench; batch recv per-site wins). A knob nobody sets is
-   a perf feature nobody gets: run the multi-process soak matrix
-   (fence/convoy shapes × the full test suite × N processes, the
-   "Convoy collapse forensics" methodology) and promote the survivors to
-   default-on. The async sharded flavour stays falsified (benchmarks.md
-   "Async sharded-terminal A/B") and is excluded. Verify: same-binary knob
-   A/B per knob (`sharded_term` / `sharded_term_async` benches,
-   `bench_ab.sh -B sharded_term -B async_vs_tokio`), plus the soak.
+   `YOUPIPE_BATCH_RECV`)** — **resolved 2026-10-20 (r9)**. The soak matrix
+   ran on the post-#4-fix tree (12 processes × 12 runs per cell, shapes
+   single/sync2/fence/async2, both cadences; `YOUPIPE_SHARDED_TERM_ASYNC`
+   split off first so the sync decision could not drag the falsified async
+   flavour). Survivors promoted: `YOUPIPE_SHARDED_TERM` + `YOUPIPE_BATCH_RECV`
+   are now default-ON as a pair (sharded alone is bimodal; batch's claim
+   removes the slow mode; −19…−62 % mean on every soak cell, 9/9 dominant
+   on every `sharded_term` criterion id — readings: benchmarks.md
+   "Default-policy soak + pair promotion"). Riding along: the per-worker
+   claim share (see the batch section above). Not promoted:
+   `YOUPIPE_SPIN_ANCHOR` / `YOUPIPE_FWD_BATCH` (cost faces are
+   load-shape-local: the spin's 2–4× lucky-fast-seed cost and idle burn)
+   and `YOUPIPE_SHARDED_TERM_ASYNC` (falsified). The async2 soak cell
+   doubled as the decoupling leak check: the sync knob left the async
+   terminal untouched (off/on medians 236.7/239.6 ms pre-flip tree).
 
 5. **Async-family convoy remains open (crossfire-level, candidate (c))**.
    The async shape's slow face (15-worker crowd sending into the mixed-mode

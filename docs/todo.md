@@ -18,59 +18,17 @@
 
 ## 性能
 
-### 1. [P0] streaming 终端通道扇入：分片已落地（opt-in），默认策略待 soak
-
-- 已落地（2026-09-29，`handoff/sharded.rs` + `drain_*_sharded`）：per-worker
-  SPSC 分片终通道，运行时旋钮 `YOUPIPE_SHARDED_TERM=1`（默认 off）。A/B
-  （`sharded_term` evidence bench，5 轮隔离交错同 binary）12 id 全部改善、
-  零回归、全部 dominant/stable：100K 单级 cheap/cpu −29…−32 %、expand
-  −58.5 %、workers2 −23.2 %、multi2 −8.0 %；1K −4.9…−42.5 %（含 workers2，
-  无需 auto 门槛）。读数与机制见 benchmarks.md "Sharded terminal fan-in
-  A/B"、streaming.md 对应小节。mixed_load（fused 路径）与 sync_fuse
-  fence_infra 对照均为噪声——旋钮不泄漏出 streaming 终端。
-- 遗留：默认 on/auto 未开。convoy 修复前基线 soak 已完成（2026-09-29，
-  convoy-probe `single` 形状，12 进程 × 12 run/格，144 样本）：OFF 侧病态
-  大规模复现（single 4.9% 塌缩 + 76% run 落争用模式、fence 45.1%、async2
-  82.6%），ON 侧 fence 塌缩减半（18.1%）且争用中位数大幅改善（single
-  −58%、fence −75%），但 sync2 出现真实回归面（back-to-back 节奏下 OFF 的
-  8.9 ms 流水线模式 ON 从未达到）；ON 侧无单调墙漂移、RSS 持平。默认维持
-  off；翻转决策等 #4 修复合并后复跑 soak 才最终权威（读数 benchmarks.md
-  "Sharded-terminal default-policy soak"）。
-- 数据面探针已落地（2026-09-29，channel.rs 15 探针 + hotpath 5 个
-  true-streaming 场景，读数 benchmarks.md "true-streaming"）——try_recv p50
-  551 ns/item（31 sender cache-line 乒乓）、feeder 侧 send 901 ns/item 占
-  feeder 线程 94%。
-- 残余方向：(c) **已证伪关闭**（2026-09-29 落地 opt-in 后实测）：async 终端
-  分片（`sharded_mpsc_async_channel` + `drain_*_async_sharded`，同旋钮、
-  shard 数 min(io_concurrency, async_workers)）在目标形状上 stable 回归
-  +42…+51% @100K（0/100）——one-shard anchor 的 waker 不对称把全局节拍拖到
-  锚定环（生产者是 runtime task，满环 park 等空间而 collector 在等锚定环的
-  item）；仅 async-only feeder 饱和链受益 −57.5%。代码保留 opt-in（该形状
-  有真实收益），混合链开旋钮会伤 async 侧——**已于 2026-10-20（r9）解耦**：
-  async 终端分片独立为 `YOUPIPE_SHARDED_TERM_ASYNC` 旋钮（bench/测试同步
-  更名），`YOUPIPE_SHARDED_TERM` 只管 sync/expand 终端，sync 默认翻转不再
-  需要 async 侧前置。读数 benchmarks.md "Async sharded-terminal A/B"、机制
-  streaming.md "Async terminal flavour"。(d) ~~crossfire 批量 recv 接口~~
-  已落地（2026-09-30，fork `pop_batch`/
-  `try_push_batch` + wrapper + 全接入点，运行时旋钮 `YOUPIPE_BATCH_RECV`，
-  默认 off）：四组合 A/B（benchmarks.md "Batched ring ops four-combo"）
-  组合态 100K 1.4–4.1×（5/6 形状达 ≥1.6× 门槛）；batch 在 sharded 之上对
-  fan-in 形状 dominant 增益（workers2 −69 %、single_unordered_cpu −34 %、
-  multi2 −15 %）并消除 sharded 单开的双峰慢档，但单独启用在共享终端环上
-  双峰不稳定且 1K 形状有回归 → 保持 opt-in，与 `YOUPIPE_SHARDED_TERM`
-  成对启用为推荐矩阵（tuning.md）。探针：try_recv 882 ns/item →
-  ~352 ns/item 摘销，终端环 send 侧 1.74 µs → 90 ns（本轮最大收益）。
-  miri（tree-borrows）fork 6/6 + 集成 5/5 + drain 批量 3/3 绿；预先存在的
-  1M 项窗口溢出测试非 miri 可行（排除，非新代码）。合并后复测（两分支
-  合入 main 后，worker 循环统一为 anchor_claim 三段式）：fence_infra
-  canary 100K off 188 ms 双峰 → SPIN=30 45 ms（−76 %，9/9）；
-  workers2/single_unordered 100K 组合态 4.17×/2.64×（分支 4.12×/2.32×）
-  ——两条分支结论均穿过合并成立，读数 benchmarks.md "Post-merge
-  re-tests"。
-- 风险记录：MPSC 是当年 in-pipeline 剖析选出（streaming.md "MPSC Channels"），
-  分片把复用开销移回 collector 侧——实测无回归（每 pass k−1 次失败 try_recv
-  被突发摊销）；burst 边界泊车未用（已证伪，e1684fc→aa842a6）。
-- 关联：#4（convoy 双稳）疑为同一数据面争用的形态侧表现（见上 soak 观察）。
+<!-- #1 streaming 终端通道扇因：已关闭（2026-10-20，r9）。终局：解耦 async
+分片为独立旋钮 YOUPIPE_SHARDED_TERM_ASYNC（默认 off，async1 形状证伪
++42…+51%，仅 async-only 饱和链受益）；SHARDED_TERM + BATCH_RECV 成对提升为
+默认（soak 后决策：sharded 单开在 single 形状双峰——中位赢但 ~30% run 落
+convoy 慢档；pair 全格均值 −19…−62% 且尾部收紧，criterion 侧全部 id 9/9
+dominant）。翻转暴露并修复 batch 整段 claim 的并行度垄断：stage/expand
+worker claim 按 max(1, cap/workers) 分摊（sole-consumer 站点全额），回归
+覆盖 test_stage_options_workers_pins_parallelism。读数 benchmarks.md
+"Default-policy soak + pair promotion"、机制 streaming.md 对应小节。
+后续注意：gungraun Ir 基线需重存（stream 路径指令数按设计变化）；sync2@1K
+p90 +20% lean（均值/p50 改善）记录在 soak 表，不单独跟踪。 -->
 
 ### 2. [P1] zstd_shape 残余差距（capped/uniform 落后）
 
@@ -128,7 +86,9 @@
   开销 + 活跃稀疏期烧 CPU），opt-in 指南见 advanced/tuning.md。
 - 遗余：async 形状（async2/15-1 等）場缩未修，归因已明确（上段），
   待候选 (c)；快 mode 下自旋开销的进一步收窄（预算上限/退避曲线）
-  未探索。
+  未探索。r9 缓解记录：pair 默认（SHARDED+BATCH）对 async2 soak 均值
+  230→109 ms、p50 242→29 ms（sync 前缀的 batch claim 改善停车面），但
+  p90 291 ms 的慢 mode 仍在——候选 (c) 依旧是正解。
 - 验证：`sync_fuse` 家族（canary `fence_infra` + async/fence/cancel 形状）。
 - 合并后复测（与 #1 (d) 合入同一 main 后）：fence_infra canary 100K
   off 188.3 ms（169–222 双峰）/ SPIN=30 45.5 ms（27.9–60.3，−75.9 %，
