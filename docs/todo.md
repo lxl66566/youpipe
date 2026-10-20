@@ -3,6 +3,7 @@
 范围：**未落地**的工作项。已关闭需求的落地记录与实测读数保存在 docs/src/dev/
 对应主题文档（scheduler.md / benchmarks.md / streaming.md / core-types.md）
 与代码注释里，勿凭记忆重做；已证伪方向见 [dev/dead-ends.md](src/dev/dead-ends.md)。
+编号不复用（dev 文档以「todo #N」引用条目），已关闭条目留下空缺编号。
 
 验证统一规范（见 `dev/benchmarks.md`）：
 
@@ -17,18 +18,6 @@
 ---
 
 ## 性能
-
-<!-- #1 streaming 终端通道扇因：已关闭（2026-10-20，r9）。终局：解耦 async
-分片为独立旋钮 YOUPIPE_SHARDED_TERM_ASYNC（默认 off，async1 形状证伪
-+42…+51%，仅 async-only 饱和链受益）；SHARDED_TERM + BATCH_RECV 成对提升为
-默认（soak 后决策：sharded 单开在 single 形状双峰——中位赢但 ~30% run 落
-convoy 慢档；pair 全格均值 −19…−62% 且尾部收紧，criterion 侧全部 id 9/9
-dominant）。翻转暴露并修复 batch 整段 claim 的并行度垄断：stage/expand
-worker claim 按 max(1, cap/workers) 分摊（sole-consumer 站点全额），回归
-覆盖 test_stage_options_workers_pins_parallelism。读数 benchmarks.md
-"Default-policy soak + pair promotion"、机制 streaming.md 对应小节。
-后续注意：gungraun Ir 基线需重存（stream 路径指令数按设计变化）；sync2@1K
-p90 +20% lean（均值/p50 改善）记录在 soak 表，不单独跟踪。 -->
 
 ### 2. [P1] zstd_shape 残余差距（capped/uniform 落后）
 
@@ -59,43 +48,19 @@ p90 +20% lean（均值/p50 改善）记录在 soak 表，不单独跟踪。 -->
 - 验证：`cpu_balanced` 1M/2M/4M 隔离 A/B + `horizontal-counters`（youpipe-bench）
   复查 task-clock / ctx-switch / migration。
 
-### 4. [P1] streaming 多种群交接的吞吐塌缩（sync→async / fence）
+### 4. [P1] streaming async 形状的吞吐塌缩（残余）
 
-- 现状（2026-09-28，由相邻 sync 融合证伪 bench 发现，数据见
-  dead-ends.md「streaming 相邻 sync stage 编译期自动融合」）：
-  `stage(f1).stage(f2).stage_async(g)` @100K 独立进程稳定 ~237 ms
-  （2.4 µs/item），而单 sync 前缀 25.9 ms、手动复合前缀 24.0 ms；同形状
-  逐 run 双稳（探针 5 采样 [23, 24, 53, 151, 244] ms；独立进程复跑三组
-  中位 239/164/155 ms）。零负载
-  `stage(bump).fence(Chunked(500)).stage(bump)` 226 ms；3-stage fence
-  （10W/阶段）36 ms，4W pin 113–121 ms——病态方向随 worker 数非单调，
-  疑似 anchor+burst recv 的 convoy 双稳（recv-loop 注释记录过 8-worker
-  形态）。async-only 链 83 ms 另受 feeder 单线程推送率限制（15–32 个
-  sync 生产者并发推送时无此限制）。
-- 方向：**fence 家族已修**（2026-09-30，候选 (a)+(b)，`AnchorSpin`/
-  `fence_batch_send`，旋钮 `YOUPIPE_SPIN_ANCHOR`/`YOUPIPE_FWD_BATCH` 默认
-  off）。读数与机制见 dev/streaming.md 「Fix (a)+(b) landed」。
-- **候选 (c) 已证伪并关闭（2026-10-21）**："wake-one（非 wake-all）
-  fire() 策略"的前提是误读——upstream `fire()` 在 committed 队列上本来就
-  只唤醒一个 waiter（`pop_again` 扇出仅穿透 Init-front 且停在首个
-  committed 唤醒）；同 binary A/B 中性。`fire()` 已改写为 `_fire_n(1)`
-  统一唤醒会计（语义清理，非 perf）。async collector 侧 anchor 自旋原型
-  亦证伪回退（快档 collector parks −10–25× 但墙钟不变，慢档照旧——
-  terminal 到达 clumpy，门控衰减回纯泊车）。两项均记入 dead-ends.md；
-  再归因见 streaming.md「Async face re-attribution (2026-10-21)」。
-- 遗余：async 形状（async2 等）塌缩未修，但归因已再锚定——残余慢档是
+- 现状：async 形状（async2 等）塌缩未修，归因已再锚定——残余慢档是
   全链背压驱动的逐项唤醒链（`--buffer n` 全量解救，8/8 run 24–31 ms），
   节拍在 anchor 自旋不可达的面（io task `send_cached` 停进满 terminal
-  ring）。下一步方向：terminal 通道容量解耦（末级通道容量自动取 run 的
-  in-flight 上界而非 `buffer_size`）或 task→terminal 批量交接；worker/
-  collector anchor 自旋面已穷尽。r9 缓解记录：pair 默认（SHARDED+BATCH）
-  对 async2 soak 均值 230→109 ms、p50 242→29 ms，p90 291 ms 慢档仍在。
+  ring）。fence 家族已修，sync 前缀融合与 wake-one/anchor 自旋候选均已
+  证伪关闭（记录见 dev/streaming.md 与 dev/dead-ends.md）。r9 pair 默认
+  （SHARDED+BATCH）缓解：async2 soak 均值 230→109 ms、p50 242→29 ms，
+  p90 291 ms 慢档仍在。
+- 方向：terminal 通道容量解耦（末级通道容量自动取 run 的 in-flight 上界
+  而非 `buffer_size`）或 task→terminal 批量交接；worker/collector anchor
+  自旋面已穷尽。
 - 验证：`sync_fuse` 家族（canary `fence_infra` + async/fence/cancel 形状）。
-- 合并后复测（与 #1 (d) 合入同一 main 后）：fence_infra canary 100K
-  off 188.3 ms（169–222 双峰）/ SPIN=30 45.5 ms（27.9–60.3，−75.9 %，
-  9/9）；与分支持论一致（200.5→41.9）。复测顺带修了 sync_fuse 的
-  fence_infra 重复注册 panic（fc56019）。读数 benchmarks.md "Post-merge
-  re-tests"。
 
 ### 5. [P1] `ordered()` + `expand()`：批量 payload 方案
 
@@ -128,91 +93,13 @@ p90 +20% lean（均值/p50 改善）记录在 soak 表，不单独跟踪。 -->
 - 残余方向：`RunOutcome` 或 `try_run_checked` 报告
   `Cancelled { emitted }`（collector 排干后查 token 即可）。
 
-<!-- #8 API 小项包已处理并关闭（2026-10-20，r7）。落地：StreamPipe
-补 with_workload（fused pass-through/reduce/fold 读 config.workload，
-channel 拓扑忽略）；StreamPipe::collect() 别名；with_config 整体替换语义
-在全部 8 个 builder 的 rustdoc 写明（不合并字段：diff-against-default
-无法区分「未设置」与「显式恢复默认」，且每个字段已有专属 setter）；
-drain 家族（state/stream.rs drain_* / run_ordered_collect）'static 放宽为
-Send——对公开的 run_ordered_collect 有实际意义（RecvItem 为开放 trait，
-自定义 receiver 可携带借用条目；内置通道仍因 endpoint 被 spawn 的 worker
-捕获而要求 T: Send + 'static），回归测试
-run_ordered_collect_accepts_borrowed_items。
-
-复核时前提已不成立而跳过：Pipe::filter 的 O bound——pipe()/map()/try_map()
-构造期已对 I/N 施加 Send + 'static，filter 永远见不到非 Send 的 O，补上
-是无法触发的死约束（probe 实证：非 Send 输出在产生它的调用处以单条
-E0277 报错）；MpscSender::try_send——已存在且与其余三种 sender 语义一致；
-run() runtime 构建失败 rustdoc——main 已覆盖（Panics 节 + try_run/
-with_async_pool 指引）。编号 8 不再使用，后续条目编号不动。 -->
-
 ## 代码健康（重构/坏味道）
-
-<!-- #9 终端 prologue 复制已完成并移除（2026-10-20，r8）：抽
-`terminal_plan(n, workload, num_threads) -> TerminalPlan { Serial,
-Parallel(SplitPlan) }` + `serial_stage_collect` / `serial_stage_for_each` /
-`serial_stage_try_collect` 串行回退 helper。实际站点数 drifted 到 25 个
-（reduce/fold 家族、RangePipe 两终端与 pass-through 两入口共享同一序列），
-全部收编——`prefers_serial` 与 `SplitPlan::new` 现仅在 terminal_plan 内出现。
-编号 9 不再使用，后续条目编号不动。 -->
-
-<!-- #10 StageSpawn 五路 spawn 体去重已完成并移除（2026-10-20，r8）。
-落地：OutChannel（Mpmc/Mpsc/Mixed/ShardedMpsc）+ AsyncOutChannel
-（AsyncMpmc/AsyncMpsc/AsyncSharded）工厂 trait，make/wrap 收编构造与
-FinalRx 包装（含 sharded in-flight hint 归位到构造点）；spawn_stage_into /
-spawn_expand_stage_into / spawn_fence_into + spawn_*_terminal 选择器，
-15 个 dispatch 体缩为 prev 递归 + 单行核心调用，clone 包装 spawn_stage /
-spawn_expand_stage 与 async 三函数（body/_single/consumers）删除。
-AsyncSendItem 已由 r7 c96870a 先行落地（spawn_async_terminal_tasks 共享
-任务循环）。安全网：try_exec 终端 Single-variant debug_assert + 新增
-fence 终端 / fence→async→sync 链测试。架构记录 streaming.md
-"Spawn dispatch: channel factories"。编号 10 不再使用，后续条目编号不动。 -->
-
-<!-- #11 builder setter 复制已完成并移除（2026-10-20，r8）：抽内部
-`ExecOptions { config, compute_pool, oversubscribe }` move 进全部七个 fused
-builder（todo 漏数了 RangePipe），`map`/`filter` 重建变单字段搬运
-`exec: self.exec`；五个 setter 由 `exec_setters!` 宏生成（fused.rs），Pipe
-保留手写规范文档、其余经宏参数附加各自差异行（含 ScopedPipe 的 scope
-示例 doctest，仍执行）。budget 漂移 bug 的回归覆盖仍在：
-`test_resolve_exec_pool_precedence`（resolve 层）+ pool_cache /
-pipeline_integration 的 builder 级 with_compute_workers 测试。编号 11 不再
-使用，后续条目编号不动。 -->
-
-<!-- #12 死代码清理已完成并移除（2026-10-20）：pool 侧四项随 8eb4b67、
-`BoxFuture` 与 `CancellationToken::reset`（含自测）随 r7 d5425c8 删除，
-全 repo 零引用复核通过。编号 12 不再使用，后续条目编号不动。 -->
 
 ### 13. [P2] 正确性相邻与杂项
 
-<!-- r8（2026-10-20）落地并移除六项：`FenceBarrier::reuse` 改 total API
-（非空批 append 回 pending buffer——数据不丢、容量照常回收，消灭
-debug_assert 契约）；feeder-slot 预测与 stage_buffer floor 收敛到
-`floored_channel_capacity` 单点（doc 记录单调性互锁：floor 规则改动不同步
-预测 = parking lease 欠预留死锁，无测试兜底）；drain 四体
-（unordered/ordered × sync/async）收敛为 state/stream.rs 的 `drain_loop!`
-宏模板（tokio sync/async 孪生惯用法），R7 的 0-claim probe 手工双改即其
-动机；TLS worker + registry_id 四处独立 unsafe 收敛为
-`Registry::current_worker_of` 单点 SAFETY 论证；文档 bug 修正（run()
-Panics 节 ordered+expand 链接改指 `StageSpawn::has_expand`；floor 措辞
-"downstream_workers * 4" 改为 producing stage 自身 worker 数——实为三处，
-config.rs 的 `PipelineConfig::buffer_size` 字段 doc 同错，核实后顺带修）。
-reorder window 魔法数一项核实不成立：`next_power_of_two().clamp(1<<10,
-1<<20)` 现仅 `OrderedWindow::open` 一处（`auto` 的 `(1<<10).max(in_flight)`
-是不同形状的 floor 表达式），无重复可抽，关闭。 -->
-
-- ~~crossfire 错误映射七份手抄~~ 已完成（2026-10-20，r8 收尾）：
-  `map_send_err`/`map_recv_err` 单点映射收编全部包装（实为八处：四个
-  try_send + 四个 try_recv），均为错误冷路径、零热路径抽象；
 - `try_exec` ~257 行混四职责（admission/lease 解析、StreamCtx 构建、
   feeder 通道选路、终端 drain）→ 拆 `resolve_admission`，让不变量注释贴着
-  维护它的代码；
-- ~~StageSpawn 默认实现删除改必选~~ 已完成（2026-10-20，r8）：五个
-  channel-shape dispatch 方法必选（删 delegating/bridge 默认体），
-  StreamStart 补 spawn_for_async 覆盖（原默认体 Sync 臂，经
-  `fence→stage_async→stage` 可达，测试
-  test_stream_fence_prefix_async_chain_sync_feeder）；空链 panic 部分经查
-  已在 main 由 3d2d435 修复（StreamStart::spawn_single 桥接 MPSC +
-  pipeline_integration 测试），以代码为准不重做；
+  维护它的代码。
 
 ### 14. [P1] `pipeline_integration` 间歇性 hang 残余
 
