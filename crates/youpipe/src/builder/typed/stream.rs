@@ -1732,6 +1732,31 @@ impl<M: Send + Unpin + 'static> OutChannel<M> for ShardedMpsc {
     }
 }
 
+/// Terminal data-plane policy: the runtime knobs governing the terminal
+/// channel's shape and the async-chain capacity floor, read once per run in
+/// [`StreamPipe::try_exec`] (see `handoff/mod.rs` for each knob's rationale).
+#[derive(Clone, Copy)]
+pub(crate) struct TermPolicy {
+    /// `YOUPIPE_SHARDED_TERM`: a multi-worker terminal sync/expand stage
+    /// fans its output channel into per-worker SPSC shards.
+    sharded: bool,
+    /// `YOUPIPE_SHARDED_TERM_ASYNC`: the falsified async-sharded flavour.
+    sharded_async: bool,
+    /// `YOUPIPE_ASYNC_CHAIN_FLOOR`: async-tailed chains lift their unpinned
+    /// stage-output channel capacities (see `stage_buffer`).
+    chain_floor: bool,
+}
+
+impl TermPolicy {
+    fn from_env() -> Self {
+        Self {
+            sharded: crate::handoff::sharded_term_enabled(),
+            sharded_async: crate::handoff::sharded_term_async_enabled(),
+            chain_floor: crate::handoff::async_chain_floor_enabled(),
+        }
+    }
+}
+
 /// Shared per-run configuration: pool handles, cancellation, buffer sizing.
 /// Built fresh in `StreamPipe::run` and passed by reference to every stage's
 /// `spawn` call.
@@ -1766,19 +1791,14 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// dedicated threads keep such chains deadlock-free at the cost of one
     /// `thread::spawn` per worker.
     pub dedicated_threads: bool,
-    /// Runtime knob `YOUPIPE_SHARDED_TERM` (read once per run in
-    /// [`StreamPipe::try_exec`]; default on): a multi-worker terminal sync /
-    /// expand stage fans its output channel into per-worker SPSC shards
-    /// (see `handoff/sharded.rs`). Channel shape only — worker count, the
-    /// parking lease budget, and every semantic contract are unchanged.
-    sharded_terminal: bool,
-    /// Runtime knob `YOUPIPE_SHARDED_TERM_ASYNC` (read once per run in
-    /// [`StreamPipe::try_exec`]): the async-terminal flavour of the same
-    /// channel swap — one async shard ring per task group. A separate knob
-    /// because the async flavour's verdict is opposite on sync-fed async
-    /// terminals (see `handoff/mod.rs`).
-    #[cfg(feature = "tokio-runtime")]
-    sharded_async_terminal: bool,
+    /// Whether the chain contains any async stage (`StageSpawn::
+    /// has_async_stage`). Gates the async-chain capacity floor in
+    /// [`Self::stage_buffer`]: pure-sync chains show no slow mode at the
+    /// small default, so the lift binds only where runtime-task wake-RTT
+    /// pacing exists.
+    pub(crate) has_async_stage: bool,
+    /// Terminal channel-shape policy (runtime knobs; see [`TermPolicy`]).
+    pub(crate) terminal_policy: TermPolicy,
     /// The pool-capacity lease backing pool mode (`dedicated_threads ==
     /// false`); `None` in dedicated mode. Every channel-parking job
     /// submitted for this run is wrapped through [`ParkingLease::wrap_job`].
@@ -1874,7 +1894,7 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     /// single-worker terminal already IS one SPSC ring (one sender, one
     /// receiver) — sharding it would only rename the channel.
     fn sharded_terminal(&self, parallelism: usize) -> bool {
-        self.sharded_terminal && parallelism > 1
+        self.terminal_policy.sharded && parallelism > 1
     }
 
     /// Shard count for an async terminal whose consumer fan-out is
@@ -1887,7 +1907,7 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     /// `io_concurrency` rings up front — up to 512).
     #[cfg(feature = "tokio-runtime")]
     fn sharded_async_terminal(&self, concurrency: usize) -> usize {
-        if !self.sharded_async_terminal || concurrency <= 1 {
+        if !self.terminal_policy.sharded_async || concurrency <= 1 {
             return 0;
         }
         concurrency.min(self.config.async_workers.max(1))
@@ -1967,6 +1987,21 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
         }
     }
 
+    /// The async-chain floor applied to an already-floored unpinned capacity
+    /// (`YOUPIPE_ASYNC_CHAIN_FLOOR`; see [`Self::stage_buffer`]). Generic
+    /// over the channel's full slot type for the byte clamp.
+    fn async_chain_floor<SLOT>(&self, buffer: usize) -> usize {
+        if !self.has_async_stage || !self.terminal_policy.chain_floor {
+            return buffer;
+        }
+        let budget_slots = crate::handoff::ASYNC_CHAIN_FLOOR_BYTES / size_of::<SLOT>().max(1);
+        buffer.max(
+            self.n
+                .min(crate::handoff::ASYNC_CHAIN_FLOOR_SLOTS)
+                .min(budget_slots.max(1)),
+        )
+    }
+
     /// Resolve a stage's output-channel capacity: the stage's explicit
     /// buffer pin (used verbatim — the caller opted into this exact
     /// backpressure), or the config value floored at the producing stage's
@@ -1975,13 +2010,23 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     /// downstream stage's). Takes the buffer field because every options
     /// kind ([`SyncStageOptions`] / [`AsyncStageOptions`] /
     /// [`FenceOptions`]) carries it.
-    pub fn stage_buffer(&self, buffer: Option<NonZeroUsize>, parallelism: usize) -> usize {
-        let buffer = buffer.map_or_else(|| self.buffer_size(parallelism), NonZeroUsize::get);
+    ///
+    /// `YOUPIPE_ASYNC_CHAIN_FLOOR` (async-tailed chains only): the unpinned
+    /// capacity additionally floors at `min(n, ASYNC_CHAIN_FLOOR_SLOTS)`
+    /// slots, byte-clamped per ring — the capacity slack that removes the
+    /// chain's per-item wake-chain slow mode (see `handoff/mod.rs`).
+    /// Generic over the channel's full slot type for the byte clamp;
+    /// callers turbofish with their `(u64, M)` slot type.
+    pub fn stage_buffer<SLOT>(&self, buffer: Option<NonZeroUsize>, parallelism: usize) -> usize {
+        let resolved = buffer.map_or_else(
+            || self.async_chain_floor::<SLOT>(self.buffer_size(parallelism)),
+            NonZeroUsize::get,
+        );
         // In-flight estimate: one output channel of this capacity per call
         // site (the sharded fan-out variants note their extra shards at the
         // `sharded_*_channel` construction sites).
-        self.note_in_flight(buffer);
-        buffer
+        self.note_in_flight(resolved);
+        resolved
     }
 
     /// Resolve an async stage's task fan-out: the stage's explicit
@@ -2410,7 +2455,7 @@ where
     F: Fn(A) -> M + Send + Sync + 'static,
     M: Send + Unpin + 'static,
 {
-    let buffer = ctx.stage_buffer(opts.buffer, parallelism);
+    let buffer = ctx.stage_buffer::<(u64, M)>(opts.buffer, parallelism);
     let (txs, out_rx) = Ch::make(ctx, buffer, parallelism);
     spawn_stage_fanout(ctx, mid_rx, txs, f);
     Ch::wrap(out_rx)
@@ -2547,7 +2592,7 @@ where
     F: Fn(A, &mut Vec<N>) + Send + Sync + 'static,
     N: Send + Unpin + 'static,
 {
-    let buffer = ctx.stage_buffer(opts.buffer, parallelism);
+    let buffer = ctx.stage_buffer::<(u64, N)>(opts.buffer, parallelism);
     let (txs, out_rx) = Ch::make(ctx, buffer, parallelism);
     spawn_expand_stage_fanout(ctx, mid_rx, txs, f);
     Ch::wrap(out_rx)
@@ -2676,7 +2721,7 @@ where
     R: AsyncRuntime,
     O: Send + Unpin + 'static,
 {
-    let buffer = ctx.stage_buffer(buffer_pin, ctx.per_stage_parallelism);
+    let buffer = ctx.stage_buffer::<(u64, O)>(buffer_pin, ctx.per_stage_parallelism);
     let (mut txs, fenced_rx) = Ch::make(ctx, buffer, 1);
     let fenced_tx = txs
         .pop()
@@ -2714,9 +2759,7 @@ where
         // prev is async (runtime-task funnel). Then run the consumer fan-out.
         // The output is already a fully-async channel, handed back directly.
         let a_in_rx = self.prev.spawn_for_async::<R>(rx, ctx);
-        spawn_async_consumers_into::<AsyncMpmc, R, _, _, _, _>(
-            self.f, a_in_rx, &self.opts, ctx,
-        )
+        spawn_async_consumers_into::<AsyncMpmc, R, _, _, _, _>(self.f, a_in_rx, &self.opts, ctx)
     }
 
     fn stage_budget(&self) -> StageBudget {
@@ -2764,7 +2807,10 @@ where
         // prev stages keep the async channel as far downstream as their own
         // consumers need it (see their `spawn_async_feeder` overrides).
         let prev_rx = self.prev.spawn_async_feeder::<R>(rx, ctx);
-        let buffer = ctx.stage_buffer(self.opts.buffer, ctx.stage_io_concurrency(&self.opts));
+        let buffer = ctx.stage_buffer::<(u64, Prev::Out)>(
+            self.opts.buffer,
+            ctx.stage_io_concurrency(&self.opts),
+        );
         let a_in_rx = bridge_final_rx_to_async::<Prev::Out, R>(prev_rx, buffer, ctx);
         FinalRx::Async(spawn_async_consumers_into::<AsyncMpmc, R, _, _, _, _>(
             self.f,
@@ -2785,7 +2831,10 @@ where
         // shards under `YOUPIPE_SHARDED_TERM_ASYNC=1`), mirroring
         // `spawn_single` vs `spawn`.
         let prev_rx = self.prev.spawn_async_feeder::<R>(rx, ctx);
-        let buffer = ctx.stage_buffer(self.opts.buffer, ctx.stage_io_concurrency(&self.opts));
+        let buffer = ctx.stage_buffer::<(u64, Prev::Out)>(
+            self.opts.buffer,
+            ctx.stage_io_concurrency(&self.opts),
+        );
         let a_in_rx = bridge_final_rx_to_async::<Prev::Out, R>(prev_rx, buffer, ctx);
         spawn_async_consumers_terminal(self.f, a_in_rx, &self.opts, ctx)
     }
@@ -2985,7 +3034,7 @@ where
     M: Send + Unpin + 'static,
 {
     let concurrency = ctx.stage_io_concurrency(opts);
-    let buffer = ctx.stage_buffer(opts.buffer, concurrency);
+    let buffer = ctx.stage_buffer::<(u64, M)>(opts.buffer, concurrency);
     ctx.note_in_flight(concurrency); // one in-flight item per consumer task
     let (senders, out_rx) = Ch::make(ctx, buffer, concurrency);
     spawn_async_terminal_tasks(f, a_in_rx, ctx, senders);
@@ -4627,9 +4676,8 @@ where
             n,
             per_stage_parallelism,
             dedicated_threads,
-            sharded_terminal: crate::handoff::sharded_term_enabled(),
-            #[cfg(feature = "tokio-runtime")]
-            sharded_async_terminal: crate::handoff::sharded_term_async_enabled(),
+            has_async_stage: stages.has_async_stage(),
+            terminal_policy: TermPolicy::from_env(),
             lease,
             worker_slots_left: Cell::new(worker_slots_left),
             stages_left: Cell::new(stages_left),
@@ -4655,7 +4703,13 @@ where
             ctx.acquire_async()?;
         }
 
-        let buffer = ctx.buffer_size(per_stage_parallelism);
+        // The async-chain floor covers the feeder ring too (same wake-chain
+        // face — the serial feeder pushing into a stage-1 crowd). The
+        // lifted capacity only moves the feeder's inline/job threshold
+        // upward, so the parking-lease prediction (`feeder_slot`, computed
+        // from the unfloored `floored_channel_capacity`) can only
+        // over-reserve a slot — returned by the lease's drop, never missed.
+        let buffer = ctx.async_chain_floor::<(u64, I)>(ctx.buffer_size(per_stage_parallelism));
         // In-flight estimate, feeder side: the feeder channel's capacity,
         // the one item held in a blocked `send`, and the collector's batch
         // scratch (`batch_recv_cap()` items claimed but not yet inserted).
@@ -4932,8 +4986,12 @@ mod tests {
                 n: 4,
                 per_stage_parallelism: 1,
                 dedicated_threads: false,
-                sharded_terminal: sync,
-                sharded_async_terminal: async_,
+                has_async_stage: false,
+                terminal_policy: TermPolicy {
+                    sharded: sync,
+                    sharded_async: async_,
+                    chain_floor: false,
+                },
                 lease: None,
                 worker_slots_left: Cell::new(0),
                 stages_left: Cell::new(0),
@@ -4953,6 +5011,63 @@ mod tests {
         assert_eq!(ctx(true, true).sharded_async_terminal(128), 4);
         // Concurrency floor: one task is already a single SPSC ring.
         assert_eq!(ctx(true, true).sharded_async_terminal(1), 0);
+    }
+
+    /// `stage_buffer` applies the async-chain floor only where eligible:
+    /// the knob plus an async-tailed chain lifts the unpinned capacity to
+    /// `min(n, ASYNC_CHAIN_FLOOR_SLOTS)` (byte-clamped); pure-sync chains,
+    /// explicit pins, and rings beyond the byte budget keep the standard
+    /// rule.
+    #[cfg(all(test, feature = "tokio-runtime"))]
+    #[test]
+    fn stage_buffer_async_chain_floor_gates() {
+        use crate::runtime::TokioPool;
+
+        let cfg = PipelineConfig::default(); // buffer_size 256
+        let pool = TokioPool::build(1).expect("build test runtime");
+        let ctx = |n: usize, floor: bool, has_async: bool| {
+            StreamCtx::<TokioPool> {
+                config: &cfg,
+                cancel: None,
+                n,
+                per_stage_parallelism: 1,
+                dedicated_threads: false,
+                has_async_stage: has_async,
+                terminal_policy: TermPolicy {
+                    sharded: false,
+                    sharded_async: false,
+                    chain_floor: floor,
+                },
+                lease: None,
+                worker_slots_left: Cell::new(0),
+                stages_left: Cell::new(0),
+                in_flight: Cell::new(0),
+                compute_pool: None,
+                async_pool: Some(pool.clone()),
+                cached_pool: OnceLock::new(),
+                async_panic: OnceLock::new(),
+                _marker: PhantomData,
+            }
+        };
+        // Knob off, or a pure-sync chain: the floored default.
+        assert_eq!(ctx(100_000, false, true).stage_buffer::<(u64, u64)>(None, 8), 256);
+        assert_eq!(ctx(100_000, true, false).stage_buffer::<(u64, u64)>(None, 8), 256);
+        // Knob on, async chain: lifted to the slot floor.
+        assert_eq!(
+            ctx(100_000, true, true).stage_buffer::<(u64, u64)>(None, 8),
+            crate::handoff::ASYNC_CHAIN_FLOOR_SLOTS
+        );
+        // Small run: the lift never exceeds `n`.
+        assert_eq!(ctx(1_000, true, true).stage_buffer::<(u64, u64)>(None, 8), 1_000);
+        // Byte budget: 1 KiB payloads clamp the floor to
+        // 8 MiB / 1032 B ≈ 8123 slots (still above the 256 default).
+        assert_eq!(
+            ctx(100_000, true, true).stage_buffer::<(u64, [u8; 1024])>(None, 8),
+            crate::handoff::ASYNC_CHAIN_FLOOR_BYTES / size_of::<(u64, [u8; 1024])>()
+        );
+        // Explicit pin: the caller's exact backpressure request, verbatim.
+        let pin = NonZeroUsize::new(16).unwrap();
+        assert_eq!(ctx(100_000, true, true).stage_buffer::<(u64, u64)>(Some(pin), 8), 16);
     }
 
     /// `Feeder::finish` re-raises the caught feeder-job payload (the
@@ -5098,9 +5213,12 @@ mod tests {
             n: 4,
             per_stage_parallelism: 1,
             dedicated_threads: false,
-            sharded_terminal: false,
-            #[cfg(feature = "tokio-runtime")]
-            sharded_async_terminal: false,
+            has_async_stage: false,
+            terminal_policy: TermPolicy {
+                sharded: false,
+                sharded_async: false,
+                chain_floor: false,
+            },
             lease: None,
             worker_slots_left: Cell::new(0),
             stages_left: Cell::new(0),

@@ -95,6 +95,47 @@ pub(crate) fn sharded_term_async_enabled() -> bool {
     })
 }
 
+// `YOUPIPE_ASYNC_CHAIN_FLOOR` lifts the unpinned stage-output channel
+// capacities (the feeder ring included) of async-tailed chains — any chain
+// containing an async stage: each such channel floors at
+// `min(n, ASYNC_CHAIN_FLOOR_SLOTS)` slots, byte-clamped per ring.
+// Mechanism (todo #4, "Async face re-attribution" in docs/src/dev/
+// streaming.md): the surviving async2 slow mode is a backpressure-driven
+// per-item wake chain; a capacity sweep showed every ring lifted to ~16K
+// slots removes it entirely (terminal-only decoupling to the full
+// in-flight bound `n` does NOT — the mid/mixed rings re-seed the chain —
+// and `buffer = n` measures slightly worse than 16K, paying the bigger
+// eager allocation's cache footprint). Pure-sync chains do not lift: sync2
+// shows no slow mode at the small default, so the floor binds only where
+// the runtime-task wake-RTT pacing exists. Explicit per-stage buffer pins
+// win verbatim (the caller opted into that exact backpressure). Runtime
+// knob so A/B benches compare the same binary.
+
+/// Slot floor for the lifted channels: the smallest sweep value with zero
+/// collapsed runs (async2 @100K, 4 processes x 12 runs per cell; 16K and
+/// 64K both clean, 16K keeps the eager allocation at 256 KB/slot-ring for
+/// u64 payloads).
+pub(crate) const ASYNC_CHAIN_FLOOR_SLOTS: usize = 16384;
+
+/// Byte budget for the lift: bounded rings allocate every slot up front,
+/// so one lifted ring costs `cap x size_of::<SLOT>()` bytes. Beyond the
+/// budget the floored `buffer_size` stays — large payloads amortize the
+/// wake-RTT pathology anyway (per-item work dwarfs the ~1-2 µs RTT).
+pub(crate) const ASYNC_CHAIN_FLOOR_BYTES: usize = 8 << 20;
+
+static ASYNC_CHAIN_FLOOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn async_chain_floor_enabled() -> bool {
+    *ASYNC_CHAIN_FLOOR.get_or_init(|| match std::env::var("YOUPIPE_ASYNC_CHAIN_FLOOR") {
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" || v.is_empty() => false,
+        Ok(other) => panic!(
+            "YOUPIPE_ASYNC_CHAIN_FLOOR: invalid value {other:?} (leave unset or use \"0\"/\"1\")"
+        ),
+        Err(_) => false,
+    })
+}
+
 // ── Convoy fix knobs (todo #4; attribution in docs/src/dev/streaming.md
 // "Convoy collapse forensics") ──
 //
