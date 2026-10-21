@@ -48,19 +48,18 @@
 - 验证：`cpu_balanced` 1M/2M/4M 隔离 A/B + `horizontal-counters`（youpipe-bench）
   复查 task-clock / ctx-switch / migration。
 
-### 4. [P1] streaming async 形状的吞吐塌缩（残余）
+### 4. [P2] streaming async 形状的吞吐塌缩（残余 ~1%）
 
-- 现状：async 形状（async2 等）塌缩未修，归因已再锚定——残余慢档是
-  全链背压驱动的逐项唤醒链（`--buffer n` 全量解救，8/8 run 24–31 ms），
-  节拍在 anchor 自旋不可达的面（io task `send_cached` 停进满 terminal
-  ring）。fence 家族已修，sync 前缀融合与 wake-one/anchor 自旋候选均已
-  证伪关闭（记录见 dev/streaming.md 与 dev/dead-ends.md）。r9 pair 默认
-  （SHARDED+BATCH）缓解：async2 soak 均值 230→109 ms、p50 242→29 ms，
-  p90 291 ms 慢档仍在。
-- 方向：terminal 通道容量解耦（末级通道容量自动取 run 的 in-flight 上界
-  而非 `buffer_size`）或 task→terminal 批量交接；worker/collector anchor
-  自旋面已穷尽。
-- 验证：`sync_fuse` 家族（canary `fence_infra` + async/fence/cancel 形状）。
+- 现状：`YOUPIPE_ASYNC_CHAIN_FLOOR`（默认开，2026-10-22）已解决主体——
+  async 链的未 pin 通道（stage 输出 + feeder 环）floor 到
+  `min(n, 16384)` slot（8 MiB/环字节预算），async2 深 soak 慢档
+  18–30/120 → 0/120（release gate 二进制 21/96 → 2/96）；terminal-only
+  解耦与 `buffer=n` 必要性均已证伪（dead-ends.md；落地记录见
+  dev/streaming.md「Async-chain capacity floor — resolution」与
+  benchmarks.md 同名节）。
+- 残余：最终 gate 下 on 侧仍有 ~1% 慢 run（2/216，单进程偶发）。若可
+  复现，候选：floor 提到 64K 档（扫描中 64K 同样 0/48）、或与
+  `YOUPIPE_SPIN_ANCHOR` 的组合面。
 
 ### 5. [P1] `ordered()` + `expand()`：批量 payload 方案
 

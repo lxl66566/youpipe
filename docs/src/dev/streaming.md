@@ -651,6 +651,34 @@ instead of `buffer_size`) or a batched task→terminal handoff; the
 worker/collector anchor surfaces are exhausted. The wake-one `fire()`
 cleanup itself landed (behaviorally neutral, accounting-uniform).
 
+### Async-chain capacity floor — resolution (2026-10-22)
+
+The capacity direction above landed, in a different shape than proposed:
+**terminal-only decoupling is falsified** (the terminal ring sized at the
+full in-flight bound `n` leaves the slow-mode rate unchanged — the
+mid/mixed rings re-seed the wake chain; only medians tighten), and a
+capacity sweep showed every ring lifted to **~16K slots** removes the slow
+mode with `buffer = n` measuring slightly worse (eager-allocation cache
+footprint). The landed policy (`YOUPIPE_ASYNC_CHAIN_FLOOR`, default on
+since 2026-10-22): when the chain contains an async stage, every unpinned
+channel it builds — stage outputs through `StreamCtx::stage_buffer` and
+the feeder ring — floors at `min(n, ASYNC_CHAIN_FLOOR_SLOTS = 16384)`
+slots, byte-clamped at 8 MiB per ring (bounded rings allocate eagerly, so
+the lift must not turn a big-payload run into a big allocation; large
+payloads amortize the wake-RTT pathology anyway). Explicit `buffer` pins
+win verbatim; pure-sync chains never lift (sync2 has no slow mode at the
+small default). The feeder-ring lift also moves the feeder's inline/job
+threshold upward, which can only over-reserve the parking-lease prediction
+— returned by the lease's drop.
+
+Verdicts (tables in benchmarks.md "Async-chain capacity floor"): async2
+soak 18–30/120 collapsed runs off → **0/120 on** (release-gate binary:
+21/96 → 2/96, residual ~1 %), async0_cheap/100K −41.8 %, async1 shapes
+−2…−15 %, sync_fuse async_pair rows −8…−61 %, every pure-sync family
+inert noise. `SPIN_ANCHOR` remains the fence-family opt-in; for async
+chains the floor is the default answer and the spin is not needed.
+
+
 ## Pool-wide parking lease (deadlock freedom across concurrent runs)
 
 A channel-parking job — a non-inline feeder, a sync/expand stage worker, a
@@ -888,6 +916,9 @@ noted.
    decoupling), and the io tasks' `send_cached` parks into a full
    terminal ring remain the un-spinnable face. Re-anchored attribution and
    the remaining direction: "Async face re-attribution (2026-10-21)" above.
+   **Resolved 2026-10-22** by the async-chain capacity floor ("Async-chain
+   capacity floor — resolution" above): the rescue needs chain-wide slack
+   (~16K slots), not terminal-only capacity; the floor is the default.
 
 6. **Smells (no perf claim).**
    - ~~`StageSpawn::spawn_for_async`'s default impl is unreachable through

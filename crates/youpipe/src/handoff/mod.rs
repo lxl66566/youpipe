@@ -110,6 +110,11 @@ pub(crate) fn sharded_term_async_enabled() -> bool {
 // the runtime-task wake-RTT pacing exists. Explicit per-stage buffer pins
 // win verbatim (the caller opted into that exact backpressure). Runtime
 // knob so A/B benches compare the same binary.
+//
+// Default ON (promoted with the A/B above: async2 soak 0/120 collapsed
+// runs vs 18-30/120 off, async0_cheap/100K −41.8 %, every async shape
+// 9/9 dominant, all sync families inert noise). "0" recovers the unfloored
+// sizing.
 
 /// Slot floor for the lifted channels: the smallest sweep value with zero
 /// collapsed runs (async2 @100K, 4 processes x 12 runs per cell; 16K and
@@ -127,12 +132,13 @@ static ASYNC_CHAIN_FLOOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new()
 
 pub(crate) fn async_chain_floor_enabled() -> bool {
     *ASYNC_CHAIN_FLOOR.get_or_init(|| match std::env::var("YOUPIPE_ASYNC_CHAIN_FLOOR") {
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" || v.is_empty() => false,
+        Ok(v) if v == "1" || v.is_empty() => true,
+        Ok(v) if v == "0" => false,
         Ok(other) => panic!(
             "YOUPIPE_ASYNC_CHAIN_FLOOR: invalid value {other:?} (leave unset or use \"0\"/\"1\")"
         ),
-        Err(_) => false,
+        // Unset = the default-on policy (see the knob comment above).
+        Err(_) => true,
     })
 }
 

@@ -1442,6 +1442,69 @@ exist to expose. Convoy shapes separately: async1/async2 bistable with
 medians flipping within noise on both sides (streaming.md "Async face
 re-attribution (2026-10-21)").
 
+## Async-chain capacity floor (`YOUPIPE_ASYNC_CHAIN_FLOOR`, 2026-10-22)
+
+The todo #4 remaining direction ("capacity-side decoupling of the async
+terminal") was resolved by measurement in three steps (all convoy-probe
+async2 @100K unless noted; "slow" = run > 100 ms, the forensics-calibrated
+collapsed threshold; fresh process per cell, sides alternating).
+
+**Step 1 — terminal-only decoupling is falsified.** Sizing only the
+terminal ring at the run's in-flight bound `n` (prototype knob
+`YOUPIPE_ASYNC_TERM_DECOUPLE`, byte-budget-gated): a 10-process soak read
+off 22/120 slow runs, on 17/120 — the deep slow mode persists at the same
+rate; only the medians tighten (on 19.1–20.7 ms vs off 20.5–41.9). The
+mid/mixed rings re-seed the per-item wake chain without the terminal's
+help.
+
+**Step 2 — capacity sweep: ~16K everywhere beats `n`.** `--buffer` sweep
+(4 processes × 12 runs per cell, mean of per-process medians):
+
+| buffer | 256 (default) | 1024 | 4096 | 16384 | 65536 | 100000 (= n) |
+| --- | --- | --- | --- | --- | --- | --- |
+| mean med (ms) | 36.5 | 20.9 | 19.8 | **19.0** | 19.1 | 23.3 |
+| slow runs | 9/48 | 1/48 | 3/48 | **0/48** | 0/48 | 0/48 |
+
+Every ring at ~16K slots removes the slow mode entirely; `buffer = n` is
+slightly *worse* than 16K/64K (the bigger eager allocation's cache
+footprint). Isolation via `--pinbuf 16384` (stage outputs only, feeder and
+terminal small): 1/48 slow — the sync-side rings carry most of the effect,
+and adding the terminal decouple completes it (0/48, 20.9 ms).
+
+**Step 3 — the floor knob, default-on.** The landed policy lifts every
+unpinned channel an async-tailed chain builds (stage outputs + the feeder
+ring) to `min(n, 16384)` slots, byte-clamped at 8 MiB per ring; explicit
+`buffer` pins win verbatim; pure-sync chains do not lift. Soaks:
+
+| cell | off ("0") | on (unset) |
+| --- | --- | --- |
+| async2, stage-outputs-only floor (pre-feeder-lift tree) | 30/120 slow | 3/120 slow |
+| async2, final policy | 18/120 slow, med 20.5–41.9 ms | **0/120 slow, med 17.7–20.4 ms** |
+| async2, final binary release gate (8 proc) | 21/96 slow | 2/96 slow, med 17.7–19.8 ms |
+| async1 probe (6 proc) | med 21.8–23.2 ms | med 19.2–21.0 ms |
+| async0 probe (6 proc) | med 52.0–67.1 ms | med 35.2–48.9 ms |
+| sync2 / single / fence probes | flat both sides (knob inert — no async stage) | same |
+
+Criterion A/B (`bench_ab.sh -E`, 3 interleaved rounds, same binary,
+off=`"0"` vs on=`"1"`): every async shape improves 9/9 dominant —
+`sharded_term_async` async0_cheap/100K **−41.8 %**, async1_ordered_cpu/100K
+**−15.3 %**, async0_cheap/1K −13.6 %, async1_cpu −6.3 %, async1_cheap
+−5.6 %, the 1K async1 rows −2.2…−2.8 %; `sync_fuse` async_pair_cpu_split/
+100K **−61.0 %** (the off side collapsed in 2/3 rounds: 49.7/77.5 vs
+19.2–19.5 ms tight), merged/1K −22.0 %, split/1K −11.1 %, merged/100K
+−8.2 %. All pure-sync families noise; the one flag
+(`fence_pair_cheap_split/100000` +18.2 %) re-tested at 5 rounds reads
+−7.3 % noise (the documented ±28 % swing family, and a chain the knob
+cannot touch — `has_async_stage` is false). Final-binary confirmation on
+the promotion tree (`-E old="0"` vs new-default unset) favors the new
+default on every async row (old side collapsed 38–69 ms where the new side
+is tight at 19–23 ms).
+
+The eager-allocation cost of the lift is bounded: 16K slots × 16 B = 256 KB
+per u64 ring, and the 8 MiB byte budget declines the lift entirely for
+payloads above ~500 B/slot (where per-item work dwarfs the ~1–2 µs wake RTT
+that drives the pathology anyway).
+
 ## Horizontal cross-library comparison (2026-09)
 
 `crates/youpipe/benches/horizontal.rs` answers the "what should I pick for my workload?"

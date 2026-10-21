@@ -139,6 +139,14 @@
   移入 sealed-marker-bounded 固有 impl，两块固有 impl 不重叠、解析命中
   融合版），如未来病态修复后重开此方向可复用该设计（注意 E0592：两个
   无界的同名固有方法 impl 不允许）。
+- **async terminal-only 容量解耦到 in-flight 上界**（2026-10-22，todo #4
+  候选方向，原型 `YOUPIPE_ASYNC_TERM_DECOUPLE` 后回退）：只把 terminal 环
+  容量取 `n`（字节预算门限）不充分——async2 深 soak 慢档率 off 22/120 vs
+  on 17/120 几乎不变，仅中位数收紧；mid/mixed 环会自行再播种逐项唤醒链。
+  同时证伪「必须 `buffer = n`」：容量扫描显示全环 ~16K slot 即 0/48 慢档，
+  `n` 反而略慢（更大 eager 分配的 cache 足迹）。正确形态是链路全局 floor
+  （`YOUPIPE_ASYNC_CHAIN_FLOOR`，stage 输出 + feeder 环，默认开）——读数
+  见 benchmarks.md "Async-chain capacity floor"。
 - **crossfire `RegistryMulti` wake-one 唤醒策略**（2026-10-21，todo #4
   候选 (c)，代码判读 + 临时旋钮 `YOUPIPE_FIRE_ALL` 同 binary A/B）：
   前提不成立——"fire() 把整个人群全部唤醒"是对 `pop_again` 循环的误读。
