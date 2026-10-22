@@ -7,6 +7,7 @@
 - [Getting started](guide/getting-started.md)
 - [Fused CPU pipelines](guide/pipe.md)
 - [Streaming pipelines](guide/stream.md)
+- [DAG pipelines](guide/graph.md)
 - [Borrowing data](guide/scope.md)
 - [Fallible pipelines](guide/errors.md)
 

@@ -19,6 +19,10 @@ required-features = ["tokio-runtime"]
 name              = "mixed_cpu_io"
 required-features = ["tokio-runtime"]
 
+[[example]]
+name              = "graph_diamond"
+required-features = ["tokio-runtime"]
+
 [[bench]]
 harness = false
 name    = "sync_vs_rayon"

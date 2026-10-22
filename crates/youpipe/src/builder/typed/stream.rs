@@ -68,8 +68,9 @@ use crate::{
 // channel between adjacent stages — a leased pool job in pool mode).
 
 /// True iff `cancel` is set and the pipeline should stop feeding new work.
+/// `pub(crate)`: shared by the graph engine's worker/feeder loops.
 #[inline]
-fn cancel_active(cancel: Option<&CancellationToken>) -> bool {
+pub(crate) fn cancel_active(cancel: Option<&CancellationToken>) -> bool {
     cancel.is_some_and(CancellationToken::is_cancelled)
 }
 
@@ -111,7 +112,10 @@ fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
 /// writer wins (same policy as the fused path's `ErasedFailure::record`):
 /// when every task dies (nested `run()` re-raise) the original panic is the
 /// meaningful one.
-type PanicSlot = Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
+///
+/// `pub(crate)`: shared by the graph engine (same first-wins re-raise
+/// contract there).
+pub(crate) type PanicSlot = Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
 
 /// Pool-capacity lease covering one streaming run's channel-parking jobs
 /// (non-inline feeder + sync/expand stage workers).
@@ -141,10 +145,22 @@ pub(crate) struct ParkingLease {
 }
 
 impl ParkingLease {
+    /// Lease `reserved` parking slots on `registry` (graph engine entry;
+    /// the stream engine computes its own `need` inline in `try_exec`).
+    pub(crate) fn new(registry: Arc<Registry>, reserved: usize) -> Self {
+        Self {
+            registry,
+            reserved,
+            spawned: Cell::new(0),
+        }
+    }
+
     /// Wrap `job` so its completion — return or unwind — returns one leased
     /// slot. The release must not precede the job's last channel access,
     /// hence drop-guard (a plain tail call would be skipped on unwind).
-    fn wrap_job<F>(&self, job: F) -> impl FnOnce() + Send + 'static
+    ///
+    /// `pub(crate)`: shared by the graph engine's job dispatch.
+    pub(crate) fn wrap_job<F>(&self, job: F) -> impl FnOnce() + Send + 'static
     where
         F: FnOnce() + Send + 'static,
     {
@@ -196,7 +212,9 @@ impl Feeder {
 /// Record `payload` in `slot` unless an earlier panic is already stored
 /// (first-wins, see [`PanicSlot`]). Poison recovery: a panic stored under
 /// this mutex poisons it, but the payload is still valid to record/read.
-fn record_panic(slot: &PanicSlot, payload: Box<dyn std::any::Any + Send>) {
+///
+/// `pub(crate)`: shared by the graph engine.
+pub(crate) fn record_panic(slot: &PanicSlot, payload: Box<dyn std::any::Any + Send>) {
     let mut guard = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -207,7 +225,9 @@ fn record_panic(slot: &PanicSlot, payload: Box<dyn std::any::Any + Send>) {
 
 /// Re-raise the stored panic payload (if any) on the calling thread. Same
 /// poison-recovery pattern as the hybrid dispatcher's fail slot.
-fn resume_stored_panic(slot: &PanicSlot) {
+///
+/// `pub(crate)`: shared by the graph engine.
+pub(crate) fn resume_stored_panic(slot: &PanicSlot) {
     if let Some(payload) = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1873,7 +1893,7 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
 /// deadlocks. No test pins this shape (it depends on run/pool sizing), so
 /// the two call sites must move together.
 #[inline]
-fn floored_channel_capacity(buffer_size: usize, parallelism: usize) -> usize {
+pub(crate) fn floored_channel_capacity(buffer_size: usize, parallelism: usize) -> usize {
     buffer_size.max(parallelism * 4)
 }
 

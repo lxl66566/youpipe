@@ -11,6 +11,13 @@ pub(crate) use self::fused::{
 };
 // Reducer wrappers for the scoped aggregation terminals (see builder/mod.rs).
 pub(crate) use self::traits::{CountReducer, OptionReducer, SumReducer};
+// Lifecycle helpers shared with the graph engine (same parking-lease
+// admission, panic-slot policy and channel-capacity floor as the stream
+// engine — one implementation so the two cannot drift).
+pub(crate) use self::stream::{
+    PanicSlot, ParkingLease, cancel_active, floored_channel_capacity, record_panic,
+    resume_stored_panic,
+};
 pub use self::{
     borrowed::{PipeRef, TryPipeRef, pipe_ref},
     fused::{Pipe, RangePipe, TryPipe, pipe, pipe_range},

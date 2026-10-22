@@ -5,7 +5,7 @@ English | [简体中文](https://github.com/lxl66566/youpipe/blob/main/README.zh
 youpipe is a high-performance, data-first parallel pipeline supporting mixed
 CPU workloads and streaming async IO. Items enter at the front, stages chain
 naturally, and a single terminal call (`.collect()` / `.run()`) executes the
-whole chain. Two pipeline engines cover different regimes:
+whole chain. Three pipeline engines cover different regimes:
 
 - `Pipe` — compile-time fused CPU chains. `.map().filter().map()` becomes a
   single monomorphized closure per worker with no intermediate allocations.
@@ -13,6 +13,9 @@ whole chain. Two pipeline engines cover different regimes:
   async IO, cancellation, fences, 1-to-N expansion, and more. Pure sync
   chains (`.stage()`s only, unpinned) auto-fuse onto the fused core at
   `.run()`/`.collect()` — fused performance with the streaming API.
+- `graph()` — runtime DAG orchestration for non-linear topologies: broadcast
+  fan-out, fair fan-in joins, multiple sources and sinks, with sync CPU
+  nodes and async IO nodes mixed freely in one graph.
 
 A rayon-style work-stealing scheduler (`st3` LIFO deque + packed atomic
 sleep counters) handles balanced and unbalanced loads. `scope()` supports
@@ -42,6 +45,16 @@ let r: Vec<u64> = (0..1000).stream()
     .stage(|x: u64| x + 1)
     .stage_async(|x: u64| async move { fetch(x).await })
     .run();
+
+// runtime DAG: broadcast to two branches, join them back, sink the union
+let mut g = youpipe::graph();
+let src = g.source("load", 0..1000u64);
+let a = g.node("hash", Default::default(), |x: u64| x * 2);
+let b = g.node_async("meta", Default::default(), |x: u64| async move { fetch(x).await });
+let join = g.node("join", Default::default(), |x: u64| x);
+let snk = g.sink("out", |x: u64| { /* side effect */ });
+g.edge(src, a).edge(src, b).edge(a, join).edge(b, join).edge(join, snk);
+g.run();
 ```
 
 For index-shaped work (`0..n`), `pipe_range(0..n)` skips input materialization
@@ -57,7 +70,7 @@ Pick the engine and tuning knobs by workload — see
 Full manual at **[lxl66566.github.io/youpipe](https://lxl66566.github.io/youpipe/)**:
 
 - [User guide](https://lxl66566.github.io/youpipe/guide/getting-started.html) —
-  fused, streaming, borrowing and fallible pipelines
+  fused, streaming, DAG, borrowing and fallible pipelines
 - [Performance tuning](https://lxl66566.github.io/youpipe/advanced/choosing-engine.html) —
   engine choice, workload hints, pools, per-stage knobs
 - [Benchmarks and methodology](https://lxl66566.github.io/youpipe/dev/benchmarks.html) —

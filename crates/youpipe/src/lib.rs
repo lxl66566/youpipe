@@ -61,6 +61,7 @@ const _: () = {
 
 pub mod builder;
 pub mod executor;
+pub mod graph;
 pub mod handoff;
 pub(crate) mod pool;
 pub mod prelude;
@@ -76,6 +77,10 @@ pub use builder::{
     pipe, pipe_range, pipe_ref, stream,
 };
 pub use executor::{ComputePool, compute::MAX_COMPUTE_WORKERS};
+// `graph` names the module (type namespace) and the entry function (value
+// namespace) — the same one-name pattern as the `stream` fn, which lives in
+// a module named after its engine.
+pub use graph::{AsyncNodeOptions, GraphBuilder, NodeHandle, NodeOptions, graph};
 pub use handoff::{AsyncReceiver, AsyncSender, Receiver, Sender, async_channel, channel};
 #[cfg(feature = "tokio-runtime")]
 pub use runtime::TokioPool;

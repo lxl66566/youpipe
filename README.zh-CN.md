@@ -4,13 +4,15 @@
 
 youpipe 是一个高性能、数据优先、支持混合 CPU 负载与流式异步 IO 的并行 pipeline。
 数据从入口传入，各阶段自然串联，最终通过一次终端调用（`.collect()` / `.run()`）
-执行完整链。两种 pipeline 引擎覆盖不同场景：
+执行完整链。三种 pipeline 引擎覆盖不同场景：
 
 - `Pipe` — 编译期融合的 CPU 链。`.map().filter().map()` 编译为每个工作线程上
   单一的单态化闭包，不产生任何中间分配。
 - `StreamPipe` — 基于通道的流式处理，覆盖融合无法处理的场景：异步 IO、
   Cancellation、fence、一对多展开等。纯同步链（仅 `.stage()`、无 pin）在
   `.run()`/`.collect()` 时自动融合到 fused 核心执行——用 streaming API 拿到 fused 性能。
+- `graph()` — 运行期 DAG 编排，覆盖非线性拓扑：fan-out 广播、fan-in 公平
+  汇聚、多源多汇，同步 CPU 节点与异步 IO 节点可在同一张图中混用。
 
 工作窃取调度器采用 rayon 风格的 `st3` LIFO 双端队列 + 紧凑原子休眠计数器，
 兼顾均衡与不均衡负载。`scope()` 支持借用栈上局部数据的非 `'static` 闭包。
@@ -39,6 +41,16 @@ let r: Vec<u64> = (0..1000).stream()
     .stage(|x: u64| x + 1)
     .stage_async(|x: u64| async move { fetch(x).await })
     .run();
+
+// 运行期 DAG：广播到两个分支，再汇聚回一个节点，汇点接收两路全集
+let mut g = youpipe::graph();
+let src = g.source("load", 0..1000u64);
+let a = g.node("hash", Default::default(), |x: u64| x * 2);
+let b = g.node_async("meta", Default::default(), |x: u64| async move { fetch(x).await });
+let join = g.node("join", Default::default(), |x: u64| x);
+let snk = g.sink("out", |x: u64| { /* 副作用 */ });
+g.edge(src, a).edge(src, b).edge(a, join).edge(b, join).edge(join, snk);
+g.run();
 ```
 
 索引形状的负载（`0..n`）可用 `pipe_range(0..n)` 完全跳过输入物化——条目直接在并行叶子内生成，
@@ -51,7 +63,7 @@ let r: Vec<u64> = (0..1000).stream()
 详见 **[Github Pages](https://lxl66566.github.io/youpipe/)**：
 
 - [用户指南](https://lxl66566.github.io/youpipe/guide/getting-started.html) ——
-  融合、流式、借用与 fallible pipeline
+  融合、流式、DAG、借用与 fallible pipeline
 - [性能调优](https://lxl66566.github.io/youpipe/advanced/choosing-engine.html) ——
   引擎选择、workload 提示、线程池、逐阶段可调参数
 - [Benchmark 与方法论](https://lxl66566.github.io/youpipe/dev/benchmarks.html) ——

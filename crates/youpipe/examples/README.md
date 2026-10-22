@@ -54,6 +54,7 @@ form for explicitness; user code typically uses the prelude form.
 | Do 1-to-N flatMap-style expansion | [`nested_expand`](nested_expand.rs) | `.expand()` vs rayon `flat_map` vs std |
 | Build a multi-stage streaming CPU chain | [`stream_chain`](stream_chain.rs) | `stream().stage().stage()` vs tokio `spawn_blocking` |
 | Cancel a pipeline mid-flight | [`cancellation`](cancellation.rs) | `with_cancel(token)` aborts feeder + workers + bridges |
+| Build a DAG with fan-out / fan-in | [`graph_diamond`](graph_diamond.rs) | `graph()` diamond: broadcast to a sync and an async branch, join, sink |
 
 ## Detailed notes
 
@@ -146,6 +147,13 @@ spawned).
 canceller thread signals the token after 5 ms; the feeder, every stage worker,
 and every bridge thread check the token per iteration. In-flight items are
 drained to completion but no new items are accepted.
+
+### `graph_diamond`
+
+A runtime DAG via `graph()`: one source broadcasts into a sync CPU branch and
+an async IO branch (fan-out), a join node round-robins both inbound edges
+(fan-in), and an async persist node feeds the sink. Verifies broadcast
+conservation — the sink observes every item on both branches.
 
 ## Related benchmarks
 

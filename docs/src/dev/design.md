@@ -48,6 +48,25 @@ type-level-detected at `.run()` and executed as one composed pass on the
 fused core (no channels, feeder, or collector) — see
 [streaming.md](streaming.md#fused-pass-through-pure-sync-chains).
 
+### Graph: runtime DAG orchestration
+
+The third engine, `graph()` (`src/graph/`), generalizes the streaming
+topology from a compile-time chain to a runtime DAG: nodes register with
+`source` / `node` / `node_expand` / `node_async` / `sink`, `edge` connects
+two `NodeHandle`s with a compile-time type check, and `run()` validates the
+topology (cycles, dangling nodes, duplicate names/edges — errors name the
+node) before starting it. It reuses both planes unchanged: the data plane is
+the same crossfire MPMC channels (fan-out = one channel per outbound edge +
+per-edge `Clone`; fan-in = fair round-robin over the inbound edges), and the
+scheduling faces are the same `ComputePool` (sync nodes) and `AsyncRuntime`
+(async nodes, pull-based async sources). The engines position as: `pipe` for
+compile-time linear fusion, `stream` for runtime linear chains, `graph` for
+runtime DAGs — linear workloads should stay on the cheaper engines; see the
+[user guide](../guide/graph.md). Node workers default to an automatic
+budget split over the pool; blocked workers on a too-narrow pool fall back
+to dedicated OS threads, which also makes nested runs (a `graph()` inside a
+pool worker) deadlock-free.
+
 ### Non-`'static` Lifetime Support
 
 The `scope()` API allows closures to borrow stack-local variables without `'static` bounds. The `'env` lifetime is threaded through `ScopedPipe` and the underlying `fused_collect_scoped` drives the same `ComputePool::join` work-stealing core — whose `Registry::in_worker_cold` blocks the calling thread until every spawned sub-task finishes — guaranteeing borrowed references outlive the pool's access to them.
@@ -103,6 +122,7 @@ crates/youpipe/src/
 │   │   ├── mod.rs    # ComputePool unit tests
 │   │   └── worker.rs # ComputePool: Injector/Stealer/sleep counters wake/graceful shutdown/join
 │   └── mod.rs
+├── graph/            # Runtime DAG engine (graph()): builder, validation, per-node executors
 ├── handoff/          # Data transfer layer
 │   ├── channel.rs    # MPMC channels (crossfire wrapper: sync + async)
 │   └── mod.rs

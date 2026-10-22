@@ -19,3 +19,8 @@ pub(crate) use typed::{
     fused_fold_scoped, fused_for_each_scoped, fused_reduce_scoped, fused_try_collect_scoped,
     fused_try_fold_scoped, fused_try_reduce_scoped,
 };
+// Shared lifecycle helpers the graph engine reuses (see typed/mod.rs).
+pub(crate) use typed::{
+    PanicSlot, ParkingLease, cancel_active, floored_channel_capacity, record_panic,
+    resume_stored_panic,
+};
