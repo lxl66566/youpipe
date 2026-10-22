@@ -1924,3 +1924,44 @@ rather than merged: its scenario already lived on as the `real_doc` row of
 `benches/horizontal` (interleaved rounds, stricter methodology), and its
 "youpipe all-sync 3 stages" row is moot since pure-sync `stream` chains now
 fuse onto the fused core.
+
+### Graph-engine DAG shapes (`graph_shapes`, 2026-10-22)
+
+First A/B of the `graph()` engine against its closest sibling, the streaming
+engine, plus DAG-only shape anchors. Same-binary knob
+(`YOUPIPE_GRAPH_VARIANT=graph|stream`), 5 per-id isolated interleaved rounds
+on the 32-core Linux box (spread < 8 % across rounds; the same shapes on the
+Windows dev box drifted ±30 % and even showed a phantom 2.5× chain gap that
+vanished on Linux — the drift, not the engine).
+
+| shape              | graph @1K | stream @1K | graph @100K | stream @100K |
+| ------------------ | --------- | ---------- | ----------- | ----------- |
+| chain_cpu (2 hops) | 233 µs    | 210 µs     | 18.45 ms    | 18.39 ms    |
+| chain_cheap        | 235 µs    | 213 µs     | 18.39 ms    | 18.37 ms    |
+| diamond_cpu        | 327 µs    | 192 µs     | 30.37 ms    | 15.32 ms    |
+
+`chain_*` is the strict same-shape control (source → cpu → cpu → sink; the
+stream side's never-fired `with_cancel` only forces the streaming topology):
+**steady-state throughput is a wash at 100K (1.00×)** — the graph assembly
+layer (runtime plan, Kahn validation, type-erased spawn, budget split) costs
+nothing per item; @1K it shows as a fixed ~23 µs per-run assembly delta.
+
+`diamond_cpu` compares the graph diamond (hash → broadcast → fast/slow →
+fair fan-in merge → sink) against the *workload-equivalent serial* stream
+chain (3× cpu + 1 bump per item — a shape comparison, not an engine A/B):
+the diamond costs 2× the serial chain. The cheap anchors attribute it:
+`diamond_cheap_graph` @100K = 29.8 ms ≈ `diamond_cpu_graph` = 30.4 ms, i.e.
+the closure work is fully hidden and the gap is pure data-plane — per source
+item the diamond pays 2 clones + 6 channel ops (vs 3 hops serial) and every
+node's claim cap is split across more worker populations.
+`fanin_cheap_graph` (two sources → one node, no broadcast) @100K = 56.0 ms
+for 200K items ≈ 280 ns/item vs the chain's 184 ns/item — the fair fan-in
+round-robin poll alone accounts for most of the per-item premium.
+
+Verdict: no regression for what `graph()` exists for (topologies `stream`
+cannot express); the DAG data-plane premium (~1.5–2× per item at the 50-mul
+CPU anchor) is dominated by fan-in polling and broadcast clones. With real
+CPU/IO per-item work (µs-scale, the engine's target regime) it amortizes to
+noise. Improvement levers if the light-item regime ever matters: batched
+broadcast sends (`try_send_batch` per edge) and a fan-in claim cap that does
+not shrink with the node's worker count.

@@ -86,9 +86,16 @@ name    = "pool_reuse"
 # Horizontal cross-library comparison (youpipe vs rayon vs tokio vs futures vs
 # std threads), JSON-exporting, self-interleaved. See perf/plot-horizontal.py.
 [[bench]]
-harness           = false
-name              = "horizontal"
+harness = false
+name    = "horizontal"
 required-features = ["tokio-runtime"]
+
+# Graph-engine DAG shapes: strict chain A/B against the streaming engine
+# (YOUPIPE_GRAPH_VARIANT=graph|stream same-binary knob), plus diamond /
+# two-source fan-in anchors. See the bench file's module docs.
+[[bench]]
+harness = false
+name    = "graph_shapes"
 
 [dependencies]
 concurrent-queue = { workspace = true }
