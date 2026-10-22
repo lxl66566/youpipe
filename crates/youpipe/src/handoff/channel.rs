@@ -303,6 +303,14 @@ impl<T: Send + 'static> MpscSender<T> {
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         self.tx.try_send(item).map_err(map_send_err)
     }
+
+    /// Native-batch twin of [`SyncSender::try_send_batch`] (one `sender`
+    /// CAS per free run on the MPSC ring; the per-worker sharded terminal
+    /// rings are the default-on caller).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscSender"))]
+    pub fn try_send_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        unsafe { self.tx.try_send_batch(buf) }
+    }
 }
 
 impl<T: Send + 'static> SendItem<T> for MpscSender<T> {
@@ -314,6 +322,11 @@ impl<T: Send + 'static> SendItem<T> for MpscSender<T> {
     #[inline]
     fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         MpscSender::try_send(self, item)
+    }
+
+    #[inline]
+    fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
+        MpscSender::try_send_batch(self, values)
     }
 }
 
@@ -582,6 +595,47 @@ pub trait SendItem<T>: Clone + Send + 'static {
         }
         n
     }
+
+    /// Deliver every item of `batch`: one `try_send_batch` for the free
+    /// prefix, then per-item blocking [`Self::send`] for the remainder —
+    /// backpressure granularity (park per item, only when full) and item
+    /// order are identical to the per-item loop this replaces; what
+    /// changes is one tail CAS per free run instead of one per item on
+    /// backings with a native batch op. `batch` is drained on return;
+    /// `staged` is caller-owned scratch, `clear`-reused per call (one
+    /// allocation per caller, not per batch). Returns `false` as soon as a
+    /// send reports the channel closed; the unsent remainder is dropped
+    /// with its destructors run (a `Vec<MaybeUninit<_>>` drop would skip
+    /// them).
+    ///
+    /// No cancellation hook by design: the per-item worker loops this
+    /// serves observe cancel between item productions, never between
+    /// production and send, so delivering every already-produced item
+    /// matches their contract. A caller that must not park after cancel
+    /// checks the token around its own blocking sends.
+    fn send_batch(&self, batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) -> bool {
+        if batch.is_empty() {
+            return true;
+        }
+        staged.clear();
+        staged.extend(batch.drain(..).map(MaybeUninit::new));
+        let sent = self.try_send_batch(staged);
+        let mut j = sent;
+        while j < staged.len() {
+            // SAFETY: only [..j) was moved out (batch send or this loop);
+            // slot `j` is still initialized.
+            let item = unsafe { staged[j].assume_init_read() };
+            j += 1;
+            if self.send(item).is_err() {
+                // SAFETY: [j..] were never moved out.
+                for slot in &mut staged[j..] {
+                    unsafe { slot.assume_init_drop() };
+                }
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl<T: Send + 'static> SendItem<T> for SyncSender<T> {
@@ -774,6 +828,7 @@ pub enum TryRecvError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_channel_basic() {
@@ -942,5 +997,54 @@ mod tests {
         assert_eq!(rx.recv().unwrap(), 3);
         drop(rx);
         assert!(matches!(tx.try_send(4), Err(TrySendError::Closed(4))));
+    }
+
+    /// The batched blocking flush keeps item order across the free-prefix /
+    /// fallback boundary: a batch larger than the ring capacity must park
+    /// per item for the remainder without reordering. A concurrent drainer
+    /// keeps the fallback's per-item parks bounded.
+    #[test]
+    fn send_batch_preserves_order_across_full_ring() {
+        for cap in [1, 2, 7] {
+            let (tx, rx) = channel::<u32>(cap);
+            let drainer = std::thread::spawn(move || {
+                let mut got = Vec::with_capacity(32);
+                while let Ok(v) = rx.recv() {
+                    got.push(v);
+                }
+                got
+            });
+            let mut batch: Vec<u32> = (0..32).collect();
+            let mut staged: Vec<MaybeUninit<u32>> = Vec::with_capacity(32);
+            assert!(SendItem::send_batch(&tx, &mut batch, &mut staged));
+            assert!(batch.is_empty(), "batch must be drained on success");
+            drop(tx);
+            assert_eq!(drainer.join().unwrap(), (0..32).collect::<Vec<u32>>());
+        }
+    }
+
+    /// Closed mid-batch: the unsent remainder must run its destructors (the
+    /// `Vec<MaybeUninit<_>>` staging would otherwise drop them silently) —
+    /// the failed `send` consumes item 0, the explicit drop covers 1..8.
+    #[test]
+    fn send_batch_closed_mid_batch_runs_destructors() {
+        let counter = Arc::new(Drops::default());
+        let (tx, rx) = mpsc_channel::<DropCounted>(4);
+        drop(rx);
+        let mut batch: Vec<_> = (0..8).map(|_| DropCounted(counter.clone())).collect();
+        let mut staged: Vec<MaybeUninit<DropCounted>> = Vec::with_capacity(8);
+        assert!(!SendItem::send_batch(&tx, &mut batch, &mut staged));
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 8);
+    }
+
+    #[derive(Default)]
+    struct Drops(std::sync::atomic::AtomicUsize);
+
+    struct DropCounted(Arc<Drops>);
+
+    impl Drop for DropCounted {
+        fn drop(&mut self) {
+            self.0.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }

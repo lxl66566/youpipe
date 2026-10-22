@@ -184,6 +184,29 @@ pub(crate) fn fwd_batch_enabled() -> bool {
     })
 }
 
+// `YOUPIPE_STREAM_TX_BATCH` batches the sync stage/expand workers' output
+// delivery: the mapped claim batch is staged and flushed with
+// `SendItem::send_batch` (one `try_send_batch` per free run + per-item
+// blocking fallback) instead of one blocking `send` per item — the graph
+// engine's tx-batch lever ported to the streaming data plane (it is what
+// let the graph chain overtake the stream chain on the identical shape).
+// Zero-cap claim caps (YOUPIPE_BATCH_RECV=0) keep the per-item send:
+// staging single-item claims only adds moves. Runtime knob so A/B benches
+// compare the same binary. Default ON; "0" recovers the per-item loops.
+static STREAM_TX_BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn stream_tx_batch() -> bool {
+    *STREAM_TX_BATCH.get_or_init(|| match std::env::var("YOUPIPE_STREAM_TX_BATCH") {
+        Ok(v) if v == "1" || v.is_empty() => true,
+        Ok(v) if v == "0" => false,
+        Ok(other) => panic!(
+            "YOUPIPE_STREAM_TX_BATCH: invalid value {other:?} (leave unset or use \"0\"/\"1\")"
+        ),
+        // Unset = the default-on policy (see the knob comment above).
+        Err(_) => true,
+    })
+}
+
 // Worker-side batch burst helpers (todo #1 residual (d)); crate-internal.
 pub use channel::{
     AsyncReceiver, AsyncRecvItem, AsyncSendItem, AsyncSender, ChannelError, MpscAsyncReceiver,

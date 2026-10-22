@@ -21,6 +21,7 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `YOUPIPE_FWD_BATCH` | fence forwarder pushes released batches via `try_send` | streaming | rarely useful alone; pairs with `YOUPIPE_SPIN_ANCHOR` on fence-heavy chains |
 | `YOUPIPE_ASYNC_CHAIN_FLOOR` | unpinned channel capacities of async-tailed chains floor at `min(n, 16384)` slots (default on; `"0"` = unfloored) | streaming (chains with an async stage) | leave on — it removes the async convoy slow mode; escape only to pin backpressure tightly (per-stage `buffer` pins are the better tool) |
 | `YOUPIPE_GRAPH_TX_BATCH` | graph node/source outputs flushed per claim batch (`try_send_batch` per edge; default on; `"0"` = per-item `send`) | graph | leave on — the per-item loops cost 2–3× on light items; `"0"` only to isolate the knob in a bench |
+| `YOUPIPE_STREAM_TX_BATCH` | stream stage/expand workers flush the mapped claim batch (`try_send_batch` per free run; default on; `"0"` = per-item `send`) | streaming (pure-sync chains — async-tailed chains always keep per-item) | leave on — 1.6–3× on multi-stage light-item chains; `"0"` only to isolate the knob in a bench |
 
 `Workload` and `buffer_size`/`async_workers`/`io_concurrency` are disjoint: a
 fused `pipe()` ignores the streaming knobs (it has no channels and no async

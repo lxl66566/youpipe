@@ -365,6 +365,46 @@ fails the test in seconds; the stalled worker leaks until process exit
 libtest joins test threads, so an inline hang holds the process and the
 shared cargo lock hostage).
 
+#### Worker output batching (`YOUPIPE_STREAM_TX_BATCH`)
+
+Default on (2026-10-22): the sync stage/expand workers stage each mapped
+claim batch and flush it with one `try_send_batch` per free run plus the
+per-item blocking fallback (`SendItem::send_batch`, a provided
+`SendItem` method also adopted by `fence_batch_send`'s batched arm) —
+the graph engine's tx-batch lever ported to the streaming data plane.
+Zero-cap claims (`YOUPIPE_BATCH_RECV=0`) keep the per-item send; the
+expand workers flush the staging buffer at the batch cap so an expansion
+fan-out cannot grow it with a whole claim batch's outputs.
+
+The MPSC ring carries a native fork extension for the send side now
+(`array_queue_mpsc::try_push_batch`, mirroring the MPMC twin): one
+`sender` CAS claims the free run, values + Release stamps per item.
+Freeness is counted in *slot-backed positions*
+(`real_positions` — the per-lap positions `cap..one_lap` have no slot,
+so a raw cursor distance overcounts; found by the cap-3 fork test which
+double-wrote slot 0). A torn snapshot (stale tail + freshly refreshed
+head) can overcount the free run, and the claim CAS then fails on the
+stale tail bits — overclaiming never lands (the spurious-span
+debug_assert that assumption violated is documented in
+`real_positions`, not asserted).
+
+Cancel semantics are unchanged from the per-item loop: the token is
+checked before every stage/expand call (the same observation point), and
+the outputs of calls that completed before the token was observed are
+delivered — the identical item set the per-item loop sends. Arrival
+order within a batch is preserved on the fallback path; unordered
+channels interleave producers anyway and ordered runs re-sequence by
+`seq`.
+
+**Async-tailed chains are gated off** (`!ctx.has_async_stage`, the
+capacity-floor predicate): on `stage().stage().stage_async()` batched
+delivery measured +2.2…+4.9 % on BOTH hops (the mixed hop worst;
+convoy-probe async2 median +3–7 %, no slow mode) — async consumer tasks
+poll `MAsyncRx::recv` and their pacing does not benefit from send-side
+runs the way the sync anchor + burst-drain loops do. Readings:
+benchmarks.md "Stream worker tx batching"; the falsified variant is in
+dead-ends.md.
+
 ## Worker recv loops: anchor + burst-drain
 
 Every sync consumer loop (`spawn_stage` / `spawn_expand_stage` workers, the

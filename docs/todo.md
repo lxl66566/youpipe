@@ -92,22 +92,14 @@
 - 残余方向：`RunOutcome` 或 `try_run_checked` 报告
   `Cancelled { emitted }`（collector 排干后查 token 即可）。
 
-### 16. [P1] streaming stage worker 的逐项 send 批量化
+### 16. ~~[P1] streaming stage worker 的逐项 send 批量化~~（已落地）
 
-- 现状：`YOUPIPE_GRAPH_TX_BATCH`（2026-10-22，默认开）把 graph 引擎的
-  feeder/node/expand 输出改为 claim 批次暂存 + 每边一次 `try_send_batch`
-  （+逐项阻塞 fallback），graph_shapes 全 id −24…−66 %（benchmarks.md
-  「Graph data-plane batching」）；graph chain @100K 8.5 ms 反超 stream
-  18.4 ms 的直接原因就是 stream worker（`spawn_stage_fanout` /
-  `spawn_expand_stage_fanout`）仍逐项 `tx.send`。
-- 方向：同型改动移植到 stream worker（暂存 `(seq, output)` 批、
-  `try_send_batch` 前缀 + 逐项 fallback，序保持——批内 drain 顺序不变）。
-  风险面：stream 侧所有历史 verdict 均以逐项 send 为基线；下游是
-  share-capped 批量 claim 的 crowd，发送批变大可能改变下游争用形状，
-  需全套 `stream_pipeline`/`sharded_term`/`sync_fuse`/`mixed_load` 隔离
-  A/B；sharded 终端路径的 per-worker SPSC sender 需逐一核对批量 API。
-- 验证：同 binary 旋钮 A/B（`bench_ab.sh -E`）+ 上述家族 per-id 隔离
-  交错；convoy 家族（fence/async2）用 convoy-probe 复查慢档率。
+- `YOUPIPE_STREAM_TX_BATCH`（2026-10-22，默认开）+ fork MPSC ring 原生
+  `try_push_batch` 已落地：multi2 −49 %、cancel_quad −65 %、fence_pair
+  −20…−25 %、workers2 −10…−17 %，全 25/25 或 9/9 稳定；async 尾链按
+  `!has_async_stage` 门控保持逐项（两跳批量均 +2.2…+4.9 %，证伪记录在
+  dead-ends.md）。读数：benchmarks.md「Stream worker tx batching」；
+  机制与语义：streaming.md「Worker output batching」。
 
 ## 代码健康（重构/坏味道）
 
@@ -121,8 +113,14 @@
 
 - 现状：pool-wide parking lease（74211b1）修复了确定的并发预算成分后，hang
   仍偶发（2026-09-28 又一次：并行 cargo test 下某测试二进制 107 线程全部
-  futex wait、13 分钟 0 CPU，kill 后其余测试正常）。Cargo.toml 的
-  `crossfire-trace` feature 即为其取证插桩。
+  futex wait、13 分钟 0 CPU，kill 后其余测试正常；2026-10-22 又一次：
+  **graph 引擎侧**，`graph_dag` 二进制 `diamond_broadcast_conservation`
+  （n=10K、buffer=4），68 线程全部 futex——21 个阻塞在 `recv`、11 个阻塞
+  在 `send`（ring 满）、主线程在 `graph/exec.rs` 完成 condvar wait，
+  standalone 重跑 20/20 秒通过，与 stream 侧改动无关）。Cargo.toml 的
+  `crossfire-trace` feature 即为其取证插桩；graph 侧复现的 stack 签名
+  （producers Full / consumers Empty / 主线程 join condvar）与 #14 历史
+  形态一致，说明该间歇性死锁跨引擎存在。
 - 方向：复现时用 `crossfire-trace` + gdb 取证（lost-wakeup 假设优先）；关注
   fence pool-job 化（41e0a6a）后的新交互面。
 - 验证：并行 harness 反复跑 `pipeline_integration`；无确定性复现前不动代码。

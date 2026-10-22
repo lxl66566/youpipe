@@ -2003,3 +2003,50 @@ Every graph id stable 25/25; final-binary confirmation (default on vs `"0"`,
   noise alone (|Δ| ≤ 5 %, mixed signs) and +6–8 % on top of tx on the
   diamond @100K: with sends batched, the per-claim round walk over k rings
   is not on the critical path. Removed; see dead-ends.md.
+
+### Stream worker tx batching (`YOUPIPE_STREAM_TX_BATCH`, 2026-10-22)
+
+The same lever ported to the streaming engine's stage/expand workers
+(todo #16): the mapped claim batch is staged and flushed with one
+`try_send_batch` per free run + per-item blocking fallback
+(`SendItem::send_batch`), instead of one blocking `send` per item. The
+MPSC ring gained a native fork extension for it (one `sender` CAS per
+free run — without it the terminal/shard rings rode the per-item
+fallback and only the mid-MPMC hops benefited; workers2 rows moved from
+noise to −16.5 % the moment it landed). Chains containing an async stage
+keep the per-item sends on every hop (the gate measured below).
+
+Same-binary knob A/B (`bench_ab.sh -E`, isolated per-id, 5 interleaved
+rounds, 32 cores; fused-path `merged` rows and `mixed_load` stream ids
+are controls):
+
+| id | Δ | verdict |
+| --- | --- | --- |
+| sync_fuse/cancel_quad_cpu_split @100K / @1K | **−64.7 % / −49.9 %** | 9/9, 9/9 stable |
+| sharded_term/multi2_cpu @100K / @1K | **−49.1 % / −37.4 %** | 25/25 stable |
+| sync_fuse/cancel_pair_cpu_split @100K / @1K | **−50.2 % / −38.5 %** | 9/9 stable |
+| sync_fuse/cancel_pair_cheap_split @100K / @1K | −50.2 % / −38.6 % | 25/25 stable |
+| sync_fuse/fence_pair_cpu_split @1K | −24.9 % | 25/25 stable |
+| sync_fuse/fence_pair_cheap_split @1K / @100K | −24.6 % / −20.4 % | 25/25 dominant |
+| sharded_term/workers2_cpu @1K / @100K | −16.5 % / −9.7 % | 25/25 stable |
+| sync_fuse/async_pair_cpu_split @1K (pre-gate) | −14.4 % | 25/25 — see below |
+| sync_fuse/fence_infra @100K / @1K | −6.7 % / −5.8 % | 25/25 |
+| sharded_term/single_* (6 rows) | −1.3…+0.3 % | noise, leaning win |
+| sharded_term/expand_cheap @1K/@100K | +0.3/+1.9 % | noise (19–24 % spreads) |
+| expand_heavy youpipe rows | −0.4…−3.9 % | noise-to-win; rayon control ±4 % |
+| async rows (post-gate), fused controls, mixed_load | ±1.5 % | noise |
+
+The async-tail gate: on `stage().stage().stage_async()` the batched
+delivery regressed **+4.9 % @100K (0/25)** with the mixed hop batched and
+still **+3.3 % @1K (0/25)** with only the mid-MPMC hop batched — both
+hops of an async-tailed chain lose under send-side runs (the async
+terminal's task pacing does not benefit the way sync consumer loops do;
+convoy-probe async2: median +3–7 %, no slow mode on either side). The
+gate is `!ctx.has_async_stage` — same predicate as the capacity floor —
+so async chains keep the per-item rhythm byte-for-byte and read ±1.5 %
+noise. The pre-gate 1K win (−14.4 %) was the mixed hop's, outweighed by
+its @100K cost; see dead-ends.md. Single-stage rows sit at noise: their
+only channel is the terminal shard ring, whose send-side CAS was already
+uncontended (sole producer); the win concentrates where sends contend
+(mid MPMC rings shared by k workers) or the claim share is small
+(workers2).

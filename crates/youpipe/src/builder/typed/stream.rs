@@ -37,7 +37,7 @@ use crate::{
     executor::compute::ComputePool,
     handoff::{
         Claim, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, ShardedReceiver, SyncSender,
-        TrySendError, channel::channel, claim_poll, mpsc_channel, sharded::MIN_SHARD_BUFFER,
+        channel::channel, claim_poll, mpsc_channel, sharded::MIN_SHARD_BUFFER,
         sharded_mpsc_channel,
     },
     pool::Registry,
@@ -571,24 +571,22 @@ fn anchor_claim<T: Send + 'static>(
 /// `YOUPIPE_FWD_BATCH`).
 ///
 /// `batched == false`: one blocking `send` per item (baseline).
-/// `batched == true`: `try_send_batch` claims the longest sendable prefix
-/// with one tail CAS per run (falling back to per-item `try_send` on
+/// `batched == true`: [`SendItem::send_batch`] claims the longest sendable
+/// prefix with one tail CAS per run (falling back to per-item `try_send` on
 /// backings without a native batch op) and parks only on the unsent
 /// remainder — once per full ring, not per item. The fence-output channel
 /// is the serial-supplier→crowd interface where a per-item blocking send
 /// serializes a wake RTT into every item under a crowd of downstream
 /// workers.
 ///
-/// The batched path pops from the tail: `pop` is O(1) and keeps the
-/// allocation intact for the caller's [`FenceBarrier::reuse`] (a
-/// mid-vector `remove` would shift the remainder; `drain` consumes the
-/// whole batch before a `Full` can park). Arrival order within a batch was
-/// never a contract — unordered output interleaves workers anyway, ordered
-/// runs re-sequence by `seq` in the collector's `ReorderBuffer`.
-///
+/// Arrival order within a batch was never a contract — unordered output
+/// interleaves workers anyway, ordered runs re-sequence by `seq` in the
+/// collector's `ReorderBuffer` — so the in-order `send_batch` fallback is
+/// free to replace the historical tail-pop. `batch` ends empty either way,
+/// keeping the allocation intact for the caller's [`FenceBarrier::reuse`].
 /// `staged` is the forwarder-owned staging scratch for the batched arm
 /// (allocated once per forwarder and `clear`-reused per chunk, like
-/// `push_items`'s staging — a per-chunk `collect()` would regrow
+/// `push_items`' staging — a per-chunk `collect()` would regrow
 /// 1→2→…→k); the baseline path ignores it.
 fn fence_batch_send<T: Send + 'static, Tx: SendItem<T>>(
     tx: &Tx,
@@ -604,32 +602,7 @@ fn fence_batch_send<T: Send + 'static, Tx: SendItem<T>>(
         }
         return true;
     }
-    // Stage through the caller-owned scratch (one allocation per forwarder,
-    // `clear`-reused across released chunks — the same shape as
-    // `push_items`'s staging): the historical per-chunk `collect()` regrew a
-    // fresh Vec 1→2→…→k, reintroducing exactly the batch-allocation
-    // regrowth `FenceBarrier::reuse` removed. Each slot is written by moving
-    // out of `batch` and is either sent (slot moved out) or written back
-    // below — `batch` is left holding exactly the unsent remainder.
-    staged.clear();
-    staged.extend(batch.drain(..).map(std::mem::MaybeUninit::new));
-    let sent = tx.try_send_batch(staged);
-    // SAFETY: only [..sent) was moved out by the batch send; every slot
-    // from `sent` on is still initialized.
-    batch.extend(unsafe { staged[sent..].iter_mut().map(|s| s.assume_init_read()) });
-    while let Some(it) = batch.pop() {
-        match tx.try_send(it) {
-            Ok(()) => {},
-            // Full: park once for this item, then resume the batch.
-            Err(TrySendError::Full(it)) => {
-                if tx.send(it).is_err() {
-                    return false;
-                }
-            },
-            Err(TrySendError::Closed(_)) => return false,
-        }
-    }
-    true
+    tx.send_batch(batch, staged)
 }
 
 /// Spawn `parallelism` workers that pull from `rx`, apply `stage`, and
@@ -683,6 +656,18 @@ fn spawn_stage_fanout<I, O, Tx, R>(
     let workers = txs.len().max(1);
     let batch_cap = crate::handoff::batch_recv_cap();
     let claim_cap = if batch_cap == 0 { 0 } else { (batch_cap / workers).max(1) };
+    // Batched output delivery (YOUPIPE_STREAM_TX_BATCH): stage the mapped
+    // claim batch, flush with one `try_send_batch` per free run + per-item
+    // blocking fallback. Zero-cap claims keep the per-item send (staging
+    // single-item batches only adds moves). Async-tailed chains keep the
+    // per-item rhythm everywhere: on `stage().stage().stage_async()` the
+    // batched delivery measured +2.2…+4.9 % on BOTH hops (sync_fuse
+    // async_pair_cpu_split A/B; convoy-probe async2 median +3-7 %, no slow
+    // mode) — the async terminal's task pacing does not benefit from
+    // send-side runs the way sync consumer loops do (`ctx.has_async_stage`
+    // is known before spawning, same predicate as the capacity floor).
+    let tx_batch =
+        crate::handoff::stream_tx_batch() && claim_cap > 0 && !ctx.has_async_stage;
     // Collect all worker closures and submit as a single batch. This reduces
     // injector-queue notification overhead from N SeqCst fences + N JEC
     // increments (one per `submit`) down to 1 (one `submit_batch`), which
@@ -701,6 +686,12 @@ fn spawn_stage_fanout<I, O, Tx, R>(
                 // (d)); cap 0 keeps the per-item anchor + burst rhythm. The
                 // claim cap is the per-worker share (see `claim_cap` above).
                 let mut scratch: Vec<(u64, I)> = Vec::with_capacity(claim_cap.max(1));
+                // Output staging for the batched arm (see `tx_batch`); zero
+                // capacity when inert (`with_capacity(0)` allocates nothing).
+                let stage_cap = if tx_batch { claim_cap } else { 0 };
+                let mut mapped: Vec<(u64, O)> = Vec::with_capacity(stage_cap);
+                let mut staged: Vec<std::mem::MaybeUninit<(u64, O)>> =
+                    Vec::with_capacity(stage_cap);
                 'outer: loop {
                     // Anchor + burst-drain via `anchor_claim`: absorb
                     // already-queued items while the channel's cache lines are
@@ -718,13 +709,37 @@ fn spawn_stage_fanout<I, O, Tx, R>(
                     if claimed == 0 {
                         break;
                     }
-                    for (seq, item) in scratch.drain(..) {
-                        if cancel_active(worker_cancel.as_ref()) {
+                    if tx_batch {
+                        // Stage the mapped outputs, cancel checked before
+                        // every stage call — exactly the per-item loop's
+                        // observation point.
+                        let mut cancelled = false;
+                        mapped.clear();
+                        for (seq, item) in scratch.drain(..) {
+                            if cancel_active(worker_cancel.as_ref()) {
+                                cancelled = true;
+                                break;
+                            }
+                            mapped.push((seq, stage(item)));
+                        }
+                        // Deliver even on cancel: every mapped output's stage
+                        // call completed before the token was observed — the
+                        // same item set the per-item loop sends.
+                        if !tx.send_batch(&mut mapped, &mut staged) {
                             break 'outer;
                         }
-                        let output = stage(item);
-                        if tx.send((seq, output)).is_err() {
+                        if cancelled {
                             break 'outer;
+                        }
+                    } else {
+                        for (seq, item) in scratch.drain(..) {
+                            if cancel_active(worker_cancel.as_ref()) {
+                                break 'outer;
+                            }
+                            let output = stage(item);
+                            if tx.send((seq, output)).is_err() {
+                                break 'outer;
+                            }
                         }
                     }
                 }
@@ -766,6 +781,13 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
     let workers = txs.len().max(1);
     let batch_cap = crate::handoff::batch_recv_cap();
     let claim_cap = if batch_cap == 0 { 0 } else { (batch_cap / workers).max(1) };
+    // Batched output delivery (see `spawn_stage_fanout` for the knob and
+    // the async-tail gate). The staging flush cap sits at the batch cap so
+    // an expansion fan-out cannot grow the staging buffer with a whole
+    // claim batch's outputs.
+    let tx_batch =
+        crate::handoff::stream_tx_batch() && claim_cap > 0 && !ctx.has_async_stage;
+    let flush_cap = batch_cap.max(claim_cap).max(1);
     let jobs: Vec<_> = txs
         .into_iter()
         .map(|tx| {
@@ -780,25 +802,15 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
                 // Adaptive pre-anchor spin state (todo #4); see
                 // `spawn_stage_fanout`.
                 let mut spin = AnchorSpin::new(crate::handoff::spin_anchor_us());
-                // Expand `item` into the scratch buffer and forward the
-                // outputs. Returns false when the downstream channel closed
-                // mid-group (unforwarded outputs are dropped by the next
-                // `clear` — the worker is on its abort path anyway).
-                let mut forward = |seq: u64, item: I| -> bool {
-                    buf.clear();
-                    expand(item, &mut buf);
-                    let mut open = true;
-                    for n in buf.drain(..) {
-                        if tx.send((seq, n)).is_err() {
-                            open = false;
-                            break;
-                        }
-                    }
-                    open
-                };
                 // Batch claim scratch (see `spawn_stage`); the claim cap is
                 // the per-worker share (see `claim_cap` above).
                 let mut scratch: Vec<(u64, I)> = Vec::with_capacity(claim_cap.max(1));
+                // Output staging for the batched arm (see `tx_batch`); zero
+                // capacity when inert (`with_capacity(0)` allocates nothing).
+                let stage_cap = if tx_batch { claim_cap } else { 0 };
+                let mut mapped: Vec<(u64, N)> = Vec::with_capacity(stage_cap);
+                let mut staged: Vec<std::mem::MaybeUninit<(u64, N)>> =
+                    Vec::with_capacity(stage_cap);
                 'outer: loop {
                     // Anchor + burst-drain, same shape as `spawn_stage`
                     // (batched + spin-gated via `anchor_claim` there too).
@@ -806,15 +818,59 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
                     if claimed == 0 {
                         break;
                     }
-                    for (seq, item) in scratch.drain(..) {
-                        if cancel_active(worker_cancel.as_ref()) {
+                    if tx_batch {
+                        // Stage the `(seq, output)` pairs, cancel checked
+                        // before every expand call — exactly the per-item
+                        // loop's observation point. Outputs of one input
+                        // inherit its `seq` (the collector groups them).
+                        let mut cancelled = false;
+                        mapped.clear();
+                        for (seq, item) in scratch.drain(..) {
+                            if cancel_active(worker_cancel.as_ref()) {
+                                cancelled = true;
+                                break;
+                            }
+                            buf.clear();
+                            expand(item, &mut buf);
+                            mapped.extend(buf.drain(..).map(|n| (seq, n)));
+                            if mapped.len() >= flush_cap
+                                && !tx.send_batch(&mut mapped, &mut staged)
+                            {
+                                break 'outer;
+                            }
+                        }
+                        // Deliver the tail (and, on cancel, the outputs whose
+                        // expand calls completed before the token was
+                        // observed — the same item set the per-item loop
+                        // sends).
+                        if !tx.send_batch(&mut mapped, &mut staged) {
                             break 'outer;
                         }
-                        // Downstream closed mid-group: the group's
-                        // unforwarded outputs are dropped by the next
-                        // `clear` — the worker is on its abort path anyway.
-                        if !forward(seq, item) {
+                        if cancelled {
                             break 'outer;
+                        }
+                    } else {
+                        for (seq, item) in scratch.drain(..) {
+                            if cancel_active(worker_cancel.as_ref()) {
+                                break 'outer;
+                            }
+                            // Expand `item` into the scratch buffer and
+                            // forward the outputs; false = downstream closed
+                            // mid-group (unforwarded outputs are dropped by
+                            // the next `clear` — the worker is on its abort
+                            // path anyway).
+                            buf.clear();
+                            expand(item, &mut buf);
+                            let mut open = true;
+                            for n in buf.drain(..) {
+                                if tx.send((seq, n)).is_err() {
+                                    open = false;
+                                    break;
+                                }
+                            }
+                            if !open {
+                                break 'outer;
+                            }
                         }
                     }
                 }

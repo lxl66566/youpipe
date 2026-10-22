@@ -178,3 +178,16 @@
   证实残余慢档是全链背压驱动的逐项唤醒链，节拍在 anchor 自旋不可达的
   面（io task `send_cached` 停进满 terminal ring）。方向关闭，读数与
   再归因见 streaming.md「Async face re-attribution (2026-10-21)」。
+
+- **async 尾链上的 worker 输出批量发送**（2026-10-22，
+  `YOUPIPE_STREAM_TX_BATCH` 门控前的 A/B，`bench_ab.sh -E` 每 id 隔离
+  5 轮）：`stage().stage().stage_async()` 形状上，mixed hop（sync
+  worker → async 消费者）批量发送 **+4.9 % @100K（0/25）**，仅中段
+  MPMC hop 批量（mixed 保持逐项）仍 **+3.3 % @1K（0/25）**——两跳皆负，
+  且 @1K 的 −14.4 % 优势完全来自 mixed hop（被其 @100K 代价压倒）。
+  convoy-probe async2：中位 +3–7 %，无塌缩档（容量 floor 的解救不
+  受影响）。async 消费者是 runtime task，`MAsyncRx::recv` 先
+  `try_recv` 后注册 waker，节拍不吃发送侧 run 化的收益；与 sync
+  消费者的 anchor + burst-drain 形成对照。落地策略：链含 async
+  stage 即整体逐项（`!ctx.has_async_stage`，与 capacity floor 同
+  谓词），读数见 benchmarks.md「Stream worker tx batching」。
