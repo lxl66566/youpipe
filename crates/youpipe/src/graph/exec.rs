@@ -200,23 +200,60 @@ impl GraphCore {
 
 /// Source feeder: pull the iterator and broadcast each item to every open
 /// edge. Single worker per source.
+///
+/// With the tx-batch knob on, items are staged in `cap`-sized batches and
+/// each edge takes one `try_send_batch` per free run (`send_batch`); the
+/// per-item path below is the knob-off baseline.
 fn source_feeder_worker<T, I>(iter: I, mut out: Broadcast<T>, cancel: Option<&CancellationToken>)
 where
     T: Send + Clone + 'static,
     I: Iterator<Item = T> + Send + 'static,
 {
-    for item in iter {
+    let cap = if super::fanin::graph_tx_batch() {
+        crate::handoff::batch_recv_cap()
+    } else {
+        0
+    };
+    if cap == 0 {
+        for item in iter {
+            if cancel_active(cancel) {
+                return;
+            }
+            if !out.send(item) {
+                return;
+            }
+        }
+        return;
+    }
+    let mut iter = iter.into_iter();
+    let mut batch: Vec<T> = Vec::with_capacity(cap);
+    let mut staged: Vec<std::mem::MaybeUninit<T>> = Vec::with_capacity(cap);
+    loop {
+        batch.clear();
+        for item in iter.by_ref() {
+            batch.push(item);
+            if batch.len() == cap {
+                break;
+            }
+        }
+        if batch.is_empty() {
+            return;
+        }
         if cancel_active(cancel) {
             return;
         }
-        if !out.send(item) {
+        if !out.send_batch(&mut batch, &mut staged, cancel) {
             return;
         }
     }
 }
 
 /// One sync node worker: fair fan-in claim, map, broadcast. Exits on EOF
-/// (every input closed), cancel, or every output edge closed.
+/// (every input closed), cancel, or every output edge closed. With the
+/// tx-batch knob on the mapped claim batch is staged and flushed per edge
+/// with one `try_send_batch` per free run (single-item claims —
+/// `claim_cap == 0` — keep the per-item send: staging a 1-item batch only
+/// adds moves).
 fn node_worker<I, O, F>(
     f: &F,
     mut fanin: FanIn<I>,
@@ -228,19 +265,33 @@ fn node_worker<I, O, F>(
     O: Send + Clone + 'static,
     F: Fn(I) -> O + Send + Sync,
 {
+    let tx_batch = super::fanin::graph_tx_batch() && claim_cap > 0;
     let mut spin = RoundSpin::new(crate::handoff::spin_anchor_us());
     let mut scratch: Vec<I> = Vec::with_capacity(claim_cap.max(1));
+    let mut mapped: Vec<O> = Vec::new();
+    let mut staged: Vec<std::mem::MaybeUninit<O>> = Vec::new();
     loop {
         let claimed = fanin.claim(&mut scratch, claim_cap, &mut spin);
         if claimed == 0 {
             return; // EOF
         }
-        for item in scratch.drain(..) {
+        if tx_batch {
             if cancel_active(cancel) {
                 return;
             }
-            if !out.send(f(item)) {
+            mapped.clear();
+            mapped.extend(scratch.drain(..).map(f));
+            if !out.send_batch(&mut mapped, &mut staged, cancel) {
                 return; // every output edge closed
+            }
+        } else {
+            for item in scratch.drain(..) {
+                if cancel_active(cancel) {
+                    return;
+                }
+                if !out.send(f(item)) {
+                    return; // every output edge closed
+                }
             }
         }
     }
@@ -248,7 +299,10 @@ fn node_worker<I, O, F>(
 
 /// One expansion node worker: like [`node_worker`] but each input expands
 /// into zero or more outputs pushed into a reused per-worker scratch `Vec`
-/// (zero steady-state allocation), each broadcast downstream.
+/// (zero steady-state allocation), each broadcast downstream. The batched
+/// arm flushes the staged outputs whenever they reach the batch cap — an
+/// expansion's fan-out must not force the staging buffer to grow with the
+/// whole claim batch's expansion.
 fn expand_worker<I, O, F>(
     f: &F,
     mut fanin: FanIn<I>,
@@ -260,23 +314,48 @@ fn expand_worker<I, O, F>(
     O: Send + Clone + 'static,
     F: Fn(I, &mut Vec<O>) + Send + Sync,
 {
+    let tx_batch = super::fanin::graph_tx_batch() && claim_cap > 0;
+    let flush_cap = crate::handoff::batch_recv_cap().max(claim_cap).max(1);
     let mut spin = RoundSpin::new(crate::handoff::spin_anchor_us());
     let mut scratch: Vec<I> = Vec::with_capacity(claim_cap.max(1));
     let mut buf: Vec<O> = Vec::new();
+    let mut mapped: Vec<O> = Vec::new();
+    let mut staged: Vec<std::mem::MaybeUninit<O>> = Vec::new();
     loop {
         let claimed = fanin.claim(&mut scratch, claim_cap, &mut spin);
         if claimed == 0 {
             return;
         }
-        for item in scratch.drain(..) {
+        if tx_batch {
             if cancel_active(cancel) {
                 return;
             }
-            buf.clear();
-            f(item, &mut buf);
-            for expanded in buf.drain(..) {
-                if !out.send(expanded) {
+            mapped.clear();
+            for item in scratch.drain(..) {
+                buf.clear();
+                f(item, &mut buf);
+                mapped.append(&mut buf);
+                if mapped.len() >= flush_cap {
+                    if !out.send_batch(&mut mapped, &mut staged, cancel) {
+                        return;
+                    }
+                    mapped.clear();
+                }
+            }
+            if !mapped.is_empty() && !out.send_batch(&mut mapped, &mut staged, cancel) {
+                return;
+            }
+        } else {
+            for item in scratch.drain(..) {
+                if cancel_active(cancel) {
                     return;
+                }
+                buf.clear();
+                f(item, &mut buf);
+                for expanded in buf.drain(..) {
+                    if !out.send(expanded) {
+                        return;
+                    }
                 }
             }
         }

@@ -1960,8 +1960,46 @@ round-robin poll alone accounts for most of the per-item premium.
 
 Verdict: no regression for what `graph()` exists for (topologies `stream`
 cannot express); the DAG data-plane premium (~1.5–2× per item at the 50-mul
-CPU anchor) is dominated by fan-in polling and broadcast clones. With real
-CPU/IO per-item work (µs-scale, the engine's target regime) it amortizes to
-noise. Improvement levers if the light-item regime ever matters: batched
-broadcast sends (`try_send_batch` per edge) and a fan-in claim cap that does
-not shrink with the node's worker count.
+CPU anchor) is dominated by per-item channel ops on the output edges.
+With real CPU/IO per-item work (µs-scale, the engine's target regime) it
+amortizes to noise. The two improvement levers this named were tried the
+same day — see the next section: batched broadcast sends landed
+(`YOUPIPE_GRAPH_TX_BATCH`, default on), fan-in claim sweeps falsified.
+
+### Graph data-plane batching (`YOUPIPE_GRAPH_TX_BATCH`, 2026-10-22)
+
+The batched-send lever above, landed: source feeders stage `cap`-sized
+batches from the iterator and node/expand workers stage the mapped claim
+batch, then every open edge takes one `try_send_batch` per free run
+(clones for all edges but the last — the last takes the owned items) with
+the per-item blocking fallback, i.e. exactly `push_items` /
+`fence_batch_send`'s rhythm generalized to k edges. Four-combo same-binary
+A/B (`bench_ab.sh -E`, sides = {tx, sweep} × on/off, 5 per-id isolated
+rounds, 32 cores; `chain/diamond_*_stream` rows run as drift controls):
+
+| shape | off | tx on | Δ |
+| ----- | --- | ----- | --- |
+| diamond_cpu @100K | 29.03 ms | 10.06 ms | **−65.3 %** (25/25) |
+| diamond_cheap @100K | 29.56 ms | 10.07 ms | **−65.9 %** (25/25) |
+| diamond @1K | 328 µs | 148 µs | **−54.7 %** (25/25) |
+| chain_cpu @100K | 17.94 ms | 8.47 ms | **−52.8 %** (25/25) |
+| chain_cheap @1K | 227 µs | 131 µs | **−42.2 %** (25/25) |
+| fanin_cheap @100K | 52.75 ms | 37.35 ms | **−29.2 %** (25/25) |
+| fanin_cheap @1K | 560 µs | 425 µs | **−24.1 %** (25/25) |
+| stream control rows (6) | — | — | ±2 % noise |
+
+Every graph id stable 25/25; final-binary confirmation (default on vs `"0"`,
+3 rounds) reproduced all of them 9/9 (−27.7…−66.5 %). Consequences:
+
+- The graph engine now **beats the streaming engine on the identical chain
+  shape** (8.5 vs 18.4 ms @100K, 135 vs 214 µs @1K despite the ~23 µs
+  assembly overhead): the stream stage workers still `send` per item —
+  porting this lever there is the open follow-up (todo #16).
+- The diamond's residual premium over the serial chain collapsed to
+  ~10.0 vs 15.3 ms (the DAG parallelism now WINS the shape comparison the
+  first table recorded at 2× the serial chain's cost).
+- The sibling lever, fan-in claim sweeps (one `FanIn::round` claiming from
+  every open input — the verdict's "claim cap" idea), measured as pure
+  noise alone (|Δ| ≤ 5 %, mixed signs) and +6–8 % on top of tx on the
+  diamond @100K: with sends batched, the per-claim round walk over k rings
+  is not on the critical path. Removed; see dead-ends.md.

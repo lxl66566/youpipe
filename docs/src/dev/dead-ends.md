@@ -157,6 +157,16 @@
   async2）两侧双稳同分布、中位差 < 噪声。`fire()` 已改写为 `_fire_n(1)`
   统一唤醒会计（语义同集，非 perf 变化），机制记录见
   crossfire-waker-designs.md §15。
+- **graph fan-in claim sweeps**（2026-10-22，graph_shapes 结论点名的
+  "claim cap" 杠杆，四路同 binary A/B 后移除）：`FanIn::round` 从「首个
+  ready 输入即返」改为一次扫描 claim 每个 open 输入（各 ≤ claim_cap，
+  追加进同一 scratch）。单独开：全 id 噪声（|Δ| ≤ 5 %、符号混杂，含
+  fanin_cheap 双源形状）；叠在批量发送（`YOUPIPE_GRAPH_TX_BATCH`）之上：
+  chain/fanin 中性、diamond @100K 反而 +6–8 %。机制：输出侧逐项
+  channel op 批量化后，每次 claim 对 k 个 ring 的轮询游走不在关键路径
+  （每 ring 的 claim 本就已是批量 CAS）。sweep 路径连同 `claim_poll`
+  的 append 语义一起移除；批量发送侧读数见 benchmarks.md「Graph
+  data-plane batching」。
 - **async collector 侧 pre-anchor 自旋**（2026-10-21，原型 `AnchorSpin`
   async 孪生 + 旋钮 `YOUPIPE_SPIN_ANCHOR_ASYNC`，实现后 A/B 回退）：
   async 终端 drain 的 anchor await 前按活动门控预算自旋 `try_recv`。

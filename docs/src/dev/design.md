@@ -59,7 +59,12 @@ node) before starting it. It reuses both planes unchanged: the data plane is
 the same crossfire MPMC channels (fan-out = one channel per outbound edge +
 per-edge `Clone`; fan-in = fair round-robin over the inbound edges), and the
 scheduling faces are the same `ComputePool` (sync nodes) and `AsyncRuntime`
-(async nodes, pull-based async sources). The engines position as: `pipe` for
+(async nodes, pull-based async sources). Output delivery is batched
+(`Broadcast::send_batch`, `YOUPIPE_GRAPH_TX_BATCH`): feeders and workers
+stage each claim batch and every open edge takes one `try_send_batch` per
+free run with a per-item blocking fallback — per-item output sends measured
+2–3× slower on light items (benchmarks.md "Graph data-plane batching").
+The engines position as: `pipe` for
 compile-time linear fusion, `stream` for runtime linear chains, `graph` for
 runtime DAGs — linear workloads should stay on the cheaper engines; see the
 [user guide](../guide/graph.md). Node workers default to an automatic

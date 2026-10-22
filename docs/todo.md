@@ -92,6 +92,23 @@
 - 残余方向：`RunOutcome` 或 `try_run_checked` 报告
   `Cancelled { emitted }`（collector 排干后查 token 即可）。
 
+### 16. [P1] streaming stage worker 的逐项 send 批量化
+
+- 现状：`YOUPIPE_GRAPH_TX_BATCH`（2026-10-22，默认开）把 graph 引擎的
+  feeder/node/expand 输出改为 claim 批次暂存 + 每边一次 `try_send_batch`
+  （+逐项阻塞 fallback），graph_shapes 全 id −24…−66 %（benchmarks.md
+  「Graph data-plane batching」）；graph chain @100K 8.5 ms 反超 stream
+  18.4 ms 的直接原因就是 stream worker（`spawn_stage_fanout` /
+  `spawn_expand_stage_fanout`）仍逐项 `tx.send`。
+- 方向：同型改动移植到 stream worker（暂存 `(seq, output)` 批、
+  `try_send_batch` 前缀 + 逐项 fallback，序保持——批内 drain 顺序不变）。
+  风险面：stream 侧所有历史 verdict 均以逐项 send 为基线；下游是
+  share-capped 批量 claim 的 crowd，发送批变大可能改变下游争用形状，
+  需全套 `stream_pipeline`/`sharded_term`/`sync_fuse`/`mixed_load` 隔离
+  A/B；sharded 终端路径的 per-worker SPSC sender 需逐一核对批量 API。
+- 验证：同 binary 旋钮 A/B（`bench_ab.sh -E`）+ 上述家族 per-id 隔离
+  交错；convoy 家族（fence/async2）用 convoy-probe 复查慢档率。
+
 ## 代码健康（重构/坏味道）
 
 ### 13. [P2] 正确性相邻与杂项

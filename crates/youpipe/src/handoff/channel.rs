@@ -872,7 +872,7 @@ mod tests {
     #[test]
     fn claim_poll_zero_batch_open_channel_is_single_probe() {
         let rx = ProbeMock::open();
-        let mut scratch: Vec<i32> = Vec::new();
+        let mut scratch: Vec<i32> = Vec::with_capacity(8);
         assert_eq!(claim_poll(&rx, &mut scratch, 64), Claim::Empty);
         assert_eq!(rx.batch_calls.get(), 1);
         assert_eq!(
@@ -888,7 +888,7 @@ mod tests {
             disconnected: true,
             ..ProbeMock::open()
         };
-        let mut scratch: Vec<i32> = Vec::new();
+        let mut scratch: Vec<i32> = Vec::with_capacity(8);
         assert_eq!(claim_poll(&rx, &mut scratch, 64), Claim::Closed);
         assert_eq!(
             rx.recv_calls.get(),
@@ -900,7 +900,7 @@ mod tests {
     #[test]
     fn claim_poll_batch_cap_zero_uses_try_recv_only() {
         let rx = ProbeMock::open();
-        let mut scratch: Vec<i32> = Vec::new();
+        let mut scratch: Vec<i32> = Vec::with_capacity(8);
         assert_eq!(claim_poll(&rx, &mut scratch, 0), Claim::Empty);
         assert_eq!(rx.batch_calls.get(), 0);
         assert_eq!(rx.recv_calls.get(), 1);
@@ -919,7 +919,7 @@ mod tests {
         match claim_poll(&rx, &mut scratch, 8) {
             Claim::Ready(n) => {
                 assert!((1..=2).contains(&n));
-                let mut got = std::mem::take(&mut scratch);
+                let mut got: Vec<i32> = std::mem::take(&mut scratch);
                 got.sort_unstable();
                 assert_eq!(got, vec![1, 2][..n]);
             },
