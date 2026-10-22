@@ -205,6 +205,134 @@ impl<T> ArrayQueueMpsc<T> {
         self._try_push(sender_val, tail, head_cached, value).ok()
     }
 
+    /// youpipe fork extension (batch send): claim a run of FREE slots with
+    /// ONE `sender` CAS, then write the values. Non-blocking prefix
+    /// semantics: sends `values[..n]` where `n` is bounded by both the
+    /// batch length and the free run from the current tail (0 = nothing
+    /// sendable right now — full, or CAS lost after bounded retries).
+    /// Backpressure granularity is unchanged from per-item push: callers
+    /// fall back to per-item blocking pushes for the remainder.
+    ///
+    /// Freeness is derived from the cached head (refreshed once from `recv`
+    /// when it reports full), never from per-slot stamps: every position in
+    /// `[tail, head_cached + one_lap)` was popped in the previous lap, so
+    /// claiming it before writing is the same claimed-but-unpublished
+    /// window a per-item push opens between its CAS and its stamp store.
+    /// A torn snapshot (stale tail + fresh head, torn-snapshot note in
+    /// `real_positions`) can only OVERCOUNT the free run, and the claim
+    /// CAS then fails on the stale tail bits — overclaiming never lands.
+    /// Concurrent producers claim disjoint runs (each CAS moves `tail`
+    /// past the previous claim); the consumer's `_read` spin on a claimed
+    /// slot stays bounded-wait because the claimer always completes its
+    /// writes, and `pop_batch`'s stamp walk stops at unpublished slots.
+    ///
+    /// # Safety
+    ///
+    /// `values` must be fully initialized; on return the first `n` entries
+    /// have been moved out of `values` (the caller must not read them
+    /// again); entries from `n` on remain owned by the caller.
+    #[inline]
+    pub unsafe fn try_push_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
+        let mut sender_val = self.sender.load(Ordering::Relaxed);
+        let backoff = Backoff::new();
+        // Strong CAS + bounded retries (the MPMC twin's rationale): a
+        // 0-return must mean "contended/full, fall back to per-item",
+        // never "spurious weak-CAS failure ate all retries" — Miri
+        // simulates those.
+        for _attempt in 0..4 {
+            let tail = sender_val as u32;
+            let mut head_cached = (sender_val >> 32) as u32;
+            if head_cached.wrapping_add(self.one_lap) == tail {
+                // Full per the cached head: refresh once, same as
+                // `push_with_ptr`.
+                let head = self.recv.load(Ordering::SeqCst) as u32;
+                if head == head_cached {
+                    return 0;
+                }
+                head_cached = head;
+            }
+            let free = self.real_positions(tail, head_cached.wrapping_add(self.one_lap));
+            let n = values.len().min(free as usize);
+            debug_assert!(n > 0);
+            let mut new_tail = tail;
+            for _ in 0..n {
+                new_tail = self.advance(new_tail);
+            }
+            let new_sender_val = ((head_cached as u64) << 32) | (new_tail as u64);
+            match self.sender.compare_exchange(
+                sender_val,
+                new_sender_val,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let mut pos = tail;
+                    for i in 0..n {
+                        let index = (pos & (self.one_lap - 1)) as usize;
+                        debug_assert!(index < self.buffer.len());
+                        let slot = self.buffer.get_unchecked(index);
+                        let item: &mut MaybeUninit<T> = &mut *slot.value.get();
+                        item.write(ptr::read(values[i].as_ptr()));
+                        // Publication order of `_try_push`: value first,
+                        // then the Release stamp.
+                        slot.stamp.store((pos as usize).wrapping_add(1), Ordering::Release);
+                        pos = self.advance(pos);
+                    }
+                    return n;
+                },
+                Err(current) => {
+                    sender_val = current;
+                    backoff.spin();
+                },
+            }
+        }
+        0
+    }
+
+    /// One position step from `pos` (`_try_push` / `pop_batch`'s lap wrap:
+    /// the last buffer slot skips to the next lap base — positions
+    /// `buffer.len()..one_lap` have no slots).
+    #[inline]
+    fn advance(&self, pos: u32) -> u32 {
+        let index = pos & (self.one_lap - 1);
+        if (index as usize) + 1 < self.buffer.len() {
+            pos.wrapping_add(1)
+        } else {
+            (pos & !(self.one_lap - 1)).wrapping_add(self.one_lap)
+        }
+    }
+
+    /// Count the slot-backed positions in the half-open range `[from, to)`
+    /// (`to - from <= one_lap`): positions whose lap index falls in
+    /// `buffer.len()..one_lap` have no slot, so a raw distance OVERCOUNTS
+    /// the free run exactly there (found by `batch_push_sends_free_prefix_
+    /// across_laps`: cap 3 / lap 4 claimed 4 slots and double-wrote slot 0).
+    fn real_positions(&self, from: u32, to: u32) -> u32 {
+        let mask = self.one_lap - 1;
+        let cap = self.buffer.len() as u32;
+        // NOTE: `from` (tail) and `to` (refreshed head + lap) come from
+        // different moments — a producer descheduled between its sender
+        // load and the head refresh can see `to - from > one_lap` when
+        // other producers advanced the tail meanwhile. The overcounted
+        // free run from such a torn snapshot is rejected by the caller's
+        // CAS (the stale tail bits no longer match), so no span assertion
+        // here (a debug_assert on the span fired spuriously in
+        // batch_push_multi_producer on exactly this interleaving).
+        if to == from {
+            return 0;
+        }
+        // Real count of an index range [a, b) with 0 <= a < b <= one_lap.
+        let seg_real = |a: u32, b: u32| b.min(cap).saturating_sub(a.min(cap));
+        let idx_from = from & mask;
+        let idx_to = to & mask;
+        if to.wrapping_sub(from) == self.one_lap || idx_to <= idx_from {
+            // The range crosses a lap base: [idx_from, one_lap) + [0, idx_to).
+            seg_real(idx_from, self.one_lap) + seg_real(0, idx_to)
+        } else {
+            seg_real(idx_from, idx_to)
+        }
+    }
+
     #[inline]
     pub fn start_read(&self, final_check: bool) -> Option<Token> {
         if let Some((head, tail_cached)) = self._start_read::<true>(final_check) {
@@ -543,6 +671,141 @@ mod batch_tests {
                     while !unsafe { q.push_with_ptr(v.as_ptr()) } {
                         std::hint::spin_loop();
                     }
+                }
+            }));
+        }
+        let mut got: Vec<u32> = Vec::new();
+        let mut buf: Vec<u32> = Vec::with_capacity(5);
+        let mut idle = 0usize;
+        while got.len() < P * N as usize {
+            let n = q.pop_batch(buf.spare_capacity_mut());
+            if n == 0 {
+                idle += 1;
+                assert!(idle < 1_000_000, "consumer stalled");
+                continue;
+            }
+            idle = 0;
+            // SAFETY: pop_batch initialized exactly buf[..n].
+            unsafe { buf.set_len(n) };
+            got.append(&mut buf);
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        got.sort_unstable();
+        assert_eq!(got, (0..u32::try_from(P).unwrap() * N).collect::<Vec<_>>());
+    }
+
+    /// Stage `k` fresh values starting at `next` as an uninit batch.
+    fn stage(k: usize, next: u32) -> Vec<MaybeUninit<u32>> {
+        (next..next + k as u32).map(MaybeUninit::new).collect()
+    }
+
+    /// Batch-push the free prefix, drain interleaved, across laps — the
+    /// send-side twin of `batch_claims_fifo_prefix_across_laps`: the claim
+    /// must respect the buffer-end lap wrap (cap 3 has no power-of-two lap)
+    /// and never exceed the free run.
+    #[test]
+    fn batch_push_sends_free_prefix_across_laps() {
+        let q = ArrayQueueMpsc::new(3);
+        let mut next = 0u32;
+        // SAFETY for every call: the batch is fully initialized and the
+        // sent prefix is never read again.
+        let mut send = |q: &ArrayQueueMpsc<u32>, k: usize| -> usize {
+            let n = unsafe { q.try_push_batch(&mut stage(k, next)) };
+            next += n as u32;
+            n
+        };
+        // first claim: whole batch fits (3 free)
+        assert_eq!(send(&q, 4), 3, "claim is capped by the free run, not the batch");
+        // full now: 0 until the consumer frees slots
+        assert_eq!(send(&q, 2), 0);
+        assert_eq!(collect_batch(&q, 8), vec![0, 1, 2]);
+        // interleaved rounds exercising the lap wrap on both sides
+        for r in 1..7u32 {
+            assert_eq!(send(&q, 2), 2, "ring drained, both fit");
+            assert_eq!(send(&q, 2), 1, "one slot left");
+            assert_eq!(send(&q, 2), 0, "full");
+            assert_eq!(collect_batch(&q, 8), vec![3 * r, 3 * r + 1, 3 * r + 2]);
+        }
+        assert_eq!(collect_batch(&q, 8), vec![]);
+    }
+
+    /// Mixed per-item pushes, batch pushes and batch pops over a lap-skip
+    /// capacity: FIFO order and the stamp protocol must survive every
+    /// interleaving.
+    #[test]
+    fn batch_push_mixed_with_per_item_across_laps() {
+        let q = ArrayQueueMpsc::new(5);
+        let mut expect = Vec::new();
+        for round in 0..200u32 {
+            let base = round * 6;
+            // item per-push (drain-until-pushable: a prior round may leave
+            // the ring full — there is no end-of-round drain)
+            while !unsafe { q.push_with_ptr(MaybeUninit::new(base).as_ptr()) } {
+                let got = collect_batch(&q, 8);
+                let k = got.len();
+                assert_eq!(got, expect.drain(..k).collect::<Vec<_>>());
+            }
+            expect.push(base);
+            // batch push the rest; the unsent remainder re-pushes per-item
+            // (the production callers' fallback rhythm), draining only as
+            // blocked
+            let mut uninit = stage(5, base + 1);
+            // SAFETY: fully initialized; the sent prefix moves out.
+            let sent = unsafe { q.try_push_batch(&mut uninit) };
+            expect.extend((base + 1)..(base + 1 + sent as u32));
+            // SAFETY: [sent..] was never moved out.
+            let rest: Vec<u32> = unsafe {
+                uninit[sent..].iter_mut().map(|s| s.assume_init_read()).collect()
+            };
+            for (j, v) in rest.into_iter().enumerate() {
+                while !unsafe { q.push_with_ptr(MaybeUninit::new(v).as_ptr()) } {
+                    // drain what is available; the drained prefix must
+                    // match the expected FIFO prefix
+                    let got = collect_batch(&q, 8);
+                    let k = got.len();
+                    assert_eq!(got, expect.drain(..k).collect::<Vec<_>>());
+                    let _ = j;
+                }
+                expect.push(v);
+            }
+        }
+        let got = collect_batch(&q, 64);
+        assert_eq!(got.len(), expect.len());
+        assert!(got == expect, "FIFO order must survive mixed interleavings");
+    }
+
+    /// Multi-producer batch claims must partition the stream with no loss
+    /// and no duplication even when the ring is contended.
+    #[test]
+    fn batch_push_multi_producer_no_loss_no_dup() {
+        const P: usize = 4;
+        const N: u32 = if cfg!(miri) { 100 } else { 2000 };
+        let q = std::sync::Arc::new(ArrayQueueMpsc::<u32>::new(7));
+        let mut hs = Vec::new();
+        for p in 0..P {
+            let q = std::sync::Arc::clone(&q);
+            let base = u32::try_from(p).unwrap() * N;
+            hs.push(std::thread::spawn(move || {
+                let mut i = 0u32;
+                let mut idle = 0usize;
+                while i < N {
+                    let k = (N - i).min(5) as usize;
+                    let batch: Vec<u32> = (base + i..base + i + k as u32).collect();
+                    let mut uninit: Vec<MaybeUninit<u32>> =
+                        batch.into_iter().map(MaybeUninit::new).collect();
+                    // SAFETY: fully initialized; the sent prefix moves out.
+                    let n = unsafe { q.try_push_batch(&mut uninit) };
+                    if n == 0 {
+                        idle += 1;
+                        assert!(idle < 1_000_000, "producer stalled");
+                        continue;
+                    }
+                    idle = 0;
+                    i += n as u32;
+                    // the unsent remainder drops; values are re-derived
+                    // from `i` on the next attempt, so nothing is lost
                 }
             }));
         }

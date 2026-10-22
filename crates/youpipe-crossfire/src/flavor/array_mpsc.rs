@@ -71,6 +71,11 @@ impl<T> FlavorImpl for ArrayMpsc<T> {
         unsafe { self.0.try_push_oneshot(item) }
     }
 
+    #[inline]
+    unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
+        self.0.try_push_batch(values)
+    }
+
     #[inline(always)]
     fn try_recv_cached(&self) -> Option<T> {
         self.0.pop_cached()
