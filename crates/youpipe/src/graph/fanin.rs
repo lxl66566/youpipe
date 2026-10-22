@@ -49,10 +49,10 @@ pub(crate) fn graph_tx_batch() -> bool {
 /// The claim rhythm mirrors the streaming workers' anchor + burst-drain
 /// shape, generalized from one ring to a round of rings (same shape as the
 /// sharded terminal's `ShardSet`): one non-blocking round over every open
-/// input, then a blocking anchor on the first open one. EOF is every input
-/// disconnected — an upstream node whose workers all exited closes its
-/// sender clones and the input here reports `Closed` while the others keep
-/// flowing.
+/// input, then an any-of-N blocking anchor (see [`FanIn::anchor`]). EOF is
+/// every input disconnected — an upstream node whose workers all exited
+/// closes its sender clones and the input here reports `Closed` while the
+/// others keep flowing.
 pub(crate) struct FanIn<T: Send + 'static> {
     rxs: Vec<Receiver<T>>,
     /// Closed inputs are never polled again (a `try_recv`/`recv` on a closed
@@ -105,8 +105,8 @@ impl<T: Send + 'static> FanIn<T> {
 
     /// Claim the next batch of items into `scratch`; `0` means EOF (every
     /// input disconnected). Burst round first, knob-gated spin second
-    /// (see [`RoundSpin`]), blocking anchor last — the anchor parks on the
-    /// first open input from `cursor`, and its park latency folds back into
+    /// (see [`RoundSpin`]), blocking anchor last — the anchor parks
+    /// registered on every open input, and its park latency folds back into
     /// the spin budget.
     pub(crate) fn claim(
         &mut self,
@@ -132,16 +132,75 @@ impl<T: Send + 'static> FanIn<T> {
         got
     }
 
-    /// Blocking anchor: park on the first open input from `cursor`; on
-    /// `Ok` the cursor moves past that input (a parked anchor must not pin
-    /// the same producer twice in a row); an input that closes while we wait
-    /// is marked and the next open one is tried. Blocking on one input (not
-    /// any-of-N) is safe for the same reason the sharded terminal's anchor
-    /// is: every open input's producer either sends (waking us), blocks on
-    /// its own upstream (progress elsewhere eventually feeds it), or drops
-    /// its sender (closing the input) — items landing in other inputs while
-    /// we park are picked up by the next round.
+    /// Blocking anchor: park registered on every open input at once
+    /// (crossfire `Select`), so an arrival or close on ANY input wakes the
+    /// worker; the winning input's item is claimed through the select's
+    /// reserved token (CAS-reserved, safe under the MPMC competition of
+    /// sibling workers), and the cursor rotates past it. A close event
+    /// (ring drained + every sender dropped) marks the input and re-anchors
+    /// over the survivors; `0` is EOF.
+    ///
+    /// Why an any-of-N park, not a park on one input: in a DAG the anchored
+    /// input's producer chain can itself be blocked behind a ring only THIS
+    /// worker drains — broadcast edges flush sequentially and block per
+    /// edge, so the upstream feeding the anchored ring may be a worker
+    /// parked on a full ring whose sole consumer is this node. Parking on
+    /// one input then deadlocks the whole run (the graph-side shape of todo
+    /// #14's intermittent hang: `diamond_broadcast_conservation`, n=10K,
+    /// buffer=4 — every fan-in worker parked on the starved ring while the
+    /// other ring's producers blocked on Full). The single-input park is
+    /// only sound for a linear chain's sole input (stream stages, the
+    /// sharded terminal), where "the producer blocks on its own upstream"
+    /// cannot skip this consumer.
     fn anchor(&mut self, scratch: &mut Vec<T>) -> usize {
+        if self.open == 1 {
+            return self.anchor_single(scratch);
+        }
+        loop {
+            if self.open == 0 {
+                return 0;
+            }
+            let n = self.rxs.len();
+            // Registration order follows the cursor rotation so the
+            // select's round-robin starts where our round did.
+            let mut order: Vec<usize> = Vec::with_capacity(n);
+            let mut sel = crossfire::select::Select::new();
+            for k in 0..n {
+                let i = (self.cursor + k) % n;
+                if !self.closed[i] {
+                    sel.add(self.rxs[i].crossfire_rx());
+                    order.push(i);
+                }
+            }
+            // `open > 0` guarantees a nonempty handler set; `select()`
+            // errors only when no handler is registered.
+            let res = sel.select().expect("open inputs registered");
+            let slot = order
+                .iter()
+                .position(|&i| res.is_from(self.rxs[i].crossfire_rx()))
+                .expect("select result names a registered input");
+            let ring = order[slot];
+            if let Ok(item) = self.rxs[ring].crossfire_rx().read_select(res) {
+                self.cursor = (ring + 1) % n;
+                scratch.push(item);
+                return 1;
+            }
+            // Close event: drop the input from the round and re-anchor
+            // over the survivors (items always win over the close token,
+            // so the drain-before-Closed contract holds).
+            self.closed[ring] = true;
+            self.open -= 1;
+        }
+    }
+
+    /// Single open input: a plain blocking recv. The sole live producer
+    /// chain either sends (waking us), parks on its own upstream, or drops
+    /// its sender — no OTHER ring still needs this worker to drain it (the
+    /// closed ones are drained and disconnected), so the linear-chain park
+    /// is sound. Fast path for the linear-chain majority (chains' nodes
+    /// have one input each), which then pays none of the any-of-N
+    /// registration cost.
+    fn anchor_single(&mut self, scratch: &mut Vec<T>) -> usize {
         let n = self.rxs.len();
         for k in 0..n {
             let i = (self.cursor + k) % n;
@@ -153,7 +212,6 @@ impl<T: Send + 'static> FanIn<T> {
                 scratch.push(item);
                 return 1;
             }
-            // Disconnected while we waited: mark it and try the next open one.
             self.closed[i] = true;
             self.open -= 1;
         }
@@ -438,5 +496,61 @@ mod tests {
         let mut batch = vec![1, 2];
         let mut staged = Vec::new();
         assert!(!b.send_batch(&mut batch, &mut staged, None));
+    }
+    /// Liveness regression (the graph-side shape of todo #14's intermittent
+    /// hang): a fan-in worker anchored while one input is empty must still
+    /// claim from the OTHER input. In a DAG the anchored input's producer
+    /// chain can be blocked behind a ring only this worker drains, so an
+    /// anchor that only wakes for its own ring's events deadlocks the run
+    /// (repro: `diamond_broadcast_conservation`, n=10K, buffer=4 — all
+    /// fan-in workers parked on the starved ring while the other ring's
+    /// producers block on Full).
+    #[test]
+    fn anchored_worker_claims_from_other_input() {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::{Duration, Instant},
+        };
+
+        let (tx_a, rx_a) = channel::<u32>(4);
+        let (tx_b, rx_b) = channel::<u32>(4);
+        let mut fan = FanIn::new(vec![rx_a, rx_b]);
+        let mut spin = RoundSpin::new(0);
+        let claimed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&claimed);
+        let worker = std::thread::spawn(move || {
+            let mut scratch = Vec::new();
+            loop {
+                let n = fan.claim(&mut scratch, 0, &mut spin);
+                if n == 0 {
+                    return; // EOF: both inputs closed
+                }
+                counter.fetch_add(scratch.drain(..).count(), Ordering::SeqCst);
+            }
+        });
+        // Let the worker park: both rings empty, cursor 0 → the anchor parks
+        // on ring A. Ring A's producer then stays silent for the whole test
+        // (its chain is "blocked upstream" in the deadlock shape).
+        std::thread::sleep(Duration::from_millis(100));
+        for v in 0..4u32 {
+            tx_b.send(v).expect("ring B has capacity 4");
+        }
+        // The anchored worker must drain ring B without any event on ring A.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while claimed.load(Ordering::SeqCst) < 4 {
+            assert!(
+                Instant::now() < deadline,
+                "fan-in worker anchored on a silent input never claimed the other input's items"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // EOF: close both rings, the worker exits.
+        drop(tx_a);
+        drop(tx_b);
+        worker.join().unwrap();
+        assert_eq!(claimed.load(Ordering::SeqCst), 4);
     }
 }

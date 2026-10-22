@@ -106,6 +106,13 @@ impl<T: Send + 'static> Clone for SyncSender<T> {
 }
 
 impl<T: Send + 'static> SyncReceiver<T> {
+    /// The underlying crossfire MPMC receiver. Crate-internal: the graph
+    /// fan-in anchor parks registered on every input ring at once via
+    /// `crossfire::select::Select` (any-of-N wait — see `graph::fanin`).
+    pub(crate) fn crossfire_rx(&self) -> &crossfire::MRx<mpmc::Array<T>> {
+        &self.rx
+    }
+
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SyncReceiver"))]
     pub fn recv(&self) -> Result<T, ChannelError> {
         #[cfg(feature = "crossfire-trace")]
@@ -227,6 +234,19 @@ impl<T: Send + Unpin + 'static> Clone for AsyncSender<T> {
 }
 
 impl<T: Send + Unpin + 'static> AsyncReceiver<T> {
+    /// The concrete `recv_cached` future (`CachedRecvFuture`, an `Unpin`
+    /// struct) for callers that collect per-input futures into a
+    /// multi-input select (the graph async fan-in anchor); `Err` is
+    /// crossfire's `RecvError` (senders dropped + ring drained). The
+    /// plain `recv_cached` resolves through the async trait method, whose
+    /// opaque return type hides `Unpin`.
+    pub(crate) fn recv_cached_unpin<'a>(
+        &'a self,
+        slot: &'a mut WakerSlot,
+    ) -> impl Future<Output = Result<T, crossfire::RecvError>> + Unpin + 'a {
+        crossfire::AsyncRx::recv_cached(&self.rx, slot)
+    }
+
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncReceiver"))]
     pub async fn recv(&self) -> Result<T, ChannelError> {
         self.rx.recv().await.map_err(|_| ChannelError::Closed)

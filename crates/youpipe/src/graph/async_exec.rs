@@ -30,7 +30,8 @@ use super::{
 /// Fair fan-in over the shared async receivers of one node's input edges,
 /// owned by ONE task of an async node (each task clones every input — the
 /// same MPMC-competition shape as the sync [`FanIn`](super::fanin::FanIn),
-/// with an awaited anchor instead of a blocking one). EOF is every input
+/// with an any-of-N awaited anchor instead of a blocking one). EOF is
+/// every input disconnected.
 /// disconnected.
 pub(crate) struct AsyncFanIn<T: Send + Unpin + 'static> {
     rxs: Vec<AsyncReceiver<T>>,
@@ -59,12 +60,8 @@ impl<T: Send + Unpin + 'static> AsyncFanIn<T> {
     }
 
     /// Fair claim: one non-blocking round over every open input, then an
-    /// awaited anchor on the first open one (rotating; an input that closes
-    /// while parked is marked and the next open one awaited). `None` means
-    /// EOF. Items landing in other inputs while anchored are picked up by
-    /// the next round — the liveness argument is the sharded anchor's: every
-    /// open input's producer either sends, awaits its own upstream, or drops
-    /// its sender.
+    /// awaited anchor parked on every open input at once (see
+    /// [`AsyncFanIn::anchor`]). `None` means EOF.
     pub(crate) async fn claim(&mut self) -> Option<T> {
         let n = self.rxs.len();
         for k in 0..n {
@@ -87,20 +84,116 @@ impl<T: Send + Unpin + 'static> AsyncFanIn<T> {
         if self.open == 0 {
             return None;
         }
+        self.anchor().await
+    }
+
+    /// Awaited anchor: park the task registered on every open input at
+    /// once — `futures::future::select_all` over the per-input
+    /// `recv_cached` futures; polling each to `Pending` registers this
+    /// task's waker with that input, so an arrival or close on ANY input
+    /// wakes the task. The first ready input wins and the cursor rotates
+    /// past it; a future resolving `Err(Closed)` marks its input and the
+    /// anchor re-arms over the survivors. `None` is EOF.
+    ///
+    /// Why every input, not one: the same DAG liveness hole as the sync
+    /// [`FanIn::anchor`](super::fanin::FanIn::anchor) — the awaited input's
+    /// producer chain can be blocked behind a ring only this node drains,
+    /// so awaiting one input can deadlock the run (todo #14's graph-side
+    /// shape). The one-input anchor stays sound for the sharded terminal,
+    /// whose shards all hang off one producer population in a linear
+    /// chain.
+    ///
+    /// Cost: one select cycle drops the k−1 futures that did not win, and
+    /// each dropped pending future abandons (unregisters) its waker node —
+    /// the next anchor re-allocates those nodes. That per-park churn is
+    /// the price of the any-of-N registration; the winner's slot stays
+    /// cached for reuse (P-4).
+    async fn anchor(&mut self) -> Option<T> {
+        if self.open == 1 {
+            return self.anchor_single().await;
+        }
+        loop {
+            if self.open == 0 {
+                return None;
+            }
+            let n = self.rxs.len();
+            // Registration order follows the cursor rotation so the first
+            // ready future in poll order is the round's fair pick. The
+            // per-input slots move out of `iter_mut` (disjoint borrows); the
+            // rotation shuffles (ring, slot) pairs, not raw indices.
+            let closed = &self.closed;
+            let rxs = &self.rxs;
+            let mut pairs: Vec<_> = self.slots.iter_mut().enumerate().collect();
+            pairs.rotate_left(self.cursor);
+            let mut order = Vec::with_capacity(self.open);
+            let mut futs = Vec::with_capacity(self.open);
+            for (i, slot) in pairs {
+                if closed[i] {
+                    continue;
+                }
+                order.push(i);
+                futs.push(rxs[i].recv_cached_unpin(slot));
+            }
+            // The combinator is consumed by the await; the losing futures
+            // drop inside it, ending the slot borrows before the marks
+            // below.
+            let (res, slot) = FirstReady { futs }.await;
+            let ring = order[slot];
+            // RecvError: senders dropped + ring drained.
+            if let Ok(item) = res {
+                self.cursor = (ring + 1) % n;
+                return Some(item);
+            }
+            self.closed[ring] = true;
+            self.open -= 1;
+        }
+    }
+
+    /// Single open input: await it directly — the linear-chain park, sound
+    /// for the same reason as the sync `anchor_single` (the sole live
+    /// producer chain must eventually send or close; no other ring needs
+    /// this task). Skips the any-of-N combinator and its Vec churn for the
+    /// linear-chain majority.
+    async fn anchor_single(&mut self) -> Option<T> {
+        let n = self.rxs.len();
         for k in 0..n {
             let i = (self.cursor + k) % n;
             if self.closed[i] {
                 continue;
             }
-            if let Ok(item) = self.rxs[i].recv_cached(&mut self.slots[i]).await {
+            // RecvError: senders dropped + ring drained.
+            if let Ok(item) = self.rxs[i].recv_cached_unpin(&mut self.slots[i]).await {
                 self.cursor = (i + 1) % n;
                 return Some(item);
             }
-            // Disconnected while parked: mark it and await the next open one.
             self.closed[i] = true;
             self.open -= 1;
         }
         None
+    }
+}
+
+/// Poll a set of futures in order and resolve with the first `Ready`
+/// (output + index); the losing futures are dropped. On `Pending` every
+/// future has been polled, so each one's waker registration is in place —
+/// the any-of-N wait [`AsyncFanIn::anchor`] parks on. A private stand-in
+/// for `futures::future::select_all`: the `futures` crate is a
+/// dev-dependency by design and this needs none of its machinery.
+struct FirstReady<F> {
+    futs: Vec<F>,
+}
+
+impl<F: Future + Unpin> Future for FirstReady<F> {
+    type Output = (F::Output, usize);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let futs = &mut self.futs;
+        for (i, f) in futs.iter_mut().enumerate() {
+            if let Poll::Ready(out) = Pin::new(f).poll(cx) {
+                return Poll::Ready((out, i));
+            }
+        }
+        Poll::Pending
     }
 }
 
@@ -324,4 +417,58 @@ where
     F: Future<Output = ()>,
 {
     CatchPanic { fut, slot, cancel }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    use super::*;
+    use crate::handoff::async_channel;
+
+    /// Async twin of the sync anchor liveness regression (todo #14): a task
+    /// anchored while one input is empty must still claim from the OTHER
+    /// input's arrivals. Ring A stays silent (its producer chain "blocked
+    /// upstream"); items land in ring B only — an anchor that only wakes
+    /// for its own input's events deadlocks the run.
+    #[test]
+    fn anchored_async_task_claims_from_other_input() {
+        let (tx_a, rx_a) = async_channel::<u32>(4);
+        let (tx_b, rx_b) = async_channel::<u32>(4);
+        let mut fan = AsyncFanIn::new(vec![rx_a, rx_b]);
+        let claimed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&claimed);
+        let task = std::thread::spawn(move || {
+            futures::executor::block_on(async {
+                while let Some(_item) = fan.claim().await {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        });
+        // Let the task park: both rings empty → the anchor awaits ring A.
+        std::thread::sleep(Duration::from_millis(100));
+        for v in 0..4u32 {
+            futures::executor::block_on(async { tx_b.send(v).await })
+                .expect("ring B has capacity 4");
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while claimed.load(Ordering::SeqCst) < 4 {
+            assert!(
+                Instant::now() < deadline,
+                "anchored async task never claimed the other input's items"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // EOF: close both rings, the task exits.
+        drop(tx_a);
+        drop(tx_b);
+        task.join().unwrap();
+        assert_eq!(claimed.load(Ordering::SeqCst), 4);
+    }
 }

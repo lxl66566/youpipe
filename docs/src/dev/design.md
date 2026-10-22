@@ -57,7 +57,11 @@ two `NodeHandle`s with a compile-time type check, and `run()` validates the
 topology (cycles, dangling nodes, duplicate names/edges — errors name the
 node) before starting it. It reuses both planes unchanged: the data plane is
 the same crossfire MPMC channels (fan-out = one channel per outbound edge +
-per-edge `Clone`; fan-in = fair round-robin over the inbound edges), and the
+per-edge `Clone`; fan-in = fair round-robin over the inbound edges, with the
+blocking anchor parked on every open input at once — sync workers via crossfire
+`Select` (reservation tokens), async tasks via a poll-all `FirstReady`
+combinator; a fan-in worker parked on a single input deadlocks DAGs, see
+`FanIn::anchor`), and the
 scheduling faces are the same `ComputePool` (sync nodes) and `AsyncRuntime`
 (async nodes, pull-based async sources). Output delivery is batched
 (`Broadcast::send_batch`, `YOUPIPE_GRAPH_TX_BATCH`): feeders and workers
