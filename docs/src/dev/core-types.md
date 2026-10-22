@@ -186,7 +186,7 @@ counterpart (`E: 'static`, same erased-failure-slot caveat as
 IS the index, generated inside the leaves, so no input buffer ever exists
 (`pipe(0..n)` pays a serial O(n) iota fill + buffer lifecycle on the calling
 thread — 56–70 % of the whole owned call at 1 M/4 M; see
-[benchmarks.md](benchmarks.md) "Input materialization"). Input type is fixed
+[benchmarks/sync-fused.md](benchmarks/sync-fused.md) "Input materialization"). Input type is fixed
 to `usize`, which is also what lets the terminals dispatch to the generation
 core statically (`S: FusedStage<usize, Output = O>`).
 

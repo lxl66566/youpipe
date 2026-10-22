@@ -18,4 +18,4 @@ This book has three parts:
 | [Developer guide](dev/design.md) | Internals: scheduler, channels, verification, methodology. |
 
 Benchmark charts and the full cross-library comparison live in
-[Benchmarks and methodology](dev/benchmarks.md).
+[Cross-library comparison and counters](dev/benchmarks/counters.md).

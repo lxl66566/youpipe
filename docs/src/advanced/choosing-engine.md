@@ -61,4 +61,4 @@ back-to-back and CPU stays isolated from IO (same benchmark harness):
 
 Balanced CPU: youpipe wins 1K–100K items (−57 % vs rayon at 100K) and ties
 at 1M (bandwidth-bound). Full
-data and methodology: [benchmarks](../dev/benchmarks.md).
+data and methodology: [benchmarks](../dev/benchmarks/counters.md).

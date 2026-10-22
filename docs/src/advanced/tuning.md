@@ -7,7 +7,7 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | Knob | Effect | Applies to | Reach for when |
 | --- | --- | --- | --- |
 | `with_workload(Workload)` | fork/join split granularity | fused + `stream()`'s fused cores | item costs are skewed |
-| `with_filter_collect(FilterCollectMode)` | implementation of by-ref filter collects (default `Auto`: merge tree < 100K items, write-then-compact ≥ 100K) | fused by-ref `.collect()` with a filter stage | the Auto gate mismatches your shape (all identical output; see [dev/benchmarks](../dev/benchmarks.md) "filter-chain collect") |
+| `with_filter_collect(FilterCollectMode)` | implementation of by-ref filter collects (default `Auto`: merge tree < 100K items, write-then-compact ≥ 100K) | fused by-ref `.collect()` with a filter stage | the Auto gate mismatches your shape (all identical output; see [dev/benchmarks](../dev/benchmarks/sync-fused.md) "Filter-chain collect") |
 | `with_buffer_size(n)` | channel capacity between stages | streaming | bursty producers, memory bounds |
 | `with_io_concurrency(n)` | in-flight async tasks per async stage | streaming | IO waits are cheap and plentiful |
 | `.ordered()` | reorder pass restoring input order | streaming | output must match input order |
@@ -111,7 +111,7 @@ the stage / expand / fence-forwarder burst phase and the feeder push loop
 claim runs of consecutive ring slots with one atomic cursor update per
 run instead of one per item (fork extension — mechanism in
 [dev/streaming](../dev/streaming.md), verdicts in
-[dev/benchmarks](../dev/benchmarks.md)). Backpressure granularity, item
+[dev/benchmarks](../dev/benchmarks/streaming.md)). Backpressure granularity, item
 order, capacity and cancellation semantics are unchanged; async terminals
 keep per-item recv. Stage/expand workers claim at most `cap / workers`
 items per claim (a whole-run claim would let one worker monopolize a
@@ -120,7 +120,7 @@ promoted together with `YOUPIPE_SHARDED_TERM`: the pair measured −19…−62 %
 mean on every multi-process soak cell with the sharded-alone bimodality
 removed, and `"0"` on both knobs is the documented escape hatch to the
 shared-ring per-item configuration (readings:
-[dev/benchmarks](../dev/benchmarks.md) "Default-policy soak + pair
+[dev/benchmarks](../dev/benchmarks/streaming.md) "Default-policy soak + pair
 promotion").
 
 Why auto is safe for consumers that read the output right after collect
@@ -147,7 +147,7 @@ ordering and cancellation semantics are unchanged. Default on since
 is bimodal on single-stage fan-in shapes (median wins, convoy slow mode
 in ~30 % of back-to-back runs), while the pair with batched claiming is
 tight and wins every soak cell — turning either knob off should turn
-both off (readings: [dev/benchmarks](../dev/benchmarks.md)
+both off (readings: [dev/benchmarks](../dev/benchmarks/streaming.md)
 "Default-policy soak + pair promotion").
 
 ## `YOUPIPE_SHARDED_TERM_ASYNC`: async terminal sharding (streaming)
@@ -159,7 +159,7 @@ purpose — the async flavour is a measured **loss** on sync-fed async
 terminals (+42…+51 % @100K: the one-shard anchor's waker asymmetry paces
 the whole fan-in), so it must not ride along with `YOUPIPE_SHARDED_TERM`.
 Its sole measured winner is the async-only feeder-saturated chain at
-−57.5 % (readings: [dev/benchmarks](../dev/benchmarks.md)); reach for it
+−57.5 % (readings: [dev/benchmarks](../dev/benchmarks/streaming.md)); reach for it
 only on that shape.
 
 ## `YOUPIPE_ASYNC_CHAIN_FLOOR`: async-chain capacity floor (streaming)
@@ -172,7 +172,7 @@ mode: with the small default buffers a sync-prefix→`stage_async` chain
 collapses into a per-item park+wake chain paced by wake latency (~20 % of
 back-to-back runs at 100K items; 130–230 ms vs 18–21 ms fast), and the
 floor takes the collapsed runs to zero while tightening the fast mode
-(readings: [dev/benchmarks](../dev/benchmarks.md) "Async-chain capacity
+(readings: [dev/benchmarks](../dev/benchmarks/attribution.md) "Async-chain capacity
 floor"). Pure-sync chains never lift — their convoy face is the fence
 family, addressed by `YOUPIPE_SPIN_ANCHOR`.
 

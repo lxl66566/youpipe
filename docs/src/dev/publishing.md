@@ -89,3 +89,11 @@ Checklist per release:
    `tests/`, `examples/`, README symlink), so docs/tooling can't leak into
    the tarball; cargo dereferences the README symlink to a regular file.
 4. Publish in the order above.
+
+The same matrix discipline applies per change round, not only per release:
+every round must run the full feature-combination matrix
+(`cargo test -p youpipe --no-default-features` and
+`cargo test -p youpipe --all-features`), not only the combination the round
+touched. A dormant break survives until the acceptance bench otherwise —
+a real case: a `NonZeroUsize` import sat behind `cfg(tokio-runtime)` while
+async-only handoff types were imported unconditionally.

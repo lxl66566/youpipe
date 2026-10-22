@@ -1,193 +1,31 @@
-# 已证伪方向（勿重复尝试）
+# Falsified Directions (do not retry)
 
-跨主题的失败实验索引：每项均已实现并实测为负/危险后回退。详细数据与机制
-记录在 [scheduler.md](scheduler.md)、[benchmarks.md](benchmarks.md)、
-[crossfire-waker-designs.md](crossfire-waker-designs.md) 与对应代码注释。
-新想法先对照本清单；开放中的工作项见 [todo.md](../../todo.md)。
+Cross-topic index of failed experiments: every entry below was implemented and measured as negative or dangerous before being reverted. Detailed data and mechanisms are recorded in [scheduler.md](scheduler.md), the benchmarks chapters ([sync-fused.md](benchmarks/sync-fused.md), [streaming.md](benchmarks/streaming.md), [attribution.md](benchmarks/attribution.md)), and the corresponding code comments. Check this list before trying a new idea; open work items are in [todo.md](../../todo.md).
 
-- **driver 偷已注入 chunk** 的三个变体（claim-flag / pop-any / pop-requeue）：
-  破坏 injector FIFO（stream 正确性的隐式全局依赖）或 `counter==0 ⇒ JobRef
-  全部消费` 不变量（UAF / 全池死锁）。安全形态只有 reserve chunk（现状）。
-- **flat 顶层派发**：小中 N 赢、大 N 单注入器争用崩盘；hybrid 是定论。
-- **on-pool 无门控 hybrid**（2026-07）：小批量 P 并发嵌套把 ~P² 个小 chunk
-  灌进全局 injector，每个 driver 的窃取等待都在同一 MPMC 上弹跳出队——
-  `nested_saturated/1K` **+430 %**、`nested_single/1K` +3 %。单树的本地
-  deque + 偷取才是小批量的正确形态；on-pool hybrid 仅大批量（`chunk_splits
-  > 0`）启用。详见 `hybrid_dispatch` 的 regime 注释。
-- **local-deque hybrid 解除小批量门控**（2026-09-25，`YOUPIPE_ONPOOL_HYBRID
-  =2` + `YOUPIPE_ONPOOL_HYBRID_SMALL`，5 轮交错）：分布到 driver 本地 deque
-  只救回饱和侧——`nested_saturated/1K` −8 %（25/25），但 `nested_single/1K`
-  仍 **+80 %**（0/25）：P−1 worker 停机、单 driver 的形状里，hybrid 的固定
-  开销（chunk 划分 + 一次 wake cascade + latch 等待）压不过单树逐层 push
-  的增量 ramp。按 regime 混合结论 ⇒ 门控保留；自适应门控即 cost-EMA 类，
-  已两次证伪。大批量侧的 level 2 本体成立（vs level 1 稳定 −1.7…−2.9 %，
-  见 scheduler.md），默认仍 0。
-- **cost-EMA 自适应 chunk 数 / execute-time split-back**：门条件在稳态几乎
-  不同时成立（实测 1 次/进程），机制零命中即删。
-- **count-then-place 用于低选择率 filter**（2026-09-27，5 轮同 binary
-  knob A/B，时为 `YOUPIPE_FILTER_CTP`、现为 `YOUPIPE_FILTER_COLLECT=ctp`）：前提反了——merge 树开销随存活数缩放，
-  count-then-place 随输入数持平（stage 跑两遍），交叉点 ~25 % @100K：
-  keep10 **+41 %**、全部 10K 形状 +28…+75 %（均 0/25）。高选择率侧成立
-  （keep90 −50.5 %、keep50 −37.1 %、33 % −31.1 %，均 25/25），故 knob 以
-  opt-in 保留、默认关。数据见 benchmarks.md filter 小节。
-- **write-then-compact 用于 10K 中高选择率**（2026-09-27，
-  `YOUPIPE_FILTER_COLLECT=wtc` 三侧终测，5 轮同 binary）：存活 payload
-  （keep90 @10K = 72 KB）低于 256 KB 并行压缩门槛，driver 顺序压缩为 worker
-  刚写完的 cache line 付跨核传输——keep90 **+25 %**（0/25）、keep33 +8 %。
-  调低门槛不可救（fork/join ramp ~10 µs > 顺序传输 ~5 µs）。其余形状占优
-  （100K keep33/50/90 −24…−38 % 均 25/25、1K −12.8 %），knob 以 opt-in 保留、
-  默认 merge；数据与机制见 benchmarks.md filter 小节。
-- **加宽自旋或 yield 窗口**（32/64 之外）、**限制 steal 扫描范围**（有界探测）：
-  均为全局回退。
-- **去掉 async→async bridge funnel**（consumer 直接 clone 上游 receiver）：
-  MPMC 多 waker 唤醒风暴，+0.5…0.8% 稳定回退。
-- **async stage 消费端 burst-drain recv**（2026-09）：把逐项 `rx.recv().await`
-  改成 anchor + `try_recv` 突发，`io_async_pure/mixed`（200/500/2000，5 轮
-  交错 A/B）全部 ±0.5% 纯噪声（sync 侧同形状 −4.9…−13.8%）。机制：crossfire
-  `MAsyncRx::recv` 先 `try_recv` 后才注册 waker，非空队列上本就无 waker 往返
-  可省。详见 `spawn_async_consumers_body` 的 NOTE(perf)。
-- **池缩到物理核数**：zstd SMT 收益 ~1.9×，直接 +78…89% 墙钟。
-- **小批量自动串行**：API 诚实性问题（`prefers_serial` 注释），仅保留
-  n≤1 / 单线程池的平凡短路。
-- **chunk 边界 cache line 对齐**（`YOUPIPE_ALIGN_CHUNKS`，2026-09）：顶层
-  chunk 边界与 `par_*_rec` 每层 mid 全部 snap 到 input/output 双 buffer
-  的 64B 边界格点（同余联合，output 优先；纯 index 重排，off 路径
-  bit-for-bit 不变）。同 binary 5 对 off/on 进程交替（horizontal
-  cpu_balanced，rounds=5，taskset 1-31）：youpipe 2M +0.35%、4M +0.28%、
-  1M −0.02%、100K −0.31%，全部在 rayon 对照 ±0.8% 噪声底内；1K +1.9%、
-  10K +0.7% 反付每 batch 的格点计算 + bounds Vec 分配固定开销。机制归因：
-  每 chunk（4M/32 ≈ 131K 元素）仅首尾 2/16K 条 line 跨界（~0.01% 量级），
-  且 SIMD store 对齐前提已由 malloc 16B 对齐保证——64B 全 line 对齐在 Zen
-  上无边际收益，差距不在边界对齐。
-- **hot-epoch 条件性保温窗口**（`YOUPIPE_HOT_EPOCH_MS`，2026-09-25）：机制——
-  进程级 activity 时间戳（锚点仅 2 个：fused dispatch 完成 + fused 批注入，
-  每批各一次，driver 侧执行）+ idle sleepy 决策点判定：热窗内（now −
-  last_activity < epoch）把该 idle episode 退避临时扩为 2048/2048（同因果
-  验证值），deadline 封顶、过期即回默认泊车；off 路径行为不变。A/B
-  （horizontal cpu_balanced 100K/1M/2M/4M，同 binary 两进程交替 ×5 对 +
-  rayon 对照进程，taskset 1-31，1 对 off 进程被外部负载污染剔除）：per-pair
-  中位 100K ~0%、1M −2.0%、2M −0.3%、4M −1.4%，全部低于 +3% 门槛（2M 对
-  rayon gap 仅 12.5→11.5 pt）。空闲 burn（3×2M 批后 10s 空转，getrusage
-  全进程 utime+stime）：off 0.1–0.2 ms、epoch=1ms 2–6 ms、epoch=2ms
-  0.4–15 ms（末批尾部分布的运气主导，鲁棒性差）、epoch=5ms 47–70 ms ≈
-  全局 2048/2048（~60 ms）——封顶语义生效，但窗口≈批时长（5ms vs ~1ms/批）
-  时机制退化为全局加宽。失败根因：时间窗无法区分两种 idle——批内
-  ramp-down（工人做完 chunk，widening 烧核干扰在职工人，正是 ROUNDS_SPIN
-  回退机制）与批间 gap（widening 的收益来源）；2M 批执行 ~1ms >> gap
-  30–100µs，净收益抵消至 ~1 pt，与全局 2048 的 1–4 pt 因果上界一致。
-  旁证（不作结论）：外部 bench 挤占 20+ 核的争载下同 A/B 一致 −8~−13%，
-  提示泊车频率被放大时窗口才有净收益。「下一批将至」的显式提示（caller
-  侧声明、非时间推断）与尾部 straggler 细化仍开放（todo.md）。
-- **quiescence 门控保温自旋**（2026-09-26，实现后 A/B 前回退）：机制——
-  worker 在 spin→yield 相位边界检查 `counters.inactive == num_threads`
-  （全池静默 = 没有在执行的工人 = 批间 gap 而非 ramp-down），静默期间以
-  有界预算（env 旋钮）延长 busy-spin 跨过批间 gap。判据本身正确地区分了
-  两种 idle，但**生效太晚**：capped/uniform 形状里早停工人在批尾（尚有
-  straggler 在跑、非静默）就耗尽 32+32 窗口泊车，静默成立时救援窗口已过；
-  冒烟（uniform，q=2048 vs 0）+1.5…+2.8% 无收益，而对照组全局
-  spin=2048 同形状 −4%（收益全部来自「非静默期间也保温」，即被证伪的
-  全局加宽）。结论：批间 park/wake 残差不存在只作用于 gap idle 的
-  池内信号；opt-in 核绑定（scheduler.md "Worker affinity"）从唤醒落核侧
-  收回了同一残差。
-- **`Slots::uninit` 输出分配 `MADV_HUGEPAGE`**（2026-09，机制性证伪未跑
-  A/B）：sysfs THP `enabled=[madvise]`（非 never），但此机内存状态使
-  madvise 无效——buddyinfo Normal zone order-9 空闲块 0、MemFree ~2 GB
-  碎片化，fault-time 2 MiB 分配恒失败（纯 mmap 2M 对齐 + madvise + 写
-  touch 实测 6/6 `AnonHugePages: 0 kB`）；khugepaged 异步 collapse 30 s
-  后仍为 0（`pages_to_scan=4096`/轮 × 10 s 周期，bench 秒级迭代等不到）。
-  bench 场景依赖 fault-time 路径，除非机器重启后早期或空闲大块充足，
-  否则该方向不可测。first-touch 单 NUMA 无意义（已排除）。
-- **终端 collector 通道换 `std::sync::mpsc::sync_channel`**（2026-09，实验
-  e1684fc → revert aa842a6）：微基准（无竞争 1P1C）曾显示 sync_channel(256)
-  比当前 crossfire mpsc flavor 快 17–31 %（41/58 vs 35/44 Melem/s），但
-  in-pipeline A/B（`bench_ab.sh -a base=main -b wt`，5 轮 per-id 交错；控制列
-  `mixed_load/rayon_par_iter` ±0.5 %、`pipeline_fusion/fused_3_stages` ±0.1 %
-  排除环境漂移与布局噪声）全面回退：`stream_pipeline` 1K 档三 id
-  +11.1…+12.0 %（两侧轮次中位区间几乎不重叠）、`with_fence/100K` +13.6 %、
-  100K 多生产者档 +1.2…+1.9 %；`mixed_load/youpipe_stream_cpu` 1K/100K
-  +0.1/−3.6 %（±22–25 % 噪声底内）。机制：微基准赢在无竞争稳态吞吐
-  （recv 侧无 CAS、无 waker 注册表），但真实 collector 是 burst-drain 节奏
-  ——burst 之间通道清空，std 的空 recv / 满 send 立即 park（无自旋窗口），
-  每个 burst 边界都付一次 futex 往返；1K 小批量另付每 run 的通道构造差异
-  （std block 链表初始化 vs crossfire ring 一次分配）；`with_fence` 的
-  单生产者→单消费者 ping-pong（Chunked(500) 突发释放）是 std 最差形状，
-  每次唤醒延迟直接串行化进 chunk 间隔。语义对齐本身无问题（disconnect
-  排干后 Err、try_recv 区分 Empty/Closed、多生产者 Clone，std 亦无
-  crossfire #70 假 Disconnected 窗口）。结论：crossfire mpsc 保留；微基准
-  （无竞争稳态）与 in-pipeline（burst 节奏 + park 往返）两种口径的矛盾
-  以此收束——当初切 crossfire 的 in-pipeline profiling 依据仍成立。
-- **streaming 相邻 sync stage 编译期自动融合**（2026-09-29，`sync_fuse`
-  家族同 binary knob A/B：`YOUPIPE_SYNC_FUSE_VARIANT=split|merged`，5 轮
-  per-id 隔离交错，32 核）：核心前提"相邻 sync stage 间每 item 一次
-  channel hop 可省"在稳态不成立——hop 是流水化的（各 channel 并发推进），
-  稳态每 item 成本由**每 channel 争用**主导，融合把两个 15W 种群并成一个
-  31W 种群、争用集中反而更慢。纯 sync streaming 链（`with_cancel` 强制
-  streaming）全面回退：pair @100K **+21.2 %**（24.6→29.8 ms）、@1K
-  +13.6 %；quad @100K **+34.6 %**（22.2→29.9 ms）、@1K +21.1 %；cheap
-  形状同向（+20.2 %/+13.0 %）；每 item 成本随单 channel worker 数单调
-  （8W 222 ns / 16W 246 ns / 31W 298 ns，quad-split/pair-split/pair-merged）。
-  async 尾链的表面大胜（`stage(f1).stage(f2).stage_async(g)` @100K
-  237 ms → 手动复合 25 ms，−89.4 %）经探针证伪为**双稳态 convoy 病态**
-  而非融合收益：同形状逐 run 双稳（探针 5 采样 [23, 24, 53, 151,
-  244] ms；独立进程复跑三组中位 239/164/155 ms，进程内亦混有快慢 run），
-  单 sync 前缀 25.9 ms / 复合前缀 24.0 ms / async-only 83 ms
-  （后者受 feeder 单线程推送率限制）；fence 链的表面 +477…+563 % 回退
-  同属该病态——零负载 `stage(bump).fence(Chunked(500)).stage(bump)` 即
-  226 ms @100K，与是否融合无关（canary：`sync_fuse/fence_infra`；另立
-  todo 跟踪）。结论：不做自动融合；convoy 病态才是该形状的正解。曾验证
-  过落地方案的可编译性（`SyncStage` 加 pin 标记类型参数 + 泛型 `stage`
-  移入 sealed-marker-bounded 固有 impl，两块固有 impl 不重叠、解析命中
-  融合版），如未来病态修复后重开此方向可复用该设计（注意 E0592：两个
-  无界的同名固有方法 impl 不允许）。
-- **async terminal-only 容量解耦到 in-flight 上界**（2026-10-22，todo #4
-  候选方向，原型 `YOUPIPE_ASYNC_TERM_DECOUPLE` 后回退）：只把 terminal 环
-  容量取 `n`（字节预算门限）不充分——async2 深 soak 慢档率 off 22/120 vs
-  on 17/120 几乎不变，仅中位数收紧；mid/mixed 环会自行再播种逐项唤醒链。
-  同时证伪「必须 `buffer = n`」：容量扫描显示全环 ~16K slot 即 0/48 慢档，
-  `n` 反而略慢（更大 eager 分配的 cache 足迹）。正确形态是链路全局 floor
-  （`YOUPIPE_ASYNC_CHAIN_FLOOR`，stage 输出 + feeder 环，默认开）——读数
-  见 benchmarks.md "Async-chain capacity floor"。
-- **crossfire `RegistryMulti` wake-one 唤醒策略**（2026-10-21，todo #4
-  候选 (c)，代码判读 + 临时旋钮 `YOUPIPE_FIRE_ALL` 同 binary A/B）：
-  前提不成立——"fire() 把整个人群全部唤醒"是对 `pop_again` 循环的误读。
-  upstream `fire()` 弹出队头唤醒，committed（Waiting→Woken）落地即
-  `is_done` 早退，**committed 队列上一次 fire 本来就只唤醒一个 waiter**；
-  `pop_again` 扇出仅在队头为 Init/Skip 时触发（stream/sink 常驻 Init 的
-  waker），且同样停在首个 committed 唤醒。A/B（convoy-probe async1/
-  async2）两侧双稳同分布、中位差 < 噪声。`fire()` 已改写为 `_fire_n(1)`
-  统一唤醒会计（语义同集，非 perf 变化），机制记录见
-  crossfire-waker-designs.md §15。
-- **graph fan-in claim sweeps**（2026-10-22，graph_shapes 结论点名的
-  "claim cap" 杠杆，四路同 binary A/B 后移除）：`FanIn::round` 从「首个
-  ready 输入即返」改为一次扫描 claim 每个 open 输入（各 ≤ claim_cap，
-  追加进同一 scratch）。单独开：全 id 噪声（|Δ| ≤ 5 %、符号混杂，含
-  fanin_cheap 双源形状）；叠在批量发送（`YOUPIPE_GRAPH_TX_BATCH`）之上：
-  chain/fanin 中性、diamond @100K 反而 +6–8 %。机制：输出侧逐项
-  channel op 批量化后，每次 claim 对 k 个 ring 的轮询游走不在关键路径
-  （每 ring 的 claim 本就已是批量 CAS）。sweep 路径连同 `claim_poll`
-  的 append 语义一起移除；批量发送侧读数见 benchmarks.md「Graph
-  data-plane batching」。
-- **async collector 侧 pre-anchor 自旋**（2026-10-21，原型 `AnchorSpin`
-  async 孪生 + 旋钮 `YOUPIPE_SPIN_ANCHOR_ASYNC`，实现后 A/B 回退）：
-  async 终端 drain 的 anchor await 前按活动门控预算自旋 `try_recv`。
-  快档下 collector parks 塌缩 ~10–25×（main v 0.9–2.5 K/run → 47–200），
-  但墙钟不变；慢档照旧（~2 parks/item）——塌缩态下 terminal 到达是
-  clumpy 的（间隙超过门控窗口，预算被 quarter 回纯泊车），collector 不是
-  残余慢档的节拍器。与 worker 侧 `YOUPIPE_SPIN_ANCHOR=30` 同开亦无救援
-  （165–225 ms 慢 run 仍现）。`--buffer n` 全量解救（8/8 run 24–31 ms）
-  证实残余慢档是全链背压驱动的逐项唤醒链，节拍在 anchor 自旋不可达的
-  面（io task `send_cached` 停进满 terminal ring）。方向关闭，读数与
-  再归因见 streaming.md「Async face re-attribution (2026-10-21)」。
-
-- **async 尾链上的 worker 输出批量发送**（2026-10-22，
-  `YOUPIPE_STREAM_TX_BATCH` 门控前的 A/B，`bench_ab.sh -E` 每 id 隔离
-  5 轮）：`stage().stage().stage_async()` 形状上，mixed hop（sync
-  worker → async 消费者）批量发送 **+4.9 % @100K（0/25）**，仅中段
-  MPMC hop 批量（mixed 保持逐项）仍 **+3.3 % @1K（0/25）**——两跳皆负，
-  且 @1K 的 −14.4 % 优势完全来自 mixed hop（被其 @100K 代价压倒）。
-  convoy-probe async2：中位 +3–7 %，无塌缩档（容量 floor 的解救不
-  受影响）。async 消费者是 runtime task，`MAsyncRx::recv` 先
-  `try_recv` 后注册 waker，节拍不吃发送侧 run 化的收益；与 sync
-  消费者的 anchor + burst-drain 形成对照。落地策略：链含 async
-  stage 即整体逐项（`!ctx.has_async_stage`，与 capacity floor 同
-  谓词），读数见 benchmarks.md「Stream worker tx batching」。
+- **Driver stealing injected chunks**, three variants (claim-flag / pop-any / pop-requeue): each breaks either the injector FIFO (an implicit global dependency of stream correctness) or the `counter == 0 ⇒ all JobRefs consumed` invariant (UAF / pool-wide deadlock). The only safe shape is reserving a chunk (the current design).
+- **Flat top-level dispatch**: wins at small-to-medium N, collapses into single-injector contention at large N; the hybrid is the settled verdict.
+- **On-pool hybrid without gating** (2026-07): small-batch P-concurrent nested submission poured ~P² small chunks into the global injector, and every driver's steal wait bounced dequeues off the same MPMC — `nested_saturated/1K` **+430%**, `nested_single/1K` +3%. A single tree over local deques + stealing is the correct shape for small batches; the on-pool hybrid is enabled only for large batches (`chunk_splits > 0`). See the regime comments on `hybrid_dispatch`.
+- **Lifting the small-batch gate on the local-deque hybrid** (2026-09-25, `YOUPIPE_ONPOOL_HYBRID=2` + `YOUPIPE_ONPOOL_HYBRID_SMALL`, 5 interleaved rounds): distributing into driver-local deques rescued only the saturated side — `nested_saturated/1K` −8% (25/25), while `nested_single/1K` stayed **+80%** (0/25). In the single-driver shape with P−1 workers parked, the hybrid's fixed cost (chunk splitting + one wake cascade + latch wait) cannot beat the incremental ramp of pushing a single tree level by level. The per-regime mixed verdict ⇒ the gate stays; adaptive gating of the cost-EMA family is twice falsified. On the large-batch side level 2 itself holds (vs level 1 a stable −1.7…−2.9%, see scheduler.md); the default stays 0.
+- **cost-EMA adaptive chunk count / execute-time split-back**: the gate conditions almost never hold simultaneously in steady state (measured once per process); the mechanism hit zero times and was deleted.
+- **count-then-place for low-selectivity filters** (2026-09-27, 5 rounds of same-binary knob A/B, knob then `YOUPIPE_FILTER_CTP`, now `YOUPIPE_FILTER_COLLECT=ctp`): the premise was inverted — merge-tree cost scales with the survivor count while count-then-place stays flat in the input count (the stage runs twice); the crossover sits at ~25% @100K: keep10 **+41%**, all 10K shapes +28…+75% (all 0/25). The high-selectivity side does hold (keep90 −50.5%, keep50 −37.1%, 33% −31.1%, all 25/25), so the knob stays opt-in, default off. Readings in [sync-fused.md](benchmarks/sync-fused.md).
+- **write-then-compact for 10K mid/high selectivity** (2026-09-27, `YOUPIPE_FILTER_COLLECT=wtc`, 5 rounds of same-binary knob A/B): the surviving payload (keep90 @10K = 72 KB) sits below the 256 KB parallel-compaction threshold, and the driver's sequential compaction pays cross-core transfer for cache lines the workers just wrote — keep90 **+25%** (0/25), keep33 +8%. Lowering the threshold cannot rescue it (fork/join ramp ~10 µs > sequential transfer ~5 µs). Every other shape wins (100K keep33/50/90 −24…−38%, all 25/25; 1K −12.8%), so the knob stays opt-in with merge the default; data and mechanism in [sync-fused.md](benchmarks/sync-fused.md).
+- **Widening the spin or yield window beyond 32/64, bounding the steal scan range (bounded probing)**: both are global regressions.
+- **Removing the async→async bridge funnel** (the consumer clones the upstream receiver directly): MPMC multi-waker wake storms, a stable +0.5…0.8% regression.
+- **Burst-drain recv on the async stage consumer side** (2026-09): replacing per-item `rx.recv().await` with an anchor + `try_recv` burst left `io_async_pure/mixed` (200/500/2000, 5 interleaved A/B rounds) all within ±0.5%, pure noise (the sync side on the same shapes gains −4.9…−13.8%). Mechanism: crossfire `MAsyncRx::recv` does `try_recv` first and registers a waker only afterwards, so on a non-empty queue there was never a waker round-trip to save. See the NOTE(perf) on `spawn_async_consumers_body`.
+- **Shrinking the pool to physical cores**: zstd gains ~1.9× from SMT; the shrink costs +78…89% wall clock.
+- **Automatic serialization of small batches**: an API honesty problem (see the `prefers_serial` comment); only the trivial short-circuits for n≤1 and single-thread pools remain.
+- **Cache-line-aligning chunk boundaries** (`YOUPIPE_ALIGN_CHUNKS`, 2026-09): the top-level chunk boundaries and every per-level `par_*_rec` mid were snapped to the 64B boundary lattice shared by the input and output buffers (congruence union, output wins; a pure index permutation, the off path is bit-for-bit unchanged). Same-binary, 5 off/on process pairs alternating (horizontal cpu_balanced, rounds=5, taskset 1-31): youpipe 2M +0.35%, 4M +0.28%, 1M −0.02%, 100K −0.31%, all inside the rayon control's ±0.8% noise floor; 1K +1.9% and 10K +0.7% paid the fixed per-batch lattice arithmetic + bounds-Vec allocation for nothing. Mechanism: per chunk (4M/32 ≈ 131K elements) only the first and last 2 of 16K lines straddle a boundary (~0.01%), and malloc's 16B alignment already satisfies the SIMD store alignment precondition — full 64B line alignment has no marginal benefit on Zen, the gap was never boundary alignment.
+- **hot-epoch conditional keep-warm window** (`YOUPIPE_HOT_EPOCH_MS`, 2026-09-25). Mechanism: a process-level activity timestamp (only 2 anchors: fused dispatch completion + fused batch injection, once per batch each, driver-side) plus a check at the idle sleepy decision point: inside the hot window (now − last_activity < epoch) the idle episode's backoff is temporarily widened to 2048/2048 (the same values the causal verification used), capped by a deadline and reverting to default parking on expiry; off-path behavior unchanged. A/B (horizontal cpu_balanced 100K/1M/2M/4M, same-binary two-process alternating ×5 pairs + a rayon control process, taskset 1-31, one off process dropped as polluted by external load): per-pair medians 100K ~0%, 1M −2.0%, 2M −0.3%, 4M −1.4%, all below the +3% gate (the 2M gap to rayon moved only 12.5→11.5 pt). Idle burn (10 s idle after 3×2M batches, getrusage whole-process utime+stime): off 0.1–0.2 ms, epoch=1ms 2–6 ms, epoch=2ms 0.4–15 ms (dominated by luck in the last batch's tail distribution, poor robustness), epoch=5ms 47–70 ms ≈ global 2048/2048 (~60 ms) — the capping semantics work, but once the window ≈ batch duration (5 ms vs ~1 ms/batch) the mechanism degenerates into global widening. Root cause of the failure: a time window cannot tell the two idles apart — in-batch ramp-down (workers done with their chunks; widened spinning burns cores and disturbs the workers still running, exactly the ROUNDS_SPIN regression mechanism) vs the inter-batch gap (the source of widening's benefit); a 2M batch runs ~1 ms >> the 30–100 µs gap, so the net benefit cancels down to ~1 pt, consistent with global 2048's causal ceiling of 1–4 pt. Side evidence (no conclusion drawn): under contention from an external bench occupying 20+ cores, the same A/B read a consistent −8~−13%, hinting the window nets a benefit only when the parking frequency is amplified. An explicit "next batch incoming" hint (caller-side declaration, not time inference) and tail-straggler refinement remain open (todo.md).
+- **Quiescence-gated keep-warm spin** (2026-09-26, reverted after implementation, before the A/B). Mechanism: at the spin→yield phase boundary the worker checks `counters.inactive == num_threads` (whole pool silent = no executing workers = inter-batch gap, not ramp-down) and, while silent, extends busy-spin with a bounded budget (env knob) across the inter-batch gap. The criterion itself separates the two idles correctly, but it **engages too late**: in the capped/uniform shapes the early-finishing workers exhaust their 32+32 window and park at the batch tail (stragglers still running, silence not yet reached), and by the time silence holds the rescue window has passed. Smoke test (uniform, q=2048 vs 0) +1.5…+2.8%, no benefit, while the control's global spin=2048 read −4% on the same shape (all of that benefit comes from staying warm also while not silent, i.e. the falsified global widening). Conclusion: no in-pool signal exists that acts only on gap idle for the inter-batch park/wake residual; opt-in core pinning (scheduler.md "Worker affinity") reclaims the same residual from the wake-landing side.
+- **`MADV_HUGEPAGE` on the `Slots::uninit` output allocation** (2026-09, falsified on mechanism, no A/B run): sysfs THP is `enabled=[madvise]` (not never), but this machine's memory state renders madvise ineffective — buddyinfo Normal zone order-9 free blocks 0, MemFree ~2 GB fragmented, fault-time 2 MiB allocation always fails (a pure-mmap 2M-aligned + madvise + write-touch probe measured 6/6 `AnonHugePages: 0 kB`); khugepaged's async collapse was still 0 after 30 s (`pages_to_scan=4096`/round × 10 s period; second-scale bench iterations never live to see it). Bench scenarios depend on the fault-time path; unless the machine is in an early post-reboot state or large free blocks are plentiful, this direction is untestable. First-touch is meaningless on single-NUMA (already excluded).
+- **Swapping the terminal collector channel for `std::sync::mpsc::sync_channel`** (2026-09, experiment e1684fc → revert aa842a6): the microbenchmark (uncontended 1P1C) showed sync_channel(256) 17–31% faster than the current crossfire mpsc flavor (41/58 vs 35/44 Melem/s), but the in-pipeline A/B (`bench_ab.sh -a base=main -b wt`, 5 rounds of per-id interleaving; the control columns `mixed_load/rayon_par_iter` ±0.5% and `pipeline_fusion/fused_3_stages` ±0.1% rule out environment drift and layout noise) regressed across the board: `stream_pipeline` 1K tier, three ids, +11.1…+12.0% (the two sides' round-median ranges barely overlap); `with_fence/100K` +13.6%; the 100K multi-producer tiers +1.2…+1.9%; `mixed_load/youpipe_stream_cpu` 1K/100K +0.1/−3.6% (inside a ±22–25% noise floor). Mechanism: the microbenchmark wins on uncontended steady-state throughput (no CAS on the recv side, no waker registry), but the real collector lives in a burst-drain rhythm — the channel drains empty between bursts, and std's empty recv / full send parks immediately (no spin window), paying one futex round-trip at every burst boundary; the 1K small-batch tier additionally pays the per-run channel construction difference (std's block linked-list initialization vs crossfire's one-shot ring allocation); `with_fence`'s single-producer→single-consumer ping-pong (Chunked(500) burst release) is std's worst shape, every wake latency serializing straight into the chunk interval. Semantic alignment itself was sound (disconnect drains then Err, try_recv distinguishes Empty/Closed, multi-producer Clone; std also lacks crossfire #70's spurious-Disconnected window). Conclusion: the crossfire mpsc stays; the contradiction between the microbenchmark caliber (uncontended steady state) and the in-pipeline caliber (burst rhythm + park round-trips) is closed by this — the in-pipeline profiling evidence behind the original switch to crossfire still stands.
+- **Compile-time auto-fusion of adjacent sync stages in streaming** (2026-09-29, `sync_fuse` family same-binary knob A/B: `YOUPIPE_SYNC_FUSE_VARIANT=split|merged`, 5 rounds of per-id isolated interleaving, 32 cores): the core premise, "the per-item channel hop between adjacent sync stages can be saved", does not hold in steady state — the hop is pipelined (the channels advance concurrently), steady-state per-item cost is dominated by **per-channel contention**, and fusing merges two 15W populations into one 31W population, concentrating contention and running slower. Pure sync streaming chains (`with_cancel` forcing streaming) regressed across the board: pair @100K **+21.2%** (24.6→29.8 ms), @1K +13.6%; quad @100K **+34.6%** (22.2→29.9 ms), @1K +21.1%; the cheap shapes point the same way (+20.2%/+13.0%); per-item cost is monotonic in the per-channel worker count (8W 222 ns / 16W 246 ns / 31W 298 ns, quad-split/pair-split/pair-merged). The apparent huge win on async-tail chains (`stage(f1).stage(f2).stage_async(g)` @100K 237 ms → manual composition 25 ms, −89.4%) was falsified by probes as a **bistable convoy pathology**, not a fusion benefit: the same shape is bistable run to run (probe 5 samples [23, 24, 53, 151, 244] ms; three independent process reruns with medians 239/164/155 ms, fast and slow runs mixed inside one process too), single sync prefix 25.9 ms / composite prefix 24.0 ms / async-only 83 ms (the last limited by the feeder's single-thread push rate); the fence chain's apparent +477…+563% regressions are the same pathology — zero-load `stage(bump).fence(Chunked(500)).stage(bump)` alone runs 226 ms @100K, independent of fusion (canary: `sync_fuse/fence_infra`; tracked separately in todo). Conclusion: no auto-fusion; the convoy pathology is the real fix target for that shape. The compilability of a landing design was verified once (`SyncStage` gains a pin marker type parameter + the generic `stage` moves into a sealed-marker-bounded inherent impl; the two inherent impl blocks do not overlap and resolution hits the fused version), reusable if this direction reopens after the pathology is fixed (mind E0592: two unbounded same-name inherent method impls are not allowed). Readings in [benchmarks/streaming.md](benchmarks/streaming.md).
+- **async terminal-only capacity decoupling to an in-flight bound** (2026-10-22, todo #4 candidate direction, prototype `YOUPIPE_ASYNC_TERM_DECOUPLE`, reverted): sizing only the terminal ring's capacity to `n` (the byte-budget threshold) is insufficient — the async2 deep-soak slow-run rate was off 22/120 vs on 17/120, nearly unchanged, only the median tightened; the mid/mixed rings re-seed per-item wake chains on their own. The claim "must be `buffer = n`" was falsified at the same time: the capacity sweep shows the whole chain reaches 0/48 slow runs at ~16K slots, while `n` is slightly slower (the cache footprint of the larger eager allocation). The correct shape is a chain-wide floor (`YOUPIPE_ASYNC_CHAIN_FLOOR`, stage outputs + feeder ring, on by default) — readings in [attribution.md](benchmarks/attribution.md).
+- **crossfire `RegistryMulti` wake-one policy** (2026-10-21, todo #4 candidate (c), code reading + temporary knob `YOUPIPE_FIRE_ALL`, same-binary A/B): the premise does not hold — "fire() wakes the whole population" was a misreading of the `pop_again` loop. Upstream `fire()` pops the queue head and wakes it; once committed (Waiting→Woken) it early-exits via `is_done`, so **one fire on a committed queue wakes exactly one waiter**; the `pop_again` fan-out engages only when the head is Init/Skip (the stream/sink resident-Init wakers), and it too stops at the first committed wake. A/B (convoy-probe async1/async2): both sides bistable in the same distribution, median difference below noise. `fire()` is now written as `_fire_n(1)` for uniform wake accounting (the same semantics, not a perf change).
+- **graph fan-in claim sweeps** (2026-10-22, the "claim cap" lever named by the graph_shapes conclusions, four-way same-binary A/B, then removed): `FanIn::round` changed from "return on the first ready input" to one sweep claiming every open input (each ≤ claim_cap, appended into the same scratch). Alone: all ids noise (|Δ| ≤ 5%, mixed signs, the fanin_cheap two-source shape included); stacked on top of batched sends (`YOUPIPE_GRAPH_TX_BATCH`): chain/fanin neutral, diamond @100K +6–8% worse. Mechanism: once the output-side per-item channel ops were batched, the per-claim polling walk over k rings left the critical path (each ring's claim was already a batched CAS). The sweep path was removed together with `claim_poll`'s append semantics; the batched-send readings are in [benchmarks/graph.md](benchmarks/graph.md).
+- **async collector-side pre-anchor spin** (2026-10-21, prototype `AnchorSpin` async twin + knob `YOUPIPE_SPIN_ANCHOR_ASYNC`, reverted after A/B): spin `try_recv` under an activity-gated budget ahead of the anchor await in the async terminal drain. In fast runs the collector's parks collapse ~10–25× (main v 0.9–2.5 K/run → 47–200) while wall clock is unchanged; slow runs stay as they are (~2 parks/item) — in the collapsed state terminal arrivals are clumpy (gaps exceed the gated window, the budget is quartered back to pure parking), the collector is not the pacemaker of the residual slow runs. Combined with the worker-side `YOUPIPE_SPIN_ANCHOR=30` it still does not rescue (165–225 ms slow runs keep appearing). `--buffer n` rescues fully (8/8 runs 24–31 ms), proving the residual slow runs are a chain-wide backpressure-driven per-item wake chain, paced on a face anchor spin cannot reach (the io task's `send_cached` parking on a full terminal ring). Direction closed; readings and the re-attribution are in [streaming-forensics.md](streaming-forensics.md).
+- **Worker batched sends on async-tail chains** (2026-10-22, the A/B ahead of the `YOUPIPE_STREAM_TX_BATCH` gating, `bench_ab.sh -E` per-id isolated, 5 rounds): on `stage().stage().stage_async()` shapes, batching the mixed hop (sync worker → async consumer) regressed **+4.9% @100K (0/25)**, and batching only the mid-chain MPMC hop (the mixed hop kept per-item) still regressed **+3.3% @1K (0/25)** — batching either hop is a net loss, and the @1K −14.4% advantage came entirely from the mixed hop (overwhelmed by its @100K cost). convoy-probe async2: median +3–7%, no collapsed runs (the capacity floor's rescue is unaffected). The async consumers are runtime tasks; `MAsyncRx::recv` does `try_recv` first and registers a waker only afterwards, so their pacing takes no benefit from run-ifying the send side; contrast with the sync consumer's anchor + burst-drain. Landed policy: a chain containing an async stage stays per-item throughout (`!ctx.has_async_stage`, the same predicate as the capacity floor); readings in [benchmarks/streaming.md](benchmarks/streaming.md).
+- **Skipping the inject-path fence when counters show everyone awake** (2026-10-20, analyzed and rejected): the idea was to skip `Sleep::new_injected_jobs`'s unconditional `fence(SeqCst)` whenever the packed counters already read `sleeping == 0 && awake_but_idle == 0`, saving one locked op per `inject` on the stream-dispatch path. Unsound as stated: the no-lost-wake guarantee rests on the poster-fence/sleeper-fence SeqCst pair ordering *across* variables (queue indexes vs the packed counters); a same-variable SeqCst counter load cannot substitute, and a thread that enters `start_looking` after the poster's check can reach the pre-park queue probe with no happens-before edge to the push. Any future variant must keep a full fence unless the counters can prove no sleeper is racing, which this protocol never can.
+- **Switching `sleep.rs` to the fork's asm fence flavor** (2026-10-20, rejected): `sleep.rs` fences via std (`mfence` on x86) while the concurrent-queue fork uses the `lock not` asm fence. The fork's own four-side A/B (the microbenchmark favored the asm, the integrated verdict kept it) bounds the difference at single-digit nanoseconds, and the inject path already contains a SeqCst RMW that is itself a full barrier on x86. Expected ≈ 0; skip unless the injector path is reopened for other reasons.
+- **The `None => break` early-exit recipe for the unbounded `push_n` CAS path** (2026-10, review-suggested fix, rejected as unsafe): a reserved-but-unwritten slot makes `pop` spin forever and UBs `Drop`. The correct shape is stage-then-reserve: stage values out of the iterator and CAS-reserve only what was taken, so a lying `len` just ends the batch early.
+- **The `uninit()`-overwrite one-liner for `SendFuture` first-poll drop** (2026-10, review-suggested fix, rejected): overwriting with `uninit()` plus an unconditional `assume_init_drop` has inverted polarity, it double-drops after a successful send. Ownership needs an explicit `consumed` flag: owned-until-sent, every path drops exactly once.

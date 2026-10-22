@@ -63,7 +63,7 @@ scheduling faces are the same `ComputePool` (sync nodes) and `AsyncRuntime`
 (`Broadcast::send_batch`, `YOUPIPE_GRAPH_TX_BATCH`): feeders and workers
 stage each claim batch and every open edge takes one `try_send_batch` per
 free run with a per-item blocking fallback — per-item output sends measured
-2–3× slower on light items (benchmarks.md "Graph data-plane batching").
+2–3× slower on light items (see [benchmarks/graph.md](benchmarks/graph.md)).
 The engines position as: `pipe` for
 compile-time linear fusion, `stream` for runtime linear chains, `graph` for
 runtime DAGs — linear workloads should stay on the cheaper engines; see the
@@ -155,6 +155,12 @@ crates/youpipe/src/
 │   └── mod.rs
 └── ...
 ```
+
+Visibility note for the handoff wrapper: downgrading the visibility of a
+type used in a public signature (`ShardedReceiver` / `FinalRx` /
+`StageSpawn`) cascades into `private_interfaces` / `private_bounds` lint
+errors, so a crate-internal module is the correct home for such types
+(`handoff/mod.rs`).
 
 The miri/loom-transparent primitive layer (former `src/util/`) lives in its
 own workspace crate, `crates/youpipe-sys`:

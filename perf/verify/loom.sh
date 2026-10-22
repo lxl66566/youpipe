@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Loom model-check runner. Loom is switched on by the `--cfg loom` rustflag
-# (NOT a cargo feature — see Cargo.toml / docs/testing.md), so this script
+# (NOT a cargo feature — see Cargo.toml / docs/src/dev/testing.md), so this script
 # is the canonical entry point:
 #
 #   * youpipe's sync-core models (`#[cfg(all(test, loom))] mod loom_tests`)

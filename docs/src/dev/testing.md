@@ -68,6 +68,10 @@ crate gates explicitly and `loom.sh` runs it without RUSTFLAGS:
 LOOM_MAX_PREEMPTIONS=2 cargo test -p youpipe-crossfire --features loom --lib -- loom_
 ```
 
+The `-- loom_` filter in that command is mandatory, not cosmetic: running
+the whole lib under `--features loom` false-fails the non-loom tests that
+use std concurrency.
+
 The vendored `youpipe-st3` is a second deliberate exception, in two ways:
 it keeps upstream's own `st3_loom` cfg name (so its rustflag cannot leak
 into dependencies carrying `cfg(loom)` shims), and loom is a **regular
@@ -80,9 +84,11 @@ tests link the lib *without* `cfg(test)`, so under that form every model
 degenerates to one real-atomic schedule and passes vacuously in ~0.00s
 (caught by the 2026-10 review; the fork's 12 models had never actually
 explored). Re-enabling them also required constructing buffer slots via
-`UnsafeCell::new` under loom: loom cells carry model state that the
-fork's `set_len`-over-uninitialized-memory allocation cannot provide
-(symptom: index-out-of-bounds in `loom::rt::cell::Cell::start_write`).
+`UnsafeCell::new` under loom: loom's `UnsafeCell` is not plain data —
+model locations must be registered — so exposing uninitialized slots via
+`set_len` explodes loom on the first write (symptom: index-out-of-bounds
+in `loom::rt::cell::Cell::start_write`); build the buffers per-slot under
+`cfg(st3_loom)`.
 
 ```sh
 # Upstream CI's preemption budget; models take 0.3s-2min each under real
@@ -142,12 +148,20 @@ real multi-worker concurrency (fence-over-large-input, which deadlocks on
 miri's single emulated worker) remain `#[cfg_attr(miri, ignore)]`d, with
 the reason documented at each site.
 
+Miri budget: tests that grind on real-channel feeder ping-pong must also
+be scaled down under miri (e.g. 1280 items / 2x200 / 300), and the scaling
+must cover the whole family, not only the obviously heavy tests — a
+filter-ctp by-ref test kept n=10_007 where its wtc sibling had scaled to
+503 and blew the 1800 s budget once debug assertions were re-enabled.
+
 ### Build-profile guard (`lib.rs`)
 
 youpipe ships a `.cargo/config.toml` override (`opt-level=3`, `panic=unwind`) that applies inside its workspace but is **not** inherited by downstream crates. Two downstream profile settings are known to be harmful; one is detected at compile time, the other is documented only:
 
 - `panic = "abort"` — disables `catch_unwind`, so the `LeafGuard` / `ForEachGuard` panic-safety paths never run; any panic inside a pool worker aborts the process instead of propagating. Detected in `lib.rs` via `#[cfg(panic = "abort")]` (the deprecated-const warning trick) — this is accurate inside the library compilation, unlike cargo's build-script `CARGO_CFG_PANIC` env var which mirrors the build-script's own panic strategy (always `unwind`), not the target crate's.
 - `opt-level = "s"` / `"z"` — disables the leaf-loop auto-vectorizer (~2× regression on the lightweight warm path). No longer detected at compile time: the rationale and the `[build] rustflags = ["-C", "opt-level=3"]` override recipe live in youpipe's own `.cargo/config.toml` comment for downstream users to copy.
+
+Separately, the workspace's own profile wiring has a cargo pitfall: cargo emits `-C debug-assertions` only when it differs from the default implied by the profile's opt-level, and it is blind to `[build]` rustflags, so opt-level overrides must live in profile tables, never in profile-blind rustflags (an opt-level override sitting in `[build]` rustflags silently left dev/test without debug assertions until it moved into `[profile.dev]`). Enabling the assertion layer immediately exposed two latent test bugs: a reorder alias assert that contradicted the deliberate-overflow unit tests (the invariant is the caller's, so the assert was removed), and an integration test doing u64 arithmetic that overflow checks reject.
 
 # Fuzzing (cargo-fuzz)
 
@@ -250,63 +264,3 @@ real close. Async paths were never exposed: their waker nodes are
 per-future, not per-thread. Deterministic regression tests (fork and
 vendored) stamp the shared node Closed from outside mid-episode, on both
 the send and recv sides.
-
-
-## Audit 2026-10-20: open items
-
-Gate run on `r6/audit-infra` @ `0ddc9c2` (worktree `target/wt/d`, 14 GB box,
-`CARGO_BUILD_JOBS=6`):
-
-- `cargo test` (default members) — pass: 331 tests / 25 binaries, 0 failed,
-  slowest binary 6.0 s.
-- `cargo clippy --workspace --all-targets` — pass: 0 warnings in workspace
-  code; the fork `[lints]` holds. One cargo note: `nom v4.2.3` (via
-  `perfcnt v0.8.0`) is future-incompatible (item 2).
-- `cargo check -p youpipe --no-default-features` / `--all-features` — pass.
-- `mdbook build docs` — clean, no warnings.
-- Manual relative-link scan over docs/src (mdbook has no linkcheck
-  preprocessor): 0 broken links, including every `[todo.md](../../todo.md)`
-  pointer — `docs/todo.md` exists on main, so those references are not
-  dangling and there was nothing to clean.
-
-Open items:
-
-1. **Fallible pure path has no bench id (verification debt).**
-   `try_apply_pure` (`2a580c7`) is codegen-layout sensitive and the commit
-   names the debt explicitly, but it is recorded only in the
-   `FusedTryStage` doc comment
-   (`crates/youpipe/src/builder/typed/traits.rs:577`); `docs/todo.md` (the
-   open-items tracker) has no entry. Impact: a later layout shift on the
-   `try_collect` fast paths could move ±16-30 % with nothing flagging the
-   unverified path. Action: add a filterless `try_collect` id to the bench
-   suite, run the same-binary interleaved-recompile A/B, record the verdict
-   in benchmarks.md, track the residual in todo.md.
-
-2. **`perfcnt`/`nom v4` future-incompat (contained, unmaintained
-   upstream).** Clippy flags `nom v4.2.3` via `perfcnt v0.8.0`
-   (`crates/youpipe-criterion-perf-counters/Cargo.toml:41`,
-   `crates/youpipe-bench/Cargo.toml:64`). Contained by design (bench crates
-   only, `publish = false`), but perfcnt sees no upstream releases; a
-   future rustc will reject it. Action when it breaks: vendor/fork perfcnt
-   like st3, or port the counters onto youpipe-gungraun's valgrind path.
-
-3. **mdbook does not validate intra-book links.** `docs/book.toml` sets
-   `create-missing = false` (SUMMARY entries are checked) but plain
-   relative links in page bodies are not; this audit's scan was a one-off
-   script. Action (optional): add mdbook-linkcheck to the build.
-
-4. **Stale path in a perf script comment.** `perf/verify/loom.sh:3` cites
-   `docs/testing.md`; the file is `docs/src/dev/testing.md`. Cosmetic;
-   perf/ was outside this round's write scope.
-
-No-action findings: README/README.zh-CN examples and the guide/advanced
-pages match the current API (terminals, options types, and env knobs
-verified method-by-method against the code; historical knob names appear
-only in dead-ends/benchmarks records that mark them local or temporary);
-benches/tests contain no duplicate or stale harnesses (the
-`stream_reduce`/`stream_reduce_alloc` and `sharded_term`/`sharded_term_async`
-pairs are distinct alloc/event-loop harnesses by design);
-`.gitignore`/`clippy.toml`/`rustfmt.toml` entries all resolve; examples/
-and fuzz targets match the README claims. Fixed this round: the
-`try_apply_pure` paragraph in core-types.md and the terminal enumeration in
-guide/scope.md (e9acfbb).

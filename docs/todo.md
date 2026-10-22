@@ -1,143 +1,76 @@
 # TODO
 
-范围：**未落地**的工作项。已关闭需求的落地记录与实测读数保存在 docs/src/dev/
-对应主题文档（scheduler.md / benchmarks.md / streaming.md / core-types.md）
-与代码注释里，勿凭记忆重做；已证伪方向见 [dev/dead-ends.md](src/dev/dead-ends.md)。
-编号不复用（dev 文档以「todo #N」引用条目），已关闭条目留下空缺编号。
+Scope: **unlanded** work items. Landing records and measured readings for closed requirements live in the topical docs under docs/src/dev/ (scheduler.md / the benchmarks chapters / streaming.md / core-types.md) and in the code comments; do not redo them from memory. Falsified directions are in [dev/dead-ends.md](src/dev/dead-ends.md). Entry numbers are never reused (the dev docs reference entries as "todo #N"); closed entries leave gaps in the numbering.
 
-验证统一规范（见 `dev/benchmarks.md`）：
+Verification conventions (see `dev/benchmarks/`):
 
-- 结论一律用 `perf/bench-suite` 交错 A/B（同机同 session，median-of-rounds）；
-- 100K fused 家族必须隔离交替跑（整组跑有 2–3× 塌缩陷阱）；stream 家族 ±10% 漂移需隔离交替；
-- 调度器类改动用**同 binary 运行时旋钮** A/B（`bench_ab.sh -E`，重编译对紧基准有 ±30% 纯代码布局噪声，2026-07 在未改动的 rayon 锚点上实测 +31%）；
-- 重尾（heavy-tail）结论必须多 seed（chunk 边界运气主导单 seed 方差）。
+- Every verdict uses `perf/bench-suite` interleaved A/B (same machine, same session, median-of-rounds).
+- The 100K fused families must run as isolated per-id interleaving (running the whole group has a 2–3× collapse trap); the stream families drift ±10% and also need isolated interleaving.
+- Scheduler-class changes use same-binary runtime-knob A/B (`bench_ab.sh -E`); recompilation swings tight benches ±30% through pure code layout (measured +31% on an untouched rayon anchor in 2026-07).
+- Heavy-tail conclusions need multiple seeds (chunk-boundary luck dominates single-seed variance).
 
-优先级：P0 = 高价值/证据充分；P1 = 中等；P2 = 实验/微优化/口径修正。
-代码位置以符号名为主（行号随主分支漂移）。
+Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / micro-optimization / caliber fixes. Code locations are given by symbol name (line numbers drift on main).
 
 ---
 
-## 性能
+## Performance
 
-### 2. [P1] zstd_shape 残余差距（capped/uniform 落后）
+### 2. [P1] zstd_shape residual gap (capped/uniform behind)
 
-- 现状：wide-tier 边界 64→48 已落地（scheduler.md "Wide-tier boundary
-  scan"，heavy-tail n=3000 vs-rayon 收至 +2.5%）；opt-in
-  `ComputePool::new_pinned` 已从唤醒落核侧收回大部分残差（capped
-  −6.1…−6.9%、uniform −4.0…−4.6%，scheduler.md "Worker affinity"）。残余：
-  capped +1…+2%、uniform +4…+6%、heavy-tail n=2000（narrow）~+1% 仍落后
-  rayon；默认路径（无 pinning）残余需按 pinning 闸下口径重估。
-- 方向：capped 形状的残余是重尾 spread（4.2 pt）而非均值——考虑 chunk 内
-  条目乱序化或第三档；cost-EMA 类自适应已两次证伪（dead-ends.md），勿再走
-  运行时成本估计路线。
-- 验证：`zstd_shape` 全形状 × 多 seed（`ZSTD_SEEDS`/`ZSTD_SHAPE_NS` 网格
-  透传）；cheap 侧档位经算术核对不随边界变化（cpu_unbalanced n=200/5000
-  均未跨 48）。
+- Status: the wide-tier boundary 64→48 has landed (scheduler.md "Wide-tier boundary scan"; the heavy-tail n=3000 vs-rayon gap tightened to +2.5%); the opt-in `ComputePool::new_pinned` has reclaimed most of the residual from the wake-landing side (capped −6.1…−6.9%, uniform −4.0…−4.6%, scheduler.md "Worker affinity"). Residual: capped +1…+2%, uniform +4…+6%, and heavy-tail n=2000 (narrow) ~+1% still behind rayon; the default-path (no pinning) residual needs re-estimation under the pinning-gate caliber.
+- Direction: the capped-shape residual is heavy-tail spread (4.2 pt), not a mean shift — consider reordering entries within chunks, or a third tier; cost-EMA-style adaptation is twice falsified (dead-ends.md), do not take the runtime-cost-estimation route again.
+- Verification: `zstd_shape` all shapes × multiple seeds (`ZSTD_SEEDS`/`ZSTD_SHAPE_NS` grid passed through); the cheap-side tiers, checked arithmetically, do not move with the boundary (cpu_unbalanced n=200/5000, neither crosses 48).
 
-### 3. [P1] fused 批间泊车/唤醒占用亏损（默认路径残余）
+### 3. [P1] fused inter-batch park/wake occupancy loss (default-path residual)
 
-- 现状：归因与收束记录见 benchmarks.md（"Attributing the 2M/4M
-  fused-collect gap"、"NT-store attribution"）：空闲工人泊车 + futex 唤醒
-  + 落冷核 vs rayon 全程自旋保温。NT-store auto（~13 pt）与 opt-in
-  pinning（cpu_balanced 1M/2M/4M −5.1…−7.2%）已落地；新口径（2026-09-26，
-  7 轮交错）cpu_balanced 1M +0.6%、2M +1.5%、4M −6.8%（反超），readback
-  口径领先 24–29%。**默认路径残余 ≈1.5 pt @2M**。
-- 方向：尾部 straggler 细化——末段更细粒度 oversplit（动态，非 cost-EMA
-  路线，残余价值有限，新口径下 2M 仅 +1.5%）；勿拉长全局自旋窗口、勿做
-  时间窗/静默门控保温（均证伪，见 dead-ends.md）。
-- 验证：`cpu_balanced` 1M/2M/4M 隔离 A/B + `horizontal-counters`（youpipe-bench）
-  复查 task-clock / ctx-switch / migration。
+- Status: attribution and closure records in [attribution.md](src/dev/benchmarks/attribution.md) ("Attributing the 2M/4M fused-collect gap", "NT-store attribution"): idle workers parking + futex wakes + landing on cold cores, vs rayon spinning warm throughout. NT-store auto (~13 pt) and opt-in pinning (cpu_balanced 1M/2M/4M −5.1…−7.2%) have landed; under the new caliber (2026-09-26, 7 interleaved rounds) cpu_balanced 1M +0.6%, 2M +1.5%, 4M −6.8% (ahead of rayon), and the readback caliber leads by 24–29%. **The default-path residual is ≈1.5 pt @2M**.
+- Direction: tail-straggler refinement — finer-grained oversplit of the final segment (dynamic; not the cost-EMA route, which is falsified; limited residual value, only +1.5% @2M under the new caliber). Do not lengthen the global spin window and do not build time-window or quiescence-gated keep-warm (both falsified, see dead-ends.md).
+- Verification: `cpu_balanced` 1M/2M/4M isolated A/B + `horizontal-counters` (youpipe-bench) to re-check task-clock / ctx-switch / migration.
 
-### 4. [P2] streaming async 形状的吞吐塌缩（残余 ~1%）
+### 4. [P2] throughput collapse of streaming async shapes (residual ~1%)
 
-- 现状：`YOUPIPE_ASYNC_CHAIN_FLOOR`（默认开，2026-10-22）已解决主体——
-  async 链的未 pin 通道（stage 输出 + feeder 环）floor 到
-  `min(n, 16384)` slot（8 MiB/环字节预算），async2 深 soak 慢档
-  18–30/120 → 0/120（release gate 二进制 21/96 → 2/96）；terminal-only
-  解耦与 `buffer=n` 必要性均已证伪（dead-ends.md；落地记录见
-  dev/streaming.md「Async-chain capacity floor — resolution」与
-  benchmarks.md 同名节）。
-- 残余：最终 gate 下 on 侧仍有 ~1% 慢 run（2/216，单进程偶发）。若可
-  复现，候选：floor 提到 64K 档（扫描中 64K 同样 0/48）、或与
-  `YOUPIPE_SPIN_ANCHOR` 的组合面。
+- Status: `YOUPIPE_ASYNC_CHAIN_FLOOR` (on by default, 2026-10-22) resolved the main body — the async chain's unpinned channels (stage outputs + the feeder ring) are floored to `min(n, 16384)` slots (an 8 MiB/ring byte budget), taking the async2 deep-soak slow runs from 18–30/120 to 0/120 (release-gate binary 21/96 → 2/96); terminal-only decoupling and the necessity of `buffer = n` are both falsified (dead-ends.md; the landing record is in [streaming.md](src/dev/streaming.md) "Async-chain capacity floor — resolution" and the same-named section of [attribution.md](src/dev/benchmarks/attribution.md)).
+- Residual: under the final gate the on side still shows ~1% slow runs (2/216, a single-process sporadic). If reproducible, candidates: raise the floor to the 64K tier (64K also read 0/48 in the sweep), or the combination surface with `YOUPIPE_SPIN_ANCHOR`.
 
-### 5. [P1] `ordered()` + `expand()`：批量 payload 方案
+### 5. [P1] `ordered()` + `expand()`: the batched-payload design
 
-2026-10 设计分析确认三条硬约束，实现前必须先解决（详见 dev/core-types.md
-对应记录）：
+The 2026-10 design analysis confirmed three hard constraints that must be solved before implementation (details in the corresponding record in [core-types.md](src/dev/core-types.md)):
 
-- **空展开组不可信令（阻断项）**：`(seq, sub, end_of_group)` 方案里 `end`
-  标志只能附着在组内最后一个条目上；`expand` 返回空 `Vec` 时该组没有任何
-  消息可携带完成信号——collector 从第一个空组起无法推进前缀 flush，退化为
-  close 时全量排序：剩余流全量缓冲（内存）+ 固定容量 reorder ring 静默丢弃
-  （数据丢失）。唯一完好方案是 **expand 后链路改批量 payload**（channel 携带
-  `(seq, Vec<N>)`，空组=空 Vec 消息，天然支持嵌套 expand 保序，ReorderBuffer
-  直接复用），但 `ordered` 是运行时 flag、批量与否是编译期类型——需把
-  `ordered` 提为 typestate（`.ordered()` 必须先于 `.expand()`）或双 API。
-- **多层 expand 需要完整路径**：两级 expand 的全局序是 `(seq, sub1, sub2)`
-  字典序，3 字段 tag 丢 `sub1`；批量 payload 方案天然免疫（嵌套即展平）。
-- **泛型约束坑**：`Fn(I, &mut Vec<N>)` 参数位不约束 `N`（E0207），需
-  `ExpandStage<Prev, F, N>` 结构体泛型承载（expand_emit 已这么做了）。
+- **Empty expand groups cannot carry a signal (blocker)**: in the `(seq, sub, end_of_group)` design the `end` flag can only attach to the last entry of a group; when `expand` returns an empty `Vec`, no message of that group can carry the completion signal — from the first empty group on, the collector can no longer advance the prefix flush and degrades to sorting the whole remaining stream at close: the rest of the stream is buffered in full (memory cost) and the fixed-capacity reorder ring silently drops items (data loss). The only sound design is **batched payloads downstream of the expand** (the channel carries `(seq, Vec<N>)`; an empty group is an empty-Vec message; nested expands keep order naturally; the ReorderBuffer is reused as-is), but `ordered` is a runtime flag while batched-vs-not is a compile-time type — `ordered` must be promoted to a typestate (`.ordered()` must precede `.expand()`), or a dual API is needed.
+- **Multi-level expand needs the full path**: the global order of a two-level expand is the `(seq, sub1, sub2)` lexicographic order; a 3-field tag loses `sub1`; the batched-payload design is naturally immune (nesting flattens).
+- **Generic-constraint trap**: `Fn(I, &mut Vec<N>)` does not constrain `N` in argument position (E0207); it must be carried as a struct generic, `ExpandStage<Prev, F, N>` (expand_emit already does this).
 
-顺带收益：与 crossfire per-thread waker（设计 C，dev/crossfire-waker-designs.md
-§11）叠加后每组的 channel hop 数减少。
+### 7. [P1] cancellation partial-output semantics (residual: RunOutcome reporting)
 
-### 7. [P1] 取消的部分输出语义（残余：RunOutcome 报告）
+- The documentation contract is in place (2026-10-20, r7): `run()` gained a Cancellation section, `for_each`/`with_cancel` gained inline notes, and guide/stream.md was synced — cancellation produces silently truncated output, indistinguishable from a normal short run. The old guide wording was also corrected: a worker stops once it has finished the current item (the token is checked per item), it does not "drain in-flight items to completion".
+- Residual direction: `RunOutcome`, or a `try_run_checked`, reporting `Cancelled { emitted }` (the collector checks the token after draining).
 
-- 文档契约已补（2026-10-20，r7）：`run()` 新增 Cancellation 节，
-  `for_each`/`with_cancel` 内联说明，guide/stream.md 同步——取消产出静默
-  截断的输出，与正常短 run 不可区分。顺带修正 guide 旧措辞：worker 只
-  完成当前条目即停（逐条目查 token），并非 "in-flight items drain to
-  completion"。
-- 残余方向：`RunOutcome` 或 `try_run_checked` 报告
-  `Cancelled { emitted }`（collector 排干后查 token 即可）。
+### 16. ~~[P1] batching the per-item sends of streaming stage workers~~ (landed)
 
-### 16. ~~[P1] streaming stage worker 的逐项 send 批量化~~（已落地）
+- `YOUPIPE_STREAM_TX_BATCH` (2026-10-22, on by default) + the fork MPSC ring's native `try_push_batch` have landed: multi2 −49%, cancel_quad −65%, fence_pair −20…−25%, workers2 −10…−17%, all stable at 25/25 or 9/9; async-tail chains stay per-item under the `!has_async_stage` gate (both batched hops +2.2…+4.9%, falsification record in dead-ends.md). Readings: [benchmarks/streaming.md](src/dev/benchmarks/streaming.md) "Stream worker tx batching"; mechanism and semantics: [streaming.md](src/dev/streaming.md) "Worker output batching".
 
-- `YOUPIPE_STREAM_TX_BATCH`（2026-10-22，默认开）+ fork MPSC ring 原生
-  `try_push_batch` 已落地：multi2 −49 %、cancel_quad −65 %、fence_pair
-  −20…−25 %、workers2 −10…−17 %，全 25/25 或 9/9 稳定；async 尾链按
-  `!has_async_stage` 门控保持逐项（两跳批量均 +2.2…+4.9 %，证伪记录在
-  dead-ends.md）。读数：benchmarks.md「Stream worker tx batching」；
-  机制与语义：streaming.md「Worker output batching」。
+## Code health (refactoring / smells)
 
-## 代码健康（重构/坏味道）
+### 13. [P2] correctness-adjacent items and miscellany
 
-### 13. [P2] 正确性相邻与杂项
+- `try_exec`, ~257 lines, mixes four duties (admission/lease resolution, StreamCtx construction, feeder channel routing, terminal drain) → split out `resolve_admission` so the invariant comments sit next to the code that maintains them.
 
-- `try_exec` ~257 行混四职责（admission/lease 解析、StreamCtx 构建、
-  feeder 通道选路、终端 drain）→ 拆 `resolve_admission`，让不变量注释贴着
-  维护它的代码。
+### 14. [P1] `pipeline_integration` intermittent hang, residual
 
-### 14. [P1] `pipeline_integration` 间歇性 hang 残余
+- Status: the pool-wide parking lease (74211b1) fixed the deterministic concurrent-budget component, but the hang still recurs (again on 2026-09-28: under parallel cargo test, one test binary had 107 threads all in futex wait, 0 CPU for 13 minutes, and the remaining tests ran normally after the kill; again on 2026-10-22, **on the graph-engine side**: the `graph_dag` binary's `diamond_broadcast_conservation` (n=10K, buffer=4), 68 threads all in futex — 21 blocked in `recv`, 11 blocked in `send` (ring full), the main thread in a condvar wait in `graph/exec.rs`; a standalone rerun passed 20/20, unrelated to the stream-side changes). The `crossfire-trace` feature in Cargo.toml is the forensic instrumentation for this; the graph-side reproduction's stack signature (producers Full / consumers Empty / main-thread join condvar) matches #14's historical shape, so the intermittent deadlock spans engines.
+- Inspection so far: the youpipe wrapper loops show no lost-wake — every anchor (worker `anchor_claim`, fence forwarder, sharded `recv_anchor`, async `recv_cached`) re-probes after each park, cancel paths break out, and every `Closed` verdict flows through `try_recv`'s final drain. The remaining suspects are fork-side. One forensic fingerprint to keep in mind: crossfire's `Tx::send` calls `std::thread::yield_now()` (`crates/youpipe-crossfire/src/blocking_tx.rs`) after every send that leaves the ring full, so sustained backpressure produces ~16 `sched_yield` per item, the same scheduler-churn fingerprint the hang reproducers saw; the fork source is unmodifiable, treat it as a noise source when instrumenting.
+- Direction: on a reproduction, take forensics with `crossfire-trace` + gdb under a debuginfo build (lost-wakeup hypothesis first): a per-waker-seq reproducer on the terminal MPSC ring and one mid MPMC ring under full-suite concurrency. Watch the new interaction surface created by the fence pool-job conversion (41e0a6a).
+- Verification: run `pipeline_integration` repeatedly under the parallel harness; do not touch the code without a deterministic reproduction.
 
-- 现状：pool-wide parking lease（74211b1）修复了确定的并发预算成分后，hang
-  仍偶发（2026-09-28 又一次：并行 cargo test 下某测试二进制 107 线程全部
-  futex wait、13 分钟 0 CPU，kill 后其余测试正常；2026-10-22 又一次：
-  **graph 引擎侧**，`graph_dag` 二进制 `diamond_broadcast_conservation`
-  （n=10K、buffer=4），68 线程全部 futex——21 个阻塞在 `recv`、11 个阻塞
-  在 `send`（ring 满）、主线程在 `graph/exec.rs` 完成 condvar wait，
-  standalone 重跑 20/20 秒通过，与 stream 侧改动无关）。Cargo.toml 的
-  `crossfire-trace` feature 即为其取证插桩；graph 侧复现的 stack 签名
-  （producers Full / consumers Empty / 主线程 join condvar）与 #14 历史
-  形态一致，说明该间歇性死锁跨引擎存在。
-- 方向：复现时用 `crossfire-trace` + gdb 取证（lost-wakeup 假设优先）；关注
-  fence pool-job 化（41e0a6a）后的新交互面。
-- 验证：并行 harness 反复跑 `pipeline_integration`；无确定性复现前不动代码。
+### 15. [P2] leftovers from the 2026-10-20 audit
 
-### 15. [P2] 2026-10-20 审计遗留项
+Items from the 2026-10-20 three-way audit that were not scheduled into the adjacent round:
 
-Round-6 三路审计的完整发现（机制、证据、验证计划）记录在各主题文档的
-`Audit 2026-10-20: open items` 节（scheduler.md / streaming.md / testing.md）；
-此处仅列未安排进紧邻轮次的条目：
+- st3 `WorkerThread::push`'s `is_empty()`+`push()` performs 5 atomic reads on the line shared with stealers, reducible to 3 — first verify with cargo-show-asm whether LLVM already merges the adjacent Relaxed loads (generic monomorphization within one CGU may already eliminate them); only if unmerged, evaluate a fork API (costly under the fork-stays-diffable constraint, expected gain <1%).
+- `try_apply_pure` has no bench id: the path is sensitive to codegen layout (ErasedStrategy recorded ±16–30% layout regressions), so a layout shift could silently regress the `try_collect` fast path.
+- `perfcnt` → `nom v4` future-incompat: upstream is unmaintained, a future rustc will refuse to compile it; when that happens, vendor/fork it or port the counters onto gungraun's valgrind path.
+- mdbook has no linkcheck preprocessor, so relative intra-book links are unvalidated (a one-off script scan on 2026-10-20 found 0 broken links; moving it into CI is pending).
 
-- st3 `WorkerThread::push` 的 `is_empty()`+`push()` 对偷取者共享行的 5 次原子
-  读可减为 3 次——先 cargo-show-asm 验证 LLVM 是否已合并相邻 Relaxed 载荷
-  （泛型单态化在同 CGU 可能已消除），未合并再评估 fork API（fork 可 diff
-  约束下代价高，预期收益 <1%）；
-- `try_apply_pure` 无 bench id：该路径对 codegen 布局敏感（ErasedStrategy
-  记录过 ±16–30% 布局回归），布局一变 `try_collect` 快路径可能无声回归；
-- `perfcnt`→`nom v4` future-incompat：upstream 停更，rustc 未来版本会拒绝
-  编译，届时需 vendor/fork 或把计数器移植到 gungraun 的 valgrind 路径；
-- mdbook 无 linkcheck preprocessor，页内相对链接无校验（2026-10-20 一次性
-  脚本扫描为 0 断链，CI 化待做）。
+### 17. [P2] seq-less unordered channel flavor
+
+A seq-less unordered channel flavor (dropping the `(u64, T)` tag; `spawn_stage`'s unification rationale is at `crates/youpipe/src/builder/typed/stream.rs:611`) would halve per-item slot bytes for `u64` payloads, but it splits every spawn path per ordering. The expected win is single-digit % at best on cache-bound shapes. Worth only a throwaway prototype.
