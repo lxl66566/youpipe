@@ -244,7 +244,9 @@ fn node_expand_count_conservation() {
         2 * usize::try_from(n).unwrap(),
         "expand emits exactly two outputs per input"
     );
-    assert_eq!(items.iter().copied().sum::<u64>(), (0..n).map(|x| 2 * x + 1).sum());
+    // turbofish: with the serde feature on, u64: PartialEq<serde_json::Value>
+    // makes the bare sum() ambiguous in assert_eq!
+    assert_eq!(items.iter().copied().sum::<u64>(), (0..n).map(|x| 2 * x + 1).sum::<u64>());
 }
 
 // ── Async nodes (tokio-runtime) ──
@@ -279,7 +281,7 @@ fn async_diamond_broadcast() {
     assert_eq!(items.len(), 2 * n_usize, "join receives both full branches");
     assert_eq!(
         items.iter().copied().sum::<u64>(),
-        (0..n).map(|x| x.wrapping_mul(2) + x + 1000).sum(),
+        (0..n).map(|x| x.wrapping_mul(2) + x + 1000).sum::<u64>(),
         "both branch outputs account for every item"
     );
 }
