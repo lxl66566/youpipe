@@ -21,7 +21,12 @@
 # through pure layout shift; with 32 B function alignment the same commit
 # measures 1.00x against its parent. The flag costs nothing on the aligned
 # side (v0.6.0 base: 1.00x with/without) and converts the layout lottery
-# into a stable grid.
+# into a stable grid. Not a complete cure: function-entry alignment cannot
+# pin glue that may or may not be emitted at all — 5d199e7's Vec::extend
+# landing pad monomorphized per-type drop glue that shifted the fused leaf
+# ≡48 mod 64 (+33..+40 %, fixed in handoff/channel.rs `stage_batch`);
+# `-align-all-functions=6` (64 B) would close that class too but re-rolls
+# every bench baseline once (open, see attribution.md 2026-10-23).
 [build]
 rustflags = [
     "-C",
