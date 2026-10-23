@@ -1,4 +1,4 @@
-use std::{future::Future, mem::MaybeUninit};
+use std::{future::Future, mem::MaybeUninit, ptr};
 
 use crossfire::{mpmc, mpsc};
 
@@ -575,6 +575,41 @@ pub enum ChannelError {
 
 // ── SendItem trait: abstracts over SyncSender and MpscSender ──
 
+/// Move every item of `batch` into the caller-owned `staged` scratch;
+/// `batch` ends empty with its allocation intact, `staged` holds exactly
+/// the moved items in order (exact `reserve`, pointer moves only).
+///
+/// The loop body is panic-free (the `reserve` precedes every move), so no
+/// landing pads and no per-type drop glue are emitted for it. The
+/// `staged.extend(batch.drain(..).map(..))` this replaces emitted a
+/// `drop_in_place::<Map<Drain<T>, _>>` glue per channel item type: three
+/// ~112 B functions that shifted the fused collect leaf off its 32-byte
+/// uop-window boundary and regressed horizontal `cpu_balanced` by
+/// +33..+40 % — code the staging never executes; pure single-CGU layout.
+/// `#[inline(never)]` keeps this a per-type copy whose codegen (and thus
+/// its address-range footprint) does not depend on any caller.
+#[inline(never)]
+fn stage_batch<T>(batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) {
+    staged.clear();
+    let n = batch.len();
+    staged.reserve(n);
+    let dst = staged.as_mut_ptr();
+    let src = batch.as_ptr();
+    for i in 0..n {
+        // SAFETY: `i` indexes an initialized slot of `batch` not yet moved
+        // out, and a reserved (uninitialized) slot of `staged`.
+        unsafe {
+            dst.add(i).write(MaybeUninit::new(ptr::read(src.add(i))));
+        }
+    }
+    // SAFETY: every slot of `batch` was moved out above; [..n) of `staged`
+    // is initialized.
+    unsafe {
+        staged.set_len(n);
+        batch.set_len(0);
+    }
+}
+
 /// A sender that can deliver one item synchronously (blocking until space is
 /// available in a bounded channel). Implemented by both [`SyncSender`] (MPMC
 /// backing) and [`MpscSender`] (MPSC backing) so that [`spawn_stage`] etc. can
@@ -637,8 +672,7 @@ pub trait SendItem<T>: Clone + Send + 'static {
         if batch.is_empty() {
             return true;
         }
-        staged.clear();
-        staged.extend(batch.drain(..).map(MaybeUninit::new));
+        stage_batch(batch, staged);
         let sent = self.try_send_batch(staged);
         let mut j = sent;
         while j < staged.len() {
@@ -847,8 +881,9 @@ pub enum TryRecvError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
+
+    use super::*;
 
     #[test]
     fn test_channel_basic() {

@@ -246,7 +246,10 @@ fn node_expand_count_conservation() {
     );
     // turbofish: with the serde feature on, u64: PartialEq<serde_json::Value>
     // makes the bare sum() ambiguous in assert_eq!
-    assert_eq!(items.iter().copied().sum::<u64>(), (0..n).map(|x| 2 * x + 1).sum::<u64>());
+    assert_eq!(
+        items.iter().copied().sum::<u64>(),
+        (0..n).map(|x| 2 * x + 1).sum::<u64>()
+    );
 }
 
 // ── Async nodes (tokio-runtime) ──
