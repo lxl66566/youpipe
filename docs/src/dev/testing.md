@@ -417,7 +417,9 @@ Miri (tree-borrows + ignore-leaks, per-test wall):
   batch run: 11.8 / 25.8 / 19.4 / 20.8 / 13.2 / 3.9 / 9.6 / 21.4 / 8.2 /
   9.8 — heavy-10 sum 565 s → 145 s, all still passing. The
   pipeline_integration miri pass is now ~8–12 min by the same
-  mid-anchored extrapolation (was ~31 min).
+  mid-anchored extrapolation (was ~31 min). Confirmed by a full
+  post-trim pass (r10 code): **367 s, 94 passed / 14 ignored / 0
+  failed** — use 6 min for planning.
 - compute_pool: `test_hybrid_driver_assists_when_workers_busy` n 256 → 64
   (still 4 injected chunks on the 4-worker pool); full binary 71.6 s → 37 s.
 - Protection lost: interpreted repetition count per shape only. The
@@ -435,8 +437,10 @@ Benches:
 
 ## Where the time goes
 
-native + clippy ≈ 1 min · miri ≈ 0.8 h (pipeline_integration ≈ 2/3) ·
-loom ≈ 10–30 min · benches ≥ 30 min for full sweeps. The levers and their
+native + clippy ≈ 1 min · miri ≈ 32 min (lib ~9 · pipeline_integration
+6 · sharded_terminal_async ~4.7 · the other 18 targets ~12) ·
+loom ≈ 10–30 min · benches ≥ 30 min for full sweeps (~3 min saved by
+`--sweep`). The levers and their
 protection costs: todo #19 (landed 2026-10-25, see "After r9 trims"
 above); the miri.sh coverage gap discovered by the census (4 of 20
 integration binaries in the default target list): todo #18.
