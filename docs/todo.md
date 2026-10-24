@@ -70,3 +70,35 @@ Items from the 2026-10-20 three-way audit that were not scheduled into the adjac
 ### 17. [P2] seq-less unordered channel flavor
 
 A seq-less unordered channel flavor (dropping the `(u64, T)` tag; `spawn_stage`'s unification rationale is at `crates/youpipe/src/builder/typed/stream.rs:611`) would halve per-item slot bytes for `u64` payloads, but it splits every spawn path per ordering. The expected win is single-digit % at best on cache-bound shapes. Worth only a throwaway prototype.
+
+### 20. [P2] `Broadcast::send_batch` re-introduces the extend-over-drain staging 7d3cff3 removed
+
+- graph/fanin.rs `send_batch`'s last-edge staging is `staged.extend(batch.drain(..).map(MaybeUninit::new))` — the exact `Map<Drain<T>>` drop-glue/landing-pad class commit 7d3cff3 eradicated from `SendItem::send_batch` (single-CGU layout hazard documented in `.cargo/config.toml`; that class regressed horizontal cpu_balanced +33-40 % once, through code the staging never executes). Make `stage_batch` pub(crate) in handoff/channel.rs and route the last edge through it; the per-edge clone staging (`extend(iter().cloned())`) holds trivially-droppable iterators and can stay.
+
+### 21. [P2] graph-engine cancel semantics diverge from the stream engine's
+
+- Acceptance granularity: `node_worker`'s batched arm checks the token once per claim batch (up to `batch_recv_cap` items accepted after cancel) while the stream engine's batched arm checks before every stage call ("the same item set the per-item loop sends") and the graph per-item arm checks per item. `GraphBuilder::with_cancel`'s doc says "per batch", guide/graph.md says "per item" — the guide overstates.
+- Delivery on cancel: `Broadcast::flush_edge` drops mapped-but-unsent items when the token fires with a full output ring (`send_batch_cancel_drops_remainder_without_parking` pins it deliberately), while `SendItem::send_batch` has no cancellation hook by design and delivers every mapped output. The same graph can therefore emit different item sets depending on `YOUPIPE_GRAPH_TX_BATCH` and ring pressure. Harmonize with the stream contract or state the divergence in guide/graph.md's Cancellation paragraph.
+
+### 22. [P3] review miscellany (2026-10-25 audit, non-blocking)
+
+- guide/graph.md tuning table: `with_compute_workers(n)` reads "size of the per-run compute pool" — it pins the worker budget divided across sync nodes (see `GraphBuilder::with_compute_workers`'s doc), not the pool size.
+- graph/async_exec.rs module doc: duplicated word ("disconnected." on its own line).
+- `FanIn::anchor` allocates an `order` Vec + `Select` per park episode and per close re-anchor; hoistable into per-worker scratch (park path only, minor).
+
+## Verification suite (coverage / duration)
+
+### 18. [P1] miri.sh default target list is stale — graph_dag and batch_recv uncovered
+
+- The runner's comment claims the default target list "covers lib + all integration binaries", but it predates the 2026-10 test-binary growth: it names 4 of today's 20 integration binaries (compute_pool, handoff_channel, pipeline_integration, scope_integration). Uncovered despite being miri-aware (`cfg!(miri)` scaling, miri-ignored walls already annotated): graph_dag (20 tests — the DAG conservation/deadlock shapes; the anchor liveness regressions themselves live in the lib and stay covered), batch_recv (the `MaybeUninit` staging / `try_send_batch` / `send_batch` drop paths — exactly the unsafe 7d3cff3 touched), ordered_window, sharded_terminal(_async), stream_reduce(_alloc), on_pool_nested, pool_cache, hybrid_assist, expand_alloc, pipe_range_alloc, filter_collect_panic, submit_batch_alloc, async_waker_alloc.
+- Adding graph_dag + batch_recv is the priority (both miri-ran clean during their landing rounds); the rest costs ~10–15 min more — pick against the duration table in [testing.md](src/dev/testing.md) "Suite duration census".
+
+### 19. [P2] suite-duration trims (census 2026-10-25)
+
+Baseline and methodology: [testing.md](src/dev/testing.md) "Suite duration census (2026-10-25)". Each line: trim → protection lost.
+
+- hybrid_assist `stress_streams_plus_assist_drivers`: fixed `sleep(Duration::from_secs(6))` watchdog → 2 s. Lost: 3× shorter soak window for the assist-driver interleaving (periodic panic/drop accounting still runs several rounds).
+- stream_reduce_alloc: `N = 1<<20` → `1<<19` (output Vec still 4 MiB, above the 1 MiB counter threshold — same detection classes). Lost: fewer items through the same aggregation shapes.
+- miri pipeline_integration (≈31 min of the ≈48 min full pass): heavy-tier fence/stress/pin tests measure 55–76 s each; deepen their `cfg!(miri)` divisors (graph_dag's /20 convention) or split the heaviest 3–5 into a release-gate-only target. Lost: fewer interpreted repetitions of interleaving classes whose park/wake cores are already exhaustively model-checked by loom.
+- miri compute_pool (72 s, dominated by `test_hybrid_driver_assists_when_workers_busy`): scale its miri iteration counts. Lost: fewer assist interleavings interpreted (Sleep/CountLatch/SleepMask are loom-covered; the interpretation adds UB detection, which the channel-side targets keep).
+- Bench full sweeps: 273 criterion ids ≈ 16 min per pass; sync_vs_rayon (88) + unbalanced (46) are 49 % of the grid. In exploratory sweeps skip the rayon/tokio drift-control ids and the middle size of 3-size families; keep both in interleaved A/B, where the verdict methodology needs them. Lost: cross-library drift visibility and size-axis coverage in sweep mode only (A/B unaffected).

@@ -265,3 +265,121 @@ real close. Async paths were never exposed: their waker nodes are
 per-future, not per-thread. Deterministic regression tests (fork and
 vendored) stamp the shared node Closed from outside mid-episode, on both
 the send and recv sides.
+
+# Suite duration census (2026-10-25)
+
+Wall-clock audit of the full test/miri/bench suite (32-core NixOS host,
+`CARGO_BUILD_JOBS=8`, warm registry, `bench.lock` held for every timing
+run; native per-test times from `cargo nextest run --message-format
+libtest-json` — requires `NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1` on nextest
+0.9.146 — miri from per-target subset runs under the miri.sh flag combo,
+bench ids from `cargo bench --no-run` + criterion `--list`). Trim proposals
+with their protection costs are todo #18/#19; numbers below are the
+baseline they trim against.
+
+## Native (default members, debug)
+
+| step                                               | wall                      |
+| -------------------------------------------------- | ------------------------- |
+| `cargo nextest run`, cold worktree (build + 360 tests) | 40 s                   |
+| `cargo nextest run`, warm                          | 7 s (Σ per-test exec 32.4 s) |
+| `cargo test` (libtest, all binaries + doctests)    | 12 s                      |
+| `cargo test --doc`                                 | 2 s (32 passed, 1 ignored) |
+| `cargo clippy --all-targets` cold / warm           | 3 s / 0 s, 0 warnings     |
+
+The native suite is not the cost. Two tests hold 37 % of Σ exec:
+`stream_reduce_alloc$streaming_aggregations_no_output_materialisation`
+6.07 s (the 1 Mi-item shape) and `hybrid_assist$stress_streams_plus_
+assist_drivers` 6.01 s (a fixed `sleep(6 s)` watchdog soak window). Next
+three: `test_sync_to_async_does_not_stall_tokio_driver` 1.69 s,
+`test_stream_ordered_exact_order_stress` 1.59 s, ordered_window
+`ordered_straggler_tiny_buffer_returns_everything` 1.26 s. Largest
+binaries by Σ exec: pipeline_integration 108 tests / 7.1 s, lib 155 /
+2.1 s, scope_integration 26 / 0.9 s, compute_pool 6 / 0.8 s,
+handoff_channel 8 / 0.7 s. Doctests are not run by nextest (known
+limitation); `cargo test` covers them at the 2 s figure above.
+
+## Miri (miri.sh default targets, tree-borrows + ignore-leaks)
+
+Full miri was deliberately not run (round rule); counts from `-- --list`
+per target, durations from stratified subset runs, extrapolation
+mid-anchored and ±50 %.
+
+| target                | listed / miri-ignored | measured slice                            | extrapolated |
+| --------------------- | --------------------- | ----------------------------------------- | ------------ |
+| lib                   | 152 / 2               | 30 tests / 117 s (reorder+window 4.5 s, fanin/graph/fused 4.3 s, sharded 0.4 s per test) | ~9 min |
+| compute_pool          | 5 / 0                 | full binary: 71.6 s (hybrid-driver test dominates) | 72 s |
+| handoff_channel       | 8 / 0                 | full binary: 2.9 s                        | 3 s |
+| pipeline_integration  | 108 / 14              | heavy 55.7 / 75.7 s per test, light 3.4 s, mid 5 tests / 117.3 s | **~31 min** |
+| scope_integration     | 26 / 3                | 4 tests / 3.7 s                           | ~21 s |
+| doc                   | 33 / 1                | full target: 118 s                        | 2 min |
+| youpipe-crossfire lib | 52 / 0                | 9 'batch' tests / 42.3 s                  | ~4 min |
+
+Total ≈ **45–50 min**, two thirds of it pipeline_integration. Miri
+amplification over native is shape-dependent (35× on the ordered-stress
+shape, ~1700× on fence_large_input), so per-test extrapolation inside
+that binary carries the ±50 % above; a one-off timed full pass (with
+`MIRI_TIMEOUT_SECS=1800` per binary) is the cheap follow-up that pins it.
+
+The miri build itself is cheap (`cargo miri test --no-run` 6 s after a
+native build; per-binary interpreter startup ≤ 4 s).
+
+## Loom
+
+31 models total: pool cores 16 (sleep 4, latch 3, sleep_mask 9), st3 6,
+concurrent-queue 3, crossfire waker-registry 6. Documented per-model range
+0.3 s–2 min under exploration → full `perf/verify/loom.sh` pass ≈ 10–30
+min. Not re-timed this round (no loom-relevant changes in the audited
+range).
+
+## Benches
+
+`cargo bench --no-run` (default members): 64 s release build at jobs=8.
+**273 criterion ids across 12 binaries** at the shared tuned config
+(~3.5 s per id: 20 samples, 1 s warmup, 2 s measure — benches/common/
+mod.rs) ≈ **16 min for one full criterion pass**. The grid:
+sync_vs_rayon 88, unbalanced 46, sync_fuse 26, io_async 24, expand 16,
+graph_shapes 16, pool_reuse 12, sharded_term 12, channel_bench 10,
+async_vs_tokio 9, sharded_term_async 8, mixed_load 6. `horizontal` is a
+custom scenario harness (not criterion; 69 scenario×lib×n cells in the
+current results.json × 5 rounds × ~0.7 s measure ≈ 8–15 min a pass);
+youpipe-bench adds 4 one-shot bins (convoy-probe, file-encrypt,
+horizontal-counters, hotpath-profile) plus perf_events;
+youpipe-gungraun's Ir benches are valgrind-count driven.
+
+## Where the time goes
+
+native + clippy ≈ 1 min · miri ≈ 0.8 h (pipeline_integration ≈ 2/3) ·
+loom ≈ 10–30 min · benches ≥ 30 min for full sweeps. The levers and their
+protection costs: todo #19; the miri.sh coverage gap discovered by the
+census (4 of 20 integration binaries in the default target list): todo
+#18.
+
+## 2026-10-25 code-review audit (8ab8610..5ff8f5d): verified non-issues
+
+One line each; real findings are todo #20–#22.
+
+- `FanIn::anchor`'s `select().expect(..)`: crossfire's `Select::select`
+  returns `Err` only with zero registered handlers; `open > 0` guards it.
+- crossfire `try_push_batch`: a torn snapshot can only overcount the free
+  run with a stale tail, which the claim CAS then rejects;
+  `real_positions`' slot-backed count handles the cap..one_lap phantom
+  positions (cap-3 lap-wrap test); the claim-then-write window is bounded
+  by `pop_batch`'s stamp walk and `_read`'s spin.
+- `stage_batch` (7d3cff3): panic-free pointer loop (`reserve` precedes
+  every move), `batch.set_len(0)` prevents double-drop; matches the
+  miri-clean claim.
+- `dispatch_jobs`' wrapper: the done-counter decrements on every path
+  (panic caught → recorded → cancel); async→sync bridge threads are
+  uncounted but their EOF propagates channel-wise before downstream
+  workers can finish, so `done.wait()` ordering holds.
+- `resolve_budget`: `need` is gated atomically by `try_reserve_parking`;
+  nested-run detection (`is_on_this_pool`) falls back to dedicated
+  threads (tested both ways).
+- `Broadcast::send` / `AsyncBroadcast::send` swap_remove survivor loops
+  are correct (the async side keeps `txs`/`slots` pairing).
+- `claim_poll`'s half-close contract survives the batch path (stragglers
+  drained before Closed; the ProbeMock tests pin the single-probe shape).
+- Stream tx-batch gate `!has_async_stage` matches the falsification
+  record; cancel item-set parity between the batched and per-item arms
+  holds on the stream side (the graph side is todo #21).
