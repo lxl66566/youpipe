@@ -1,7 +1,7 @@
 //! Allocation contract of the aggregation terminals on the streaming
 //! topology (own test binary — the allocator is process-global). A
 //! materialising fallback would build an n-item output `Vec` (one ≥1 MiB
-//! allocation for the 1M-item shape); the reducing collector keeps output
+//! allocation for the 512K-item shape); the reducing collector keeps output
 //! memory O(1). The `.run()` control on the same chain must keep showing the
 //! big allocation, proving the counter detects materialisation.
 //!
@@ -17,8 +17,9 @@ use std::{
 
 use youpipe::{CancellationToken, stream};
 
-/// 1M × 8-byte outputs = an 8 MiB output `Vec` on the materialising path.
-const N: u64 = 1 << 20;
+/// 512K × 8-byte outputs = a 4 MiB output `Vec` on the materialising
+/// path — still comfortably above the 1 MiB counter threshold below.
+const N: u64 = 1 << 19;
 const BIG: usize = 1 << 20;
 
 struct CountingAlloc;

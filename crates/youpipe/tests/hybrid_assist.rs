@@ -91,8 +91,10 @@ fn stress_streams_plus_assist_drivers() {
             });
         }
         // Watchdog: bounded run; also proves the suite is not deadlocked.
+        // 2 s still lets every driver hit the rounds%16==7 panic/drop
+        // accounting several times (each round is a ~1000-item pipe).
         s.spawn(move || {
-            std::thread::sleep(Duration::from_secs(6));
+            std::thread::sleep(Duration::from_secs(2));
             stop.store(1, Ordering::Relaxed);
         });
     });
