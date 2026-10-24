@@ -24,7 +24,7 @@ use crate::{
     builder::PipelineConfig,
     executor::compute::ComputePool,
     runtime::{AsyncRuntime, DefaultRuntime},
-    sync::CancellationToken,
+    sync::{CancellationToken, RunOutcome},
 };
 
 mod async_exec;
@@ -383,9 +383,10 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     }
 
     /// Attach a [`CancellationToken`]: every worker / feeder / task checks it
-    /// per batch and drains fast once fired; `run` then returns normally. A
-    /// worker panic also cancels the token (user-supplied or internal) to
-    /// accelerate the drain.
+    /// per batch and drains fast once fired; `run` then returns normally
+    /// (use [`run_checked`](Self::run_checked) to observe the cancellation
+    /// instead of checking the token yourself). A worker panic also cancels
+    /// the token (user-supplied or internal) to accelerate the drain.
     #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
@@ -422,5 +423,42 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     pub fn run(self) {
         self.try_run()
             .expect("graph run: failed to build async runtime (see try_run)");
+    }
+
+    /// Run the graph and report whether it completed or was cancelled —
+    /// [`run`](Self::run)'s opt-in counterpart that makes the cancelled
+    /// short-circuit observable.
+    ///
+    /// Identical execution to [`run`](Self::run) (same validation panics,
+    /// same panic re-raising — a node panic unwinds the caller before any
+    /// outcome exists); the only addition is one token read after every sink
+    /// drained. The graph engine has no collector (sinks are user nodes), so
+    /// the outcome is `RunOutcome<()>`: a cancelled run reports
+    /// [`Cancelled`](RunOutcome::Cancelled) with `emitted == 0` — count in
+    /// the sink if the partial count matters. With no token attached the
+    /// outcome is always [`Completed`](RunOutcome::Completed).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`run`](Self::run).
+    pub fn run_checked(self) -> RunOutcome<()> {
+        self.try_run_checked()
+            .expect("graph run: failed to build async runtime (see try_run)")
+    }
+
+    /// Fallible counterpart to [`run_checked`](Self::run_checked), as
+    /// [`try_run`](Self::try_run) is to [`run`](Self::run).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`try_run`](Self::try_run).
+    pub fn try_run_checked(self) -> std::io::Result<RunOutcome<()>> {
+        let token = self.cancel.clone();
+        exec::run_graph(self)?;
+        // `emitted == 0`: no collector exists — sinks are user nodes (see
+        // `run_checked`). A worker panic cancels the token too, but
+        // `run_graph` re-raises it above, so this read only sees user
+        // cancellation.
+        Ok(RunOutcome::classify((), 0, token.as_ref()))
     }
 }

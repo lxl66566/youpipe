@@ -344,6 +344,43 @@ fn cancel_returns_normally() {
     assert!(seen < 10_000_000, "cancel must stop the stream: {seen}");
 }
 
+/// `run_checked`: the same mid-stream cancellation observed through the
+/// outcome instead of a post-hoc token read. The graph engine has no
+/// collector (sinks are user nodes), so `emitted` stays 0 by contract.
+#[test]
+fn run_checked_reports_cancelled() {
+    let token = CancellationToken::new();
+    let sink_token = token.clone();
+    let count = Arc::new(AtomicU64::new(0));
+    let acc = Arc::clone(&count);
+    let mut g = graph();
+    let src = g.source("src", (0..).take(10_000_000));
+    let out = g.sink("out", move |_: u64| {
+        let n = acc.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 2_000 {
+            sink_token.cancel();
+        }
+    });
+    g.edge(src, out);
+    let outcome = g.with_cancel(token).run_checked();
+    assert_eq!(outcome, RunOutcome::Cancelled { partial: (), emitted: 0 });
+    let seen = count.load(Ordering::Relaxed);
+    assert!(
+        (2_000..10_000_000).contains(&seen),
+        "sink must see the trigger items then stop: {seen}"
+    );
+}
+
+/// `run_checked` on an uncalled graph: `Completed`.
+#[test]
+fn run_checked_completes() {
+    let mut g = graph();
+    let src = g.source("src", 0..n_items(10_000));
+    let out = g.sink("out", |_: u64| {});
+    g.edge(src, out);
+    assert_eq!(g.run_checked(), RunOutcome::Completed(()));
+}
+
 /// A panicking node re-raises on the run caller after the drain (first panic
 /// wins; the process must not abort).
 #[test]

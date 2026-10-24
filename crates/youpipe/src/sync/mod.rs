@@ -1,3 +1,3 @@
 mod cancel;
 
-pub use cancel::CancellationToken;
+pub use cancel::{CancellationToken, RunOutcome};

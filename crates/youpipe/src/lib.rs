@@ -87,7 +87,7 @@ pub use runtime::TokioPool;
 pub use runtime::{AsyncRuntime, DefaultRuntime, NoRuntime};
 pub use scope::{PipelineScope, ScopedPipe, ScopedTryPipe, scope};
 pub use state::{FenceBarrier, FenceMode, ReorderBuffer};
-pub use sync::CancellationToken;
+pub use sync::{CancellationToken, RunOutcome};
 
 /// Process-wide cache of `std::thread::available_parallelism()`.
 ///

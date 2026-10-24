@@ -40,10 +40,10 @@ The 2026-10 design analysis confirmed three hard constraints that must be solved
 - **Multi-level expand needs the full path**: the global order of a two-level expand is the `(seq, sub1, sub2)` lexicographic order; a 3-field tag loses `sub1`; the batched-payload design is naturally immune (nesting flattens).
 - **Generic-constraint trap**: `Fn(I, &mut Vec<N>)` does not constrain `N` in argument position (E0207); it must be carried as a struct generic, `ExpandStage<Prev, F, N>` (expand_emit already does this).
 
-### 7. [P1] cancellation partial-output semantics (residual: RunOutcome reporting)
+### 7. ~~[P1] cancellation partial-output semantics (residual: RunOutcome reporting)~~ (landed)
 
-- The documentation contract is in place (2026-10-20, r7): `run()` gained a Cancellation section, `for_each`/`with_cancel` gained inline notes, and guide/stream.md was synced — cancellation produces silently truncated output, indistinguishable from a normal short run. The old guide wording was also corrected: a worker stops once it has finished the current item (the token is checked per item), it does not "drain in-flight items to completion".
-- Residual direction: `RunOutcome`, or a `try_run_checked`, reporting `Cancelled { emitted }` (the collector checks the token after draining).
+- The documentation contract landed 2026-10-20 (r7): `run()` gained a Cancellation section, `for_each`/`with_cancel` gained inline notes, and guide/stream.md was synced (also correcting that a worker stops once it has finished the current item).
+- The residual landed 2026-10-25 (r8): `StreamPipe::run_checked`/`try_run_checked` and `GraphBuilder::run_checked`/`try_run_checked` return `RunOutcome` — `Cancelled { partial, emitted }` with `emitted == partial.len()` exactly for the collecting terminal (one post-drain token read, no hot-path cost; the graph engine has no collector, `emitted` stays 0). Mechanism and tests: [streaming.md](src/dev/streaming.md) "Cancellation outcome reporting".
 
 ### 16. ~~[P1] batching the per-item sends of streaming stage workers~~ (landed)
 

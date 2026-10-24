@@ -46,7 +46,7 @@ use crate::{
         FenceBarrier, FenceMode, OrderedAccounting, OrderedWindow, drain_ordered,
         drain_ordered_sharded, drain_unordered_sharded,
     },
-    sync::CancellationToken,
+    sync::{CancellationToken, RunOutcome},
 };
 
 // ── Streaming pipeline (chainable, data-first) ──
@@ -3342,7 +3342,9 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// A cancelled run produces a silently truncated output — only the
     /// items that crossed the channels before the workers stopped, which is
     /// indistinguishable from a run over a shorter input (see
-    /// [`run`](Self::run)'s Cancellation contract).
+    /// [`run`](Self::run)'s Cancellation contract). To observe the
+    /// truncation instead of checking the token yourself, use
+    /// [`run_checked`](Self::run_checked).
     #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
@@ -4252,9 +4254,14 @@ where
     /// the channels. The output is silently truncated: a cancelled run is
     /// indistinguishable from a run whose input was simply shorter (with
     /// `.ordered()` the result is still in input order — a prefix of
-    /// unknown length). If truncation matters, check the token yourself
-    /// after the run. Every terminal shares this contract
-    /// ([`for_each`](Self::for_each), [`reduce`](Self::reduce), …).
+    /// unknown length). To distinguish the two, use
+    /// [`run_checked`](Self::run_checked), which reports
+    /// [`RunOutcome::Cancelled { emitted }`](crate::RunOutcome) after the
+    /// drain (one token read, no hot-path cost). Every terminal shares the
+    /// silent-truncation contract ([`for_each`](Self::for_each),
+    /// [`reduce`](Self::reduce), …); the non-collecting terminals have no
+    /// checked twin — count in your own closure if truncation matters
+    /// there.
     ///
     /// # Panics
     ///
@@ -4596,6 +4603,61 @@ where
             }
         }
         self.try_exec(VecCollector)
+    }
+
+    /// Execute the pipeline and report whether it completed or was
+    /// cancelled — [`run`](Self::run)'s opt-in counterpart that makes the
+    /// silent truncation observable.
+    ///
+    /// Identical execution to [`run`](Self::run) (same topology selection,
+    /// same panic contract — a panicking stage still propagates before any
+    /// outcome exists); the only addition is one token read after the
+    /// collector drained, so the hot path is unchanged. With no token
+    /// attached the outcome is always
+    /// [`Completed`](RunOutcome::Completed) — cancellation cannot happen.
+    ///
+    /// ```rust
+    /// # use youpipe::prelude::*;
+    /// let token = CancellationToken::new();
+    /// let outcome = stream(0..1_000u64)
+    ///     .with_cancel(token)
+    ///     .stage(|x| x + 1)
+    ///     .run_checked();
+    /// let out = match outcome {
+    ///     RunOutcome::Completed(all) => all,
+    ///     RunOutcome::Cancelled { partial, emitted } => {
+    ///         assert_eq!(emitted, partial.len()); // items that crossed before the stop
+    ///         partial
+    ///     }
+    /// };
+    /// assert_eq!(out.len(), 1_000);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`run`](Self::run).
+    pub fn run_checked(self) -> RunOutcome<Vec<O>> {
+        self.try_run_checked().expect(
+            "StreamPipe::run_checked: failed to build async runtime (see run/try_run)",
+        )
+    }
+
+    /// Fallible counterpart to [`run_checked`](Self::run_checked), as
+    /// [`try_run`](Self::try_run) is to [`run`](Self::run): the `Err` carries
+    /// the async-runtime construction failure, the `Ok` side classifies the
+    /// drained run.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`try_run`](Self::try_run).
+    pub fn try_run_checked(self) -> std::io::Result<RunOutcome<Vec<O>>> {
+        let token = self.cancel.clone();
+        let out = self.try_run()?;
+        // `emitted == out.len()` exactly: the drain collects every item that
+        // crossed the final channel before the workers stopped, and the
+        // token read happens after the drain (see `RunOutcome::classify`).
+        let emitted = out.len();
+        Ok(RunOutcome::classify(out, emitted, token.as_ref()))
     }
 
     /// Shared execution core: spawn the chain, feed the items, and hand the

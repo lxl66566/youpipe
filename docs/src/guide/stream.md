@@ -124,18 +124,29 @@ assert_eq!(words.len(), 3);
 `.with_cancel(token)` checks a [`CancellationToken`] in the feeder, every
 stage worker, and every bridge, once per iteration. The item a worker is
 currently processing completes; no new items are accepted after
-`token.cancel()`. The terminal then returns a **silently truncated** output —
-the items that had crossed the channels, indistinguishable from a run over a
-shorter input. Check the token yourself after the run if truncation matters:
+`token.cancel()`. The default terminal then returns a **silently truncated**
+output — the items that had crossed the channels, indistinguishable from a
+run over a shorter input. `.run_checked()` (fallible twin: `.try_run_checked()`)
+makes the truncation observable instead: it reports
+`RunOutcome::Completed(Vec)` versus `RunOutcome::Cancelled { partial, emitted }`,
+with `emitted` counting exactly the items that crossed before the stop (the
+collector checks the token once after draining — no hot-path cost). With no
+token attached the outcome is always `Completed`:
 
 ```rust
 use youpipe::prelude::*;
 
 let token = CancellationToken::new();
-let r = (0..10_000).stream()
+let outcome = (0..10_000).stream()
     .with_cancel(token.clone())
     .stage(|x: u32| expensive(x))
-    .run();
+    .run_checked();
+match outcome {
+    RunOutcome::Completed(all) => { let _ = all; }       // all 10_000 items
+    RunOutcome::Cancelled { partial, emitted } => {      // emitted < 10_000
+        let _ = (partial, emitted);
+    }
+}
 // From another thread: token.cancel() aborts the run early.
 ```
 

@@ -33,7 +33,7 @@ let exp = g.node_expand("split", Default::default(), |x: u32, out: &mut Vec<u32>
 let snk = g.sink("out", |x: u32| { /* side effect */ });             // sink, 1 worker
 g.edge(src, cpu);
 g.edge(cpu, exp).edge(exp, snk);
-g.run();   // or g.try_run() -> io::Result<()>
+g.run();   // or g.try_run() -> io::Result<()>, g.run_checked() -> RunOutcome<()>
 ```
 
 Nodes are values: `g.edge(from, to)` connects two `NodeHandle`s (they are
@@ -92,7 +92,11 @@ seen every upstream close.
 **Cancellation.** `with_cancel(token)` checks the
 [`CancellationToken`](https://docs.rs/youpipe/latest/youpipe/struct.CancellationToken.html)
 per item on every node. After `token.cancel()` no new items are accepted,
-in-flight items finish, and `run()` returns promptly with the partial output.
+in-flight items finish, and `run()` returns promptly with the partial output
+(your sinks keep whatever they already consumed). `run_checked()` reports the
+difference instead: `RunOutcome::Completed(())` versus
+`RunOutcome::Cancelled` — the graph engine has no collector, so its `emitted`
+is always 0; count in the sink if the partial count matters.
 
 **Panics.** The first node panic is re-raised in the `run()` caller's thread
 with the original payload. `try_run()` returns `io::Error` only for runtime
