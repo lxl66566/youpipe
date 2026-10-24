@@ -64,7 +64,6 @@ The 2026-10 design analysis confirmed three hard constraints that must be solved
 
 Items from the 2026-10-20 three-way audit that were not scheduled into the adjacent round:
 
-- `try_apply_pure` has no bench id: the path is sensitive to codegen layout (ErasedStrategy recorded ±16–30% layout regressions), so a layout shift could silently regress the `try_collect` fast path.
 - `perfcnt` → `nom v4` future-incompat: upstream is unmaintained, a future rustc will refuse to compile it; when that happens, vendor/fork it or port the counters onto gungraun's valgrind path.
 - mdbook has no linkcheck preprocessor, so relative intra-book links are unvalidated: `perf/verify/linkcheck.sh` (2026-10-25) now covers them (0 broken on landing); moving it into CI is pending.
 

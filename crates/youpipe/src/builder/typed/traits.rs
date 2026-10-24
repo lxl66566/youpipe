@@ -574,8 +574,10 @@ pub trait FusedTryStage<T> {
     /// This path is codegen-layout sensitive (the `ErasedStrategy` comment in
     /// fused.rs records +16…30 % regressions from unrelated layout shifts):
     /// a no-regression verdict needs the same-binary interleaved-recompile
-    /// A/B procedure. The bench suite has no fallible pure-path id yet —
-    /// verification debt, to be covered when one is added.
+    /// A/B procedure. The layout canary is the dedicated
+    /// `try_collect/youpipe_try_deep` id (deep all-`try_map` chain,
+    /// benches/sync_vs_rayon.rs; baseline in docs/src/dev/benchmarks/
+    /// sync-fused.md).
     ///
     /// # Panics
     ///

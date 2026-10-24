@@ -77,6 +77,8 @@ When the chain has `MAY_FILTER == false`, `try_collect` uses the same zero-alloc
 
 The rayon row is structural: `par_iter().map(Result).collect::<Result<Vec<_>>>()` has no indexed fast path, it builds and reduces per-split partial `Vec`s, so the gap is not a tuning artifact (rayon 1.12).
 
+`try_collect/youpipe_try_deep` (2026-10-25) is the layout canary for the per-item `try_apply_pure` codegen (todo #15): a 6-deep all-`try_map` no-filter chain, so the `Result` threading through the pure path dominates the leaf loop and a layout regression there (the `ErasedStrategy` record: ±16–30 % from unrelated shifts) lands on a visible row. Landing baseline (default bench config, isolated single-id run): **9.93 µs @ 10K (1.01 Gelem/s), 23.77 µs @ 100K (4.21 Gelem/s)** — the same envelope as the 2-stage `youpipe_try_map` row, so the family is dispatch-dominated at both sizes; the canary reads the pure path's codegen, not the closure count.
+
 The owned + filter caliber (`youpipe_try_filter_owned`, `MAY_FILTER == true`, the range-tree path) was added 2026-09 together with its port off the last `Vec::split_off` tree: **−18.3 % @ 10K, −19.9 % @ 100K** (5 interleaved rounds; the 100K base side had one outlier round that inflated its spread, and every post-change round beat every pre-change round).
 
 ## Filter-chain collect: merge tree, count-then-place, write-then-compact (2026-09-27)

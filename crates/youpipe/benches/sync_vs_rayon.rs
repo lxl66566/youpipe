@@ -274,6 +274,34 @@ fn bench_try_collect(c: &mut Criterion) {
             },
         );
 
+        // Dedicated layout canary for the per-item `try_apply_pure` codegen
+        // (todo #15): a deep all-try, no-filter chain (MAY_FILTER == false, so
+        // the index fast path threads `Result` through `try_apply_pure` at
+        // every level) whose leaf loop is dominated by that Result plumbing,
+        // so a codegen-layout regression in the pure path — the ErasedStrategy
+        // record is ±16-30% from unrelated layout shifts — lands on a visible
+        // row. `youpipe_try_map` above keeps the family's vs-rayon caliber;
+        // this id is the protection row (baseline in benchmarks/sync-fused.md).
+        group.bench_with_input(
+            BenchmarkId::new("youpipe_try_deep", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    black_box(
+                        youpipe::pipe_ref(data)
+                            .try_map(|&x| -> Result<u64, &'static str> { Ok(x + 1) })
+                            .try_map(|x| -> Result<u64, &'static str> { Ok(x * 3) })
+                            .try_map(|x| -> Result<u64, &'static str> { Ok(x ^ 0x5a) })
+                            .try_map(|x| -> Result<u64, &'static str> { Ok(x.wrapping_add(7)) })
+                            .try_map(|x| -> Result<u64, &'static str> { Ok(x.rotate_left(3)) })
+                            .try_map(|x| -> Result<u64, &'static str> { Ok(x.wrapping_mul(5)) })
+                            .try_collect()
+                            .unwrap(),
+                    )
+                });
+            },
+        );
+
         // Owned + filter caliber: routes to the range-based filter tree
         // (`fused_try_filter_collect`) instead of the index fast path — the
         // A/B row for that tree. Owned input (like `youpipe_filter_map_owned`):
