@@ -589,7 +589,7 @@ pub enum ChannelError {
 /// `#[inline(never)]` keeps this a per-type copy whose codegen (and thus
 /// its address-range footprint) does not depend on any caller.
 #[inline(never)]
-fn stage_batch<T>(batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) {
+pub(crate) fn stage_batch<T>(batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) {
     staged.clear();
     let n = batch.len();
     staged.reserve(n);

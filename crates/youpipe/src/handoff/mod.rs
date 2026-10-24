@@ -214,7 +214,7 @@ pub use channel::{
     SyncSender, TryRecvError, TryRecvItem, TrySendError, WakerSlot, async_channel, channel,
     mpsc_async_channel, mpsc_channel, sync_async_channel,
 };
-pub(crate) use channel::{Claim, claim_poll};
+pub(crate) use channel::{Claim, claim_poll, stage_batch};
 #[cfg(feature = "tokio-runtime")]
 pub(crate) use sharded::{ShardedAsyncReceiver, sharded_mpsc_async_channel};
 pub(crate) use sharded::{ShardedReceiver, sharded_mpsc_channel};

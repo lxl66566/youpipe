@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     builder::cancel_active,
-    handoff::{Claim, Receiver, SyncSender, claim_poll},
+    handoff::{Claim, Receiver, SyncSender, claim_poll, stage_batch},
     sync::CancellationToken,
 };
 
@@ -355,6 +355,14 @@ impl<T: Send + Clone + 'static> Broadcast<T> {
     /// saved per item, as `send`. `staged` is caller-owned scratch,
     /// `clear`-reused per edge.
     ///
+    /// The last edge stages through [`stage_batch`] — the
+    /// `extend(drain(..).map(..))` shape emits a `Map<Drain<T>>` drop-glue
+    /// landing pad per item type, the single-CGU layout hazard 7d3cff3
+    /// eradicated from `SendItem::send_batch` (once cost horizontal
+    /// cpu_balanced +33-40 % through code this never executes). The
+    /// per-edge clone staging (`extend(iter().cloned())`) holds
+    /// trivially-droppable iterators and can stay.
+    ///
     /// Abort semantics match `send`'s per-item loop: on cancel or a closed
     /// edge the unsent remainder is dropped (`assume_init_drop` — a
     /// `Vec<MaybeUninit<_>>` drop would skip the destructors).
@@ -378,8 +386,7 @@ impl<T: Send + Clone + 'static> Broadcast<T> {
             return false; // remaining batch items drop with the Vec
         }
         let last = self.txs.len() - 1;
-        staged.clear();
-        staged.extend(batch.drain(..).map(MaybeUninit::new));
+        stage_batch(batch, staged);
         if !self.flush_edge(last, staged, cancel) {
             self.txs.swap_remove(last);
         }
