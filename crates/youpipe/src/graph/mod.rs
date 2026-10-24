@@ -91,13 +91,19 @@ impl<I, O> std::fmt::Debug for NodeHandle<I, O> {
 /// Entry point for a typed DAG pipeline.
 ///
 /// ```
-/// use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+/// use std::sync::{
+///     Arc,
+///     atomic::{AtomicU64, Ordering},
+/// };
+///
 /// use youpipe::graph;
 ///
 /// // Diamond: load -> hash -> (fast, slow) -> merge -> out
 /// let mut g = graph();
 /// let src = g.source("load", 0..1_000u64);
-/// let hash = g.node("hash", Default::default(), |x: u64| x.wrapping_mul(2654435761));
+/// let hash = g.node("hash", Default::default(), |x: u64| {
+///     x.wrapping_mul(2654435761)
+/// });
 /// let fast = g.node("fast", Default::default(), |x: u64| x / 2);
 /// let slow = g.node("slow", Default::default(), |x: u64| x * 3);
 /// let total = Arc::new(AtomicU64::new(0));

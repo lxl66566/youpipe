@@ -21,10 +21,15 @@ pub use crate::runtime::TokioPool;
 pub use crate::{
     AsyncStageOptions, FenceOptions, FilterCollectMode, GraphBuilder, Identity, NodeHandle, Pipe,
     PipeRef, PipelineConfig, RangePipe, StreamPipe, StreamStart, SyncStageOptions, TryPipe,
-    TryPipeRef, Workload, executor::{ComputePool, compute::MAX_COMPUTE_WORKERS}, graph,
-    handoff::{Receiver, Sender, async_channel, channel}, pipe, pipe_range, pipe_ref,
-    runtime::{AsyncRuntime, DefaultRuntime}, scope::{PipelineScope, ScopedPipe, ScopedTryPipe, scope},
-    state::{FenceBarrier, FenceMode, ReorderBuffer}, stream,
+    TryPipeRef, Workload,
+    executor::{ComputePool, compute::MAX_COMPUTE_WORKERS},
+    graph,
+    handoff::{Receiver, Sender, async_channel, channel},
+    pipe, pipe_range, pipe_ref,
+    runtime::{AsyncRuntime, DefaultRuntime},
+    scope::{PipelineScope, ScopedPipe, ScopedTryPipe, scope},
+    state::{FenceBarrier, FenceMode, ReorderBuffer},
+    stream,
     sync::{CancellationToken, RunOutcome},
 };
 

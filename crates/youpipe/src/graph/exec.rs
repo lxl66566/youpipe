@@ -8,6 +8,11 @@ use std::{
     sync::{Arc, Condvar, Mutex},
 };
 
+use super::{
+    GraphBuilder,
+    fanin::{Broadcast, FanIn, RoundSpin},
+    plan::{EdgeConnector, Erased, GraphPlan, NodeKind, NodeOpts, SpawnStep},
+};
 use crate::{
     builder::{
         PanicSlot, ParkingLease, PipelineConfig, cancel_active, floored_channel_capacity,
@@ -17,12 +22,6 @@ use crate::{
     handoff::{Receiver as SyncReceiver, SyncSender},
     runtime::AsyncRuntime,
     sync::CancellationToken,
-};
-
-use super::{
-    fanin::{Broadcast, FanIn, RoundSpin},
-    plan::{EdgeConnector, Erased, GraphPlan, NodeKind, NodeOpts, SpawnStep},
-    GraphBuilder,
 };
 
 /// Fire-and-forget async hooks over the concrete runtime backend. The graph
@@ -66,7 +65,9 @@ impl DoneCounter {
 
     fn dec(&self) {
         let (lock, cv) = &*self.0;
-        let mut guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = guard.saturating_sub(1);
         if *guard == 0 {
             cv.notify_all();
@@ -75,7 +76,9 @@ impl DoneCounter {
 
     fn wait(&self) {
         let (lock, cv) = &*self.0;
-        let mut guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while *guard > 0 {
             guard = cv
                 .wait(guard)
@@ -393,14 +396,18 @@ fn sink_worker<I, F>(
 /// Downcast one endpoint bundle to the concrete channel type the node
 /// expects. Failing is an internal bug — the connector was created where the
 /// edge's item type was pinned to this node's.
-pub(crate) fn downcast_endpoints<T: 'static>(endpoints: Vec<Erased>, side: &str, name: &str) -> Vec<T> {
+pub(crate) fn downcast_endpoints<T: 'static>(
+    endpoints: Vec<Erased>,
+    side: &str,
+    name: &str,
+) -> Vec<T> {
     endpoints
         .into_iter()
         .map(|boxed| {
             *boxed.downcast::<T>().unwrap_or_else(|_| {
                 panic!(
-                    "graph: internal type mismatch on {side} of node `{name}` (edge connector \
-                     and node disagree)"
+                    "graph: internal type mismatch on {side} of node `{name}` (edge connector and \
+                     node disagree)"
                 )
             })
         })
@@ -419,13 +426,15 @@ where
 {
     // Convert up front so the Send bound is carried by the iterator itself.
     let iter = iter.into_iter();
-    Box::new(move |core: &GraphCore, _workers: usize, _inputs: Vec<Erased>, outputs: Vec<Erased>| {
-        let txs = downcast_endpoints::<SyncSender<T>>(outputs, "outputs", "source");
-        let cancel = core.cancel.clone();
-        core.dispatch_job(move || {
-            source_feeder_worker(iter, Broadcast::new(txs), Some(&cancel));
-        });
-    })
+    Box::new(
+        move |core: &GraphCore, _workers: usize, _inputs: Vec<Erased>, outputs: Vec<Erased>| {
+            let txs = downcast_endpoints::<SyncSender<T>>(outputs, "outputs", "source");
+            let cancel = core.cancel.clone();
+            core.dispatch_job(move || {
+                source_feeder_worker(iter, Broadcast::new(txs), Some(&cancel));
+            });
+        },
+    )
 }
 
 /// Type-erased spawn step for one sync node (see `GraphBuilder::node`).
@@ -483,14 +492,16 @@ where
     I: Send + 'static,
     F: Fn(I) + Send + Sync + 'static,
 {
-    Box::new(move |core: &GraphCore, _workers: usize, inputs: Vec<Erased>, _outputs: Vec<Erased>| {
-        let rxs = downcast_endpoints::<SyncReceiver<I>>(inputs, "inputs", &name);
-        let claim_cap = GraphCore::claim_cap(1);
-        let f = Arc::new(f);
-        let fanin = FanIn::new(rxs);
-        let cancel = core.cancel.clone();
-        core.dispatch_job(move || sink_worker(&*f, fanin, Some(&cancel), claim_cap));
-    })
+    Box::new(
+        move |core: &GraphCore, _workers: usize, inputs: Vec<Erased>, _outputs: Vec<Erased>| {
+            let rxs = downcast_endpoints::<SyncReceiver<I>>(inputs, "inputs", &name);
+            let claim_cap = GraphCore::claim_cap(1);
+            let f = Arc::new(f);
+            let fanin = FanIn::new(rxs);
+            let cancel = core.cancel.clone();
+            core.dispatch_job(move || sink_worker(&*f, fanin, Some(&cancel), claim_cap));
+        },
+    )
 }
 
 // ── Budget resolution and the spawn walk ──
@@ -581,10 +592,9 @@ fn resolve_budget(plan: &GraphPlan, config: &PipelineConfig, pool: &ComputePool)
         .iter()
         .map(|node| match node.kind {
             NodeKind::Source | NodeKind::SourceAsync | NodeKind::Sink => 1,
-            NodeKind::Sync | NodeKind::Expand => node
-                .opts
-                .workers
-                .map_or(share, std::num::NonZeroUsize::get),
+            NodeKind::Sync | NodeKind::Expand => {
+                node.opts.workers.map_or(share, std::num::NonZeroUsize::get)
+            },
             NodeKind::Async => node
                 .opts
                 .io_concurrency

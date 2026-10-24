@@ -244,7 +244,10 @@ pub(crate) struct RoundSpin {
 
 impl RoundSpin {
     pub(crate) fn new(max_us: u32) -> Self {
-        Self { budget_us: 0, max_us }
+        Self {
+            budget_us: 0,
+            max_us,
+        }
     }
 
     /// First growth step: max/16 clamped to ≥ 1 µs (geometric doubling then
@@ -482,7 +485,10 @@ mod tests {
         // Item 1 fit the free slot (try_send_batch prefix); 2 and 3 were
         // dropped by the cancel check — the call must not park on Full.
         assert_eq!(drain_n(&rx, 1), vec![1]);
-        assert!(matches!(rx.try_recv(), Err(crate::handoff::TryRecvError::Empty)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(crate::handoff::TryRecvError::Empty)
+        ));
     }
 
     /// Every edge closed: `false`, the worker-exit signal.

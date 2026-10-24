@@ -44,7 +44,6 @@ impl Clone for CancellationToken {
     }
 }
 
-
 /// Terminal classification of a cancellable run: distinguishes a fully
 /// processed run from a cancelled one, whose output is otherwise silently
 /// truncated — indistinguishable from a run over a shorter input.
@@ -91,7 +90,10 @@ impl<Out> RunOutcome<Out> {
     /// cancellation.
     pub(crate) fn classify(out: Out, emitted: usize, cancel: Option<&CancellationToken>) -> Self {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
-            Self::Cancelled { partial: out, emitted }
+            Self::Cancelled {
+                partial: out,
+                emitted,
+            }
         } else {
             Self::Completed(out)
         }

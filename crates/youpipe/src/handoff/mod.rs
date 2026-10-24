@@ -70,7 +70,7 @@ pub(crate) fn sharded_term_enabled() -> bool {
         Ok(v) if v == "0" => false,
         Ok(other) => {
             panic!("YOUPIPE_SHARDED_TERM: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
-        }
+        },
         // Unset = the default-on policy (see the knob comment above).
         Err(_) => true,
     })

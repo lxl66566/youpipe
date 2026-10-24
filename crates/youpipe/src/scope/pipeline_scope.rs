@@ -1,12 +1,10 @@
 use std::marker::PhantomData;
 
-use crate::{
-    builder::{
-        CountReducer, ExecOptions, Filter, FusedStage, FusedTryStage, Identity, InfallibleChain,
-        MapErr, OptionReducer, StageMarker, SumReducer, SyncMap, TryMap, exec_setters,
-        fused_collect_scoped, fused_fold_scoped, fused_for_each_scoped, fused_reduce_scoped,
-        fused_try_collect_scoped, fused_try_fold_scoped, fused_try_reduce_scoped,
-    },
+use crate::builder::{
+    CountReducer, ExecOptions, Filter, FusedStage, FusedTryStage, Identity, InfallibleChain,
+    MapErr, OptionReducer, StageMarker, SumReducer, SyncMap, TryMap, exec_setters,
+    fused_collect_scoped, fused_fold_scoped, fused_for_each_scoped, fused_reduce_scoped,
+    fused_try_collect_scoped, fused_try_fold_scoped, fused_try_reduce_scoped,
 };
 
 /// Opens a scoped execution context for non-`'static` closures.

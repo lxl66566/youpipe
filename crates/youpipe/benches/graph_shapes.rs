@@ -2,25 +2,20 @@
 //! plus the DAG-only shapes (diamond, two-source fan-in) against a
 //! workload-equivalent serial stream chain.
 //!
-//! * `chain_*` — the strict A/B: a source → cpu → cpu → sink linear chain
-//!   driven through `graph()` vs the identical closure chain through
-//!   `stream()` (a never-fired cancel token forces the streaming topology,
-//!   i.e. the same channel-hop data plane the graph engine rides on). The
-//!   only delta is the assembly layer (runtime plan/validation, edge
-//!   connectors, budget split), so this isolates the graph engine's
-//!   per-run and per-item overhead against its closest sibling.
-//! * `diamond_cpu_*` — `src → hash(cpu) → (fast cpu, slow cpu) → merge(bump)
-//!   → sink` on the graph engine vs the workload-equivalent serial
-//!   `stream` chain (3 cpu stages + 1 bump): same closure work per source
-//!   item, but the graph fans the two cpu branches out to separate node
-//!   populations and fair-merges them back (sink sees 2n items). This is a
-//!   shape comparison, not an engine A/B — it reports what the DAG
-//!   parallelism actually buys.
-//! * `diamond_cheap_graph` / `fanin_cheap_graph` — graph-only infrastructure
-//!   anchors: an all-pass-through diamond isolates the broadcast-clone +
-//!   fair fan-in poll cost; two sources into one node (2n items total)
-//!   isolates the fan-in poll alone. Compare against `chain_cheap_graph`
-//!   for the added per-item cost of each shape.
+//! * `chain_*` — the strict A/B: a source → cpu → cpu → sink linear chain driven through `graph()`
+//!   vs the identical closure chain through `stream()` (a never-fired cancel token forces the
+//!   streaming topology, i.e. the same channel-hop data plane the graph engine rides on). The only
+//!   delta is the assembly layer (runtime plan/validation, edge connectors, budget split), so this
+//!   isolates the graph engine's per-run and per-item overhead against its closest sibling.
+//! * `diamond_cpu_*` — `src → hash(cpu) → (fast cpu, slow cpu) → merge(bump) → sink` on the graph
+//!   engine vs the workload-equivalent serial `stream` chain (3 cpu stages + 1 bump): same closure
+//!   work per source item, but the graph fans the two cpu branches out to separate node populations
+//!   and fair-merges them back (sink sees 2n items). This is a shape comparison, not an engine A/B
+//!   — it reports what the DAG parallelism actually buys.
+//! * `diamond_cheap_graph` / `fanin_cheap_graph` — graph-only infrastructure anchors: an
+//!   all-pass-through diamond isolates the broadcast-clone + fair fan-in poll cost; two sources
+//!   into one node (2n items total) isolates the fan-in poll alone. Compare against
+//!   `chain_cheap_graph` for the added per-item cost of each shape.
 //!
 //! Same-binary engine selection via `YOUPIPE_GRAPH_VARIANT=graph|stream`
 //! (unset = both), mirroring `sync_fuse`'s knob so recompile layout noise
@@ -43,9 +38,7 @@ use std::{
     },
 };
 
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
-};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use youpipe::{CancellationToken, NodeOptions, graph, stream};
 
 /// Per-item CPU cost of each cpu node, aligned with `mixed_load`'s

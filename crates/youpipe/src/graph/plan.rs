@@ -185,10 +185,7 @@ impl GraphPlan {
                 ));
             }
             if node.kind == NodeKind::Sink && out_deg[i] > 0 {
-                errors.push(format!(
-                    "sink `{}` must not have outgoing edges",
-                    node.name
-                ));
+                errors.push(format!("sink `{}` must not have outgoing edges", node.name));
             }
         }
 

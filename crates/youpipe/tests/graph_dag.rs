@@ -72,25 +72,29 @@ fn linear_graph_item_conservation() {
     let n = n_items(10_000);
     let mut g = graph();
     let src: NodeHandle<(), u64> = g.source("load", 0..n);
-    let a = g.node(
-        "triple",
-        NodeOptions::default(),
-        |x: u64| x.wrapping_mul(3).wrapping_add(1),
-    );
-    let b = g.node(
-        "mix",
-        NodeOptions::default(),
-        |x: u64| x.wrapping_mul(31).wrapping_add(7),
-    );
+    let a = g.node("triple", NodeOptions::default(), |x: u64| {
+        x.wrapping_mul(3).wrapping_add(1)
+    });
+    let b = g.node("mix", NodeOptions::default(), |x: u64| {
+        x.wrapping_mul(31).wrapping_add(7)
+    });
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(src, a).edge(a, b).edge(b, term);
     g.run();
 
     let items = seen.lock().unwrap();
-    assert_eq!(items.len(), usize::try_from(n).unwrap(), "one output per input");
-    let transform =
-        |x: u64| x.wrapping_mul(3).wrapping_add(1).wrapping_mul(31).wrapping_add(7);
+    assert_eq!(
+        items.len(),
+        usize::try_from(n).unwrap(),
+        "one output per input"
+    );
+    let transform = |x: u64| {
+        x.wrapping_mul(3)
+            .wrapping_add(1)
+            .wrapping_mul(31)
+            .wrapping_add(7)
+    };
     let mut got = items.clone();
     got.sort_unstable();
     let mut expect: Vec<u64> = (0..n).map(transform).collect();
@@ -107,13 +111,17 @@ fn empty_source_produces_nothing() {
     let term = g.sink("out", sink);
     g.edge(src, n).edge(n, term);
     g.run();
-    assert!(seen.lock().unwrap().is_empty(), "empty source must reach the sink 0 times");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "empty source must reach the sink 0 times"
+    );
 }
 
 #[test]
 fn empty_graph_runs() {
     let g = graph();
-    g.try_run().expect("a graph with no nodes must run trivially");
+    g.try_run()
+        .expect("a graph with no nodes must run trivially");
 }
 
 // ── Fan-out / fan-in ──
@@ -158,8 +166,16 @@ fn diamond_broadcast_conservation() {
     g.run();
 
     let n_usize = usize::try_from(n).unwrap();
-    assert_eq!(a_count.load(Ordering::Relaxed), n_usize, "branch a sees every item");
-    assert_eq!(b_count.load(Ordering::Relaxed), n_usize, "branch b sees every item");
+    assert_eq!(
+        a_count.load(Ordering::Relaxed),
+        n_usize,
+        "branch a sees every item"
+    );
+    assert_eq!(
+        b_count.load(Ordering::Relaxed),
+        n_usize,
+        "branch b sees every item"
+    );
 
     let items = seen.lock().unwrap();
     assert_eq!(items.len(), 2 * n_usize, "join receives both full branches");
@@ -214,7 +230,11 @@ fn multi_sink_broadcast() {
     for (label, seen) in [("out-a", seen_a), ("out-b", seen_b)] {
         let items = seen.lock().unwrap();
         assert_eq!(items.len(), n_usize, "sink {label} receives every item");
-        assert_eq!(items.iter().copied().sum::<u64>(), expect_sum, "sink {label} sum");
+        assert_eq!(
+            items.iter().copied().sum::<u64>(),
+            expect_sum,
+            "sink {label} sum"
+        );
     }
 }
 
@@ -301,10 +321,14 @@ fn sync_async_sync_bridge_chain() {
     let mut g = graph();
     let src = g.source("load", 0..n);
     let s1 = g.node("bump", NodeOptions::default(), |x: u64| x + 1);
-    let io = g.node_async("persist", AsyncNodeOptions::default(), |x: u64| async move {
-        tokio::time::sleep(Duration::from_micros(50)).await;
-        x.wrapping_mul(10)
-    });
+    let io = g.node_async(
+        "persist",
+        AsyncNodeOptions::default(),
+        |x: u64| async move {
+            tokio::time::sleep(Duration::from_micros(50)).await;
+            x.wrapping_mul(10)
+        },
+    );
     let s2 = g.node("tag", NodeOptions::default(), |x: u64| x.wrapping_add(7));
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
@@ -553,10 +577,14 @@ fn narrow_compute_pool_no_deadlock() {
     let src = g.source("load", 0..n);
     let scale = g.node("scale", NodeOptions::default(), |x: u64| x.wrapping_mul(3));
     let shift = g.node("shift", NodeOptions::default(), |x: u64| x.wrapping_add(1));
-    let split = g.node_expand("split", NodeOptions::default(), |x: u64, out: &mut Vec<u64>| {
-        out.push(x);
-        out.push(x.wrapping_add(1));
-    });
+    let split = g.node_expand(
+        "split",
+        NodeOptions::default(),
+        |x: u64, out: &mut Vec<u64>| {
+            out.push(x);
+            out.push(x.wrapping_add(1));
+        },
+    );
     let join = g.node("join", NodeOptions::default(), |x: u64| x);
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
@@ -582,7 +610,9 @@ fn custom_compute_pool_runs() {
     let pool = ComputePool::new(2);
     let mut g = graph();
     let src = g.source("load", 0..n);
-    let m = g.node("mix", NodeOptions::default(), |x: u64| x.wrapping_mul(5).wrapping_add(3));
+    let m = g.node("mix", NodeOptions::default(), |x: u64| {
+        x.wrapping_mul(5).wrapping_add(3)
+    });
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(src, m).edge(m, term);

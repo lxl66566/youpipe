@@ -279,11 +279,11 @@ impl<T> ArrayQueueMpsc<T> {
                         pos = self.advance(pos);
                     }
                     return n;
-                },
+                }
                 Err(current) => {
                     sender_val = current;
                     backoff.spin();
-                },
+                }
             }
         }
         0
@@ -756,9 +756,8 @@ mod batch_tests {
             let sent = unsafe { q.try_push_batch(&mut uninit) };
             expect.extend((base + 1)..(base + 1 + sent as u32));
             // SAFETY: [sent..] was never moved out.
-            let rest: Vec<u32> = unsafe {
-                uninit[sent..].iter_mut().map(|s| s.assume_init_read()).collect()
-            };
+            let rest: Vec<u32> =
+                unsafe { uninit[sent..].iter_mut().map(|s| s.assume_init_read()).collect() };
             for (j, v) in rest.into_iter().enumerate() {
                 while !unsafe { q.push_with_ptr(MaybeUninit::new(v).as_ptr()) } {
                     // drain what is available; the drained prefix must

@@ -14,17 +14,16 @@ use std::{
     task::{Context, Poll},
 };
 
+use super::{
+    exec::{GraphCore, downcast_endpoints},
+    plan::SpawnStep,
+};
 use crate::{
     builder::{PanicSlot, cancel_active, record_panic},
     handoff::{
         AsyncReceiver, AsyncSender, Receiver as SyncReceiver, TryRecvError, WakerSlot, channel,
     },
     sync::CancellationToken,
-};
-
-use super::{
-    exec::{GraphCore, downcast_endpoints},
-    plan::SpawnStep,
 };
 
 /// Fair fan-in over the shared async receivers of one node's input edges,
@@ -275,11 +274,8 @@ async fn async_node_task<I, O, F, Fut>(
 
 /// The async source task: call `f` until `None` (EOF), broadcasting each
 /// item to every open edge.
-async fn async_source_task<T, F, Fut>(
-    f: F,
-    mut out: AsyncBroadcast<T>,
-    cancel: CancellationToken,
-) where
+async fn async_source_task<T, F, Fut>(f: F, mut out: AsyncBroadcast<T>, cancel: CancellationToken)
+where
     T: Send + Clone + Unpin + 'static,
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Option<T>>,

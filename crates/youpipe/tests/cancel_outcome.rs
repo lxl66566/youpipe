@@ -8,7 +8,11 @@ use youpipe::{CancellationToken, RunOutcome, stream};
 /// counts down but keep the same dispatch paths (same convention as the
 /// other integration suites).
 fn n_items(native: u64) -> u64 {
-    if cfg!(miri) { native / 20 } else { native }
+    if cfg!(miri) {
+        native / 20
+    } else {
+        native
+    }
 }
 
 /// Mid-run cancellation: the worker that observes the trigger item fires the

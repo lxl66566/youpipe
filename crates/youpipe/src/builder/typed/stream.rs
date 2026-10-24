@@ -1,3 +1,7 @@
+// Only the tokio-runtime ctx fields use OnceLock; the data-plane knob
+// statics moved to `handoff/mod.rs` (their readers live there too).
+#[cfg(feature = "tokio-runtime")]
+use std::sync::OnceLock;
 use std::{
     cell::Cell,
     marker::PhantomData,
@@ -5,10 +9,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-// Only the tokio-runtime ctx fields use OnceLock; the data-plane knob
-// statics moved to `handoff/mod.rs` (their readers live there too).
-#[cfg(feature = "tokio-runtime")]
-use std::sync::OnceLock;
 #[cfg(feature = "tokio-runtime")]
 use std::{
     future::Future,
@@ -655,7 +655,11 @@ fn spawn_stage_fanout<I, O, Tx, R>(
     // `test_stage_options_workers_pins_parallelism`).
     let workers = txs.len().max(1);
     let batch_cap = crate::handoff::batch_recv_cap();
-    let claim_cap = if batch_cap == 0 { 0 } else { (batch_cap / workers).max(1) };
+    let claim_cap = if batch_cap == 0 {
+        0
+    } else {
+        (batch_cap / workers).max(1)
+    };
     // Batched output delivery (YOUPIPE_STREAM_TX_BATCH): stage the mapped
     // claim batch, flush with one `try_send_batch` per free run + per-item
     // blocking fallback. Zero-cap claims keep the per-item send (staging
@@ -666,8 +670,7 @@ fn spawn_stage_fanout<I, O, Tx, R>(
     // mode) — the async terminal's task pacing does not benefit from
     // send-side runs the way sync consumer loops do (`ctx.has_async_stage`
     // is known before spawning, same predicate as the capacity floor).
-    let tx_batch =
-        crate::handoff::stream_tx_batch() && claim_cap > 0 && !ctx.has_async_stage;
+    let tx_batch = crate::handoff::stream_tx_batch() && claim_cap > 0 && !ctx.has_async_stage;
     // Collect all worker closures and submit as a single batch. This reduces
     // injector-queue notification overhead from N SeqCst fences + N JEC
     // increments (one per `submit`) down to 1 (one `submit_batch`), which
@@ -688,7 +691,11 @@ fn spawn_stage_fanout<I, O, Tx, R>(
                 let mut scratch: Vec<(u64, I)> = Vec::with_capacity(claim_cap.max(1));
                 // Output staging for the batched arm (see `tx_batch`); zero
                 // capacity when inert (`with_capacity(0)` allocates nothing).
-                let stage_cap = if tx_batch { claim_cap } else { 0 };
+                let stage_cap = if tx_batch {
+                    claim_cap
+                } else {
+                    0
+                };
                 let mut mapped: Vec<(u64, O)> = Vec::with_capacity(stage_cap);
                 let mut staged: Vec<std::mem::MaybeUninit<(u64, O)>> =
                     Vec::with_capacity(stage_cap);
@@ -780,13 +787,16 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
     // more wall time than on a plain stage).
     let workers = txs.len().max(1);
     let batch_cap = crate::handoff::batch_recv_cap();
-    let claim_cap = if batch_cap == 0 { 0 } else { (batch_cap / workers).max(1) };
+    let claim_cap = if batch_cap == 0 {
+        0
+    } else {
+        (batch_cap / workers).max(1)
+    };
     // Batched output delivery (see `spawn_stage_fanout` for the knob and
     // the async-tail gate). The staging flush cap sits at the batch cap so
     // an expansion fan-out cannot grow the staging buffer with a whole
     // claim batch's outputs.
-    let tx_batch =
-        crate::handoff::stream_tx_batch() && claim_cap > 0 && !ctx.has_async_stage;
+    let tx_batch = crate::handoff::stream_tx_batch() && claim_cap > 0 && !ctx.has_async_stage;
     let flush_cap = batch_cap.max(claim_cap).max(1);
     let jobs: Vec<_> = txs
         .into_iter()
@@ -807,7 +817,11 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
                 let mut scratch: Vec<(u64, I)> = Vec::with_capacity(claim_cap.max(1));
                 // Output staging for the batched arm (see `tx_batch`); zero
                 // capacity when inert (`with_capacity(0)` allocates nothing).
-                let stage_cap = if tx_batch { claim_cap } else { 0 };
+                let stage_cap = if tx_batch {
+                    claim_cap
+                } else {
+                    0
+                };
                 let mut mapped: Vec<(u64, N)> = Vec::with_capacity(stage_cap);
                 let mut staged: Vec<std::mem::MaybeUninit<(u64, N)>> =
                     Vec::with_capacity(stage_cap);
@@ -833,8 +847,7 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
                             buf.clear();
                             expand(item, &mut buf);
                             mapped.extend(buf.drain(..).map(|n| (seq, n)));
-                            if mapped.len() >= flush_cap
-                                && !tx.send_batch(&mut mapped, &mut staged)
+                            if mapped.len() >= flush_cap && !tx.send_batch(&mut mapped, &mut staged)
                             {
                                 break 'outer;
                             }
@@ -1694,9 +1707,7 @@ trait OutChannel<M: Send + Unpin + 'static> {
 /// Fan one constructor sender out to one clone per worker — the shared-ring
 /// factories' `make`. Callers always pass at least 1 worker.
 fn clone_fanout<Tx: Clone>(tx: Tx, workers: usize) -> Vec<Tx> {
-    let mut txs: Vec<_> = (0..workers.saturating_sub(1))
-        .map(|_| tx.clone())
-        .collect();
+    let mut txs: Vec<_> = (0..workers.saturating_sub(1)).map(|_| tx.clone()).collect();
     txs.push(tx);
     txs
 }
@@ -1706,9 +1717,9 @@ fn clone_fanout<Tx: Clone>(tx: Tx, workers: usize) -> Vec<Tx> {
 struct Mpmc;
 
 impl<M: Send + Unpin + 'static> OutChannel<M> for Mpmc {
-    type Tx = SyncSender<(u64, M)>;
-    type Rx = Receiver<(u64, M)>;
     type Out = FinalRx<M>;
+    type Rx = Receiver<(u64, M)>;
+    type Tx = SyncSender<(u64, M)>;
 
     fn make<R: AsyncRuntime>(
         _ctx: &StreamCtx<'_, R>,
@@ -1731,9 +1742,9 @@ impl<M: Send + Unpin + 'static> OutChannel<M> for Mpmc {
 struct Mpsc;
 
 impl<M: Send + Unpin + 'static> OutChannel<M> for Mpsc {
-    type Tx = MpscSender<(u64, M)>;
-    type Rx = MpscReceiver<(u64, M)>;
     type Out = FinalRx<M>;
+    type Rx = MpscReceiver<(u64, M)>;
+    type Tx = MpscSender<(u64, M)>;
 
     fn make<R: AsyncRuntime>(
         _ctx: &StreamCtx<'_, R>,
@@ -1759,9 +1770,9 @@ struct Mixed;
 
 #[cfg(feature = "tokio-runtime")]
 impl<M: Send + Unpin + 'static> OutChannel<M> for Mixed {
-    type Tx = SyncSender<(u64, M)>;
-    type Rx = AsyncReceiver<(u64, M)>;
     type Out = AsyncReceiver<(u64, M)>;
+    type Rx = AsyncReceiver<(u64, M)>;
+    type Tx = SyncSender<(u64, M)>;
 
     fn make<R: AsyncRuntime>(
         _ctx: &StreamCtx<'_, R>,
@@ -1785,9 +1796,9 @@ impl<M: Send + Unpin + 'static> OutChannel<M> for Mixed {
 struct ShardedMpsc;
 
 impl<M: Send + Unpin + 'static> OutChannel<M> for ShardedMpsc {
-    type Tx = MpscSender<(u64, M)>;
-    type Rx = ShardedReceiver<(u64, M)>;
     type Out = FinalRx<M>;
+    type Rx = ShardedReceiver<(u64, M)>;
+    type Tx = MpscSender<(u64, M)>;
 
     fn make<R: AsyncRuntime>(
         ctx: &StreamCtx<'_, R>,
@@ -2019,7 +2030,8 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
         let granted = requested.min(slots.saturating_sub(after)).max(1);
         debug_assert!(
             granted <= slots,
-            "pool admission must reserve every stage's >=1 worker grant              (see the reservation-backed `worker_budget` init in `try_exec`)"
+            "pool admission must reserve every stage's >=1 worker grant              (see the \
+             reservation-backed `worker_budget` init in `try_exec`)"
         );
         self.worker_slots_left.set(slots - granted);
         // In-flight estimate: each granted worker holds at most one claim
@@ -2889,10 +2901,7 @@ where
         );
         let a_in_rx = bridge_final_rx_to_async::<Prev::Out, R>(prev_rx, buffer, ctx);
         FinalRx::Async(spawn_async_consumers_into::<AsyncMpmc, R, _, _, _, _>(
-            self.f,
-            a_in_rx,
-            &self.opts,
-            ctx,
+            self.f, a_in_rx, &self.opts, ctx,
         ))
     }
 
@@ -2987,9 +2996,9 @@ struct AsyncMpmc;
 
 #[cfg(feature = "tokio-runtime")]
 impl<M: Send + Unpin + 'static> AsyncOutChannel<M> for AsyncMpmc {
-    type Tx = AsyncSender<(u64, M)>;
-    type Rx = AsyncReceiver<(u64, M)>;
     type Out = AsyncReceiver<(u64, M)>;
+    type Rx = AsyncReceiver<(u64, M)>;
+    type Tx = AsyncSender<(u64, M)>;
 
     fn make<R: AsyncRuntime>(
         _ctx: &StreamCtx<'_, R>,
@@ -3014,9 +3023,9 @@ struct AsyncMpsc;
 
 #[cfg(feature = "tokio-runtime")]
 impl<M: Send + Unpin + 'static> AsyncOutChannel<M> for AsyncMpsc {
-    type Tx = MpscAsyncSender<(u64, M)>;
-    type Rx = MpscAsyncReceiver<(u64, M)>;
     type Out = FinalRx<M>;
+    type Rx = MpscAsyncReceiver<(u64, M)>;
+    type Tx = MpscAsyncSender<(u64, M)>;
 
     fn make<R: AsyncRuntime>(
         _ctx: &StreamCtx<'_, R>,
@@ -3042,9 +3051,9 @@ struct AsyncSharded;
 
 #[cfg(feature = "tokio-runtime")]
 impl<M: Send + Unpin + 'static> AsyncOutChannel<M> for AsyncSharded {
-    type Tx = MpscAsyncSender<(u64, M)>;
-    type Rx = ShardedAsyncReceiver<(u64, M)>;
     type Out = FinalRx<M>;
+    type Rx = ShardedAsyncReceiver<(u64, M)>;
+    type Tx = MpscAsyncSender<(u64, M)>;
 
     fn make<R: AsyncRuntime>(
         ctx: &StreamCtx<'_, R>,
@@ -3052,7 +3061,10 @@ impl<M: Send + Unpin + 'static> AsyncOutChannel<M> for AsyncSharded {
         tasks: usize,
     ) -> (Vec<Self::Tx>, Self::Rx) {
         let shards = ctx.sharded_async_terminal(tasks);
-        debug_assert!(shards > 0, "the terminal selector only picks AsyncSharded when shards > 0");
+        debug_assert!(
+            shards > 0,
+            "the terminal selector only picks AsyncSharded when shards > 0"
+        );
         // In-flight hint: shard-floor lift over the noted `buffer`
         // (see `ShardedMpsc::make`).
         ctx.note_in_flight((shards - 1) * MIN_SHARD_BUFFER);
@@ -4628,7 +4640,7 @@ where
     ///     RunOutcome::Cancelled { partial, emitted } => {
     ///         assert_eq!(emitted, partial.len()); // items that crossed before the stop
     ///         partial
-    ///     }
+    ///     },
     /// };
     /// assert_eq!(out.len(), 1_000);
     /// ```
@@ -4637,9 +4649,8 @@ where
     ///
     /// Same contract as [`run`](Self::run).
     pub fn run_checked(self) -> RunOutcome<Vec<O>> {
-        self.try_run_checked().expect(
-            "StreamPipe::run_checked: failed to build async runtime (see run/try_run)",
-        )
+        self.try_run_checked()
+            .expect("StreamPipe::run_checked: failed to build async runtime (see run/try_run)")
     }
 
     /// Fallible counterpart to [`run_checked`](Self::run_checked), as
@@ -5117,29 +5128,27 @@ mod tests {
 
         let cfg = PipelineConfig::default().with_async_workers(4);
         let pool = TokioPool::build(1).expect("build test runtime");
-        let ctx = |sync: bool, async_: bool| {
-            StreamCtx::<TokioPool> {
-                config: &cfg,
-                cancel: None,
-                n: 4,
-                per_stage_parallelism: 1,
-                dedicated_threads: false,
-                has_async_stage: false,
-                terminal_policy: TermPolicy {
-                    sharded: sync,
-                    sharded_async: async_,
-                    chain_floor: false,
-                },
-                lease: None,
-                worker_slots_left: Cell::new(0),
-                stages_left: Cell::new(0),
-                in_flight: Cell::new(0),
-                compute_pool: None,
-                async_pool: Some(pool.clone()),
-                cached_pool: OnceLock::new(),
-                async_panic: OnceLock::new(),
-                _marker: PhantomData,
-            }
+        let ctx = |sync: bool, async_: bool| StreamCtx::<TokioPool> {
+            config: &cfg,
+            cancel: None,
+            n: 4,
+            per_stage_parallelism: 1,
+            dedicated_threads: false,
+            has_async_stage: false,
+            terminal_policy: TermPolicy {
+                sharded: sync,
+                sharded_async: async_,
+                chain_floor: false,
+            },
+            lease: None,
+            worker_slots_left: Cell::new(0),
+            stages_left: Cell::new(0),
+            in_flight: Cell::new(0),
+            compute_pool: None,
+            async_pool: Some(pool.clone()),
+            cached_pool: OnceLock::new(),
+            async_panic: OnceLock::new(),
+            _marker: PhantomData,
         };
         // Sync knob alone: the async terminal stays on the single ring.
         assert_eq!(ctx(true, false).sharded_async_terminal(128), 0);
@@ -5163,40 +5172,47 @@ mod tests {
 
         let cfg = PipelineConfig::default(); // buffer_size 256
         let pool = TokioPool::build(1).expect("build test runtime");
-        let ctx = |n: usize, floor: bool, has_async: bool| {
-            StreamCtx::<TokioPool> {
-                config: &cfg,
-                cancel: None,
-                n,
-                per_stage_parallelism: 1,
-                dedicated_threads: false,
-                has_async_stage: has_async,
-                terminal_policy: TermPolicy {
-                    sharded: false,
-                    sharded_async: false,
-                    chain_floor: floor,
-                },
-                lease: None,
-                worker_slots_left: Cell::new(0),
-                stages_left: Cell::new(0),
-                in_flight: Cell::new(0),
-                compute_pool: None,
-                async_pool: Some(pool.clone()),
-                cached_pool: OnceLock::new(),
-                async_panic: OnceLock::new(),
-                _marker: PhantomData,
-            }
+        let ctx = |n: usize, floor: bool, has_async: bool| StreamCtx::<TokioPool> {
+            config: &cfg,
+            cancel: None,
+            n,
+            per_stage_parallelism: 1,
+            dedicated_threads: false,
+            has_async_stage: has_async,
+            terminal_policy: TermPolicy {
+                sharded: false,
+                sharded_async: false,
+                chain_floor: floor,
+            },
+            lease: None,
+            worker_slots_left: Cell::new(0),
+            stages_left: Cell::new(0),
+            in_flight: Cell::new(0),
+            compute_pool: None,
+            async_pool: Some(pool.clone()),
+            cached_pool: OnceLock::new(),
+            async_panic: OnceLock::new(),
+            _marker: PhantomData,
         };
         // Knob off, or a pure-sync chain: the floored default.
-        assert_eq!(ctx(100_000, false, true).stage_buffer::<(u64, u64)>(None, 8), 256);
-        assert_eq!(ctx(100_000, true, false).stage_buffer::<(u64, u64)>(None, 8), 256);
+        assert_eq!(
+            ctx(100_000, false, true).stage_buffer::<(u64, u64)>(None, 8),
+            256
+        );
+        assert_eq!(
+            ctx(100_000, true, false).stage_buffer::<(u64, u64)>(None, 8),
+            256
+        );
         // Knob on, async chain: lifted to the slot floor.
         assert_eq!(
             ctx(100_000, true, true).stage_buffer::<(u64, u64)>(None, 8),
             crate::handoff::ASYNC_CHAIN_FLOOR_SLOTS
         );
         // Small run: the lift never exceeds `n`.
-        assert_eq!(ctx(1_000, true, true).stage_buffer::<(u64, u64)>(None, 8), 1_000);
+        assert_eq!(
+            ctx(1_000, true, true).stage_buffer::<(u64, u64)>(None, 8),
+            1_000
+        );
         // Byte budget: 1 KiB payloads clamp the floor to
         // 8 MiB / 1032 B ≈ 8123 slots (still above the 256 default).
         assert_eq!(
@@ -5205,7 +5221,10 @@ mod tests {
         );
         // Explicit pin: the caller's exact backpressure request, verbatim.
         let pin = NonZeroUsize::new(16).unwrap();
-        assert_eq!(ctx(100_000, true, true).stage_buffer::<(u64, u64)>(Some(pin), 8), 16);
+        assert_eq!(
+            ctx(100_000, true, true).stage_buffer::<(u64, u64)>(Some(pin), 8),
+            16
+        );
     }
 
     /// `Feeder::finish` re-raises the caught feeder-job payload (the
