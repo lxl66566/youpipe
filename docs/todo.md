@@ -64,7 +64,6 @@ The 2026-10 design analysis confirmed three hard constraints that must be solved
 
 Items from the 2026-10-20 three-way audit that were not scheduled into the adjacent round:
 
-- st3 `WorkerThread::push`'s `is_empty()`+`push()` performs 5 atomic reads on the line shared with stealers, reducible to 3 — first verify with cargo-show-asm whether LLVM already merges the adjacent Relaxed loads (generic monomorphization within one CGU may already eliminate them); only if unmerged, evaluate a fork API (costly under the fork-stays-diffable constraint, expected gain <1%).
 - `try_apply_pure` has no bench id: the path is sensitive to codegen layout (ErasedStrategy recorded ±16–30% layout regressions), so a layout shift could silently regress the `try_collect` fast path.
 - `perfcnt` → `nom v4` future-incompat: upstream is unmaintained, a future rustc will refuse to compile it; when that happens, vendor/fork it or port the counters onto gungraun's valgrind path.
 - mdbook has no linkcheck preprocessor, so relative intra-book links are unvalidated (a one-off script scan on 2026-10-20 found 0 broken links; moving it into CI is pending).

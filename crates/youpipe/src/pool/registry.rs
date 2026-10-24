@@ -531,6 +531,13 @@ impl WorkerThread {
     /// Must only be called by the thread that owns this `WorkerThread` (TLS
     /// contract): `self.worker` is a single-producer deque.
     pub(crate) unsafe fn push(&self, job: JobRef) {
+        // Measured 2026-10-25 (cargo-show-asm on `Registry::inject_or_push`):
+        // this is_empty+push pair compiles to 5 atomic reads of the deque
+        // (push_count x2, pop_count_and_head x2, head x1) — LLVM does not CSE
+        // the duplicate Relaxed loads even after inlining. A fused st3 API
+        // would reach 3 but needs fork edits; rejected (<1% expected gain,
+        // record in docs/src/dev/scheduler.md "Vendored scheduler
+        // dependencies").
         let queue_was_empty = self.worker.is_empty();
         match self.worker.push(job) {
             Ok(()) => {
