@@ -108,7 +108,7 @@ fn test_hybrid_driver_assists_when_workers_busy() {
     });
 
     let n: u32 = if cfg!(miri) {
-        256
+        64
     } else {
         4096
     };

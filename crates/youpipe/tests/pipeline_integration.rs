@@ -538,7 +538,7 @@ fn test_stream_ordered_exact_order_stress() {
     // Miri: same dispatch/drain paths per item, fewer rounds (see
     // `cpu_heavy` for the ~1000× interpreter rationale).
     let rounds: u64 = if cfg!(miri) {
-        20
+        8
     } else {
         2000
     };
@@ -620,7 +620,17 @@ fn test_stream_fused_pass_through_equivalence() {
     let f = |x: u64| cpu_heavy(x).wrapping_add(1);
     let g = |x: u64| x.wrapping_mul(3);
 
-    for n in [1, 2, 10_000] {
+    // Miri: the hybrid-dispatch range shrinks 10x (1 and 2 are the serial
+    // and minimal-par anchors and stay as-is).
+    for n in [
+        1,
+        2,
+        if cfg!(miri) {
+            1_000
+        } else {
+            10_000
+        },
+    ] {
         let items: Vec<u64> = (0..n).collect();
         let expected: Vec<u64> = items.iter().map(|&x| g(f(x))).collect();
 
@@ -775,16 +785,23 @@ fn test_stream_with_fence_chunked() {
 fn test_stream_fence_with_options_buffer() {
     use youpipe::FenceOptions;
 
+    // Miri: the buffer(2) backpressure shaping shows up from tens of items
+    // on; 100 keeps both fence modes comfortably past every chunk boundary.
+    let n: u64 = if cfg!(miri) {
+        100
+    } else {
+        500
+    };
     for mode in [
         FenceMode::Barrier,
         FenceMode::Chunked(NonZeroUsize::new(7).unwrap()),
     ] {
-        let r: Vec<u64> = stream(0..500u64)
+        let r: Vec<u64> = stream(0..n)
             .stage(|x| x + 1)
             .fence_with(FenceOptions::new().buffer(2), mode)
             .stage(|x| x * 2)
             .run();
-        let mut expected: Vec<u64> = (0..500u64).map(|x| (x + 1) * 2).collect();
+        let mut expected: Vec<u64> = (0..n).map(|x| (x + 1) * 2).collect();
         expected.sort_unstable();
         let mut got = r;
         got.sort_unstable();
@@ -799,22 +816,23 @@ fn test_stream_fence_with_options_buffer() {
 /// selection now lives in one dispatch line per stage type).
 #[test]
 fn test_stream_fence_terminal_stage() {
+    let n: u64 = if cfg!(miri) {
+        100
+    } else {
+        300
+    };
     for mode in [
         FenceMode::Barrier,
         FenceMode::Chunked(NonZeroUsize::new(7).unwrap()),
     ] {
-        let mut r: Vec<u64> = stream(0..300u64).stage(|x| x + 1).fence(mode).run();
+        let mut r: Vec<u64> = stream(0..n).stage(|x| x + 1).fence(mode).run();
         r.sort_unstable();
-        assert_eq!(r, (1..=300u64).collect::<Vec<_>>(), "{mode:?}");
+        assert_eq!(r, (1..=n).collect::<Vec<_>>(), "{mode:?}");
 
         // Ordered flavour: the fence forwards seq-tagged items, so the
         // ordered drain's accounting must hold exactly.
-        let r: Vec<u64> = stream(0..300u64)
-            .stage(|x| x + 1)
-            .fence(mode)
-            .ordered()
-            .run();
-        assert_eq!(r, (1..=300u64).collect::<Vec<_>>(), "{mode:?}");
+        let r: Vec<u64> = stream(0..n).stage(|x| x + 1).fence(mode).ordered().run();
+        assert_eq!(r, (1..=n).collect::<Vec<_>>(), "{mode:?}");
     }
 }
 
@@ -829,13 +847,18 @@ fn test_stream_fence_terminal_stage() {
 #[cfg(feature = "tokio-runtime")]
 #[test]
 fn test_stream_fence_prefix_async_chain_sync_feeder() {
-    let r: Vec<u64> = stream(0..100u64)
+    let n: u64 = if cfg!(miri) {
+        25
+    } else {
+        100
+    };
+    let r: Vec<u64> = stream(0..n)
         .fence(FenceMode::Chunked(NonZeroUsize::new(10).unwrap()))
         .stage_async(|x| async move { x + 1 })
         .stage(|x| x * 3)
         .ordered()
         .run();
-    assert_eq!(r, (0..100u64).map(|x| (x + 1) * 3).collect::<Vec<_>>());
+    assert_eq!(r, (0..n).map(|x| (x + 1) * 3).collect::<Vec<_>>());
 }
 
 #[test]
@@ -1010,51 +1033,64 @@ fn test_async_then_sync_via_bridge() {
 #[test]
 fn test_async_first_all_downstream_kinds() {
     let pool = youpipe::ComputePool::new(2);
+    // Miri: every downstream kind still gets its own sub-run; only the item
+    // counts shrink (25 items cross the default chunk/buffer boundaries on
+    // a 2-worker pool).
+    let n: u64 = if cfg!(miri) {
+        25
+    } else {
+        100
+    };
     // .stage_async → .stage → .stage (async→sync bridge, then pure sync).
-    let r: Vec<u64> = stream(0..100u64)
+    let r: Vec<u64> = stream(0..n)
         .with_compute_pool(pool.clone())
         .stage_async(|x| async move { x + 1 })
         .stage(|x| x * 2)
         .stage(|x| x + 10)
         .ordered()
         .run();
-    assert_eq!(r, (0..100u64).map(|x| (x + 1) * 2 + 10).collect::<Vec<_>>());
+    assert_eq!(r, (0..n).map(|x| (x + 1) * 2 + 10).collect::<Vec<_>>());
 
     // .stage_async → .expand (async feeder into an expansion stage).
     // usize elements keep the fan-out count cast-free.
-    let r: Vec<usize> = stream(0..20usize)
+    let m: usize = if cfg!(miri) {
+        10
+    } else {
+        20
+    };
+    let r: Vec<usize> = stream(0..m)
         .with_compute_pool(pool.clone())
         .stage_async(|x| async move { x + 1 })
         .expand(|x| vec![x; x])
         .run();
     assert_eq!(
         r.len(),
-        (1..=20usize).sum::<usize>(),
+        (1..=m).sum::<usize>(),
         "expand after async lost items"
     );
 
     // .stage_async → .fence(Barrier) → .stage (async feeder through a fence).
-    let r: Vec<u64> = stream(0..100u64)
+    let r: Vec<u64> = stream(0..n)
         .with_compute_pool(pool.clone())
         .stage_async(|x| async move { x + 1 })
         .fence(FenceMode::Barrier)
         .stage(|x| x * 3)
         .ordered()
         .run();
-    assert_eq!(r, (0..100u64).map(|x| (x + 1) * 3).collect::<Vec<_>>());
+    assert_eq!(r, (0..n).map(|x| (x + 1) * 3).collect::<Vec<_>>());
 
     // .stage_async → .stage → .stage_async (async→sync→async round trip).
     // Input starts at 3: the last closure subtracts 3 and the expected-value
     // expression mirrors it, so a 0 input would overflow-check-panic now
     // that overflow checks actually run under `cargo test`.
-    let r: Vec<u64> = stream(3..103u64)
+    let r: Vec<u64> = stream(3..3 + n)
         .with_compute_pool(pool)
         .stage_async(|x| async move { x + 1 })
         .stage(|x| x * 2)
         .stage_async(|x| async move { x - 3 })
         .ordered()
         .run();
-    assert_eq!(r, (3..103u64).map(|x| (x + 1) * 2 - 3).collect::<Vec<_>>());
+    assert_eq!(r, (3..3 + n).map(|x| (x + 1) * 2 - 3).collect::<Vec<_>>());
 }
 
 // ── Streaming terminal inside an async context ──
@@ -1117,16 +1153,23 @@ async fn test_run_in_spawn_blocking_works() {
 #[cfg(feature = "tokio-runtime")]
 #[test]
 fn test_stage_async_panic_propagates_to_caller() {
+    // Miri: same mid-stream panic position (n/2), fewer interpreted items.
+    let n: u64 = if cfg!(miri) {
+        200
+    } else {
+        1000
+    };
+    let boom = n / 2;
     catch_panic_asserting(
         || {
-            let _ = stream(0..1000u64)
-                .stage_async(|x: u64| async move {
-                    assert!(x != 500, "async boom at {x}");
+            let _ = stream(0..n)
+                .stage_async(move |x: u64| async move {
+                    assert!(x != boom, "async boom at {x}");
                     x + 1
                 })
                 .run();
         },
-        &["async boom at 500"],
+        &[&format!("async boom at {boom}")],
     );
 }
 
@@ -1137,17 +1180,23 @@ fn test_stage_async_panic_propagates_to_caller() {
 #[cfg(feature = "tokio-runtime")]
 #[test]
 fn test_stage_async_panic_propagates_ordered() {
+    let n: u64 = if cfg!(miri) {
+        200
+    } else {
+        1000
+    };
+    let boom = n / 2;
     catch_panic_asserting(
         || {
-            let _ = stream(0..1000u64)
-                .stage_async(|x: u64| async move {
-                    assert!(x != 500, "async boom at {x}");
+            let _ = stream(0..n)
+                .stage_async(move |x: u64| async move {
+                    assert!(x != boom, "async boom at {x}");
                     x + 1
                 })
                 .ordered()
                 .run();
         },
-        &["async boom at 500"],
+        &[&format!("async boom at {boom}")],
     );
 }
 
@@ -1786,12 +1835,12 @@ fn test_hybrid_dispatch_spin_wait_stress() {
     // envelope (~tens of µs), so this exercises the spin fast path, not the
     // condvar fallback.
     const ITERS: usize = if cfg!(miri) {
-        100
+        25
     } else {
         20_000
     };
     const N: usize = if cfg!(miri) {
-        200
+        100
     } else {
         1_000
     };
@@ -2606,9 +2655,14 @@ fn test_unbalanced_try_collect_err_drop_accounting() {
 #[test]
 fn test_reduce_terminals_match_sequential() {
     use youpipe::pipe_ref;
-    let data: Vec<u64> = (0..20_057u64)
-        .map(|i| i.wrapping_mul(2_654_435_761))
-        .collect();
+    // Miri: every terminal variant still runs over the full pipeline; only
+    // the item count shrinks (2_003 keeps the not-chunk-aligned oddness).
+    let n: u64 = if cfg!(miri) {
+        2_003
+    } else {
+        20_057
+    };
+    let data: Vec<u64> = (0..n).map(|i| i.wrapping_mul(2_654_435_761)).collect();
     let f = |&x: &u64| x.wrapping_mul(3).wrapping_add(7);
     let g = |x: u64| x.wrapping_mul(3).wrapping_add(7);
     let mapped: Vec<u64> = data.iter().map(|&x| g(x)).collect();
@@ -2679,7 +2733,12 @@ fn test_reduce_terminals_match_sequential() {
             .reduce(u64::wrapping_add),
         Some(expected_sum)
     );
-    assert_eq!(stream(0..1000u64).stage(|x| x * 2).count(), 1000);
+    let c: u64 = if cfg!(miri) {
+        200
+    } else {
+        1000
+    };
+    assert_eq!(stream(0..c).stage(|x| x * 2).count() as u64, c);
 }
 
 /// Empty and fully-filtered inputs: `None` / identity returns everywhere.
