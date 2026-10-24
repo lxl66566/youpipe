@@ -8,6 +8,8 @@
 #      with a self-match-safe pattern.
 #   2. a single wedged test hanging the whole run for hours. Every test
 #      binary runs under `timeout` and the run proceeds to the next one.
+#   3. editing this script while an instance is mid-run corrupts it (bash
+#      reads incrementally) — copy-edit out-of-run only.
 #
 # Also fixes the MIRIFLAGS trap: `.cargo/config.toml` sets
 # `-Zmiri-ignore-leaks` (intentionally leaked global-pool workers), but a
