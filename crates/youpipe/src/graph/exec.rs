@@ -526,7 +526,7 @@ struct OutEdge {
 /// Resolve every node's worker count (async nodes: task fan-out) and the
 /// dispatch mode (pool jobs under a parking lease vs dedicated threads).
 ///
-/// Liveness invariant (pool mode, same as the stream engine's `try_exec`):
+/// Liveness invariant (pool mode, same as the stream engine's `resolve_admission`):
 /// every blocking job the run parks on a pool thread must be simultaneously
 /// schedulable — `source feeders + Σ sync node workers ≤ pool threads` —
 /// reserved atomically through [`ParkingLease`]. Async nodes run on the

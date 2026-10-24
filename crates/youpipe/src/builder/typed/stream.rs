@@ -146,7 +146,8 @@ pub(crate) struct ParkingLease {
 
 impl ParkingLease {
     /// Lease `reserved` parking slots on `registry` (graph engine entry;
-    /// the stream engine computes its own `need` inline in `try_exec`).
+    /// the stream engine computes its own `need` in `resolve_admission`
+    /// and builds its lease inline).
     pub(crate) fn new(registry: Arc<Registry>, reserved: usize) -> Self {
         Self {
             registry,
@@ -339,8 +340,9 @@ fn push_items<I: Send + 'static>(
 /// sender never blocks on `Full`: even if every downstream worker is blocked
 /// on the *output* channel, the calling thread finishes pushing, drops the
 /// sender, and proceeds to collect — draining the output and unblocking
-/// workers. The pool path is only taken when [`StreamPipe::try_exec`] has
-/// leased a slot for it through the pool-wide [`ParkingLease`] (on top of
+/// workers. The pool path is only taken when the run's admission
+/// ([`resolve_admission`]) has leased a slot for it through the pool-wide
+/// [`ParkingLease`] (on top of
 /// every sync stage's workers and every fence forwarder), so the feeder job
 /// is always schedulable even
 /// with other runs resident on the same pool. The dedicated-thread path is
@@ -997,7 +999,7 @@ fn forward_fenced<M, Tx>(
 /// Spawn the fence forwarder for one run: a **leased pool job** in pool
 /// mode — it parks on the mid channel exactly like a stage worker, so it
 /// must (and does, via the `fences` term of the reservation computed in
-/// [`StreamPipe::try_exec`]) count against the run's [`ParkingLease`] — or
+/// [`resolve_admission`]) count against the run's [`ParkingLease`] — or
 /// a dedicated OS thread in the dedicated-thread fallback (lease did not
 /// fit, or `run()` itself executes on a worker of the same pool).
 ///
@@ -1244,7 +1246,7 @@ pub struct StageBudget {
     /// Number of fence links: each runs one channel-parking forwarder, a
     /// leased pool job in pool mode. The runner reserves one lease slot per
     /// fence on top of the stage workers and deducts them from the
-    /// stage-worker division (see `try_exec`).
+    /// stage-worker division (see `resolve_admission`).
     pub fences: usize,
     /// Number of those stages that pinned their worker count via
     /// `SyncStageOptions::workers`.
@@ -1415,7 +1417,7 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     /// Required rather than defaulted (todo #13): a default delegating to
     /// [`spawn`](Self::spawn) silently kept the MPMC terminal whenever an
     /// impl forgot to override — the zero-stage gap once tripped
-    /// `try_exec`'s terminal Single-variant debug_assert on
+    /// `route_feeder`'s terminal Single-variant debug_assert on
     /// `stream(..).with_cancel(t).run()` (fixed in 3d2d435 by overriding).
     /// Every impl must now state its terminal shape.
     fn spawn_single<R: AsyncRuntime>(
@@ -1867,8 +1869,9 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// `FenceOptions::buffer` pin, via `stage_buffer`.
     pub per_stage_parallelism: usize,
     /// When `true`, sync/expand stage workers, fence forwarders (and a
-    /// non-inline feeder) run as dedicated OS threads instead of pool jobs. Chosen by
-    /// [`StreamPipe::try_exec`] when the pool-wide parking lease cannot host
+    /// non-inline feeder) run as dedicated OS threads instead of pool jobs. Chosen by the
+    /// run's admission ([`resolve_admission`]) when the pool-wide parking
+    /// lease cannot host
     /// the run's whole upper bound of channel-parking jobs (pool busy with
     /// other runs' leases, or more sync stages than available pool slots),
     /// or when `run()` itself executes on a worker of the same pool (nested
@@ -1892,7 +1895,7 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     pub(crate) lease: Option<ParkingLease>,
     /// Pool-mode liveness budget: worker slots still grantable to
     /// not-yet-spawned sync stages. Initialised to the parking lease's
-    /// stage-worker portion (`need - feeder - fences`, see `try_exec`) and
+    /// stage-worker portion (`need - feeder - fences`, see `resolve_admission`) and
     /// decremented by [`Self::stage_workers`] as the spawn walk grants
     /// workers upstream first. Invariant: `worker_slots_left ≥ stages_left` holds at every
     /// grant, so every stage keeps ≥ 1 resident worker and the total number
@@ -1930,9 +1933,9 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     #[cfg(feature = "tokio-runtime")]
     pub(crate) cached_pool: OnceLock<std::io::Result<R>>,
     /// First panic recorded by this run's async stage tasks
-    /// ([`CatchTaskPanic`]); re-raised on the caller by `try_exec` after the
-    /// collector returns. `OnceLock`: sync-only runs never touch it and pay
-    /// no allocation.
+    /// ([`CatchTaskPanic`]); re-raised on the caller by the terminal drain
+    /// (`drain_terminal`) after the collector returns. `OnceLock`: sync-only runs never touch it
+    /// and pay no allocation.
     #[cfg(feature = "tokio-runtime")]
     pub(crate) async_panic: OnceLock<PanicSlot>,
     /// Carries the backend type `R` even when no backend feature is enabled
@@ -1946,9 +1949,9 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
 /// stage's workers always have a few free slots to push into even when the
 /// configured capacity is smaller than the fan-out.
 ///
-/// # Interlock — feeder-slot prediction (`try_exec`)
+/// # Interlock — feeder-slot prediction (`resolve_admission`)
 ///
-/// `try_exec` predicts "will the feeder be a pool job" as
+/// `resolve_admission` predicts "will the feeder be a pool job" as
 /// `n > floored_channel_capacity(buffer_size, 1)` — the minimum capacity
 /// over every per-stage parallelism the run may resolve — to cover (never
 /// miss) the real condition `n > floored_channel_capacity(buffer_size, p)`
@@ -2031,7 +2034,7 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
         debug_assert!(
             granted <= slots,
             "pool admission must reserve every stage's >=1 worker grant              (see the \
-             reservation-backed `worker_budget` init in `try_exec`)"
+             reservation-backed `worker_budget` init in `resolve_admission`)"
         );
         self.worker_slots_left.set(slots - granted);
         // In-flight estimate: each granted worker holds at most one claim
@@ -2774,7 +2777,7 @@ where
 
     fn stage_budget(&self) -> StageBudget {
         // The forwarder is a channel-parking pool job in pool mode — one
-        // leased slot, reserved by `try_exec` on top of the stage workers.
+        // leased slot, reserved by `resolve_admission` on top of the stage workers.
         let mut budget = self.prev.stage_budget();
         budget.fences += 1;
         budget
@@ -2932,7 +2935,7 @@ where
 /// with the unobserved JoinHandle — a panicking async stage closure
 /// therefore closed its channel normally and the collector returned
 /// truncated output with no error signal. Recording here and re-raising
-/// from `try_exec` after the drain restores the fused path's contract: the
+/// from the run's terminal drain (`drain_terminal`) restores the fused path's contract: the
 /// panic reaches the `run()` caller. The same mechanism surfaces nested
 /// `run()` misuse — `block_on` inside a runtime task re-raises with the
 /// actionable `spawn_blocking` hint instead of silently killing every
@@ -4706,126 +4709,26 @@ where
             _marker,
         } = self;
 
-        // Compute the default per-stage compute-pool parallelism and the
-        // dispatch mode (pool jobs vs dedicated OS threads).
-        //
-        // Liveness invariant (pool mode): every blocking job the run parks
-        // on a pool thread must be simultaneously schedulable — that is
-        // `feeder(≤1) + Σ stage workers + Σ fence forwarders ≤ pool_threads`. A worker parked
-        // inside a crossfire send/recv never returns to the pool's find_work
-        // loop, so a job left queued while every thread is parked deadlocks
-        // the run (reproduced pre-fix: 4 stages on a 4-thread pool with
-        // n > k × buffer hung forever — the feeder job was uncounted and the
-        // per-stage floor of 1 pushed the total past the pool).
-        //
-        // That budget must hold at *pool* scope, not per run: concurrent
-        // full-budget runs on a shared pool (global pool + parallel callers)
-        // each individually fit yet jointly oversubscribe it, parking every
-        // worker with stage-2 jobs still queued (see [`ParkingLease`]). The
-        // run therefore leases its whole upper bound of parking jobs from
-        // the pool atomically, or falls back to dedicated threads.
-        //
-        // When the remaining lease capacity cannot host the run (busy pool,
-        // or more sync stages than slots), or when `run()` itself executes
-        // on a worker of the same pool (nested pipelines: the collector
-        // parks that worker for the whole run, so pool admission of *any*
-        // further blocking job — feeder included — depends on other
-        // tenants' courtesy), stage workers and the feeder fall back to
-        // dedicated OS threads, which the OS schedules independently of
-        // pool occupancy.
-        let budget = stages.stage_budget();
-        let pool = compute_pool
-            .as_ref()
-            .map_or_else(|| ComputePool::global().clone(), Clone::clone);
-        let pool_threads = pool.num_workers();
-        // Budget resolution: an explicitly pinned `with_compute_workers` wins
-        // (clamped to the pool below); unpinned follows the pool's thread
-        // count so a big blocking-IO pool actually gets its workers.
-        let workers_budget = if config.compute_workers_pinned {
-            config.compute_workers
-        } else {
-            config.compute_workers.max(pool_threads)
-        };
-        // Feeder-slot prediction must cover (never miss) the pool-job case.
-        // The feeder is a job iff `n > buffer_actual = max(buffer_size,
-        // per_stage_actual * 4)`; `per_stage_actual ≥ 1`, so predicting with
-        // the *smallest* possible buffer (the floor at parallelism 1)
-        // reserves a slot in every case the feeder could be a job — the
-        // converse (reserved but inline) merely over-reserves by one slot,
-        // returned by the lease's drop. Interlock: `floored_channel_capacity`.
-        let feeder_slot = usize::from(n > floored_channel_capacity(config.buffer_size, 1));
-        let (lease, dedicated_threads, per_stage_parallelism, worker_budget) = if pool
-            .is_on_this_pool()
-        {
-            (None, true, budget.default_workers(workers_budget), 0)
-        } else {
-            // Snapshot the pool's lease load, size this run against it, and
-            // CAS the whole grant in one piece — `try_reserve_parking`
-            // revalidates against the live counter, so a stale snapshot can
-            // only under-promise (per_stage too small), never over-admit.
-            // Each fence forwarder is one channel-parking pool job for
-            // the whole run: it takes a lease slot (never returned until
-            // the run drains) and is deducted from the stage-worker
-            // division up front, exactly like the feeder slot. Skipping
-            // this term re-opens the shared-pool deadlock for chains
-            // with fences (regression-tested in
-            // `test_fence_forwarder_counts_in_parking_lease_no_deadlock`).
-            let fences = budget.fences;
-            let used = pool.registry().parking_used();
-            let live_slots = pool_threads.saturating_sub(used + feeder_slot + fences);
-            let per_stage = budget.default_workers(workers_budget.min(live_slots));
-            // Upper bound of granted workers: pins are additionally clamped
-            // to `n` by `stage_workers`, so this never under-reserves.
-            let unpinned = budget.stages.saturating_sub(budget.explicit_stages);
-            // `per_stage >= 1` (`default_workers` floors the division)
-            // and `n >= 1` (the zero-item early return), so the unpinned
-            // term alone covers every unpinned stage's >= 1 grant —
-            // admission's promise of a resident worker per sync stage.
-            let need = feeder_slot + fences + budget.explicit_workers + unpinned * per_stage.min(n);
-            if need <= pool_threads && pool.registry().try_reserve_parking(need) {
-                let lease = ParkingLease {
-                    registry: Arc::clone(pool.registry()),
-                    reserved: need,
-                    spawned: Cell::new(0),
-                };
-                // The stage-grant budget comes from the RESERVATION, not the
-                // pre-CAS snapshot: `live_slots` can be stale-high (other
-                // runs' jobs release slots between the snapshot and the CAS —
-                // worker jobs outlive the collector's return), so a lease can
-                // be admitted against just-freed capacity while `live_slots`
-                // still reads 0 — `stage_workers`'s >= 1 grant floor then
-                // underflowed `worker_slots_left` (`0 - 1`; debug panics,
-                // release wraps). Reproduced as a miri flake (2026-10-20,
-                // stream_reduce `empty_and_single`: a 1-item run racing the
-                // previous run's unreturned lease). The reservation's own
-                // arithmetic covers every grant: `explicit_workers >=
-                // explicit_stages` (pins are NonZero) and the unpinned term
-                // >= one per unpinned stage.
-                let worker_budget = need - feeder_slot - fences;
-                (Some(lease), false, per_stage, worker_budget)
-            } else {
-                (None, true, budget.default_workers(workers_budget), 0)
-            }
-        };
-        // Per-run worker budget in pool mode: the lease's stage-worker
-        // portion (see the `worker_budget` comment above), which the
-        // reservation guarantees covers every stage's grant — including the
-        // stale-snapshot case where the pre-CAS `live_slots` read is lower
-        // than what the CAS actually admitted. Unspent remainder returns via
-        // the lease's drop.
-        let (worker_slots_left, stages_left) = if dedicated_threads {
-            (0, 0)
-        } else {
-            (worker_budget, budget.stages)
-        };
-
+        // Admission/lease resolution (pool jobs vs dedicated threads, the
+        // per-stage worker division): `resolve_admission` keeps the
+        // liveness-invariant comments next to the arithmetic that maintains
+        // them.
+        let Admission {
+            pool,
+            lease,
+            dedicated_threads,
+            per_stage_parallelism,
+            worker_slots_left,
+            stages_left,
+        } = resolve_admission(&stages.stage_budget(), &config, compute_pool.as_ref(), n);
+        let has_async_stage = stages.has_async_stage();
         let ctx: StreamCtx<'_, R> = StreamCtx {
             config: &config,
             cancel,
             n,
             per_stage_parallelism,
             dedicated_threads,
-            has_async_stage: stages.has_async_stage(),
+            has_async_stage,
             terminal_policy: TermPolicy::from_env(),
             lease,
             worker_slots_left: Cell::new(worker_slots_left),
@@ -4848,192 +4751,376 @@ where
         // construction failure (e.g. OS thread limits) surfaces here as
         // `try_run`'s `Err` instead of aborting a half-spawned pipeline.
         #[cfg(feature = "tokio-runtime")]
-        if stages.has_async_stage() {
+        if has_async_stage {
             ctx.acquire_async()?;
         }
 
-        // The async-chain floor covers the feeder ring too (same wake-chain
-        // face — the serial feeder pushing into a stage-1 crowd). The
-        // lifted capacity only moves the feeder's inline/job threshold
-        // upward, so the parking-lease prediction (`feeder_slot`, computed
-        // from the unfloored `floored_channel_capacity`) can only
-        // over-reserve a slot — returned by the lease's drop, never missed.
-        let buffer = ctx.async_chain_floor::<(u64, I)>(ctx.buffer_size(per_stage_parallelism));
-        // In-flight estimate, feeder side: the feeder channel's capacity,
-        // the one item held in a blocked `send`, and the collector's batch
-        // scratch (`batch_recv_cap()` items claimed but not yet inserted).
-        // (The feeder prefetches nothing beyond that one item — `push_items`
-        // sends straight from the input iterator.)
-        ctx.note_in_flight(buffer + 1 + crate::handoff::batch_recv_cap());
-
-        // Pick the feeder channel type from the chain's innermost real stage.
-        //
-        // When the first real consumer is async (i.e. the chain is shaped like
-        // `stream(..).stage_async(..)[.fence(..)...]`), use a mixed-mode
-        // (`SyncSender` + `AsyncReceiver`) feeder channel. The feeder still
-        // pushes via the blocking `SyncSender::send`, but the AsyncStage's
-        // `spawn_async_feeder` consumes the `AsyncReceiver` *directly* —
-        // skipping the dedicated OS-thread bridge that the sync-feeder path
-        // has to spawn. For every other chain shape (sync first stage, or no
-        // stages at all) the regular sync feeder channel is used.
-        //
-        // Both feeder branches share an identical push loop — the only
-        // difference is whether the *receiver* end is sync (-> `spawn_single`)
-        // or async (-> `spawn_async_feeder_single`). The sender side
-        // (`SyncSender`) is the same type either way, so [`feed_items`]
-        // handles both, and both `_single` terminals produce an MPSC final
-        // channel for the collector.
-        //
-        // Without any backend feature, `AsyncStage` doesn't exist, so
-        // `first_consumer_is_async` can never return `Some(true)` and the
-        // async branch is unreachable; the `cfg_not` block keeps the function
-        // compilable in that configuration.
-        let async_feeder = stages.first_consumer_is_async() == Some(true);
-        let feeder_cancel = ctx.cancel.clone();
-        debug_assert!(
-            cfg!(feature = "tokio-runtime") || !async_feeder,
-            "first_consumer_is_async == Some(true) requires an async runtime backend feature"
-        );
-
-        #[cfg(feature = "tokio-runtime")]
-        let (final_rx, feeder) = if async_feeder {
-            let (feeder_tx, feeder_rx) = sync_async_channel::<(u64, I)>(buffer);
-            let feeder = feed_items(
-                ctx.compute_pool(),
-                items,
-                feeder_tx,
-                feeder_cancel,
-                buffer,
-                dedicated_threads,
-                ctx.lease.as_ref(),
-            );
-            // `spawn_async_feeder_single` keeps the terminal MPSC property
-            // (same rationale as the sync branch's `spawn_single`): without
-            // it, async-first chains fell back to an MPMC final channel and
-            // the collector paid the per-item `lock cmpxchg` again.
-            (
-                stages.spawn_async_feeder_single::<R>(feeder_rx, &ctx),
-                feeder,
-            )
-        } else {
-            let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
-            let feeder = feed_items(
-                ctx.compute_pool(),
-                items,
-                feeder_tx,
-                feeder_cancel,
-                buffer,
-                dedicated_threads,
-                ctx.lease.as_ref(),
-            );
-            // Use `spawn_single` so the terminal stage's output channel is MPSC
-            // (store-based dequeue, lock-free waker registry) — the collector is
-            // always the sole consumer of the final channel.
-            (stages.spawn_single::<R>(feeder_rx, &ctx), feeder)
-        };
-        #[cfg(not(feature = "tokio-runtime"))]
-        let (final_rx, feeder) = {
-            let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
-            let feeder = feed_items(
-                ctx.compute_pool(),
-                items,
-                feeder_tx,
-                feeder_cancel,
-                buffer,
-                dedicated_threads,
-                ctx.lease.as_ref(),
-            );
-            (stages.spawn_single::<R>(feeder_rx, &ctx), feeder)
-        };
-
-        // Terminal-channel regression guard: both feeder paths must hand the
-        // collector a Single (MPSC) final channel — the collector is always
-        // the sole consumer. Async-first chains once silently degraded to the
-        // MPMC terminal (per-item `lock cmpxchg` in the collector); every
-        // debug-mode test run re-checks this here. `spawn_single` /
-        // `spawn_async_feeder_single` are required trait methods (no
-        // delegating default since todo #13), and `StageSpawn` is
-        // crate-private (not exported), so no impl can return a non-Single
-        // variant unnoticed.
-        #[cfg(feature = "tokio-runtime")]
-        debug_assert!(
-            matches!(
-                final_rx,
-                FinalRx::SyncSingle(_)
-                    | FinalRx::SyncSharded(_)
-                    | FinalRx::AsyncSingle(_)
-                    | FinalRx::AsyncSharded(_)
-            ),
-            "terminal channel must be single-consumer (Single or Sharded variant)"
-        );
-        #[cfg(not(feature = "tokio-runtime"))]
-        debug_assert!(
-            matches!(final_rx, FinalRx::SyncSingle(_) | FinalRx::SyncSharded(_)),
-            "terminal channel must be single-consumer (Single or Sharded variant)"
-        );
-
-        // Resolve the ordered drain's reorder window now that the spawn
-        // walk has accumulated the pipeline's in-flight occupancy: the auto
-        // window pre-sizes to that occupancy and grows to the sound
-        // `next_pow2(n)` ceiling (see `OrderedWindow`); an explicit
-        // `with_reorder_window` pin replaces both with the caller's ceiling.
-        let window = match reorder_window {
-            Some(w) => OrderedWindow::fixed(n, w),
-            None => OrderedWindow::auto(n, ctx.in_flight.get()),
-        };
-        // `ctx.cancel` feeds the ordered drain's accounting check: a fired
-        // token legitimately shortens the stream, exempting the equality
-        // form (see `OrderedAccounting`).
-        let cancel = ctx.cancel.as_ref();
-        // The drain runs under catch_unwind so a recorded async-stage panic
-        // (see `CatchTaskPanic`) wins over the ordered drain's accounting
-        // assertion: a panicked task drops its in-flight item, which would
-        // trip `emitted + dropped == n` with a misleading invariant message
-        // before the real payload could be re-raised. Any other drain panic
-        // (e.g. a user `for_each` closure on this thread) resumes unchanged.
-        let results =
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match final_rx {
-                FinalRx::Sync(rx) => Ok(terminal.drain_sync(rx, ordered, window, n, cancel)),
-                FinalRx::SyncSingle(rx) => Ok(terminal.drain_sync(rx, ordered, window, n, cancel)),
-                FinalRx::SyncSharded(rx) => {
-                    Ok(terminal.drain_sync_sharded(rx, ordered, window, n, cancel))
-                },
-                #[cfg(feature = "tokio-runtime")]
-                FinalRx::Async(rx) => {
-                    let pool = ctx.acquire_async()?;
-                    Ok(pool.block_on(terminal.drain_async(rx, ordered, window, n, cancel)))
-                },
-                #[cfg(feature = "tokio-runtime")]
-                FinalRx::AsyncSingle(rx) => {
-                    let pool = ctx.acquire_async()?;
-                    Ok(pool.block_on(terminal.drain_async(rx, ordered, window, n, cancel)))
-                },
-                #[cfg(feature = "tokio-runtime")]
-                FinalRx::AsyncSharded(rx) => {
-                    let pool = ctx.acquire_async()?;
-                    Ok(pool.block_on(terminal.drain_async_sharded(rx, ordered, window, n, cancel)))
-                },
-            })) {
-                Ok(Ok(results)) => results,
-                // Runtime acquisition failure inside the closure: report it as
-                // the run's `Err`, exactly as the bare `?` did.
-                Ok(Err(e)) => return Err(e),
-                Err(drain_panic) => {
-                    #[cfg(feature = "tokio-runtime")]
-                    if let Some(slot) = ctx.async_panic.get() {
-                        resume_stored_panic(slot);
-                    }
-                    std::panic::resume_unwind(drain_panic)
-                },
-            };
-
-        feeder.finish();
-        #[cfg(feature = "tokio-runtime")]
-        if let Some(slot) = ctx.async_panic.get() {
-            resume_stored_panic(slot);
-        }
-        Ok(results)
+        let (final_rx, feeder) = route_feeder(stages, items, &ctx);
+        drain_terminal(terminal, final_rx, feeder, ordered, reorder_window, &ctx)
     }
+}
+
+/// One run's pool-admission decision, produced by [`resolve_admission`]:
+/// the dispatch mode (leased pool jobs vs dedicated OS threads), the
+/// per-stage worker division, and the [`StreamCtx`] budget inits the spawn
+/// walk consumes.
+struct Admission {
+    /// The pool this run targets (`with_compute_pool` or the global pool);
+    /// moves into [`StreamCtx::compute_pool`].
+    pool: ComputePool,
+    /// Pool-mode lease over the run's whole upper bound of channel-parking
+    /// jobs ([`ParkingLease`]); `None` in dedicated-thread mode.
+    lease: Option<ParkingLease>,
+    /// Dedicated-OS-thread dispatch (see [`StreamCtx::dedicated_threads`]).
+    dedicated_threads: bool,
+    /// Default per-stage parallelism (see [`StreamCtx::per_stage_parallelism`]).
+    per_stage_parallelism: usize,
+    /// [`StreamCtx::worker_slots_left`] init: the lease's stage-worker
+    /// portion (`need - feeder - fences`).
+    worker_slots_left: usize,
+    /// [`StreamCtx::stages_left`] init: the chain's pool-consuming stage
+    /// count (0 in dedicated-thread mode).
+    stages_left: usize,
+}
+
+/// Resolve the run's pool admission: the default per-stage compute-pool
+/// parallelism and the dispatch mode (pool jobs vs dedicated OS threads).
+///
+/// Liveness invariant (pool mode): every blocking job the run parks
+/// on a pool thread must be simultaneously schedulable — that is
+/// `feeder(≤1) + Σ stage workers + Σ fence forwarders ≤ pool_threads`. A worker parked
+/// inside a crossfire send/recv never returns to the pool's find_work
+/// loop, so a job left queued while every thread is parked deadlocks
+/// the run (reproduced pre-fix: 4 stages on a 4-thread pool with
+/// n > k × buffer hung forever — the feeder job was uncounted and the
+/// per-stage floor of 1 pushed the total past the pool).
+///
+/// That budget must hold at *pool* scope, not per run: concurrent
+/// full-budget runs on a shared pool (global pool + parallel callers)
+/// each individually fit yet jointly oversubscribe it, parking every
+/// worker with stage-2 jobs still queued (see [`ParkingLease`]). The
+/// run therefore leases its whole upper bound of parking jobs from
+/// the pool atomically, or falls back to dedicated threads.
+///
+/// When the remaining lease capacity cannot host the run (busy pool,
+/// or more sync stages than slots), or when `run()` itself executes
+/// on a worker of the same pool (nested pipelines: the collector
+/// parks that worker for the whole run, so pool admission of *any*
+/// further blocking job — feeder included — depends on other
+/// tenants' courtesy), stage workers and the feeder fall back to
+/// dedicated OS threads, which the OS schedules independently of
+/// pool occupancy.
+fn resolve_admission(
+    budget: &StageBudget,
+    config: &PipelineConfig,
+    compute_pool: Option<&ComputePool>,
+    n: usize,
+) -> Admission {
+    let pool = compute_pool.map_or_else(|| ComputePool::global().clone(), Clone::clone);
+    let pool_threads = pool.num_workers();
+    // Budget resolution: an explicitly pinned `with_compute_workers` wins
+    // (clamped to the pool below); unpinned follows the pool's thread
+    // count so a big blocking-IO pool actually gets its workers.
+    let workers_budget = if config.compute_workers_pinned {
+        config.compute_workers
+    } else {
+        config.compute_workers.max(pool_threads)
+    };
+    // Feeder-slot prediction must cover (never miss) the pool-job case.
+    // The feeder is a job iff `n > buffer_actual = max(buffer_size,
+    // per_stage_actual * 4)`; `per_stage_actual ≥ 1`, so predicting with
+    // the *smallest* possible buffer (the floor at parallelism 1)
+    // reserves a slot in every case the feeder could be a job — the
+    // converse (reserved but inline) merely over-reserves by one slot,
+    // returned by the lease's drop. Interlock: `floored_channel_capacity`.
+    let feeder_slot = usize::from(n > floored_channel_capacity(config.buffer_size, 1));
+    let (lease, dedicated_threads, per_stage_parallelism, worker_budget) = if pool.is_on_this_pool()
+    {
+        (None, true, budget.default_workers(workers_budget), 0)
+    } else {
+        // Snapshot the pool's lease load, size this run against it, and
+        // CAS the whole grant in one piece — `try_reserve_parking`
+        // revalidates against the live counter, so a stale snapshot can
+        // only under-promise (per_stage too small), never over-admit.
+        // Each fence forwarder is one channel-parking pool job for
+        // the whole run: it takes a lease slot (never returned until
+        // the run drains) and is deducted from the stage-worker
+        // division up front, exactly like the feeder slot. Skipping
+        // this term re-opens the shared-pool deadlock for chains
+        // with fences (regression-tested in
+        // `test_fence_forwarder_counts_in_parking_lease_no_deadlock`).
+        let fences = budget.fences;
+        let used = pool.registry().parking_used();
+        let live_slots = pool_threads.saturating_sub(used + feeder_slot + fences);
+        let per_stage = budget.default_workers(workers_budget.min(live_slots));
+        // Upper bound of granted workers: pins are additionally clamped
+        // to `n` by `stage_workers`, so this never under-reserves.
+        let unpinned = budget.stages.saturating_sub(budget.explicit_stages);
+        // `per_stage >= 1` (`default_workers` floors the division)
+        // and `n >= 1` (the zero-item early return), so the unpinned
+        // term alone covers every unpinned stage's >= 1 grant —
+        // admission's promise of a resident worker per sync stage.
+        let need = feeder_slot + fences + budget.explicit_workers + unpinned * per_stage.min(n);
+        if need <= pool_threads && pool.registry().try_reserve_parking(need) {
+            let lease = ParkingLease {
+                registry: Arc::clone(pool.registry()),
+                reserved: need,
+                spawned: Cell::new(0),
+            };
+            // The stage-grant budget comes from the RESERVATION, not the
+            // pre-CAS snapshot: `live_slots` can be stale-high (other
+            // runs' jobs release slots between the snapshot and the CAS —
+            // worker jobs outlive the collector's return), so a lease can
+            // be admitted against just-freed capacity while `live_slots`
+            // still reads 0 — `stage_workers`'s >= 1 grant floor then
+            // underflowed `worker_slots_left` (`0 - 1`; debug panics,
+            // release wraps). Reproduced as a miri flake (2026-10-20,
+            // stream_reduce `empty_and_single`: a 1-item run racing the
+            // previous run's unreturned lease). The reservation's own
+            // arithmetic covers every grant: `explicit_workers >=
+            // explicit_stages` (pins are NonZero) and the unpinned term
+            // >= one per unpinned stage.
+            let worker_budget = need - feeder_slot - fences;
+            (Some(lease), false, per_stage, worker_budget)
+        } else {
+            (None, true, budget.default_workers(workers_budget), 0)
+        }
+    };
+    // Per-run worker budget in pool mode: the lease's stage-worker
+    // portion (see the `worker_budget` comment above), which the
+    // reservation guarantees covers every stage's grant — including the
+    // stale-snapshot case where the pre-CAS `live_slots` read is lower
+    // than what the CAS actually admitted. Unspent remainder returns via
+    // the lease's drop.
+    let (worker_slots_left, stages_left) = if dedicated_threads {
+        (0, 0)
+    } else {
+        (worker_budget, budget.stages)
+    };
+    Admission {
+        pool,
+        lease,
+        dedicated_threads,
+        per_stage_parallelism,
+        worker_slots_left,
+        stages_left,
+    }
+}
+
+/// Feeder channel routing: size the feeder ring, note the feeder side of
+/// the in-flight estimate, pick the feeder channel type from the chain's
+/// innermost real stage, feed the items, and spawn the stage chain.
+///
+/// When the first real consumer is async (i.e. the chain is shaped like
+/// `stream(..).stage_async(..)[.fence(..)...]`), use a mixed-mode
+/// (`SyncSender` + `AsyncReceiver`) feeder channel. The feeder still
+/// pushes via the blocking `SyncSender::send`, but the AsyncStage's
+/// `spawn_async_feeder` consumes the `AsyncReceiver` *directly* —
+/// skipping the dedicated OS-thread bridge that the sync-feeder path
+/// has to spawn. For every other chain shape (sync first stage, or no
+/// stages at all) the regular sync feeder channel is used.
+///
+/// Both feeder branches share an identical push loop — the only
+/// difference is whether the *receiver* end is sync (-> `spawn_single`)
+/// or async (-> `spawn_async_feeder_single`). The sender side
+/// (`SyncSender`) is the same type either way, so [`feed_items`]
+/// handles both, and both `_single` terminals produce an MPSC final
+/// channel for the collector.
+///
+/// Without any backend feature, `AsyncStage` doesn't exist, so
+/// `first_consumer_is_async` can never return `Some(true)` and the
+/// async branch is unreachable; the `cfg_not` block keeps the function
+/// compilable in that configuration.
+fn route_feeder<S, I, R>(
+    stages: S,
+    items: Vec<I>,
+    ctx: &StreamCtx<'_, R>,
+) -> (FinalRx<S::Out>, Feeder)
+where
+    S: StageSpawn<I>,
+    I: Send + Unpin + 'static,
+    R: AsyncRuntime,
+{
+    // The async-chain floor covers the feeder ring too (same wake-chain
+    // face — the serial feeder pushing into a stage-1 crowd). The
+    // lifted capacity only moves the feeder's inline/job threshold
+    // upward, so the parking-lease prediction (`feeder_slot`, computed
+    // from the unfloored `floored_channel_capacity` in
+    // `resolve_admission`) can only over-reserve a slot — returned by
+    // the lease's drop, never missed.
+    let buffer = ctx.async_chain_floor::<(u64, I)>(ctx.buffer_size(ctx.per_stage_parallelism));
+    // In-flight estimate, feeder side: the feeder channel's capacity,
+    // the one item held in a blocked `send`, and the collector's batch
+    // scratch (`batch_recv_cap()` items claimed but not yet inserted).
+    // (The feeder prefetches nothing beyond that one item — `push_items`
+    // sends straight from the input iterator.)
+    ctx.note_in_flight(buffer + 1 + crate::handoff::batch_recv_cap());
+
+    let async_feeder = stages.first_consumer_is_async() == Some(true);
+    let feeder_cancel = ctx.cancel.clone();
+    debug_assert!(
+        cfg!(feature = "tokio-runtime") || !async_feeder,
+        "first_consumer_is_async == Some(true) requires an async runtime backend feature"
+    );
+
+    #[cfg(feature = "tokio-runtime")]
+    let (final_rx, feeder) = if async_feeder {
+        let (feeder_tx, feeder_rx) = sync_async_channel::<(u64, I)>(buffer);
+        let feeder = feed_items(
+            ctx.compute_pool(),
+            items,
+            feeder_tx,
+            feeder_cancel,
+            buffer,
+            ctx.dedicated_threads,
+            ctx.lease.as_ref(),
+        );
+        // `spawn_async_feeder_single` keeps the terminal MPSC property
+        // (same rationale as the sync branch's `spawn_single`): without
+        // it, async-first chains fell back to an MPMC final channel and
+        // the collector paid the per-item `lock cmpxchg` again.
+        (
+            stages.spawn_async_feeder_single::<R>(feeder_rx, ctx),
+            feeder,
+        )
+    } else {
+        let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
+        let feeder = feed_items(
+            ctx.compute_pool(),
+            items,
+            feeder_tx,
+            feeder_cancel,
+            buffer,
+            ctx.dedicated_threads,
+            ctx.lease.as_ref(),
+        );
+        // Use `spawn_single` so the terminal stage's output channel is MPSC
+        // (store-based dequeue, lock-free waker registry) — the collector is
+        // always the sole consumer of the final channel.
+        (stages.spawn_single::<R>(feeder_rx, ctx), feeder)
+    };
+    #[cfg(not(feature = "tokio-runtime"))]
+    let (final_rx, feeder) = {
+        let (feeder_tx, feeder_rx) = channel::<(u64, I)>(buffer);
+        let feeder = feed_items(
+            ctx.compute_pool(),
+            items,
+            feeder_tx,
+            feeder_cancel,
+            buffer,
+            ctx.dedicated_threads,
+            ctx.lease.as_ref(),
+        );
+        (stages.spawn_single::<R>(feeder_rx, ctx), feeder)
+    };
+
+    // Terminal-channel regression guard: both feeder paths must hand the
+    // collector a Single (MPSC) final channel — the collector is always
+    // the sole consumer. Async-first chains once silently degraded to the
+    // MPMC terminal (per-item `lock cmpxchg` in the collector); every
+    // debug-mode test run re-checks this here. `spawn_single` /
+    // `spawn_async_feeder_single` are required trait methods (no
+    // delegating default since todo #13), and `StageSpawn` is
+    // crate-private (not exported), so no impl can return a non-Single
+    // variant unnoticed.
+    #[cfg(feature = "tokio-runtime")]
+    debug_assert!(
+        matches!(
+            final_rx,
+            FinalRx::SyncSingle(_)
+                | FinalRx::SyncSharded(_)
+                | FinalRx::AsyncSingle(_)
+                | FinalRx::AsyncSharded(_)
+        ),
+        "terminal channel must be single-consumer (Single or Sharded variant)"
+    );
+    #[cfg(not(feature = "tokio-runtime"))]
+    debug_assert!(
+        matches!(final_rx, FinalRx::SyncSingle(_) | FinalRx::SyncSharded(_)),
+        "terminal channel must be single-consumer (Single or Sharded variant)"
+    );
+
+    (final_rx, feeder)
+}
+
+/// Terminal drain: resolve the ordered drain's reorder window, hand
+/// `final_rx` to the terminal sink, then re-raise any recorded feeder /
+/// async-stage panic ([`Feeder::finish`], `ctx.async_panic`).
+// The fallibility is the async-pool acquisition inside the drain closure
+// (`tokio-runtime` only) — same rationale as `try_exec`'s signature.
+#[cfg_attr(not(feature = "tokio-runtime"), allow(clippy::unnecessary_wraps))]
+fn drain_terminal<T, O, R>(
+    terminal: T,
+    final_rx: FinalRx<O>,
+    feeder: Feeder,
+    ordered: bool,
+    reorder_window: Option<NonZeroUsize>,
+    ctx: &StreamCtx<'_, R>,
+) -> std::io::Result<T::Out>
+where
+    T: Terminal<O>,
+    O: Send + Unpin + 'static,
+    R: AsyncRuntime,
+{
+    let n = ctx.n;
+    // Resolve the ordered drain's reorder window now that the spawn
+    // walk has accumulated the pipeline's in-flight occupancy: the auto
+    // window pre-sizes to that occupancy and grows to the sound
+    // `next_pow2(n)` ceiling (see `OrderedWindow`); an explicit
+    // `with_reorder_window` pin replaces both with the caller's ceiling.
+    let window = match reorder_window {
+        Some(w) => OrderedWindow::fixed(n, w),
+        None => OrderedWindow::auto(n, ctx.in_flight.get()),
+    };
+    // `ctx.cancel` feeds the ordered drain's accounting check: a fired
+    // token legitimately shortens the stream, exempting the equality
+    // form (see `OrderedAccounting`).
+    let cancel = ctx.cancel.as_ref();
+    // The drain runs under catch_unwind so a recorded async-stage panic
+    // (see `CatchTaskPanic`) wins over the ordered drain's accounting
+    // assertion: a panicked task drops its in-flight item, which would
+    // trip `emitted + dropped == n` with a misleading invariant message
+    // before the real payload could be re-raised. Any other drain panic
+    // (e.g. a user `for_each` closure on this thread) resumes unchanged.
+    let results = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match final_rx {
+        FinalRx::Sync(rx) => Ok(terminal.drain_sync(rx, ordered, window, n, cancel)),
+        FinalRx::SyncSingle(rx) => Ok(terminal.drain_sync(rx, ordered, window, n, cancel)),
+        FinalRx::SyncSharded(rx) => Ok(terminal.drain_sync_sharded(rx, ordered, window, n, cancel)),
+        #[cfg(feature = "tokio-runtime")]
+        FinalRx::Async(rx) => {
+            let pool = ctx.acquire_async()?;
+            Ok(pool.block_on(terminal.drain_async(rx, ordered, window, n, cancel)))
+        },
+        #[cfg(feature = "tokio-runtime")]
+        FinalRx::AsyncSingle(rx) => {
+            let pool = ctx.acquire_async()?;
+            Ok(pool.block_on(terminal.drain_async(rx, ordered, window, n, cancel)))
+        },
+        #[cfg(feature = "tokio-runtime")]
+        FinalRx::AsyncSharded(rx) => {
+            let pool = ctx.acquire_async()?;
+            Ok(pool.block_on(terminal.drain_async_sharded(rx, ordered, window, n, cancel)))
+        },
+    })) {
+        Ok(Ok(results)) => results,
+        // Runtime acquisition failure inside the closure: report it as
+        // the run's `Err`, exactly as the bare `?` did.
+        Ok(Err(e)) => return Err(e),
+        Err(drain_panic) => {
+            #[cfg(feature = "tokio-runtime")]
+            if let Some(slot) = ctx.async_panic.get() {
+                resume_stored_panic(slot);
+            }
+            std::panic::resume_unwind(drain_panic)
+        },
+    };
+
+    feeder.finish();
+    #[cfg(feature = "tokio-runtime")]
+    if let Some(slot) = ctx.async_panic.get() {
+        resume_stored_panic(slot);
+    }
+    Ok(results)
 }
 
 /// Sync collector: drains `rx` into a `Vec` via the shared drain loops —
@@ -5231,7 +5318,7 @@ mod tests {
     /// panic-propagation contract inherited from the old feeder thread's
     /// `join`) and is a no-op for the inline variant.
     /// Fence links report one forwarder slot each in `StageBudget` — the
-    /// lease reservation in `try_exec` counts them alongside stage workers
+    /// lease reservation in `resolve_admission` counts them alongside stage workers
     /// (regression guard for the pool-job conversion).
     #[test]
     fn test_fence_links_counted_in_stage_budget() {

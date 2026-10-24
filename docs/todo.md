@@ -51,9 +51,9 @@ The 2026-10 design analysis confirmed three hard constraints that must be solved
 
 ## Code health (refactoring / smells)
 
-### 13. [P2] correctness-adjacent items and miscellany
+### 13. ~~[P2] correctness-adjacent items and miscellany~~ (landed)
 
-- `try_exec`, ~257 lines, mixes four duties (admission/lease resolution, StreamCtx construction, feeder channel routing, terminal drain) → split out `resolve_admission` so the invariant comments sit next to the code that maintains them.
+- The `try_exec` split landed 2026-10-25 (r10): the run core now delegates to `resolve_admission` (admission/lease resolution + worker division, returned as an `Admission` bundle that carries the `StreamCtx` budget inits), `route_feeder` (feeder ring sizing + in-flight note, sync/mixed-mode channel pick, terminal Single-variant guard) and `drain_terminal` (reorder window, terminal drain dispatch, feeder/async-panic re-raise); `try_exec` keeps the entry gates and the `StreamCtx` wiring. Pure refactor — same call graph, zero public API change; every invariant comment moved with its code. Interleaved per-id A/B (base=main, 3 rounds, `stream_pipeline` + `sync_fuse/cancel_pair` ids): all reroute paths (with_fence −2.4…+0.2%, every cancel id −2.4…+3.6%) read mixed-sign layout noise; the fused-pass-through ids that never execute `try_exec` swung +25%/−9% — the documented single-CGU layout class (`.cargo/config.toml`), not a behavioral delta. Full native suite green; miri (tree-borrows) clean on `pipeline_integration`.
 
 ### 14. [P1] `pipeline_integration` intermittent hang, residual (stream side)
 
