@@ -7,6 +7,7 @@ timeouts and the required flag combinations):
 ```sh
 perf/verify/miri.sh            # lib + integration binaries + vendored crossfire lib
 perf/verify/loom.sh            # youpipe + vendored queue + crossfire + st3 models
+perf/verify/linkcheck.sh       # mdbook intra-book link targets (docs/src)
 ```
 
 The `youpipe-sys` crate (workspace member `crates/youpipe-sys`) provides a
