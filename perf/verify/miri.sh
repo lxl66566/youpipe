@@ -37,14 +37,35 @@ fi
 
 export MIRIFLAGS=${MIRIFLAGS:--Zmiri-tree-borrows -Zmiri-ignore-leaks}
 
-# ── 2. per-binary timeout; the default target list covers lib + all
-#       integration binaries + doctests (doc tests are cheap here and caught
-#       8 examples). Override with MIRI_TARGETS="lib compute_pool ...".
+# ── 2. per-binary timeout; the default target list covers lib + doctests +
+#       every miri-meaningful integration binary, ordered cheap→heavy so a
+#       fresh regression surfaces early (per-target durations: testing.md
+#       "Suite duration census"). Two binaries are deliberately absent:
+#         - hybrid_assist: its only test is #[cfg_attr(miri, ignore)]
+#           (24-thread timing stress); the safety angle of assist stays
+#           covered by compute_pool's deterministic hybrid-driver test.
+#         - profile_guard: asserts native debug-assertions config — not
+#           unsafe-adjacent, meaningless under the interpreter.
+#         - ordered_window: the B6/P-1 repro shapes are size-pinned (n > 1 Mi
+#           IS the 1 Mi-window-clamp bug boundary); scaling vacates the
+#           assertion and unscaled n costs hours interpreted. The window
+#           bookkeeping itself has lib unit tests (miri-covered via lib).
+#         - stream_reduce_alloc: the counter's signal needs N ≥ 1<<17
+#           (≥1 MiB output allocation) and the streaming topology measures
+#           ~33 ms/item-pass under miri — hours for 5 passes. Its
+#           delegating-only GlobalAlloc shim class is miri-covered via
+#           expand_alloc / pipe_range_alloc / submit_batch_alloc.
+#       Override with MIRI_TARGETS="lib compute_pool ...".
 #       Valid names: lib, doc, or any --test target.
 if [[ -n ${MIRI_TARGETS:-} ]]; then
     TARGETS=($MIRI_TARGETS)
 else
-    TARGETS=(lib doc compute_pool handoff_channel pipeline_integration scope_integration)
+    TARGETS=(lib doc handoff_channel scope_integration
+             submit_batch_alloc filter_collect_panic pipe_range_alloc
+             on_pool_nested pool_cache stream_reduce expand_alloc
+             cancel_outcome async_waker_alloc sharded_terminal
+             batch_recv graph_dag sharded_terminal_async
+             compute_pool pipeline_integration)
 fi
 
 run_target() { # name -> cargo args on stdout

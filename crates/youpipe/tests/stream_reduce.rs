@@ -4,6 +4,9 @@
 
 use youpipe::{CancellationToken, stream};
 
+// Miri: both item counts scale /20 (exact-match assertions are
+// size-independent — same convention as the other integration suites).
+
 /// Never cancelled — only forces the chain off the fused pass-through.
 fn inert() -> CancellationToken {
     CancellationToken::new()
@@ -16,7 +19,11 @@ fn bump(x: u64) -> u64 {
 #[test]
 #[allow(clippy::cast_possible_truncation)] // test sizes fit usize everywhere
 fn streaming_aggregations_match_sequential() {
-    let n = 1000_u64;
+    let n = if cfg!(miri) {
+        50_u64
+    } else {
+        1000_u64
+    };
     let expected: Vec<u64> = (0..n).map(bump).collect();
 
     let chained = || {
@@ -117,7 +124,11 @@ fn streaming_aggregations_empty_and_single() {
 #[test]
 #[allow(clippy::cast_possible_truncation)] // test sizes fit usize everywhere
 fn streaming_aggregations_async_stage() {
-    let n = 500_u64;
+    let n = if cfg!(miri) {
+        25_u64
+    } else {
+        500_u64
+    };
     let expected: u64 = (0..n).map(bump).sum::<u64>();
 
     let s = stream((0..n).collect::<Vec<_>>())

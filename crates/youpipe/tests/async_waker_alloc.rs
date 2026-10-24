@@ -64,7 +64,14 @@ fn async_stage_waker_alloc_wiring() {
     // input channel fills (feeder parks per drain), the stage tasks and the
     // collector park on burst gaps. io_concurrency pinned so the endpoint
     // count stays single-digit.
-    let n = 512_u64;
+    // Miri /4: only the parking pattern matters (waker-class alloc counts
+    // against the <=256 bound), and each item burns 2000 interpreted
+    // iterations in the slow stage — full n dominates the miri run.
+    let n = if cfg!(miri) {
+        128_u64
+    } else {
+        512_u64
+    };
     let before = waker_class();
     let out = stream(0..n)
         .stage_async_with(

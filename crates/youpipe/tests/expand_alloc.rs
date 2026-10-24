@@ -74,7 +74,14 @@ fn emit_group(x: u64, out: &mut Vec<u64>) {
 
 #[test]
 fn expand_emit_zero_steady_state_allocations() {
-    let n = 1024_u64;
+    // Miri /8: every assertion is a per-item relative count (steady-state
+    // group-sized allocations must be zero), so a smaller n keeps the
+    // contract while cutting the interpreted topology passes.
+    let n = if cfg!(miri) {
+        128_u64
+    } else {
+        1024_u64
+    };
 
     // Warm up the global pool, its worker deques, and the channels so the
     // measured phases only contain steady-state traffic.
