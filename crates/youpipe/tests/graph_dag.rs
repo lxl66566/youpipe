@@ -426,6 +426,50 @@ fn cancel_mid_run_truncates() {
     );
 }
 
+/// Mid-run cancel under maximal ring pressure (every node-pinned edge at
+/// buffer 1): delivery is cancellation-blind — an accepted batch parks per
+/// item on a full ring until the downstream drains or exits — so this pins
+/// the drain cascade's liveness: the run must still finish promptly and
+/// truncate (todo #21; the flush never drops to dodge the park).
+#[test]
+#[cfg_attr(miri, ignore)] // wall-clock cancellation timing
+fn cancel_mid_run_tight_rings_drains() {
+    let n: u64 = 20_000;
+    let token = CancellationToken::new();
+    let mut g = graph();
+    let src = g.source("load", 0..n);
+    let tight = NodeOptions::new().buffer(1);
+    let a = g.node("a", tight, |x: u64| x.wrapping_mul(3).wrapping_add(1));
+    let b = g.node("b", tight, |x: u64| x.wrapping_add(1));
+    let (seen, sink) = collector_sink::<u64>();
+    let out = g.sink("out", sink);
+    g.edge(src, a).edge(a, b).edge(b, out);
+    g = g.with_cancel(token.clone());
+    {
+        let token = token.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            token.cancel();
+        });
+    }
+
+    let start = Instant::now();
+    run_with_timeout("tight-ring cancel", move || g.run());
+
+    // Serial full-chain work is far above this bound (see the test above);
+    // the cancel must drain the parked flushes, not park forever.
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "cancelled tight-ring run must drain quickly, took {:?}",
+        start.elapsed()
+    );
+    let got = seen.lock().unwrap().len();
+    assert!(
+        u64::try_from(got).unwrap() < n,
+        "cancelled run stopped early: {got}/{n}"
+    );
+}
+
 /// Pre-fired token: the run returns immediately with at most the in-flight
 /// items — no sleeps needed, so this stays miri-friendly.
 #[test]

@@ -7,11 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{
-    builder::cancel_active,
-    handoff::{Claim, Receiver, SyncSender, claim_poll, stage_batch},
-    sync::CancellationToken,
-};
+use crate::handoff::{Claim, Receiver, SyncSender, claim_poll, stage_batch};
 
 // ── Graph data-plane batching knob ──
 //
@@ -363,20 +359,27 @@ impl<T: Send + Clone + 'static> Broadcast<T> {
     /// per-edge clone staging (`extend(iter().cloned())`) holds
     /// trivially-droppable iterators and can stay.
     ///
-    /// Abort semantics match `send`'s per-item loop: on cancel or a closed
-    /// edge the unsent remainder is dropped (`assume_init_drop` — a
-    /// `Vec<MaybeUninit<_>>` drop would skip the destructors).
+    /// Cancellation is deliberately not consulted here
+    /// (`SendItem::send_batch` parity, todo #21): the acceptance point is
+    /// the caller's — workers check the token once per claim batch before
+    /// mapping — and an accepted batch is delivered in full. On a full ring
+    /// the per-item fallback parks until the consumer claims or every
+    /// receiver drops; under cancel that park always resolves (downstream
+    /// workers exit on their next token check and drop their receivers,
+    /// whose close wakes parked senders with `Closed`), so the emitted set
+    /// never depends on ring pressure. A closed edge still drops its unsent
+    /// remainder (`assume_init_drop` — a `Vec<MaybeUninit<_>>` drop would
+    /// skip the destructors).
     pub(crate) fn send_batch(
         &mut self,
         batch: &mut Vec<T>,
         staged: &mut Vec<MaybeUninit<T>>,
-        cancel: Option<&CancellationToken>,
     ) -> bool {
         let mut i = 0;
         while i + 1 < self.txs.len() {
             staged.clear();
             staged.extend(batch.iter().cloned().map(MaybeUninit::new));
-            if self.flush_edge(i, staged, cancel) {
+            if self.flush_edge(i, staged) {
                 i += 1;
             } else {
                 self.txs.swap_remove(i);
@@ -387,7 +390,7 @@ impl<T: Send + Clone + 'static> Broadcast<T> {
         }
         let last = self.txs.len() - 1;
         stage_batch(batch, staged);
-        if !self.flush_edge(last, staged, cancel) {
+        if !self.flush_edge(last, staged) {
             self.txs.swap_remove(last);
         }
         !self.txs.is_empty()
@@ -395,22 +398,13 @@ impl<T: Send + Clone + 'static> Broadcast<T> {
 
     /// Flush one fully-initialized `staged` batch through edge `i`: the
     /// free prefix goes out with one `try_send_batch`, the remainder
-    /// per-item (parking at most once per full ring, cancel checked before
-    /// every blocking send — `push_items` parity). Returns whether the
-    /// edge survived.
-    fn flush_edge(
-        &self,
-        i: usize,
-        staged: &mut [MaybeUninit<T>],
-        cancel: Option<&CancellationToken>,
-    ) -> bool {
+    /// per-item (parking at most once per full ring, cancellation-blind —
+    /// see [`send_batch`](Self::send_batch)). Returns whether the edge
+    /// survived.
+    fn flush_edge(&self, i: usize, staged: &mut [MaybeUninit<T>]) -> bool {
         let sent = self.txs[i].try_send_batch(staged);
         let mut j = sent;
         while j < staged.len() {
-            if cancel_active(cancel) {
-                drop_staged(&mut staged[j..]);
-                return true;
-            }
             // SAFETY: only [..j) was moved out; slot `j` is still initialized.
             let item = unsafe { staged[j].assume_init_read() };
             j += 1;
@@ -451,13 +445,13 @@ mod tests {
         let mut b = Broadcast::new(vec![tx1, tx2, tx3]);
         let mut batch = vec![1, 2, 3];
         let mut staged = Vec::new();
-        assert!(b.send_batch(&mut batch, &mut staged, None));
+        assert!(b.send_batch(&mut batch, &mut staged));
         assert_eq!(drain_n(&rx1, 3), vec![1, 2, 3]);
         assert_eq!(drain_n(&rx2, 3), vec![1, 2, 3]);
         assert_eq!(drain_n(&rx3, 3), vec![1, 2, 3]);
         drop(rx2); // one edge closed
         let mut batch = vec![4, 5];
-        assert!(b.send_batch(&mut batch, &mut staged, None));
+        assert!(b.send_batch(&mut batch, &mut staged));
         assert_eq!(drain_n(&rx1, 2), vec![4, 5]);
         assert_eq!(drain_n(&rx3, 2), vec![4, 5]);
     }
@@ -472,30 +466,57 @@ mod tests {
         let mut b = Broadcast::new(vec![tx]);
         let mut batch = vec![1, 2, 3, 4, 5];
         let mut staged = Vec::new();
-        assert!(b.send_batch(&mut batch, &mut staged, None));
+        assert!(b.send_batch(&mut batch, &mut staged));
         assert_eq!(drainer.join().unwrap(), vec![1, 2, 3, 4, 5]);
     }
 
-    /// Cancel during the per-item fallback drops the unsent remainder
-    /// without parking; the already-sent prefix stays delivered and the
-    /// edges stay open (the caller's loop exits on its next check).
+    /// Delivery is cancellation-blind (todo #21): a fired token must not
+    /// change the emitted set — the whole batch is delivered even when the
+    /// ring is full (the per-item fallback parks for the drainer), so no
+    /// output depends on ring pressure. Sweep the capacity: the emitted set
+    /// is identical at every pressure level.
     #[test]
-    fn send_batch_cancel_drops_remainder_without_parking() {
-        let (tx, rx) = channel::<u32>(1);
-        let cancel = CancellationToken::new();
-        let mut b = Broadcast::new(vec![tx]);
-        // Fill the ring so the fallback path is reached.
-        let mut batch = vec![1, 2, 3];
-        let mut staged = Vec::new();
-        cancel.cancel();
-        assert!(b.send_batch(&mut batch, &mut staged, Some(&cancel)));
-        // Item 1 fit the free slot (try_send_batch prefix); 2 and 3 were
-        // dropped by the cancel check — the call must not park on Full.
-        assert_eq!(drain_n(&rx, 1), vec![1]);
-        assert!(matches!(
-            rx.try_recv(),
-            Err(crate::handoff::TryRecvError::Empty)
-        ));
+    fn send_batch_cancelled_token_still_delivers_full_batch() {
+        for cap in [1, 2, 7] {
+            let (tx, rx) = channel::<u32>(cap);
+            let drainer = std::thread::spawn(move || drain_n(&rx, 5));
+            let cancel = crate::sync::CancellationToken::new();
+            cancel.cancel();
+            let mut b = Broadcast::new(vec![tx]);
+            let mut batch = vec![1, 2, 3, 4, 5];
+            let mut staged = Vec::new();
+            assert!(b.send_batch(&mut batch, &mut staged), "cap {cap}");
+            assert!(batch.is_empty(), "cap {cap}: batch must be drained");
+            assert_eq!(drainer.join().unwrap(), vec![1, 2, 3, 4, 5], "cap {cap}");
+        }
+    }
+
+    /// Same emitted set across the knob-equivalent paths and ring pressures
+    /// (todo #21): the per-item `send` loop (tx-batch knob off) and
+    /// `send_batch` (knob on) deliver identical item sets under a fired
+    /// token — acceptance granularity may differ per path, delivery never
+    /// does.
+    #[test]
+    fn send_and_send_batch_emit_identical_sets_under_cancel() {
+        for cap in [1, 2, 7] {
+            let items: Vec<u32> = (0..8).collect();
+            let cancel = crate::sync::CancellationToken::new();
+            cancel.cancel();
+            let (tx1, rx1) = channel::<u32>(cap);
+            let d1 = std::thread::spawn(move || drain_n(&rx1, 8));
+            let mut per_item = Broadcast::new(vec![tx1]);
+            for it in items.iter().copied() {
+                assert!(per_item.send(it), "cap {cap}");
+            }
+            let (tx2, rx2) = channel::<u32>(cap);
+            let d2 = std::thread::spawn(move || drain_n(&rx2, 8));
+            let mut batched = Broadcast::new(vec![tx2]);
+            let mut owned = items.clone();
+            let mut staged = Vec::new();
+            assert!(batched.send_batch(&mut owned, &mut staged), "cap {cap}");
+            assert_eq!(d1.join().unwrap(), items, "cap {cap}");
+            assert_eq!(d2.join().unwrap(), items, "cap {cap}");
+        }
     }
 
     /// Every edge closed: `false`, the worker-exit signal.
@@ -508,7 +529,7 @@ mod tests {
         let mut b = Broadcast::new(vec![tx1, tx2]);
         let mut batch = vec![1, 2];
         let mut staged = Vec::new();
-        assert!(!b.send_batch(&mut batch, &mut staged, None));
+        assert!(!b.send_batch(&mut batch, &mut staged));
     }
     /// Liveness regression (the graph-side shape of todo #14's intermittent
     /// hang): a fan-in worker anchored while one input is empty must still

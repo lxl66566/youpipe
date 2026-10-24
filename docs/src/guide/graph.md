@@ -91,8 +91,12 @@ seen every upstream close.
 
 **Cancellation.** `with_cancel(token)` checks the
 [`CancellationToken`](https://docs.rs/youpipe/latest/youpipe/struct.CancellationToken.html)
-per item on every node. After `token.cancel()` no new items are accepted,
-in-flight items finish, and `run()` returns promptly with the partial output
+on every node between claim batches — the batched data plane checks once per
+claim batch, so up to one batch per worker can still be accepted after
+`token.cancel()`; per-item paths check per item. An accepted batch is mapped
+and delivered in full: delivery never consults the token and parks on full
+rings instead of dropping, so what a sink receives never depends on ring
+pressure. `run()` returns promptly with the partial output
 (your sinks keep whatever they already consumed). `run_checked()` reports the
 difference instead: `RunOutcome::Completed(())` versus
 `RunOutcome::Cancelled` — the graph engine has no collector, so its `emitted`

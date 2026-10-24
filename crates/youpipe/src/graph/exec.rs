@@ -206,7 +206,9 @@ impl GraphCore {
 ///
 /// With the tx-batch knob on, items are staged in `cap`-sized batches and
 /// each edge takes one `try_send_batch` per free run (`send_batch`); the
-/// per-item path below is the knob-off baseline.
+/// per-item path below is the knob-off baseline. Cancel acceptance is per
+/// staged batch in the batched arm (the check precedes the send), per item
+/// in the baseline; delivery itself never consults the token.
 fn source_feeder_worker<T, I>(iter: I, mut out: Broadcast<T>, cancel: Option<&CancellationToken>)
 where
     T: Send + Clone + 'static,
@@ -245,7 +247,7 @@ where
         if cancel_active(cancel) {
             return;
         }
-        if !out.send_batch(&mut batch, &mut staged, cancel) {
+        if !out.send_batch(&mut batch, &mut staged) {
             return;
         }
     }
@@ -257,6 +259,13 @@ where
 /// with one `try_send_batch` per free run (single-item claims —
 /// `claim_cap == 0` — keep the per-item send: staging a 1-item batch only
 /// adds moves).
+///
+/// Cancel acceptance is per claim batch in the batched arm (the token check
+/// precedes the batch's mapping, so up to `claim_cap` items can be accepted
+/// after the fire) and per item in the per-item arm; either way an accepted
+/// item is always delivered — the sends never consult the token — so the
+/// emitted set is independent of ring pressure (todo #21, the stream
+/// engine's contract).
 fn node_worker<I, O, F>(
     f: &F,
     mut fanin: FanIn<I>,
@@ -284,7 +293,7 @@ fn node_worker<I, O, F>(
             }
             mapped.clear();
             mapped.extend(scratch.drain(..).map(f));
-            if !out.send_batch(&mut mapped, &mut staged, cancel) {
+            if !out.send_batch(&mut mapped, &mut staged) {
                 return; // every output edge closed
             }
         } else {
@@ -339,13 +348,13 @@ fn expand_worker<I, O, F>(
                 f(item, &mut buf);
                 mapped.append(&mut buf);
                 if mapped.len() >= flush_cap {
-                    if !out.send_batch(&mut mapped, &mut staged, cancel) {
+                    if !out.send_batch(&mut mapped, &mut staged) {
                         return;
                     }
                     mapped.clear();
                 }
             }
-            if !mapped.is_empty() && !out.send_batch(&mut mapped, &mut staged, cancel) {
+            if !mapped.is_empty() && !out.send_batch(&mut mapped, &mut staged) {
                 return;
             }
         } else {

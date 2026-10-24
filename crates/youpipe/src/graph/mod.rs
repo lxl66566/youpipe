@@ -389,10 +389,15 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     }
 
     /// Attach a [`CancellationToken`]: every worker / feeder / task checks it
-    /// per batch and drains fast once fired; `run` then returns normally
-    /// (use [`run_checked`](Self::run_checked) to observe the cancellation
-    /// instead of checking the token yourself). A worker panic also cancels
-    /// the token (user-supplied or internal) to accelerate the drain.
+    /// between claim batches — the batched data plane once per claim batch
+    /// (up to that many items can be accepted after `cancel()`), per-item
+    /// paths per item — and drains fast once fired. A batch accepted before
+    /// the fire is mapped and delivered in full: delivery never consults the
+    /// token, so the emitted set is independent of ring pressure. `run` then
+    /// returns normally (use [`run_checked`](Self::run_checked) to observe
+    /// the cancellation instead of checking the token yourself). A worker
+    /// panic also cancels the token (user-supplied or internal) to
+    /// accelerate the drain.
     #[must_use]
     pub fn with_cancel(mut self, token: CancellationToken) -> Self {
         self.cancel = Some(token);
