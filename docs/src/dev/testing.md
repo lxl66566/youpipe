@@ -301,25 +301,66 @@ limitation); `cargo test` covers them at the 2 s figure above.
 
 ## Miri (miri.sh default targets, tree-borrows + ignore-leaks)
 
-Full miri was deliberately not run (round rule); counts from `-- --list`
-per target, durations from stratified subset runs, extrapolation
-mid-anchored and ±50 %.
+Coverage refresh 2026-10-25 (todo #18): every integration binary added to
+the default list was measured IN FULL under `bench.lock` (per-target
+`MIRI_TIMEOUT_SECS`, miri.sh's `==>` timestamps); lib / doc / handoff /
+scope / compute_pool / pipeline_integration keep the census estimates.
+youpipe-crossfire lib is now measured (27 s full — the old ~4 min was an
+extrapolation artifact).
 
-| target                | listed / miri-ignored | measured slice                            | extrapolated |
-| --------------------- | --------------------- | ----------------------------------------- | ------------ |
-| lib                   | 152 / 2               | 30 tests / 117 s (reorder+window 4.5 s, fanin/graph/fused 4.3 s, sharded 0.4 s per test) | ~9 min |
-| compute_pool          | 5 / 0                 | full binary: 71.6 s (hybrid-driver test dominates) | 72 s |
-| handoff_channel       | 8 / 0                 | full binary: 2.9 s                        | 3 s |
-| pipeline_integration  | 108 / 14              | heavy 55.7 / 75.7 s per test, light 3.4 s, mid 5 tests / 117.3 s | **~31 min** |
-| scope_integration     | 26 / 3                | 4 tests / 3.7 s                           | ~21 s |
-| doc                   | 33 / 1                | full target: 118 s                        | 2 min |
-| youpipe-crossfire lib | 52 / 0                | 9 'batch' tests / 42.3 s                  | ~4 min |
+| target                | listed / miri-ignored | duration (full binary)        |
+| --------------------- | --------------------- | ----------------------------- |
+| lib                   | 152 / 2               | ~9 min (extrapolated)         |
+| doc                   | 33 / 1                | 2 min (measured)              |
+| handoff_channel       | 8 / 0                 | 3 s (measured)                |
+| scope_integration     | 26 / 3                | ~21 s (extrapolated)          |
+| submit_batch_alloc    | 1 / 0                 | 5 s                           |
+| filter_collect_panic  | 1 / 0                 | 5 s                           |
+| pipe_range_alloc      | 1 / 0                 | 12 s                          |
+| on_pool_nested        | 6 / 0                 | 26 s                          |
+| pool_cache            | 6 / 3                 | 21 s                          |
+| stream_reduce         | 4 / 0                 | 10 s (miri /20 divisor added; was 116 s unscaled) |
+| expand_alloc          | 1 / 0                 | 20 s (miri /8 divisor added; was 187 s unscaled) |
+| cancel_outcome        | 5 / 0                 | 63 s (already /20-scaled)     |
+| async_waker_alloc     | 1 / 0                 | 169 s (miri /4 divisor added; was 238 s unscaled — the fixed floor-proof loop dominates) |
+| sharded_terminal      | 1 / 0                 | 48 s                          |
+| batch_recv            | 5 / 0                 | 30 s                          |
+| graph_dag             | 20 / 2                | 85 s                          |
+| sharded_terminal_async| 1 / 0                 | 281 s (12 full async topologies; scenario count is the floor) |
+| compute_pool          | 5 / 0                 | 72 s (hybrid-driver test dominates) |
+| pipeline_integration  | 108 / 14              | **~31 min** (extrapolated ±50 %; heavy tier 55–76 s/test) |
+| youpipe-crossfire lib | 52 / 0                | 27 s (measured)               |
 
-Total ≈ **45–50 min**, two thirds of it pipeline_integration. Miri
-amplification over native is shape-dependent (35× on the ordered-stress
-shape, ~1700× on fence_large_input), so per-test extrapolation inside
-that binary carries the ±50 % above; a one-off timed full pass (with
-`MIRI_TIMEOUT_SECS=1800` per binary) is the cheap follow-up that pins it.
+Sum of the 13 added integration binaries ≈ **13 min**; projected default
+pass ≈ **57 min** with pipeline_integration's ±50 % dominating the error
+bar. Bringing the pass back under ~48 min is todo #19's divisor work on
+exactly that block (its heavy tier is 2/3 of the pass) plus compute_pool.
+
+Deliberately NOT in the default list (reasons inlined in miri.sh too):
+
+- `hybrid_assist` — its only test is `#[cfg_attr(miri, ignore)]`
+  (24-thread timing stress); the safety angle stays covered by
+  compute_pool's deterministic hybrid-driver test.
+- `profile_guard` — asserts native debug-assertions config; not
+  unsafe-adjacent, meaningless under the interpreter.
+- `ordered_window` — the B6/P-1 repro shapes are size-pinned (n > 1 Mi IS
+  the 1 Mi-window-clamp bug boundary); scaling vacates the assertion and
+  unscaled n = 100 K–1.1 M items projects to hours (killed at 150 s on
+  test 2/4). The `OrderedWindow` bookkeeping itself has lib unit tests
+  (miri-covered via lib).
+- `stream_reduce_alloc` — the counter's signal needs N ≥ 1<<17 (≥1 MiB
+  output allocation vs the size filter) and the streaming topology
+  measures ~33 ms/item-pass under miri (stream_reduce scaled: 10 s for
+  ~300 item-passes), so 5 × 131 K passes projects to hours (killed at
+  125 s). Its delegating-only GlobalAlloc shim class is miri-covered via
+  expand_alloc / pipe_range_alloc / submit_batch_alloc.
+
+Miri amplification over native is shape-dependent (35× on the
+ordered-stress shape, ~1700× on fence_large_input, ~0.1 ms/item on the
+park-free pipe_range path vs ~33 ms/item-pass on the streaming topology),
+so per-test extrapolation inside pipeline_integration keeps its ±50 %; a
+one-off timed full pass (with `MIRI_TIMEOUT_SECS=1800` per binary) is the
+cheap follow-up that pins it.
 
 The miri build itself is cheap (`cargo miri test --no-run` 6 s after a
 native build; per-binary interpreter startup ≤ 4 s).

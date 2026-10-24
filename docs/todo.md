@@ -88,10 +88,10 @@ A seq-less unordered channel flavor (dropping the `(u64, T)` tag; `spawn_stage`'
 
 ## Verification suite (coverage / duration)
 
-### 18. [P1] miri.sh default target list is stale — graph_dag and batch_recv uncovered
+### 18. [P0→closed] miri.sh default target list is stale — graph_dag and batch_recv uncovered
 
-- The runner's comment claims the default target list "covers lib + all integration binaries", but it predates the 2026-10 test-binary growth: it names 4 of today's 20 integration binaries (compute_pool, handoff_channel, pipeline_integration, scope_integration). Uncovered despite being miri-aware (`cfg!(miri)` scaling, miri-ignored walls already annotated): graph_dag (20 tests — the DAG conservation/deadlock shapes; the anchor liveness regressions themselves live in the lib and stay covered), batch_recv (the `MaybeUninit` staging / `try_send_batch` / `send_batch` drop paths — exactly the unsafe 7d3cff3 touched), ordered_window, sharded_terminal(_async), stream_reduce(_alloc), on_pool_nested, pool_cache, hybrid_assist, expand_alloc, pipe_range_alloc, filter_collect_panic, submit_batch_alloc, async_waker_alloc.
-- Adding graph_dag + batch_recv is the priority (both miri-ran clean during their landing rounds); the rest costs ~10–15 min more — pick against the duration table in [testing.md](src/dev/testing.md) "Suite duration census".
+- Status: **closed (2026-10-25)**. The default list now runs 13 more integration binaries, each measured in full under miri (durations in [testing.md](src/dev/testing.md) "Suite duration census"): graph_dag 85 s, batch_recv 30 s, cancel_outcome 63 s, sharded_terminal 48 s, sharded_terminal_async 281 s, expand_alloc 20 s (miri /8 added), pipe_range_alloc 12 s, filter_collect_panic 5 s, submit_batch_alloc 5 s, async_waker_alloc 169 s (miri /4 added), stream_reduce 10 s (miri /20 added), on_pool_nested 26 s, pool_cache 21 s — ≈13 min added. Four binaries stay out with reasons (inlined in miri.sh): hybrid_assist (only test is `#[cfg_attr(miri, ignore)]`), profile_guard (native config guard), ordered_window (size-pinned >1 Mi repro shapes; scaling vacates the assertion), stream_reduce_alloc (needs N ≥ 1<<17 for its ≥1 MiB counter signal → hours interpreted).
+- Residual: the projected default pass is ≈57 min until todo #19's pipeline_integration divisor work lands (that binary is still ~31 min of the total).
 
 ### 19. [P2] suite-duration trims (census 2026-10-25)
 
