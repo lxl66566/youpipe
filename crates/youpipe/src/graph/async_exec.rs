@@ -31,7 +31,6 @@ use crate::{
 /// same MPMC-competition shape as the sync [`FanIn`](super::fanin::FanIn),
 /// with an any-of-N awaited anchor instead of a blocking one). EOF is
 /// every input disconnected.
-/// disconnected.
 pub(crate) struct AsyncFanIn<T: Send + Unpin + 'static> {
     rxs: Vec<AsyncReceiver<T>>,
     /// Closed inputs are never polled again.

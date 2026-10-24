@@ -126,7 +126,7 @@ Graph-level knobs (same semantics as the stream engine):
 | Method | Effect |
 | --- | --- |
 | `with_compute_pool(pool)` | sync nodes run on this pool instead of the default |
-| `with_compute_workers(n)` | size of the per-run compute pool |
+| `with_compute_workers(n)` | pin the compute-worker budget divided across sync nodes |
 | `with_buffer_size(n)` | capacity of every edge channel (backpressure) |
 | `with_cancel(token)` | attach a cancellation token |
 | `with_async_pool(pool)` | reuse an `AsyncRuntime` pool across runs |

@@ -71,20 +71,18 @@ Items from the 2026-10-20 three-way audit that were not scheduled into the adjac
 
 A seq-less unordered channel flavor (dropping the `(u64, T)` tag; `spawn_stage`'s unification rationale is at `crates/youpipe/src/builder/typed/stream.rs:611`) would halve per-item slot bytes for `u64` payloads, but it splits every spawn path per ordering. The expected win is single-digit % at best on cache-bound shapes. Worth only a throwaway prototype.
 
-### 20. [P2] `Broadcast::send_batch` re-introduces the extend-over-drain staging 7d3cff3 removed
+### 20. ~~[P2] `Broadcast::send_batch` re-introduces the extend-over-drain staging 7d3cff3 removed~~ (landed)
 
-- graph/fanin.rs `send_batch`'s last-edge staging is `staged.extend(batch.drain(..).map(MaybeUninit::new))` — the exact `Map<Drain<T>>` drop-glue/landing-pad class commit 7d3cff3 eradicated from `SendItem::send_batch` (single-CGU layout hazard documented in `.cargo/config.toml`; that class regressed horizontal cpu_balanced +33-40 % once, through code the staging never executes). Make `stage_batch` pub(crate) in handoff/channel.rs and route the last edge through it; the per-edge clone staging (`extend(iter().cloned())`) holds trivially-droppable iterators and can stay.
+- Landed 2026-10-25 (r10): the last edge routes through the now-pub(crate) `stage_batch`; the recompile A/B gate (graph_shapes, 5 per-id interleaved rounds) read all-noise with the stream controls within ±1.2 %. Readings: [benchmarks/graph.md](src/dev/benchmarks/graph.md) "Broadcast staging drop-glue audit".
 
-### 21. [P2] graph-engine cancel semantics diverge from the stream engine's
+### 21. ~~[P2] graph-engine cancel semantics diverge from the stream engine's~~ (landed)
 
-- Acceptance granularity: `node_worker`'s batched arm checks the token once per claim batch (up to `batch_recv_cap` items accepted after cancel) while the stream engine's batched arm checks before every stage call ("the same item set the per-item loop sends") and the graph per-item arm checks per item. `GraphBuilder::with_cancel`'s doc says "per batch", guide/graph.md says "per item" — the guide overstates.
-- Delivery on cancel: `Broadcast::flush_edge` drops mapped-but-unsent items when the token fires with a full output ring (`send_batch_cancel_drops_remainder_without_parking` pins it deliberately), while `SendItem::send_batch` has no cancellation hook by design and delivers every mapped output. The same graph can therefore emit different item sets depending on `YOUPIPE_GRAPH_TX_BATCH` and ring pressure. Harmonize with the stream contract or state the divergence in guide/graph.md's Cancellation paragraph.
+- Landed 2026-10-25 (r10): acceptance stays batch-granular (per-item token checks would tax the batched claims) and is now documented as such (`with_cancel` rustdoc; guide/graph.md's "per item" overclaim fixed); delivery is cancellation-blind — `Broadcast::send_batch`/`flush_edge` drop the token parameter (`SendItem::send_batch` parity) and park per item on a full ring instead of dropping the mapped remainder, so the emitted set no longer depends on ring pressure or `YOUPIPE_GRAPH_TX_BATCH`. Every park resolves under cancel (downstream drains or exits; the receivers' drop closes the ring and wakes parked senders). Mechanism and tests: [streaming.md](src/dev/streaming.md) "Graph cancel semantics".
 
-### 22. [P3] review miscellany (2026-10-25 audit, non-blocking)
+### 22. ~~[P3] review miscellany (2026-10-25 audit, non-blocking)~~ (landed)
 
-- guide/graph.md tuning table: `with_compute_workers(n)` reads "size of the per-run compute pool" — it pins the worker budget divided across sync nodes (see `GraphBuilder::with_compute_workers`'s doc), not the pool size.
-- graph/async_exec.rs module doc: duplicated word ("disconnected." on its own line).
-- `FanIn::anchor` allocates an `order` Vec + `Select` per park episode and per close re-anchor; hoistable into per-worker scratch (park path only, minor).
+- Landed 2026-10-25 (r10): guide tuning-table wording fixed ("pin the compute-worker budget divided across sync nodes"); async_exec module doc deduplicated.
+- The `FanIn::anchor` scratch hoist is falsified: hoisting the per-episode `order` Vec into a FanIn field measured a stable regression on the @1K graph_shapes chain/diamond ids (+3.7…+6.3 %, dominance 0/25, side spreads <3 %, stream controls flat; the `Select` itself is not hoistable — its handlers borrow the receivers for the episode's lifetime). Left as a per-episode Vec with the measurement recorded at the allocation site; readings in [benchmarks/graph.md](src/dev/benchmarks/graph.md) "Any-of-N fan-in anchors" addendum.
 
 ## Verification suite (coverage / duration)
 

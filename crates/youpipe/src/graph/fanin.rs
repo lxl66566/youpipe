@@ -159,6 +159,16 @@ impl<T: Send + 'static> FanIn<T> {
             let n = self.rxs.len();
             // Registration order follows the cursor rotation so the
             // select's round-robin starts where our round did.
+            //
+            // `order` is a fresh Vec per park episode and per close
+            // re-anchor; hoisting it into per-worker scratch (a FanIn
+            // field) was measured as a stable regression on the @1K
+            // graph_shapes chain/diamond ids (+3.7…+6.3 %, dominance 0/25,
+            // side spreads <3 %, stream controls flat; 2026-10-25 A/B) —
+            // the park-path saving does not pay for the hot-path
+            // disturbance. The `Select` cannot be hoisted either way: its
+            // handlers borrow the receivers for the episode's lifetime, so
+            // storing it in FanIn would be self-referential.
             let mut order: Vec<usize> = Vec::with_capacity(n);
             let mut sel = crossfire::select::Select::new();
             for k in 0..n {
