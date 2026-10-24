@@ -16,6 +16,17 @@ BENCH_SAMPLE_SIZE=100 BENCH_WARMUP_MS=3000 BENCH_MEASUREMENT_MS=5000 \
 
 For A/B verdicts use `perf/bench-suite` (interleaved rounds, CPU pinning, median-of-rounds comparison) rather than back-to-back full-group passes: the stream family has ±10 % inter-run drift, and the 100 K fused family is subject to the whole-group measurement trap documented in [attribution.md](attribution.md).
 
+### Exploratory sweeps (`--sweep`)
+
+When the goal is scanning one revision for hot ids rather than a verdict, part of the full 273-id grid is ballast: the rayon/tokio/sequential drift-control ids (24 bench call sites across the grid; `sync_vs_rayon` + `unbalanced` hold 49 % of all ids and roughly a third of those two are drift anchors) exist to catch cross-library drift *between the two sides of an A/B* — a single-sided sweep cannot read that signal — and >2-size families interpolate monotonously between their anchors. `bench_ab.sh --sweep -a wt` runs one side over the trimmed core (criterion `--list` + a python filter; ~220 of 273 ids, ~3 min off the ~16 min criterion pass) and prints a per-id median-of-rounds table at the end:
+
+```sh
+perf/bench-suite/bench_ab.sh --sweep -a wt              # whole trimmed grid
+perf/bench-suite/bench_ab.sh --sweep -a wt -r 1 -B sync_vs_rayon   # one binary, one round
+```
+
+What a sweep loses by design: cross-library drift visibility (no rayon/tokio anchors on any side) and the dropped midpoints of the few >2-size families. Never use `--sweep` for verdicts — `compare.py` needs both sides and the drift-control ids on them; the flag refuses explicit filters to keep the two modes from being mixed.
+
 ## Interleaved A/B tooling (`perf/bench-suite`)
 
 `bench_ab.sh` materializes each side (git worktree, or `wt` for a snapshot of the working tree), then runs interleaved rounds: every round runs every side, and odd rounds reverse the side order to cancel position bias. Every bench process is pinned via `taskset` (default cores `1..N-1`, keeping core 0 for OS and IRQ housekeeping), the criterion sampling budget is forced through CLI flags so both sides measure identically even across historical revisions with different in-file defaults, and each (round, side) pair gets its own `CRITERION_HOME` so aggregation only ever reads fresh `new/estimates.json` files. `compare.py` reduces each id to the median of its per-round medians and grades every delta with two signals. *Stable*: the delta clearly exceeds the observed round-to-round spread with every round leaning the same way. *Dominant* (the `dom b` column): how many of the na×nb cross-side round pairs side b won; full separation survives a single outlier round, which the spread scale cannot, since one slow round inflates a side's spread to ~30 % and once buried a real −19.9 % improvement as `noise` while the improved side won all 25/25 pairwise rounds. `--fail-on-regression` trips on stable-or-dominant regressions.

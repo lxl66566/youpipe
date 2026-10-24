@@ -388,13 +388,58 @@ youpipe-bench adds 4 one-shot bins (convoy-probe, file-encrypt,
 horizontal-counters, hotpath-profile) plus perf_events;
 youpipe-gungraun's Ir benches are valgrind-count driven.
 
+### After r9 trims (2026-10-25)
+
+Measured on the r9/trims worktree (same host, same flag combo, `bench.lock`
+held; the numbers above stay as the pre-trim baseline).
+
+Native:
+
+- hybrid_assist `stress_streams_plus_assist_drivers`: watchdog sleep 6 s
+  → 2 s. Test 6.01 s → 2.00 s (4/4 runs). In the 2 s window every driver
+  still completes 3.2k–5k rounds, so the rounds%16==7 panic/drop
+  accounting fires ~200x per driver — the interleaving soak survives.
+- stream_reduce_alloc: `N` 1<<20 → 1<<19 (output Vec 4 MiB, counter
+  threshold 1 MiB). Test 6.07 s → 0.26 s.
+- The two together drop from 37 % to ~9 % of Σ per-test exec.
+
+Miri (tree-borrows + ignore-leaks, per-test wall):
+
+- pipeline_integration heavy tier re-measured BEFORE the trims — the
+  census's 55.7/75.7 s pair did not reproduce; the true heavy tier is
+  fence/async-shaped (the pin/no_deadlock family is `cfg_attr(miri,
+  ignore)`d): reduce_terminals 117.7, async_first_all_downstream 81.2,
+  stage_async_panic to_caller/ordered 74.2/74.7, fence_with_options_buffer
+  71.8, fused_pass_through 37.8, fence_terminal 31.0, ordered_stress 26.3,
+  fence_prefix_async 25.5, spin_wait_stress 25.3 (seconds).
+- The `cfg!(miri)` divisors of those ten tests deepened (same per-item
+  paths, fewer repetitions — the file's standing convention). After, same
+  batch run: 11.8 / 25.8 / 19.4 / 20.8 / 13.2 / 3.9 / 9.6 / 21.4 / 8.2 /
+  9.8 — heavy-10 sum 565 s → 145 s, all still passing. The
+  pipeline_integration miri pass is now ~8–12 min by the same
+  mid-anchored extrapolation (was ~31 min).
+- compute_pool: `test_hybrid_driver_assists_when_workers_busy` n 256 → 64
+  (still 4 injected chunks on the 4-worker pool); full binary 71.6 s → 37 s.
+- Protection lost: interpreted repetition count per shape only. The
+  park/wake cores (CountLatch spin, sleep/sleep_mask, injector FIFO) stay
+  loom-model-checked (31 models); miri keeps adding UB detection on every
+  remaining path.
+
+Benches:
+
+- `bench_ab.sh --sweep` (see benchmarks/README.md "Exploratory sweeps"):
+  single-side id enumeration + drift-control/family-midpoint trim
+  (~220 of 273 ids), median-of-rounds readout; A/B mode untouched.
+  Verified end-to-end on `channel_bench` (10/10 ids kept — the group has
+  no drift anchors; note criterion's `--sample-size` minimum is 10).
+
 ## Where the time goes
 
 native + clippy ≈ 1 min · miri ≈ 0.8 h (pipeline_integration ≈ 2/3) ·
 loom ≈ 10–30 min · benches ≥ 30 min for full sweeps. The levers and their
-protection costs: todo #19; the miri.sh coverage gap discovered by the
-census (4 of 20 integration binaries in the default target list): todo
-#18.
+protection costs: todo #19 (landed 2026-10-25, see "After r9 trims"
+above); the miri.sh coverage gap discovered by the census (4 of 20
+integration binaries in the default target list): todo #18.
 
 ## 2026-10-25 code-review audit (8ab8610..5ff8f5d): verified non-issues
 

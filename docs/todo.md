@@ -93,7 +93,17 @@ A seq-less unordered channel flavor (dropping the `(u64, T)` tag; `spawn_stage`'
 - Status: **closed (2026-10-25)**. The default list now runs 13 more integration binaries, each measured in full under miri (durations in [testing.md](src/dev/testing.md) "Suite duration census"): graph_dag 85 s, batch_recv 30 s, cancel_outcome 63 s, sharded_terminal 48 s, sharded_terminal_async 281 s, expand_alloc 20 s (miri /8 added), pipe_range_alloc 12 s, filter_collect_panic 5 s, submit_batch_alloc 5 s, async_waker_alloc 169 s (miri /4 added), stream_reduce 10 s (miri /20 added), on_pool_nested 26 s, pool_cache 21 s — ≈13 min added. Four binaries stay out with reasons (inlined in miri.sh): hybrid_assist (only test is `#[cfg_attr(miri, ignore)]`), profile_guard (native config guard), ordered_window (size-pinned >1 Mi repro shapes; scaling vacates the assertion), stream_reduce_alloc (needs N ≥ 1<<17 for its ≥1 MiB counter signal → hours interpreted).
 - Residual: the projected default pass is ≈57 min until todo #19's pipeline_integration divisor work lands (that binary is still ~31 min of the total).
 
-### 19. [P2] suite-duration trims (census 2026-10-25)
+### 19. ~~[P2] suite-duration trims (census 2026-10-25)~~ (landed)
+
+- Landed 2026-10-25 (r9): all five trims, measured before/after in
+  [testing.md](src/dev/testing.md) "After r9 trims (2026-10-25)".
+  hybrid_assist watchdog 2 s; stream_reduce_alloc `N` 1<<19; the
+  pipeline_integration miri heavy tier (10 fence/async/stress tests, the
+  census's "pin" family turned out to be `cfg_attr(miri, ignore)`d) and
+  the compute_pool hybrid-driver test with deepened `cfg!(miri)` divisors;
+  the bench sweep mode implemented as `bench_ab.sh --sweep`
+  (benchmarks/README.md "Exploratory sweeps"). No release-gate-only test
+  split was needed — divisors alone cut the heavy tier 565 s → 145 s.
 
 Baseline and methodology: [testing.md](src/dev/testing.md) "Suite duration census (2026-10-25)". Each line: trim → protection lost.
 

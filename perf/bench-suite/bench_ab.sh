@@ -56,6 +56,14 @@
 #   -w, --warmup-ms N     criterion --warm-up-time (default 1000)
 #   -m, --measurement-ms N criterion --measurement-time (default 2000)
 #       --force           skip the stray-process guard
+#       --sweep           exploratory single-revision sweep (one side is
+#                         enough): enumerates every criterion id (--list),
+#                         drops the cross-library drift-control benches
+#                         (rayon_*/tokio_*/sequential) and the middle sizes
+#                         of >2-size families, runs the kept ids, then prints
+#                         a per-id median-of-rounds table. NOT for A/B
+#                         verdicts — compare.py needs both sides AND the
+#                         drift-control ids on them.
 #
 # Examples:
 #   # classic two-sided A/B of everything, 3 interleaved rounds
@@ -71,6 +79,9 @@
 #       -E off=YOUPIPE_ONPOOL_HYBRID=0 -E on=YOUPIPE_ONPOOL_HYBRID=1 \
 #   # add two more rounds to an existing run (same outdir continues)
 #   perf/bench-suite/bench_ab.sh -o target/bench-ab/run-XXX -a ... -b ... -r 2
+#
+#   # exploratory sweep of one revision (no second side, trimmed id set)
+#   perf/bench-suite/bench_ab.sh --sweep -a wt
 set -euo pipefail
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
@@ -81,6 +92,7 @@ TASKSET_CPUS=""
 OUTDIR=""
 declare -a BENCH_TARGETS=() FILTERS=() SIDE_REVS=() SIDE_ENVS=()
 PER_ID=0
+SWEEP=0
 SAMPLES=20
 WARMUP_MS=1000
 MEASURE_MS=2000
@@ -101,6 +113,7 @@ while [[ $# -gt 0 ]]; do
         -w|--warmup-ms) WARMUP_MS="$2"; shift 2 ;;
         -m|--measurement-ms) MEASURE_MS="$2"; shift 2 ;;
         --force) FORCE=1; shift ;;
+        --sweep) SWEEP=1; shift ;;
         -h|--help) usage 0 ;;
         --) shift; FILTERS+=("$@"); break ;;
         -*) echo "unknown option: $1" >&2; usage 1 ;;
@@ -108,7 +121,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ ${#SIDE_REVS[@]} -ge 2 ]] || { echo "need at least -a and -b" >&2; usage 1; }
+if (( SWEEP )); then
+    [[ ${#SIDE_REVS[@]} -ge 1 ]] || { echo "--sweep needs at least one -a side" >&2; usage 1; }
+else
+    [[ ${#SIDE_REVS[@]} -ge 2 ]] || { echo "need at least -a and -b" >&2; usage 1; }
+fi
 
 # ── stray-process guard: leftover miri/loitering benches poison every number
 if [[ $FORCE -eq 0 ]]; then
@@ -228,6 +245,63 @@ for line in sys.stdin:
     SIDE_BINS[$label]=$kept
 done
 
+# ── sweep mode: build the exploratory id list. Criterion's filter is a
+#    positive regex only, so enumerate each binary's ids once (--list, no
+#    measurement) and trim in python:
+#      * drift-control benches (rayon_*/tokio_*/sequential) exist to catch
+#        cross-library drift BETWEEN the sides of a verdict A/B — a
+#        single-sided sweep cannot read that signal
+#      * families with >2 numeric sizes keep their two anchors; the dropped
+#        midpoints have interpolated monotonously in every scan to date
+#    (A/B mode is unaffected: it never enters this block.)
+if (( SWEEP )); then
+    [[ ${#FILTERS[@]} -eq 0 ]] \
+        || { echo "--sweep computes its own id list; drop the explicit filters" >&2; exit 1; }
+    all_ids=$(
+        for i in "${!LABELS[@]}"; do
+            while read -r bin; do
+                [[ -n "$bin" ]] || continue
+                "$bin" --list 2>/dev/null | sed -n 's/: benchmark$//p'
+            done <<< "${SIDE_BINS[${LABELS[$i]}]}"
+        done | sort -u
+    )
+    [[ -n "$all_ids" ]] || { echo "--sweep: criterion --list returned no ids" >&2; exit 1; }
+    kept=$(printf '%s\n' "$all_ids" | python3 -c '
+import sys
+
+# id = group/bench[/size]. Drift-control names live in the bench segment;
+# a 2-segment id has no size axis.
+DRIFT = ("rayon_", "tokio_", "sequential")
+
+fams: dict[str, list[str]] = {}
+for line in sys.stdin:
+    ident = line.strip()
+    if not ident:
+        continue
+    seg = ident.split("/")
+    bench = seg[-2] if len(seg) >= 3 else seg[-1]
+    if bench.startswith(DRIFT):
+        continue
+    fams.setdefault("/".join(seg[:-1]) if len(seg) >= 3 else ident, []).append(ident)
+
+kept: list[str] = []
+for _, members in sorted(fams.items()):
+    def sz(m: str):
+        tail = m.rsplit("/", 1)[1]
+        return int(tail) if tail.isdigit() else None
+    unnumbered = [m for m in members if sz(m) is None]
+    numbered = [m for m in members if sz(m) is not None]
+    kept += unnumbered
+    sizes = sorted({sz(m) for m in numbered})
+    keep = {sizes[0], sizes[-1]} if len(sizes) > 2 else None
+    kept += [m for m in numbered if keep is None or sz(m) in keep]
+print("\n".join(kept))
+')
+    mapfile -t FILTERS <<< "$kept"
+    echo "==> sweep: ${#FILTERS[@]} of $(printf '%s\n' "$all_ids" | wc -l) ids kept" \
+         "(drift-control benches + family midpoints dropped)"
+fi
+
 # combined criterion filter (alternation) — criterion matches it against the
 # full "group/bench/size" id
 if [[ ${#FILTERS[@]} -eq 0 ]]; then
@@ -320,6 +394,33 @@ for (( r=0; r<ROUNDS; r++ )); do
 done
 
 echo
-echo "==> done. aggregate with:"
-echo "    python3 perf/bench-suite/compare.py $OUTDIR"
+if (( SWEEP )); then
+    echo "==> sweep medians (per id: median of the round medians):"
+    python3 - "$OUTDIR" <<'PYREADOUT'
+import statistics
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "perf/bench-suite")
+from compare import fmt_ns, load_side
+
+outdir = Path(sys.argv[1])
+rounds = sorted((d for d in outdir.glob("round-*") if d.is_dir()),
+                key=lambda d: int(d.name.removeprefix("round-")))
+label = next((c.name for rd in rounds for c in sorted(rd.iterdir()) if c.is_dir()), None)
+if label is None:
+    sys.exit(f"no round data under {outdir}")
+side = load_side(rounds, label)
+print(f"| id ({label}) | median | spread % |")
+print("|---|---|---|")
+for ident in sorted(side):
+    vals = [side[ident][k] for k in sorted(side[ident])]
+    med = statistics.median(vals)
+    spread = (max(vals) - min(vals)) / med * 100 if len(vals) > 1 else 0.0
+    print(f"| {ident} | {fmt_ns(med)} | {spread:.1f} |")
+PYREADOUT
+else
+    echo "==> done. aggregate with:"
+    echo "    python3 perf/bench-suite/compare.py $OUTDIR"
+fi
 exit $fail
