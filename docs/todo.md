@@ -70,12 +70,12 @@ Landed 2026-10-25 (r11) as the three-mode ordering typestate (`Unordered` / `Ord
 - Trigger today is theoretical: the detached feeder loop (`push_items`) runs no user code — the input iterator is collected before any topology exists — so a feeder payload implies an internal channel failure. Fix opportunistically when the drain's error paths are next touched (S11's #23 fix rewrites this neighborhood — fold it in there rather than a dedicated pass).
 - **Landed (2026-10-26, r14)**: both early exits now run `feeder.finish()` first — the `Err(drain_panic)` arm and the `Ok(Err(e))` acquisition return, in the EOF path's feeder-then-async order — so a stored feeder payload is re-raised as the root cause; the drain panic / `io::Err` surfaces only when no payload exists. Regressions `drain_terminal_drain_panic_resumes_feeder_payload_first` / `drain_terminal_acquire_err_resumes_feeder_payload_first` (both verified failing pre-fix); record in [dev/streaming-forensics.md](src/dev/streaming-forensics.md) "r13 panic/error/cancellation audit".
 
-### 15. [P2] leftovers from the 2026-10-20 audit
+### 15. ~~[P2] leftovers from the 2026-10-20 audit~~ (landed)
 
-Items from the 2026-10-20 three-way audit that were not scheduled into the adjacent round:
+Items from the 2026-10-20 three-way audit that were not scheduled into the adjacent round. Both closed 2026-10-26 (r14):
 
-- `perfcnt` → `nom v4` future-incompat: upstream is unmaintained, a future rustc will refuse to compile it; when that happens, vendor/fork it or port the counters onto gungraun's valgrind path.
-- mdbook has no linkcheck preprocessor, so relative intra-book links are unvalidated: `perf/verify/linkcheck.sh` (2026-10-25) now covers them (0 broken on landing); moving it into CI is pending.
+- `perfcnt` → `nom v4` future-incompat: resolved by swapping the backend of `youpipe-criterion-perf-counters` to the maintained `perf-event` 0.4 crate. Vendor/fork was rejected on usage-surface grounds: only ~7 perfcnt API points were live (per-tid open, disable-at-open, enable/disable/read/reset, six `PERF_TYPE_HARDWARE` events), all covered 1:1 by perf-event (`observe_pid`, counters start disabled by default, `exclude_kernel`/`exclude_hv` are the backend defaults), whereas a fork would drag in perfcnt's nom-v4 `/proc/cpuinfo` parsing wholesale — the very code the diagnostic lives in. The builder-factory API (which existed only because perfcnt's builder cannot be cloned) became a `HardwareEvent` enum; backend types no longer leak and `youpipe-bench` lost its direct perfcnt dev-dependency. `cargo build -p youpipe-criterion-perf-counters` is future-incompat clean; perfcnt and nom v4 are gone from Cargo.lock (the remaining nom 7 comes from criterion's terminfo, no diagnostic). The gungraun/valgrind path stays what it always was — a complementary deterministic counter, not a replacement.
+- mdbook linkcheck: `perf/verify/linkcheck.sh` wired into CI — first step of the Test workflow's `test` job (PR gate, fails fast before any toolchain setup) and a pre-build step of the Docs workflow (validates before every Pages deploy). testing.md now records which verify runners CI covers verbatim vs in reduced form.
 
 ### 17. [P2] seq-less unordered channel flavor
 
