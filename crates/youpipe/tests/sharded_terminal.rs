@@ -88,6 +88,25 @@ fn sharded_terminal_semantics() {
     expected.sort_unstable();
     assert_eq!(got, expected);
 
+    // ── Ordered expand terminal (todo #5): group payloads shard exactly
+    //    like per-item payloads — one `(seq, Vec)` message per slot, EOF by
+    //    shard aggregation, empty groups included. ──
+    let got = stream(0..n_aux() as u64)
+        .with_cancel(inert_cancel())
+        .ordered()
+        .expand_emit(|x: u64, out: &mut Vec<u64>| {
+            if x % 3 != 0 {
+                out.push(x);
+                out.push(x.wrapping_mul(7).wrapping_add(1));
+            }
+        })
+        .run();
+    let expected: Vec<u64> = (0..n_aux() as u64)
+        .filter(|x| x % 3 != 0)
+        .flat_map(|x| [x, x * 7 + 1])
+        .collect();
+    assert_eq!(got, expected, "ordered expand under the sharded terminal");
+
     // ── Fence mid-chain + sharded terminal after it ──
     let mut got = stream(items.clone())
         .with_cancel(inert_cancel())

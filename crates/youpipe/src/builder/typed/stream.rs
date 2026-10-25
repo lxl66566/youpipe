@@ -759,9 +759,11 @@ fn spawn_stage_fanout<I, O, Tx, R>(
     drop(rx);
 }
 
-/// Like [`spawn_stage`] but expands each input into 0..N outputs via `expand`.
-/// Each expanded item inherits the parent's `seq` so the collector can group
-/// expansions from the same input.
+/// Like [`spawn_stage`] but expands each input into 0..N outputs via `expand`
+/// (the UNORDERED flavour — todo #5): outputs travel as individual
+/// `(seq, N)` messages sharing the parent's seq; the unordered collector
+/// ignores the tag. Ordered chains use the group-payload cores instead
+/// (`spawn_ordered_expand_into`).
 ///
 /// `expand` is push-style (`Fn(I, &mut Vec<N>)` appending outputs): each
 /// worker owns one scratch `Vec`, cleared per item and reused across items,
@@ -1268,6 +1270,70 @@ impl StageBudget {
     }
 }
 
+// ── Ordering modes (todo #5: `ordered()` + `expand()` via batched payloads) ──
+
+/// Compile-time ordering mode of a [`StreamPipe`]. Selects, at the type
+/// level, which payload shape the chain's channels carry and which drain the
+/// collector runs — the batched-vs-per-item choice changes channel slot
+/// types, so it cannot stay a runtime flag. Sealed: the modes are only ever
+/// produced by the builder methods.
+pub trait StreamMode: sealed::Sealed {}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::Unordered {}
+    impl Sealed for super::Ordered {}
+    impl Sealed for super::Grouped {}
+}
+
+/// Completion-order output (the default). `.expand()` builds the per-item
+/// fan-out ([`ExpandStage`]): one channel message per *output* item, all
+/// sharing the parent's seq — re-sequencing is impossible, hence `.ordered()`
+/// is unavailable on a chain containing this stage.
+pub struct Unordered;
+
+/// Input-order output, entered by [`.ordered()`](StreamPipe::ordered) on an
+/// expand-free chain. Payloads stay per-item (`(seq, T)` — one message per
+/// input item), so the [`ReorderBuffer`] re-sequences single items.
+/// `.expand()` here enters [`Grouped`].
+pub struct Ordered;
+
+/// Input-order output downstream of an ordered `.expand()`: the channels
+/// carry **group payloads** — one `(seq, Vec<N>)` message per input item
+/// (an empty expansion is an empty-`Vec` message, which still advances the
+/// reorder buffer; a per-item tagging could not signal an empty group at
+/// all). One seq maps to exactly one message, so the [`ReorderBuffer`] is
+/// reused as-is at group granularity. Stages appended in this mode map
+/// payloads elementwise, keeping each group atomic; nested expands flatten
+/// naturally into the same output group (`(seq, sub₁, sub₂)` order).
+pub struct Grouped;
+
+impl StreamMode for Unordered {}
+impl StreamMode for Ordered {}
+impl StreamMode for Grouped {}
+
+/// Compile-time "this chain contains no per-item [`ExpandStage`]" — the
+/// bound that makes `.ordered()` *after* `.expand()` a compile error (todo
+/// #5; it used to be a runtime panic). `Unordered` chains never contain
+/// grouped nodes (those only arise through `.ordered()….expand()`), so
+/// excluding `ExpandStage` alone is sufficient. Sealed like [`StreamMode`].
+pub trait ExpandFree: sealed_expand::Sealed {}
+
+mod sealed_expand {
+    pub trait Sealed {}
+    impl Sealed for super::StreamStart {}
+    impl<Prev: super::ExpandFree, F> Sealed for super::SyncStage<Prev, F> {}
+    impl<Prev: super::ExpandFree> Sealed for super::FenceLink<Prev> {}
+    #[cfg(feature = "tokio-runtime")]
+    impl<Prev: super::ExpandFree, F> Sealed for super::AsyncStage<Prev, F> {}
+}
+
+impl ExpandFree for StreamStart {}
+impl<Prev: ExpandFree, F> ExpandFree for SyncStage<Prev, F> {}
+impl<Prev: ExpandFree> ExpandFree for FenceLink<Prev> {}
+#[cfg(feature = "tokio-runtime")]
+impl<Prev: ExpandFree, F> ExpandFree for AsyncStage<Prev, F> {}
+
 /// Streaming pipeline for workloads that cannot be fused at compile time
 /// (multi-stage channels, fences, async stages, ordered output, cancellation).
 ///
@@ -1281,7 +1347,13 @@ impl StageBudget {
 ///     .ordered()
 ///     .run();
 /// ```
-pub struct StreamPipe<S = StreamStart, I = (), O = (), R: AsyncRuntime = DefaultRuntime> {
+pub struct StreamPipe<
+    S = StreamStart,
+    I = (),
+    O = (),
+    R: AsyncRuntime = DefaultRuntime,
+    M: StreamMode = Unordered,
+> {
     items: Vec<I>,
     stages: S,
     config: PipelineConfig,
@@ -1293,11 +1365,10 @@ pub struct StreamPipe<S = StreamStart, I = (), O = (), R: AsyncRuntime = Default
     compute_pool: Option<ComputePool>,
     #[cfg(feature = "tokio-runtime")]
     async_pool: Option<R>,
-    ordered: bool,
     /// Pinned reorder-window ceiling for `.ordered()` runs (see
     /// [`Self::with_reorder_window`]); `None` = the auto window.
     reorder_window: Option<NonZeroUsize>,
-    _marker: PhantomData<(O, R)>,
+    _marker: PhantomData<(O, R, M)>,
 }
 
 /// Typestate marker for the start of a streaming chain (no stages yet).
@@ -1327,7 +1398,6 @@ where
         compute_pool: None,
         #[cfg(feature = "tokio-runtime")]
         async_pool: None,
-        ordered: false,
         reorder_window: None,
         _marker: PhantomData,
     }
@@ -1343,10 +1413,11 @@ pub struct SyncStage<Prev, F> {
     pub(super) opts: SyncStageOptions,
 }
 
-/// 1-to-N expansion stage: `Fn(O, &mut Vec<N>)` (push-style — appends zero
-/// or more outputs to a per-worker reused scratch buffer). Expanded items
-/// inherit the parent's `seq` so the collector can group expansions from the
-/// same input.
+/// 1-to-N expansion stage (the UNORDERED flavour — todo #5): `Fn(O, &mut
+/// Vec<N>)` push-style, appends zero or more outputs to a per-worker reused
+/// scratch buffer; outputs travel as individual `(seq, N)` messages sharing
+/// the parent's seq. Ordered chains build [`OrderedExpandStage`] instead
+/// (`.ordered()` before `.expand()`).
 ///
 /// The `N` parameter exists (alongside the opaque `F`) so the
 /// `StageSpawn` impl can constrain `N` via the self type: an
@@ -1358,6 +1429,58 @@ pub struct ExpandStage<Prev, F, N> {
     pub(super) f: F,
     pub(super) opts: SyncStageOptions,
     _marker: PhantomData<fn() -> N>,
+}
+
+/// 1-to-N expansion under `.ordered()` — the group-payload transition (todo
+/// #5). Input payloads are per-item `(seq, A)`; the output channel carries
+/// ONE group message `(seq, Vec<N>)` per input item, so an empty expansion
+/// is an empty-`Vec` message that still advances the collector's reorder
+/// buffer — the property no per-item tagging can offer. Built by
+/// `.ordered()….expand()` / `expand_emit`; moves the pipe into [`Grouped`].
+///
+/// The `N` parameter exists for the same E0207 reason as on
+/// [`ExpandStage`].
+#[derive(Clone)]
+pub struct OrderedExpandStage<Prev, F, N> {
+    pub(super) prev: Prev,
+    pub(super) f: F,
+    pub(super) opts: SyncStageOptions,
+    _marker: PhantomData<fn() -> N>,
+}
+
+/// Elementwise sync stage inside a [`Grouped`] chain: maps every element of
+/// each `(seq, Vec<A>)` group payload into one `(seq, Vec<B>)` output group.
+/// The group stays atomic (one message per input item), preserving the
+/// single-message-per-seq contract the ordered drain relies on — splitting
+/// a group back into per-item messages would duplicate seqs again.
+#[derive(Clone)]
+pub struct GroupedStage<Prev, F> {
+    pub(super) prev: Prev,
+    pub(super) f: F,
+    pub(super) opts: SyncStageOptions,
+}
+
+/// Nested expansion inside a [`Grouped`] chain: every element of the input
+/// group expands (push-style) into the SAME output group, giving the
+/// `(seq, sub₁, sub₂)` lexicographic order naturally — no sub-tagging, the
+/// group flattens.
+#[derive(Clone)]
+pub struct GroupedExpandStage<Prev, F, N> {
+    pub(super) prev: Prev,
+    pub(super) f: F,
+    pub(super) opts: SyncStageOptions,
+    _marker: PhantomData<fn() -> N>,
+}
+
+/// Elementwise async stage inside a [`Grouped`] chain — the group-payload
+/// twin of [`AsyncStage`]: each consumer task maps a whole group's elements
+/// (awaiting each) into one output group.
+#[cfg(feature = "tokio-runtime")]
+#[derive(Clone)]
+pub struct GroupedAsyncStage<Prev, F> {
+    pub(super) prev: Prev,
+    pub(super) f: F,
+    pub(super) opts: AsyncStageOptions,
 }
 
 /// Async stage: `Fn(O) -> Future<Output = N>`, runs as `io_concurrency` tasks
@@ -1431,17 +1554,6 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     /// `SyncStageOptions::workers`.
     /// Used by `StreamPipe::run` to divide the pool across stages.
     fn stage_budget(&self) -> StageBudget;
-
-    /// Returns `true` if this chain contains at least one `ExpandStage`.
-    ///
-    /// Expand is a 1-to-N fan-out: one input seq produces multiple outputs
-    /// that **share** the parent's sequence number. The [`ReorderBuffer`] used
-    /// by `.ordered()` is single-item-per-seq, so `expand` + `ordered()` would
-    /// silently drop colliding items. [`StreamPipe::run`] checks this flag and
-    /// rejects the combination with a clear panic instead of corrupting output.
-    fn has_expand(&self) -> bool {
-        false
-    }
 
     /// Returns `Some(true)` if the innermost *real* stage in this chain — the
     /// first non-`StreamStart` stage that consumes the feeder channel — is
@@ -2464,10 +2576,6 @@ where
         self.prev.has_async_stage()
     }
 
-    fn has_expand(&self) -> bool {
-        self.prev.has_expand()
-    }
-
     fn fuse_exec<OP>(
         &self,
         downstream: OP,
@@ -2661,10 +2769,6 @@ where
     fn has_async_stage(&self) -> bool {
         self.prev.has_async_stage()
     }
-
-    fn has_expand(&self) -> bool {
-        true
-    }
 }
 
 /// Shared expand-stage spawn core (todo #10) — the same factory shape as
@@ -2708,6 +2812,172 @@ where
         spawn_expand_stage_into::<ShardedMpsc, R, A, F, N>(&opts, f, mid_rx, parallelism, ctx)
     } else {
         spawn_expand_stage_into::<Mpsc, R, A, F, N>(&opts, f, mid_rx, parallelism, ctx)
+    }
+}
+
+// ── Grouped-payload spawn cores (todo #5) ──
+//
+// The grouped stages reuse the per-message sync stage core
+// (`spawn_stage_fanout`) with element-adapted closures: one channel message
+// in → one group message out. The worker loop (claim sharing, tx batching,
+// cancel observed before every message = before every group) is identical
+// to the plain stage's, only the payload mapping differs.
+//
+// Allocation note: each output group is a fresh `Vec` moved into the
+// channel — one malloc per input item (`Vec::new()` for an empty group
+// allocates nothing). This is inherent to carrying the payload batched and
+// matches the unordered owned-`Vec` `expand` API's cost class; the
+// unordered `expand_emit` keeps its zero-alloc scratch shape.
+//
+// In-flight note: a grouped channel slot holds a whole group, so the
+// occupancy estimate (`note_in_flight` inside `stage_buffer`) counts
+// messages, not items — it only pre-sizes the reorder window, which grows
+// on demand (never gates correctness).
+
+/// Core of [`OrderedExpandStage`]: per-item input `(seq, A)` → one group
+/// message `(seq, Vec<N>)` per input (the [`Ordered`]→[`Grouped`]
+/// transition).
+fn spawn_ordered_expand_into<Ch, R, A, F, N>(
+    opts: &SyncStageOptions,
+    f: F,
+    mid_rx: Receiver<(u64, A)>,
+    parallelism: usize,
+    ctx: &StreamCtx<'_, R>,
+) -> Ch::Out
+where
+    Ch: OutChannel<Vec<N>>,
+    R: AsyncRuntime,
+    A: Send + Unpin + 'static,
+    F: Fn(A, &mut Vec<N>) + Send + Sync + 'static,
+    N: Send + Unpin + 'static,
+{
+    let buffer = ctx.stage_buffer::<(u64, Vec<N>)>(opts.buffer, parallelism);
+    let (txs, out_rx) = Ch::make(ctx, buffer, parallelism);
+    spawn_stage_fanout(ctx, mid_rx, txs, move |item: A| {
+        let mut group = Vec::new();
+        f(item, &mut group);
+        group
+    });
+    Ch::wrap(out_rx)
+}
+
+/// Terminal flavour of [`spawn_ordered_expand_into`] — see
+/// [`spawn_stage_terminal`].
+fn spawn_ordered_expand_terminal<A, F, N, R>(
+    opts: SyncStageOptions,
+    f: F,
+    mid_rx: Receiver<(u64, A)>,
+    parallelism: usize,
+    ctx: &StreamCtx<'_, R>,
+) -> FinalRx<Vec<N>>
+where
+    R: AsyncRuntime,
+    A: Send + Unpin + 'static,
+    F: Fn(A, &mut Vec<N>) + Send + Sync + 'static,
+    N: Send + Unpin + 'static,
+{
+    if ctx.sharded_terminal(parallelism) {
+        spawn_ordered_expand_into::<ShardedMpsc, R, A, F, N>(&opts, f, mid_rx, parallelism, ctx)
+    } else {
+        spawn_ordered_expand_into::<Mpsc, R, A, F, N>(&opts, f, mid_rx, parallelism, ctx)
+    }
+}
+
+/// Core of [`GroupedStage`]: elementwise map over each `(seq, Vec<A>)`
+/// group payload → one `(seq, Vec<B>)` group.
+fn spawn_grouped_stage_into<Ch, R, A, F, B>(
+    opts: &SyncStageOptions,
+    f: F,
+    mid_rx: Receiver<(u64, Vec<A>)>,
+    parallelism: usize,
+    ctx: &StreamCtx<'_, R>,
+) -> Ch::Out
+where
+    Ch: OutChannel<Vec<B>>,
+    R: AsyncRuntime,
+    A: Send + Unpin + 'static,
+    F: Fn(A) -> B + Send + Sync + 'static,
+    B: Send + Unpin + 'static,
+{
+    let buffer = ctx.stage_buffer::<(u64, Vec<B>)>(opts.buffer, parallelism);
+    let (txs, out_rx) = Ch::make(ctx, buffer, parallelism);
+    spawn_stage_fanout(ctx, mid_rx, txs, move |group: Vec<A>| {
+        group.into_iter().map(&f).collect()
+    });
+    Ch::wrap(out_rx)
+}
+
+/// Terminal flavour of [`spawn_grouped_stage_into`] — see
+/// [`spawn_stage_terminal`].
+fn spawn_grouped_stage_terminal<A, F, B, R>(
+    opts: SyncStageOptions,
+    f: F,
+    mid_rx: Receiver<(u64, Vec<A>)>,
+    parallelism: usize,
+    ctx: &StreamCtx<'_, R>,
+) -> FinalRx<Vec<B>>
+where
+    R: AsyncRuntime,
+    A: Send + Unpin + 'static,
+    F: Fn(A) -> B + Send + Sync + 'static,
+    B: Send + Unpin + 'static,
+{
+    if ctx.sharded_terminal(parallelism) {
+        spawn_grouped_stage_into::<ShardedMpsc, R, A, F, B>(&opts, f, mid_rx, parallelism, ctx)
+    } else {
+        spawn_grouped_stage_into::<Mpsc, R, A, F, B>(&opts, f, mid_rx, parallelism, ctx)
+    }
+}
+
+/// Core of [`GroupedExpandStage`]: every element of the input group expands
+/// into the SAME output group — the natural `(seq, sub₁, sub₂)`
+/// lexicographic flattening (no sub-tag exists; within a group one worker
+/// appends serially).
+fn spawn_grouped_expand_into<Ch, R, A, F, N>(
+    opts: &SyncStageOptions,
+    f: F,
+    mid_rx: Receiver<(u64, Vec<A>)>,
+    parallelism: usize,
+    ctx: &StreamCtx<'_, R>,
+) -> Ch::Out
+where
+    Ch: OutChannel<Vec<N>>,
+    R: AsyncRuntime,
+    A: Send + Unpin + 'static,
+    F: Fn(A, &mut Vec<N>) + Send + Sync + 'static,
+    N: Send + Unpin + 'static,
+{
+    let buffer = ctx.stage_buffer::<(u64, Vec<N>)>(opts.buffer, parallelism);
+    let (txs, out_rx) = Ch::make(ctx, buffer, parallelism);
+    spawn_stage_fanout(ctx, mid_rx, txs, move |group: Vec<A>| {
+        let mut out = Vec::new();
+        for a in group {
+            f(a, &mut out);
+        }
+        out
+    });
+    Ch::wrap(out_rx)
+}
+
+/// Terminal flavour of [`spawn_grouped_expand_into`] — see
+/// [`spawn_stage_terminal`].
+fn spawn_grouped_expand_terminal<A, F, N, R>(
+    opts: SyncStageOptions,
+    f: F,
+    mid_rx: Receiver<(u64, Vec<A>)>,
+    parallelism: usize,
+    ctx: &StreamCtx<'_, R>,
+) -> FinalRx<Vec<N>>
+where
+    R: AsyncRuntime,
+    A: Send + Unpin + 'static,
+    F: Fn(A, &mut Vec<N>) + Send + Sync + 'static,
+    N: Send + Unpin + 'static,
+{
+    if ctx.sharded_terminal(parallelism) {
+        spawn_grouped_expand_into::<ShardedMpsc, R, A, F, N>(&opts, f, mid_rx, parallelism, ctx)
+    } else {
+        spawn_grouped_expand_into::<Mpsc, R, A, F, N>(&opts, f, mid_rx, parallelism, ctx)
     }
 }
 
@@ -2791,10 +3061,6 @@ where
     fn has_async_stage(&self) -> bool {
         self.prev.has_async_stage()
     }
-
-    fn has_expand(&self) -> bool {
-        self.prev.has_expand()
-    }
 }
 
 /// Shared fence spawn core (todo #10, same factory shape as the sync
@@ -2819,6 +3085,411 @@ where
         .expect("`make(_, _, 1)` yields exactly one sender");
     spawn_forwarder(ctx, mid_rx, fenced_tx, mode, n);
     Ch::wrap(fenced_rx)
+}
+
+// ── Grouped node StageSpawn impls (todo #5) ──
+//
+// Same dispatch shape as `SyncStage`/`ExpandStage`: recurse into `prev`
+// via the entry-flavour method, then run the grouped core with the output
+// factory the topology calls for. `fuse_exec`/`fuse_exec_reduce` keep the
+// default `Err` — a grouped chain always contains an expansion, which the
+// fused core has no equivalent for (same policy as `ExpandStage`).
+
+impl<Prev, F, In, A, N> StageSpawn<In> for OrderedExpandStage<Prev, F, N>
+where
+    Prev: StageSpawn<In, Out = A>,
+    F: Fn(A, &mut Vec<N>) + Send + Sync + 'static,
+    In: Send + Unpin + 'static,
+    A: Send + Unpin + 'static,
+    N: Send + Unpin + 'static,
+{
+    type Out = Vec<N>;
+
+    fn spawn<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<N>> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_ordered_expand_into::<Mpmc, R, _, _, _>(&self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    fn spawn_single<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<N>> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_ordered_expand_terminal(self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_for_async<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> AsyncReceiver<(u64, Vec<N>)> {
+        // Expansion workers write the mixed-mode sender directly (same
+        // rationale as `ExpandStage::spawn_for_async`).
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_ordered_expand_into::<Mixed, R, _, _, _>(&self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_async_feeder<R: AsyncRuntime>(
+        self,
+        rx: AsyncReceiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<N>> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_ordered_expand_into::<Mpmc, R, _, _, _>(&self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_async_feeder_single<R: AsyncRuntime>(
+        self,
+        rx: AsyncReceiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<N>> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_ordered_expand_terminal(self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    fn stage_budget(&self) -> StageBudget {
+        let mut budget = self.prev.stage_budget();
+        budget.stages += 1;
+        if let Some(w) = self.opts.workers {
+            budget.explicit_stages += 1;
+            budget.explicit_workers += w.get();
+        }
+        budget
+    }
+
+    fn first_consumer_is_async(&self) -> Option<bool> {
+        self.prev.first_consumer_is_async().or(Some(false))
+    }
+
+    fn has_async_stage(&self) -> bool {
+        self.prev.has_async_stage()
+    }
+}
+
+impl<Prev, F, In, A, B> StageSpawn<In> for GroupedStage<Prev, F>
+where
+    Prev: StageSpawn<In, Out = Vec<A>>,
+    F: Fn(A) -> B + Send + Sync + 'static,
+    In: Send + Unpin + 'static,
+    A: Send + Unpin + 'static,
+    B: Send + Unpin + 'static,
+{
+    type Out = Vec<B>;
+
+    fn spawn<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<B>> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_grouped_stage_into::<Mpmc, R, _, _, _>(&self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    fn spawn_single<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<B>> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_grouped_stage_terminal(self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_for_async<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> AsyncReceiver<(u64, Vec<B>)> {
+        // Workers write the mixed-mode sender directly (same rationale as
+        // `SyncStage::spawn_for_async`).
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_grouped_stage_into::<Mixed, R, _, _, _>(&self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_async_feeder<R: AsyncRuntime>(
+        self,
+        rx: AsyncReceiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<B>> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_grouped_stage_into::<Mpmc, R, _, _, _>(&self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_async_feeder_single<R: AsyncRuntime>(
+        self,
+        rx: AsyncReceiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<B>> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_grouped_stage_terminal(self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    fn stage_budget(&self) -> StageBudget {
+        let mut budget = self.prev.stage_budget();
+        budget.stages += 1;
+        if let Some(w) = self.opts.workers {
+            budget.explicit_stages += 1;
+            budget.explicit_workers += w.get();
+        }
+        budget
+    }
+
+    fn first_consumer_is_async(&self) -> Option<bool> {
+        self.prev.first_consumer_is_async().or(Some(false))
+    }
+
+    fn has_async_stage(&self) -> bool {
+        self.prev.has_async_stage()
+    }
+}
+
+impl<Prev, F, In, A, N> StageSpawn<In> for GroupedExpandStage<Prev, F, N>
+where
+    Prev: StageSpawn<In, Out = Vec<A>>,
+    F: Fn(A, &mut Vec<N>) + Send + Sync + 'static,
+    In: Send + Unpin + 'static,
+    A: Send + Unpin + 'static,
+    N: Send + Unpin + 'static,
+{
+    type Out = Vec<N>;
+
+    fn spawn<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<N>> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_grouped_expand_into::<Mpmc, R, _, _, _>(&self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    fn spawn_single<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<N>> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_grouped_expand_terminal(self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_for_async<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> AsyncReceiver<(u64, Vec<N>)> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_grouped_expand_into::<Mixed, R, _, _, _>(&self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_async_feeder<R: AsyncRuntime>(
+        self,
+        rx: AsyncReceiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<N>> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_grouped_expand_into::<Mpmc, R, _, _, _>(&self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    fn spawn_async_feeder_single<R: AsyncRuntime>(
+        self,
+        rx: AsyncReceiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<N>> {
+        let mid_rx = finalize_prev_rx::<_, R>(self.prev.spawn_async_feeder::<R>(rx, ctx), ctx);
+        let parallelism = ctx.stage_workers(&self.opts);
+        spawn_grouped_expand_terminal(self.opts, self.f, mid_rx, parallelism, ctx)
+    }
+
+    fn stage_budget(&self) -> StageBudget {
+        let mut budget = self.prev.stage_budget();
+        budget.stages += 1;
+        if let Some(w) = self.opts.workers {
+            budget.explicit_stages += 1;
+            budget.explicit_workers += w.get();
+        }
+        budget
+    }
+
+    fn first_consumer_is_async(&self) -> Option<bool> {
+        self.prev.first_consumer_is_async().or(Some(false))
+    }
+
+    fn has_async_stage(&self) -> bool {
+        self.prev.has_async_stage()
+    }
+}
+
+/// Grouped twin of [`spawn_async_consumers_into`]: the element closure is
+/// adapted (`Fn(A) -> Fut` → `Fn(Vec<A>) -> Future<Output = Vec<B>>`,
+/// elements awaited in order inside one group) and fed to the shared
+/// consumer fan-out — task loop, channel factories and the sharded-terminal
+/// knobs are identical to the per-item async stage's.
+#[cfg(feature = "tokio-runtime")]
+fn spawn_grouped_async_consumers_into<Ch, R, A, B, Fut, F>(
+    f: F,
+    a_in_rx: AsyncReceiver<(u64, Vec<A>)>,
+    opts: &AsyncStageOptions,
+    ctx: &StreamCtx<'_, R>,
+) -> Ch::Out
+where
+    Ch: AsyncOutChannel<Vec<B>>,
+    R: AsyncRuntime,
+    F: Fn(A) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = B> + Send + 'static,
+    A: Send + Unpin + 'static,
+    B: Send + Unpin + 'static,
+{
+    let f = Arc::new(f);
+    spawn_async_consumers_into::<Ch, R, Vec<A>, Vec<B>, _, _>(
+        move |group: Vec<A>| {
+            let f = Arc::clone(&f);
+            async move {
+                let mut out = Vec::with_capacity(group.len());
+                for a in group {
+                    out.push(f(a).await);
+                }
+                out
+            }
+        },
+        a_in_rx,
+        opts,
+        ctx,
+    )
+}
+
+/// Terminal flavour of [`spawn_grouped_async_consumers_into`] — the
+/// grouped counterpart of [`spawn_async_consumers_terminal`].
+#[cfg(feature = "tokio-runtime")]
+fn spawn_grouped_async_consumers_terminal<A, B, Fut, F, R>(
+    f: F,
+    a_in_rx: AsyncReceiver<(u64, Vec<A>)>,
+    opts: &AsyncStageOptions,
+    ctx: &StreamCtx<'_, R>,
+) -> FinalRx<Vec<B>>
+where
+    F: Fn(A) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = B> + Send + 'static,
+    A: Send + Unpin + 'static,
+    B: Send + Unpin + 'static,
+    R: AsyncRuntime,
+{
+    if ctx.sharded_async_terminal(ctx.stage_io_concurrency(opts)) > 0 {
+        spawn_grouped_async_consumers_into::<AsyncSharded, R, A, B, Fut, F>(f, a_in_rx, opts, ctx)
+    } else {
+        spawn_grouped_async_consumers_into::<AsyncMpsc, R, A, B, Fut, F>(f, a_in_rx, opts, ctx)
+    }
+}
+
+#[cfg(feature = "tokio-runtime")]
+impl<Prev, F, In, A, B, Fut> StageSpawn<In> for GroupedAsyncStage<Prev, F>
+where
+    Prev: StageSpawn<In, Out = Vec<A>>,
+    F: Fn(A) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = B> + Send + 'static,
+    In: Send + Unpin + 'static,
+    A: Send + Unpin + 'static,
+    B: Send + Unpin + 'static,
+{
+    type Out = Vec<B>;
+
+    fn spawn<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<B>> {
+        FinalRx::Async(self.spawn_for_async::<R>(rx, ctx))
+    }
+
+    fn spawn_for_async<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> AsyncReceiver<(u64, Vec<B>)> {
+        let a_in_rx = self.prev.spawn_for_async::<R>(rx, ctx);
+        spawn_grouped_async_consumers_into::<AsyncMpmc, R, _, _, _, _>(
+            self.f, a_in_rx, &self.opts, ctx,
+        )
+    }
+
+    fn spawn_single<R: AsyncRuntime>(
+        self,
+        rx: Receiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<B>> {
+        let a_in_rx = self.prev.spawn_for_async::<R>(rx, ctx);
+        spawn_grouped_async_consumers_terminal(self.f, a_in_rx, &self.opts, ctx)
+    }
+
+    fn stage_budget(&self) -> StageBudget {
+        // Async stage runs on the async runtime, not the compute pool.
+        self.prev.stage_budget()
+    }
+
+    fn first_consumer_is_async(&self) -> Option<bool> {
+        self.prev.first_consumer_is_async().or(Some(true))
+    }
+
+    fn has_async_stage(&self) -> bool {
+        true
+    }
+
+    fn spawn_async_feeder<R: AsyncRuntime>(
+        self,
+        rx: AsyncReceiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<B>> {
+        let prev_rx = self.prev.spawn_async_feeder::<R>(rx, ctx);
+        let buffer = ctx.stage_buffer::<(u64, Prev::Out)>(
+            self.opts.buffer,
+            ctx.stage_io_concurrency(&self.opts),
+        );
+        let a_in_rx = bridge_final_rx_to_async::<Prev::Out, R>(prev_rx, buffer, ctx);
+        FinalRx::Async(
+            spawn_grouped_async_consumers_into::<AsyncMpmc, R, _, _, _, _>(
+                self.f, a_in_rx, &self.opts, ctx,
+            ),
+        )
+    }
+
+    fn spawn_async_feeder_single<R: AsyncRuntime>(
+        self,
+        rx: AsyncReceiver<(u64, In)>,
+        ctx: &StreamCtx<'_, R>,
+    ) -> FinalRx<Vec<B>> {
+        let prev_rx = self.prev.spawn_async_feeder::<R>(rx, ctx);
+        let buffer = ctx.stage_buffer::<(u64, Prev::Out)>(
+            self.opts.buffer,
+            ctx.stage_io_concurrency(&self.opts),
+        );
+        let a_in_rx = bridge_final_rx_to_async::<Prev::Out, R>(prev_rx, buffer, ctx);
+        spawn_grouped_async_consumers_terminal(self.f, a_in_rx, &self.opts, ctx)
+    }
 }
 
 // AsyncStage<Prev, F>: recurse into prev (likely sync), bridge sync→async,
@@ -2881,10 +3552,6 @@ where
 
     fn has_async_stage(&self) -> bool {
         true
-    }
-
-    fn has_expand(&self) -> bool {
-        self.prev.has_expand()
     }
 
     fn spawn_async_feeder<R: AsyncRuntime>(
@@ -3317,7 +3984,10 @@ where
 
 // ── StreamPipe builder methods ──
 
-impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
+// Mode-agnostic setters (todo #5): they express run-level configuration, not
+// payload shape, so one impl block serves every `StreamMode` — the mode
+// threads through the return type unchanged.
+impl<S, I, O, R: AsyncRuntime, M: StreamMode> StreamPipe<S, I, O, R, M> {
     /// Override the default [`PipelineConfig`] — wholesale-replace
     /// semantics, see [`Pipe::with_config`](crate::Pipe::with_config).
     #[must_use]
@@ -3366,17 +4036,8 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
         self
     }
 
-    /// Mark the output as order-preserving. The feeder tags each item with a
-    /// sequence number; the collector uses a [`ReorderBuffer`] to emit results
-    /// in input order. The default is unordered (faster — no reorder pass).
-    #[must_use]
-    pub fn ordered(mut self) -> Self {
-        self.ordered = true;
-        self
-    }
-
-    /// Pin the reorder window of an [`.ordered()`](Self::ordered) run to at
-    /// most `window` slots (rounded up to a power of two).
+    /// Pin the reorder window of an [`.ordered()`](StreamPipe::ordered) run
+    /// to at most `window` slots (rounded up to a power of two).
     ///
     /// By default the window pre-sizes to the pipeline's in-flight occupancy
     /// and grows on demand up to `next_pow2(n)` — correct for any per-item
@@ -3388,9 +4049,9 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// Only pin when a hard memory bound outweighs that robustness — e.g.
     /// very large `n` with a known-bounded reorder spread.
     ///
-    /// Inert without `.ordered()` (the unordered drains have no reorder
-    /// buffer). Values at or above `next_pow2(n)` are equivalent to the
-    /// default.
+    /// Inert on [`Unordered`] chains (no reorder buffer); in [`Grouped`]
+    /// chains a slot is one expansion group, not one item. Values at or
+    /// above `next_pow2(n)` are equivalent to the default.
     ///
     /// ```rust
     /// # use std::num::NonZeroUsize;
@@ -3420,7 +4081,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// construction costs ~ms, which would otherwise dominate small workloads.
     #[cfg(feature = "tokio-runtime")]
     #[must_use]
-    pub fn with_async_pool<R2: AsyncRuntime>(self, pool: R2) -> StreamPipe<S, I, O, R2> {
+    pub fn with_async_pool<R2: AsyncRuntime>(self, pool: R2) -> StreamPipe<S, I, O, R2, M> {
         // Rebuild with the new runtime type, transplanting every other field.
         // The `async_pool` field is the only one whose type depends on `R`.
         StreamPipe {
@@ -3430,7 +4091,6 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
             cancel: self.cancel,
             compute_pool: self.compute_pool,
             async_pool: Some(pool),
-            ordered: self.ordered,
             reorder_window: self.reorder_window,
             _marker: PhantomData,
         }
@@ -3535,13 +4195,239 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
         self.config = self.config.with_io_concurrency(n);
         self
     }
+}
+
+// ── Node-push helpers (todo #5) ──
+//
+// One per node flavour; the per-mode impl blocks below delegate so a stage
+// kind has exactly one construction site regardless of which mode exposes
+// it. Pure field moves — the bounds live on the builder methods.
+
+fn push_sync_stage<S, I, O, N, F, R: AsyncRuntime, M: StreamMode>(
+    pipe: StreamPipe<S, I, O, R, M>,
+    opts: SyncStageOptions,
+    f: F,
+) -> StreamPipe<SyncStage<S, F>, I, N, R, M> {
+    StreamPipe {
+        items: pipe.items,
+        stages: SyncStage {
+            prev: pipe.stages,
+            f,
+            opts,
+        },
+        config: pipe.config,
+        cancel: pipe.cancel,
+        compute_pool: pipe.compute_pool,
+        #[cfg(feature = "tokio-runtime")]
+        async_pool: pipe.async_pool,
+        reorder_window: pipe.reorder_window,
+        _marker: PhantomData,
+    }
+}
+
+fn push_fence<S, I, O, R: AsyncRuntime, M: StreamMode>(
+    pipe: StreamPipe<S, I, O, R, M>,
+    opts: FenceOptions,
+    mode: FenceMode,
+) -> StreamPipe<FenceLink<S>, I, O, R, M> {
+    StreamPipe {
+        items: pipe.items,
+        stages: FenceLink {
+            prev: pipe.stages,
+            mode,
+            opts,
+        },
+        config: pipe.config,
+        cancel: pipe.cancel,
+        compute_pool: pipe.compute_pool,
+        #[cfg(feature = "tokio-runtime")]
+        async_pool: pipe.async_pool,
+        reorder_window: pipe.reorder_window,
+        _marker: PhantomData,
+    }
+}
+
+#[cfg(feature = "tokio-runtime")]
+fn push_async_stage<S, I, O, N, F, R: AsyncRuntime, M: StreamMode>(
+    pipe: StreamPipe<S, I, O, R, M>,
+    opts: AsyncStageOptions,
+    f: F,
+) -> StreamPipe<AsyncStage<S, F>, I, N, R, M> {
+    StreamPipe {
+        items: pipe.items,
+        stages: AsyncStage {
+            prev: pipe.stages,
+            f,
+            opts,
+        },
+        config: pipe.config,
+        cancel: pipe.cancel,
+        compute_pool: pipe.compute_pool,
+        async_pool: pipe.async_pool,
+        reorder_window: pipe.reorder_window,
+        _marker: PhantomData,
+    }
+}
+
+/// Per-item expansion node ([`Unordered`] chains only — todo #5).
+fn push_expand<S, I, O, N, F, R: AsyncRuntime>(
+    pipe: StreamPipe<S, I, O, R, Unordered>,
+    opts: SyncStageOptions,
+    f: F,
+) -> StreamPipe<ExpandStage<S, F, N>, I, N, R, Unordered> {
+    StreamPipe {
+        items: pipe.items,
+        stages: ExpandStage {
+            prev: pipe.stages,
+            f,
+            opts,
+            _marker: PhantomData,
+        },
+        config: pipe.config,
+        cancel: pipe.cancel,
+        compute_pool: pipe.compute_pool,
+        #[cfg(feature = "tokio-runtime")]
+        async_pool: pipe.async_pool,
+        reorder_window: pipe.reorder_window,
+        _marker: PhantomData,
+    }
+}
+
+/// Group-payload transition ([`Ordered`] → [`Grouped`] — todo #5).
+fn push_ordered_expand<S, I, O, N, F, R: AsyncRuntime>(
+    pipe: StreamPipe<S, I, O, R, Ordered>,
+    opts: SyncStageOptions,
+    f: F,
+) -> StreamPipe<OrderedExpandStage<S, F, N>, I, N, R, Grouped> {
+    StreamPipe {
+        items: pipe.items,
+        stages: OrderedExpandStage {
+            prev: pipe.stages,
+            f,
+            opts,
+            _marker: PhantomData,
+        },
+        config: pipe.config,
+        cancel: pipe.cancel,
+        compute_pool: pipe.compute_pool,
+        #[cfg(feature = "tokio-runtime")]
+        async_pool: pipe.async_pool,
+        reorder_window: pipe.reorder_window,
+        _marker: PhantomData,
+    }
+}
+
+fn push_grouped_stage<S, I, O, N, F, R: AsyncRuntime>(
+    pipe: StreamPipe<S, I, O, R, Grouped>,
+    opts: SyncStageOptions,
+    f: F,
+) -> StreamPipe<GroupedStage<S, F>, I, N, R, Grouped> {
+    StreamPipe {
+        items: pipe.items,
+        stages: GroupedStage {
+            prev: pipe.stages,
+            f,
+            opts,
+        },
+        config: pipe.config,
+        cancel: pipe.cancel,
+        compute_pool: pipe.compute_pool,
+        #[cfg(feature = "tokio-runtime")]
+        async_pool: pipe.async_pool,
+        reorder_window: pipe.reorder_window,
+        _marker: PhantomData,
+    }
+}
+
+fn push_grouped_expand<S, I, O, N, F, R: AsyncRuntime>(
+    pipe: StreamPipe<S, I, O, R, Grouped>,
+    opts: SyncStageOptions,
+    f: F,
+) -> StreamPipe<GroupedExpandStage<S, F, N>, I, N, R, Grouped> {
+    StreamPipe {
+        items: pipe.items,
+        stages: GroupedExpandStage {
+            prev: pipe.stages,
+            f,
+            opts,
+            _marker: PhantomData,
+        },
+        config: pipe.config,
+        cancel: pipe.cancel,
+        compute_pool: pipe.compute_pool,
+        #[cfg(feature = "tokio-runtime")]
+        async_pool: pipe.async_pool,
+        reorder_window: pipe.reorder_window,
+        _marker: PhantomData,
+    }
+}
+
+#[cfg(feature = "tokio-runtime")]
+fn push_grouped_async_stage<S, I, O, N, F, R: AsyncRuntime>(
+    pipe: StreamPipe<S, I, O, R, Grouped>,
+    opts: AsyncStageOptions,
+    f: F,
+) -> StreamPipe<GroupedAsyncStage<S, F>, I, N, R, Grouped> {
+    StreamPipe {
+        items: pipe.items,
+        stages: GroupedAsyncStage {
+            prev: pipe.stages,
+            f,
+            opts,
+        },
+        config: pipe.config,
+        cancel: pipe.cancel,
+        compute_pool: pipe.compute_pool,
+        async_pool: pipe.async_pool,
+        reorder_window: pipe.reorder_window,
+        _marker: PhantomData,
+    }
+}
+
+// ── Unordered (default mode) ──
+
+impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R, Unordered> {
+    /// Mark the output as order-preserving. The feeder tags each item with a
+    /// sequence number; the collector uses a [`ReorderBuffer`] to emit results
+    /// in input order. The default is unordered (faster — no reorder pass).
+    ///
+    /// Only available on chains without `.expand()` — a per-item expansion
+    /// fans one seq out to N channel messages, which no re-sequencing can
+    /// order (a runtime panic before todo #5; now a compile error). To
+    /// expand **in input order**, call `.ordered()` *before* `.expand()`:
+    /// the ordered flavour carries each expansion group as one
+    /// `(seq, Vec<N>)` message — empty groups included — and later stages
+    /// map groups elementwise.
+    ///
+    /// ```rust
+    /// # use youpipe::stream;
+    /// let r: Vec<u64> = stream(0..100).stage(|x: u64| x + 1).ordered().run();
+    /// assert_eq!(r[42], 43);
+    /// ```
+    #[must_use]
+    pub fn ordered(self) -> StreamPipe<S, I, O, R, Ordered>
+    where
+        S: ExpandFree,
+    {
+        StreamPipe {
+            items: self.items,
+            stages: self.stages,
+            config: self.config,
+            cancel: self.cancel,
+            compute_pool: self.compute_pool,
+            #[cfg(feature = "tokio-runtime")]
+            async_pool: self.async_pool,
+            reorder_window: self.reorder_window,
+            _marker: PhantomData,
+        }
+    }
 
     /// Append a synchronous CPU stage: `Fn(O) -> N`. Runs on the work-stealing
     /// [`ComputePool`]; the output type changes to `N`.
     pub fn stage<N>(
         self,
         f: impl Fn(O) -> N + Send + Sync + 'static,
-    ) -> StreamPipe<SyncStage<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N, R>
+    ) -> StreamPipe<SyncStage<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N, R, Unordered>
     where
         N: Send + Unpin + 'static,
     {
@@ -3564,35 +4450,21 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
         self,
         opts: SyncStageOptions,
         f: impl Fn(O) -> N + Send + Sync + 'static,
-    ) -> StreamPipe<SyncStage<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N, R>
+    ) -> StreamPipe<SyncStage<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N, R, Unordered>
     where
         N: Send + Unpin + 'static,
     {
-        StreamPipe {
-            items: self.items,
-            stages: SyncStage {
-                prev: self.stages,
-                f,
-                opts,
-            },
-            config: self.config,
-            cancel: self.cancel,
-            compute_pool: self.compute_pool,
-            #[cfg(feature = "tokio-runtime")]
-            async_pool: self.async_pool,
-            ordered: self.ordered,
-            reorder_window: self.reorder_window,
-            _marker: PhantomData,
-        }
+        push_sync_stage(self, opts, f)
     }
 
     /// Append a 1-to-N expansion stage: `Fn(O) -> Vec<N>`. Each input item
-    /// produces zero or more outputs (like `flat_map`); expanded items inherit
-    /// the parent's sequence tag so the collector can attribute them to their
-    /// input. Note that `.ordered()` is *not* available here: one sequence tag
-    /// fans out to N items, which violates the reorder buffer's
-    /// single-item-per-seq contract — see the `# Panics` section of
-    /// [`run`](Self::run).
+    /// produces zero or more outputs (like `flat_map`); expanded items are
+    /// forwarded as individual channel messages sharing the parent's
+    /// sequence tag.
+    ///
+    /// `.ordered()` cannot follow this stage (compile error — the per-item
+    /// fan-out shares one seq across N messages). For ordered output call
+    /// `.ordered()` *before* `.expand()`; see [`Self::ordered`].
     ///
     /// This owned-`Vec` signature pays one `malloc` + `free` per input item.
     /// For expand-heavy loads prefer the push-style [`Self::expand_emit`],
@@ -3604,7 +4476,13 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     pub fn expand<N>(
         self,
         f: impl Fn(O) -> Vec<N> + Send + Sync + 'static,
-    ) -> StreamPipe<ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>, I, N, R>
+    ) -> StreamPipe<
+        ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>,
+        I,
+        N,
+        R,
+        Unordered,
+    >
     where
         N: Send + Unpin + 'static,
     {
@@ -3614,14 +4492,18 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     }
 
     /// [`Self::expand`] with per-stage tuning — see [`SyncStageOptions`].
-    #[allow(clippy::type_complexity)] // typestate builder return type; the
-    // `impl Fn` + nested `ExpandStage` + `R` param are inherent to the design
-    // and not helpfully decomposable.
+    #[allow(clippy::type_complexity)] // typestate builder return type (see `expand`).
     pub fn expand_with<N>(
         self,
         opts: SyncStageOptions,
         f: impl Fn(O) -> Vec<N> + Send + Sync + 'static,
-    ) -> StreamPipe<ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>, I, N, R>
+    ) -> StreamPipe<
+        ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>,
+        I,
+        N,
+        R,
+        Unordered,
+    >
     where
         N: Send + Unpin + 'static,
     {
@@ -3637,7 +4519,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     /// owned-`Vec` [`Self::expand`], which mallocs per input item.
     ///
     /// Output semantics are identical to [`Self::expand`]: items keep
-    /// emission order within each input's group and inherit the parent's
+    /// emission order within each input's group and share the parent's
     /// sequence tag.
     ///
     /// ```rust
@@ -3655,13 +4537,17 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     ///     .run();
     /// assert_eq!(words.len(), 100);
     /// ```
-    #[allow(clippy::type_complexity)] // typestate builder return type; the
-    // `impl Fn` + nested `ExpandStage` + `R` param are inherent to the design
-    // and not helpfully decomposable.
+    #[allow(clippy::type_complexity)] // typestate builder return type (see `expand`).
     pub fn expand_emit<N>(
         self,
         f: impl Fn(O, &mut Vec<N>) + Send + Sync + 'static,
-    ) -> StreamPipe<ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>, I, N, R>
+    ) -> StreamPipe<
+        ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>,
+        I,
+        N,
+        R,
+        Unordered,
+    >
     where
         N: Send + Unpin + 'static,
     {
@@ -3670,34 +4556,22 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
 
     /// [`Self::expand_emit`] with per-stage tuning — see
     /// [`SyncStageOptions`].
-    #[allow(clippy::type_complexity)] // typestate builder return type; the
-    // `impl Fn` + nested `ExpandStage` + `R` param are inherent to the design
-    // and not helpfully decomposable.
+    #[allow(clippy::type_complexity)] // typestate builder return type (see `expand`).
     pub fn expand_emit_with<N>(
         self,
         opts: SyncStageOptions,
         f: impl Fn(O, &mut Vec<N>) + Send + Sync + 'static,
-    ) -> StreamPipe<ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>, I, N, R>
+    ) -> StreamPipe<
+        ExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>,
+        I,
+        N,
+        R,
+        Unordered,
+    >
     where
         N: Send + Unpin + 'static,
     {
-        StreamPipe {
-            items: self.items,
-            stages: ExpandStage {
-                prev: self.stages,
-                f,
-                opts,
-                _marker: PhantomData,
-            },
-            config: self.config,
-            cancel: self.cancel,
-            compute_pool: self.compute_pool,
-            #[cfg(feature = "tokio-runtime")]
-            async_pool: self.async_pool,
-            ordered: self.ordered,
-            reorder_window: self.reorder_window,
-            _marker: PhantomData,
-        }
+        push_expand(self, opts, f)
     }
 
     /// Insert a fence (materialisation barrier) between the stages chained
@@ -3726,7 +4600,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     ///   max peak memory, no staging overlap).
     /// - [`FenceMode::Chunked`] releases batches as soon as they form so the two sides overlap —
     ///   the right default for mixed CPU/IO loads.
-    pub fn fence(self, mode: FenceMode) -> StreamPipe<FenceLink<S>, I, O, R> {
+    pub fn fence(self, mode: FenceMode) -> StreamPipe<FenceLink<S>, I, O, R, Unordered> {
         self.fence_with(FenceOptions::new(), mode)
     }
 
@@ -3739,23 +4613,8 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
         self,
         opts: FenceOptions,
         mode: FenceMode,
-    ) -> StreamPipe<FenceLink<S>, I, O, R> {
-        StreamPipe {
-            items: self.items,
-            stages: FenceLink {
-                prev: self.stages,
-                mode,
-                opts,
-            },
-            config: self.config,
-            cancel: self.cancel,
-            compute_pool: self.compute_pool,
-            #[cfg(feature = "tokio-runtime")]
-            async_pool: self.async_pool,
-            ordered: self.ordered,
-            reorder_window: self.reorder_window,
-            _marker: PhantomData,
-        }
+    ) -> StreamPipe<FenceLink<S>, I, O, R, Unordered> {
+        push_fence(self, opts, mode)
     }
 
     /// Append an async IO stage: `Fn(O) -> Future<Output = N>`. Runs as
@@ -3770,7 +4629,7 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
     pub fn stage_async<N, Fut>(
         self,
         f: impl Fn(O) -> Fut + Send + Sync + 'static,
-    ) -> StreamPipe<AsyncStage<S, impl Fn(O) -> Fut + Send + Sync + 'static>, I, N, R>
+    ) -> StreamPipe<AsyncStage<S, impl Fn(O) -> Fut + Send + Sync + 'static>, I, N, R, Unordered>
     where
         N: Send + Unpin + 'static,
         Fut: Future<Output = N> + Send + 'static,
@@ -3800,26 +4659,359 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R> {
         self,
         opts: AsyncStageOptions,
         f: impl Fn(O) -> Fut + Send + Sync + 'static,
-    ) -> StreamPipe<AsyncStage<S, impl Fn(O) -> Fut + Send + Sync + 'static>, I, N, R>
+    ) -> StreamPipe<AsyncStage<S, impl Fn(O) -> Fut + Send + Sync + 'static>, I, N, R, Unordered>
     where
         N: Send + Unpin + 'static,
         Fut: Future<Output = N> + Send + 'static,
     {
-        StreamPipe {
-            items: self.items,
-            stages: AsyncStage {
-                prev: self.stages,
-                f,
-                opts,
-            },
-            config: self.config,
-            cancel: self.cancel,
-            compute_pool: self.compute_pool,
-            async_pool: self.async_pool,
-            ordered: self.ordered,
-            reorder_window: self.reorder_window,
-            _marker: PhantomData,
-        }
+        push_async_stage(self, opts, f)
+    }
+}
+
+// ── Ordered (per-item payloads) ──
+
+impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R, Ordered> {
+    /// Idempotent re-spelling of [`.ordered()`](StreamPipe::ordered): the
+    /// chain is already order-preserving.
+    #[must_use]
+    pub fn ordered(self) -> Self {
+        self
+    }
+
+    /// [`StreamPipe::stage`] (identical node — payloads stay per-item in
+    /// this mode).
+    pub fn stage<N>(
+        self,
+        f: impl Fn(O) -> N + Send + Sync + 'static,
+    ) -> StreamPipe<SyncStage<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N, R, Ordered>
+    where
+        N: Send + Unpin + 'static,
+    {
+        self.stage_with(SyncStageOptions::new(), f)
+    }
+
+    /// [`StreamPipe::stage_with`] (identical node — see [`Self::stage`]).
+    pub fn stage_with<N>(
+        self,
+        opts: SyncStageOptions,
+        f: impl Fn(O) -> N + Send + Sync + 'static,
+    ) -> StreamPipe<SyncStage<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N, R, Ordered>
+    where
+        N: Send + Unpin + 'static,
+    {
+        push_sync_stage(self, opts, f)
+    }
+
+    /// Ordered expansion (todo #5): like [`StreamPipe::expand`] but the
+    /// whole expansion group of one input travels as a single
+    /// `(seq, Vec<N>)` channel message, so the output order is exactly the
+    /// input order — groups included, empty groups included (an empty
+    /// expansion is an empty-`Vec` message, which a per-item tagging could
+    /// not express at all). Subsequent stages (`.stage`, `.expand`,
+    /// `.stage_async`) map groups elementwise; nested expands flatten into
+    /// one group in `(sub₁, sub₂)` order.
+    ///
+    /// The channel carries one message per *input* item (fewer, larger
+    /// messages than the unordered per-item fan-out), and each group is a
+    /// fresh `Vec` moved into the channel — one allocation per input item,
+    /// the same cost class as the owned-`Vec` unordered `expand`.
+    #[allow(clippy::type_complexity)] // typestate builder return type (see
+    // `StreamPipe::expand`).
+    pub fn expand<N>(
+        self,
+        f: impl Fn(O) -> Vec<N> + Send + Sync + 'static,
+    ) -> StreamPipe<
+        OrderedExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>,
+        I,
+        N,
+        R,
+        Grouped,
+    >
+    where
+        N: Send + Unpin + 'static,
+    {
+        self.expand_emit_with(SyncStageOptions::new(), move |item, out| {
+            out.append(&mut f(item));
+        })
+    }
+
+    /// [`Self::expand`] with per-stage tuning — see [`SyncStageOptions`].
+    #[allow(clippy::type_complexity)] // typestate builder return type (see `expand`).
+    pub fn expand_with<N>(
+        self,
+        opts: SyncStageOptions,
+        f: impl Fn(O) -> Vec<N> + Send + Sync + 'static,
+    ) -> StreamPipe<
+        OrderedExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>,
+        I,
+        N,
+        R,
+        Grouped,
+    >
+    where
+        N: Send + Unpin + 'static,
+    {
+        self.expand_emit_with(opts, move |item, out| {
+            out.append(&mut f(item));
+        })
+    }
+
+    /// Push-style [`Self::expand`]: `Fn(O, &mut Vec<N>)` appends the group's
+    /// outputs to a scratch buffer the stage owns per call — identical
+    /// output semantics (one group message per input item).
+    #[allow(clippy::type_complexity)] // typestate builder return type (see `expand`).
+    pub fn expand_emit<N>(
+        self,
+        f: impl Fn(O, &mut Vec<N>) + Send + Sync + 'static,
+    ) -> StreamPipe<
+        OrderedExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>,
+        I,
+        N,
+        R,
+        Grouped,
+    >
+    where
+        N: Send + Unpin + 'static,
+    {
+        self.expand_emit_with(SyncStageOptions::new(), f)
+    }
+
+    /// [`Self::expand_emit`] with per-stage tuning — see
+    /// [`SyncStageOptions`].
+    #[allow(clippy::type_complexity)] // typestate builder return type (see `expand`).
+    pub fn expand_emit_with<N>(
+        self,
+        opts: SyncStageOptions,
+        f: impl Fn(O, &mut Vec<N>) + Send + Sync + 'static,
+    ) -> StreamPipe<
+        OrderedExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>,
+        I,
+        N,
+        R,
+        Grouped,
+    >
+    where
+        N: Send + Unpin + 'static,
+    {
+        push_ordered_expand(self, opts, f)
+    }
+
+    /// [`StreamPipe::fence`] — identical node and semantics (payloads stay
+    /// per-item in this mode).
+    pub fn fence(self, mode: FenceMode) -> StreamPipe<FenceLink<S>, I, O, R, Ordered> {
+        self.fence_with(FenceOptions::new(), mode)
+    }
+
+    /// [`Self::fence`] with per-link tuning — see [`FenceOptions`].
+    pub fn fence_with(
+        self,
+        opts: FenceOptions,
+        mode: FenceMode,
+    ) -> StreamPipe<FenceLink<S>, I, O, R, Ordered> {
+        push_fence(self, opts, mode)
+    }
+
+    /// [`StreamPipe::stage_async`] (identical node — payloads stay
+    /// per-item in this mode).
+    #[cfg(feature = "tokio-runtime")]
+    pub fn stage_async<N, Fut>(
+        self,
+        f: impl Fn(O) -> Fut + Send + Sync + 'static,
+    ) -> StreamPipe<AsyncStage<S, impl Fn(O) -> Fut + Send + Sync + 'static>, I, N, R, Ordered>
+    where
+        N: Send + Unpin + 'static,
+        Fut: Future<Output = N> + Send + 'static,
+    {
+        self.stage_async_with(AsyncStageOptions::new(), f)
+    }
+
+    /// [`Self::stage_async`] with per-stage tuning — see
+    /// [`AsyncStageOptions`].
+    #[cfg(feature = "tokio-runtime")]
+    pub fn stage_async_with<N, Fut>(
+        self,
+        opts: AsyncStageOptions,
+        f: impl Fn(O) -> Fut + Send + Sync + 'static,
+    ) -> StreamPipe<AsyncStage<S, impl Fn(O) -> Fut + Send + Sync + 'static>, I, N, R, Ordered>
+    where
+        N: Send + Unpin + 'static,
+        Fut: Future<Output = N> + Send + 'static,
+    {
+        push_async_stage(self, opts, f)
+    }
+}
+
+// ── Grouped (group payloads downstream of an ordered expand) ──
+
+impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R, Grouped>
+where
+    S: StageSpawn<I, Out = Vec<O>>,
+    I: Send + Unpin + 'static,
+    O: Send + Unpin + 'static,
+{
+    /// Idempotent re-spelling of [`.ordered()`](StreamPipe::ordered): the
+    /// chain is already order-preserving.
+    #[must_use]
+    pub fn ordered(self) -> Self {
+        self
+    }
+
+    /// Append a synchronous stage mapping each group **elementwise**:
+    /// `Fn(O) -> N` is applied to every element of each `(seq, Vec<O>)`
+    /// group payload, emitting one `(seq, Vec<N>)` group — the group stays
+    /// atomic, preserving input order.
+    pub fn stage<N>(
+        self,
+        f: impl Fn(O) -> N + Send + Sync + 'static,
+    ) -> StreamPipe<GroupedStage<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N, R, Grouped>
+    where
+        N: Send + Unpin + 'static,
+    {
+        self.stage_with(SyncStageOptions::new(), f)
+    }
+
+    /// [`Self::stage`] with per-stage tuning — see [`SyncStageOptions`].
+    pub fn stage_with<N>(
+        self,
+        opts: SyncStageOptions,
+        f: impl Fn(O) -> N + Send + Sync + 'static,
+    ) -> StreamPipe<GroupedStage<S, impl Fn(O) -> N + Send + Sync + 'static>, I, N, R, Grouped>
+    where
+        N: Send + Unpin + 'static,
+    {
+        push_grouped_stage(self, opts, f)
+    }
+
+    /// Nested expansion (todo #5): every element of each input group
+    /// expands (owned-`Vec` flavour) into the SAME output group — one
+    /// `(seq, Vec<N>)` message per original input item, elements in
+    /// `(sub₁, sub₂)` order. Empty groups and empty expansions stay
+    /// expressible.
+    #[allow(clippy::type_complexity)] // typestate builder return type (see
+    // `StreamPipe::expand`).
+    pub fn expand<N>(
+        self,
+        f: impl Fn(O) -> Vec<N> + Send + Sync + 'static,
+    ) -> StreamPipe<
+        GroupedExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>,
+        I,
+        N,
+        R,
+        Grouped,
+    >
+    where
+        N: Send + Unpin + 'static,
+    {
+        self.expand_emit_with(SyncStageOptions::new(), move |item, out| {
+            out.append(&mut f(item));
+        })
+    }
+
+    /// [`Self::expand`] with per-stage tuning — see [`SyncStageOptions`].
+    #[allow(clippy::type_complexity)] // typestate builder return type (see `expand`).
+    pub fn expand_with<N>(
+        self,
+        opts: SyncStageOptions,
+        f: impl Fn(O) -> Vec<N> + Send + Sync + 'static,
+    ) -> StreamPipe<
+        GroupedExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>,
+        I,
+        N,
+        R,
+        Grouped,
+    >
+    where
+        N: Send + Unpin + 'static,
+    {
+        self.expand_emit_with(opts, move |item, out| {
+            out.append(&mut f(item));
+        })
+    }
+
+    /// Push-style [`Self::expand`]: `Fn(O, &mut Vec<N>)` appends each
+    /// element's outputs to the output group.
+    #[allow(clippy::type_complexity)] // typestate builder return type (see `expand`).
+    pub fn expand_emit<N>(
+        self,
+        f: impl Fn(O, &mut Vec<N>) + Send + Sync + 'static,
+    ) -> StreamPipe<
+        GroupedExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>,
+        I,
+        N,
+        R,
+        Grouped,
+    >
+    where
+        N: Send + Unpin + 'static,
+    {
+        self.expand_emit_with(SyncStageOptions::new(), f)
+    }
+
+    /// [`Self::expand_emit`] with per-stage tuning — see
+    /// [`SyncStageOptions`].
+    #[allow(clippy::type_complexity)] // typestate builder return type (see `expand`).
+    pub fn expand_emit_with<N>(
+        self,
+        opts: SyncStageOptions,
+        f: impl Fn(O, &mut Vec<N>) + Send + Sync + 'static,
+    ) -> StreamPipe<
+        GroupedExpandStage<S, impl Fn(O, &mut Vec<N>) + Send + Sync + 'static, N>,
+        I,
+        N,
+        R,
+        Grouped,
+    >
+    where
+        N: Send + Unpin + 'static,
+    {
+        push_grouped_expand(self, opts, f)
+    }
+
+    /// [`StreamPipe::fence`] — the forwarder passes whole group payloads
+    /// opaquely (identical node; a slot is one group).
+    pub fn fence(self, mode: FenceMode) -> StreamPipe<FenceLink<S>, I, O, R, Grouped> {
+        self.fence_with(FenceOptions::new(), mode)
+    }
+
+    /// [`Self::fence`] with per-link tuning — see [`FenceOptions`].
+    pub fn fence_with(
+        self,
+        opts: FenceOptions,
+        mode: FenceMode,
+    ) -> StreamPipe<FenceLink<S>, I, O, R, Grouped> {
+        push_fence(self, opts, mode)
+    }
+
+    /// Append an async IO stage mapping each group **elementwise**: each
+    /// consumer task takes one whole `(seq, Vec<O>)` group, awaits the
+    /// closure per element, and emits one `(seq, Vec<N>)` group — groups
+    /// stay atomic, concurrency is across groups (bounded by
+    /// `io_concurrency`).
+    #[cfg(feature = "tokio-runtime")]
+    pub fn stage_async<N, Fut>(
+        self,
+        f: impl Fn(O) -> Fut + Send + Sync + 'static,
+    ) -> StreamPipe<GroupedAsyncStage<S, impl Fn(O) -> Fut + Send + Sync + 'static>, I, N, R, Grouped>
+    where
+        N: Send + Unpin + 'static,
+        Fut: Future<Output = N> + Send + 'static,
+    {
+        self.stage_async_with(AsyncStageOptions::new(), f)
+    }
+
+    /// [`Self::stage_async`] with per-stage tuning — see
+    /// [`AsyncStageOptions`].
+    #[cfg(feature = "tokio-runtime")]
+    pub fn stage_async_with<N, Fut>(
+        self,
+        opts: AsyncStageOptions,
+        f: impl Fn(O) -> Fut + Send + Sync + 'static,
+    ) -> StreamPipe<GroupedAsyncStage<S, impl Fn(O) -> Fut + Send + Sync + 'static>, I, N, R, Grouped>
+    where
+        N: Send + Unpin + 'static,
+        Fut: Future<Output = N> + Send + 'static,
+    {
+        push_grouped_async_stage(self, opts, f)
     }
 }
 
@@ -4226,17 +5418,633 @@ async fn for_each_async<R, T, F>(
     }
 }
 
-impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R>
+// ── Grouped collectors (todo #5) ──
+//
+// A grouped run drains `(seq, Vec<T>)` group payloads; the ordered drain
+// re-sequences GROUPS (one message per input item — empty groups included),
+// so `n` counts input items and the `emitted + dropped == n` accounting
+// closes at group granularity: each group is exactly one ReorderBuffer
+// slot, and a flushed empty group emits zero items while still advancing
+// `next_expected`. The flattening sinks below adapt the per-item terminal
+// semantics elementwise.
+
+/// Flattening drain of a sync grouped receiver (group payloads → per-item
+/// `f`), the grouped twin of `for_each_sync`.
+fn flat_drain_sync<R, T, F>(
+    rx: &R,
+    ordered: bool,
+    window: OrderedWindow,
+    n: usize,
+    cancel: Option<&CancellationToken>,
+    mut f: F,
+) where
+    R: RecvItem<(u64, Vec<T>)>,
+    T: Send + Unpin + 'static,
+    F: FnMut(T),
+{
+    if ordered {
+        drain_ordered(
+            rx,
+            n,
+            window,
+            OrderedAccounting::Validate { cancel },
+            |group| {
+                for item in group {
+                    f(item);
+                }
+            },
+        );
+    } else {
+        crate::state::drain_unordered(rx, |group| {
+            for item in group {
+                f(item);
+            }
+        });
+    }
+}
+
+/// Sharded counterpart of [`flat_drain_sync`].
+fn flat_drain_sync_sharded<T, F>(
+    rx: &mut ShardedReceiver<(u64, Vec<T>)>,
+    ordered: bool,
+    window: OrderedWindow,
+    n: usize,
+    cancel: Option<&CancellationToken>,
+    mut f: F,
+) where
+    T: Send + Unpin + 'static,
+    F: FnMut(T),
+{
+    if ordered {
+        drain_ordered_sharded(
+            rx,
+            n,
+            window,
+            OrderedAccounting::Validate { cancel },
+            |group| {
+                for item in group {
+                    f(item);
+                }
+            },
+        );
+    } else {
+        drain_unordered_sharded(rx, |group| {
+            for item in group {
+                f(item);
+            }
+        });
+    }
+}
+
+/// Async counterpart of [`flat_drain_sync`].
+#[cfg(feature = "tokio-runtime")]
+async fn flat_drain_async<R, T, F>(
+    rx: &R,
+    ordered: bool,
+    window: OrderedWindow,
+    n: usize,
+    cancel: Option<&CancellationToken>,
+    mut f: F,
+) where
+    R: AsyncRecvItem<(u64, Vec<T>)>,
+    T: Send + Unpin + 'static,
+    F: FnMut(T),
+{
+    if ordered {
+        drain_ordered_async(
+            rx,
+            n,
+            window,
+            OrderedAccounting::Validate { cancel },
+            |group| {
+                for item in group {
+                    f(item);
+                }
+            },
+        )
+        .await;
+    } else {
+        crate::state::drain_unordered_async(rx, |group| {
+            for item in group {
+                f(item);
+            }
+        })
+        .await;
+    }
+}
+
+/// Async sharded counterpart of [`flat_drain_sync`].
+#[cfg(feature = "tokio-runtime")]
+async fn flat_drain_async_sharded<T, F>(
+    rx: &mut ShardedAsyncReceiver<(u64, Vec<T>)>,
+    ordered: bool,
+    window: OrderedWindow,
+    n: usize,
+    cancel: Option<&CancellationToken>,
+    mut f: F,
+) where
+    T: Send + Unpin + 'static,
+    F: FnMut(T),
+{
+    if ordered {
+        drain_ordered_async_sharded(
+            rx,
+            n,
+            window,
+            OrderedAccounting::Validate { cancel },
+            |group| {
+                for item in group {
+                    f(item);
+                }
+            },
+        )
+        .await;
+    } else {
+        drain_unordered_async_sharded(rx, |group| {
+            for item in group {
+                f(item);
+            }
+        })
+        .await;
+    }
+}
+
+/// Flattening `Vec` collector — the behaviour of `.run()` on a [`Grouped`]
+/// chain.
+struct FlatVecCollector;
+
+impl<T: Send + Unpin + 'static> Terminal<Vec<T>> for FlatVecCollector {
+    type Out = Vec<T>;
+
+    fn drain_empty(self) -> Vec<T> {
+        Vec::new()
+    }
+
+    fn drain_sync<R: RecvItem<(u64, Vec<T>)>>(
+        self,
+        rx: R,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Vec<T> {
+        let mut results = Vec::new();
+        flat_drain_sync(&rx, ordered, window, n, cancel, |item| results.push(item));
+        results
+    }
+
+    fn drain_sync_sharded(
+        self,
+        mut rx: ShardedReceiver<(u64, Vec<T>)>,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Vec<T> {
+        let mut results = Vec::new();
+        flat_drain_sync_sharded(&mut rx, ordered, window, n, cancel, |item| {
+            results.push(item);
+        });
+        results
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    async fn drain_async<R: AsyncRecvItem<(u64, Vec<T>)>>(
+        self,
+        rx: R,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Vec<T> {
+        let mut results = Vec::new();
+        flat_drain_async(&rx, ordered, window, n, cancel, |item| results.push(item)).await;
+        results
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    async fn drain_async_sharded(
+        self,
+        mut rx: ShardedAsyncReceiver<(u64, Vec<T>)>,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Vec<T> {
+        let mut results = Vec::new();
+        flat_drain_async_sharded(&mut rx, ordered, window, n, cancel, |item| {
+            results.push(item);
+        })
+        .await;
+        results
+    }
+}
+
+/// Flattening side-effect terminal — the behaviour of `.for_each()` on a
+/// [`Grouped`] chain (`f` sees each element of each group, in input order).
+struct FlatForEachCollector<F> {
+    f: F,
+}
+
+impl<T: Send + Unpin + 'static, F: FnMut(T)> Terminal<Vec<T>> for FlatForEachCollector<F> {
+    type Out = ();
+
+    fn drain_empty(self) {}
+
+    fn drain_sync<R: RecvItem<(u64, Vec<T>)>>(
+        self,
+        rx: R,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) {
+        let Self { f } = self;
+        flat_drain_sync(&rx, ordered, window, n, cancel, f);
+    }
+
+    fn drain_sync_sharded(
+        self,
+        mut rx: ShardedReceiver<(u64, Vec<T>)>,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) {
+        let Self { f } = self;
+        flat_drain_sync_sharded(&mut rx, ordered, window, n, cancel, f);
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    async fn drain_async<R: AsyncRecvItem<(u64, Vec<T>)>>(
+        self,
+        rx: R,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) {
+        let Self { f } = self;
+        flat_drain_async(&rx, ordered, window, n, cancel, f).await;
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    async fn drain_async_sharded(
+        self,
+        mut rx: ShardedAsyncReceiver<(u64, Vec<T>)>,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) {
+        let Self { f } = self;
+        flat_drain_async_sharded(&mut rx, ordered, window, n, cancel, f).await;
+    }
+}
+
+/// Flattening reducing terminal — the aggregation terminals' behaviour on a
+/// [`Grouped`] chain (folds each element in input order).
+struct FlatReducerCollector<Red> {
+    reducer: Red,
+}
+
+impl<T, Red> Terminal<Vec<T>> for FlatReducerCollector<Red>
+where
+    T: Send + Unpin + 'static,
+    Red: Reducer<T>,
+    Red::Acc: 'static,
+{
+    type Out = Red::Acc;
+
+    fn drain_empty(self) -> Red::Acc {
+        self.reducer.identity()
+    }
+
+    fn drain_sync<R: RecvItem<(u64, Vec<T>)>>(
+        self,
+        rx: R,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Red::Acc {
+        let Self { reducer } = self;
+        let mut acc = Some(reducer.identity());
+        flat_drain_sync(&rx, ordered, window, n, cancel, |item| {
+            acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item));
+        });
+        acc.expect("drain restores the accumulator")
+    }
+
+    fn drain_sync_sharded(
+        self,
+        mut rx: ShardedReceiver<(u64, Vec<T>)>,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Red::Acc {
+        let Self { reducer } = self;
+        let mut acc = Some(reducer.identity());
+        flat_drain_sync_sharded(&mut rx, ordered, window, n, cancel, |item| {
+            acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item));
+        });
+        acc.expect("drain restores the accumulator")
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    async fn drain_async<R: AsyncRecvItem<(u64, Vec<T>)>>(
+        self,
+        rx: R,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Red::Acc {
+        let Self { reducer } = self;
+        let mut acc = Some(reducer.identity());
+        flat_drain_async(&rx, ordered, window, n, cancel, |item| {
+            acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item));
+        })
+        .await;
+        acc.expect("drain restores the accumulator")
+    }
+
+    #[cfg(feature = "tokio-runtime")]
+    async fn drain_async_sharded(
+        self,
+        mut rx: ShardedAsyncReceiver<(u64, Vec<T>)>,
+        ordered: bool,
+        window: OrderedWindow,
+        n: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Red::Acc {
+        let Self { reducer } = self;
+        let mut acc = Some(reducer.identity());
+        flat_drain_async_sharded(&mut rx, ordered, window, n, cancel, |item| {
+            acc = Some(reducer.fold(acc.take().expect("accumulator slot"), item));
+        })
+        .await;
+        acc.expect("drain restores the accumulator")
+    }
+}
+
+/// Shared streaming execution core (the former `try_exec`): admission /
+/// lease resolution, `StreamCtx` wiring, async-runtime warm-up, feeder
+/// routing, terminal drain. `Pay` is the chain's final payload type
+/// (per-item `T`, or group `Vec<T>` on [`Grouped`] chains — the terminal
+/// matches); `X` is the pipe's display-level item type, carried but
+/// unconstrained. The mode-specific run families choose the [`Terminal`]
+/// and the `ordered` drain flag.
+#[cfg_attr(not(feature = "tokio-runtime"), allow(clippy::unnecessary_wraps))]
+fn exec_stream<S, In, Pay, X, T, R, M: StreamMode>(
+    pipe: StreamPipe<S, In, X, R, M>,
+    terminal: T,
+    ordered: bool,
+) -> std::io::Result<T::Out>
+where
+    S: StageSpawn<In, Out = Pay>,
+    In: Send + Unpin + 'static,
+    Pay: Send + Unpin + 'static,
+    T: Terminal<Pay>,
+    R: AsyncRuntime,
+{
+    let n = pipe.items.len();
+    if n == 0 {
+        return Ok(terminal.drain_empty());
+    }
+    let StreamPipe {
+        items,
+        stages,
+        config,
+        cancel,
+        compute_pool,
+        #[cfg(feature = "tokio-runtime")]
+        async_pool,
+        reorder_window,
+        _marker,
+    } = pipe;
+
+    // Admission/lease resolution (pool jobs vs dedicated threads, the
+    // per-stage worker division): `resolve_admission` keeps the
+    // liveness-invariant comments next to the arithmetic that maintains
+    // them.
+    let Admission {
+        pool,
+        lease,
+        dedicated_threads,
+        per_stage_parallelism,
+        worker_slots_left,
+        stages_left,
+    } = resolve_admission(&stages.stage_budget(), &config, compute_pool.as_ref(), n);
+    let has_async_stage = stages.has_async_stage();
+    let ctx: StreamCtx<'_, R> = StreamCtx {
+        config: &config,
+        cancel,
+        n,
+        per_stage_parallelism,
+        dedicated_threads,
+        has_async_stage,
+        terminal_policy: TermPolicy::from_env(),
+        lease,
+        worker_slots_left: Cell::new(worker_slots_left),
+        stages_left: Cell::new(stages_left),
+        in_flight: Cell::new(0),
+        compute_pool: Some(pool),
+        #[cfg(feature = "tokio-runtime")]
+        async_pool,
+        #[cfg(feature = "tokio-runtime")]
+        cached_pool: OnceLock::new(),
+        #[cfg(feature = "tokio-runtime")]
+        async_panic: OnceLock::new(),
+        _marker: PhantomData,
+    };
+
+    // Warm the lazily-built async runtime (when the chain needs one)
+    // BEFORE spawning it: the OnceLock caches this result, so every
+    // `acquire_async().expect(..)` inside the spawn walk (bridges, async
+    // consumers) is guaranteed to read an `Ok` and can never panic — a
+    // construction failure (e.g. OS thread limits) surfaces here as
+    // `try_run`'s `Err` instead of aborting a half-spawned pipeline.
+    #[cfg(feature = "tokio-runtime")]
+    if has_async_stage {
+        ctx.acquire_async()?;
+    }
+
+    let (final_rx, feeder) = route_feeder(stages, items, &ctx);
+    drain_terminal(terminal, final_rx, feeder, ordered, reorder_window, &ctx)
+}
+
+// ── Per-mode run families (todo #5) ──
+//
+// Unordered and Ordered share the pass cores below (they differ only in the
+// drain flag); Grouped has its own (group payloads + flattening collectors,
+// no fused pass-through — the chain contains an expansion by construction).
+
+/// Collecting pass for per-item modes: the fused pass-through attempt (pure
+/// unpinned `SyncStage` chains, no cancellation) followed by the streaming
+/// topology with the [`VecCollector`].
+fn run_stream_pass<S, I, O, R, M: StreamMode>(
+    mut pipe: StreamPipe<S, I, O, R, M>,
+    ordered: bool,
+) -> std::io::Result<Vec<O>>
+where
+    S: StageSpawn<I, Out = O>,
+    I: Send + Unpin + 'static,
+    O: Send + Unpin + 'static,
+    R: AsyncRuntime,
+{
+    // Fused pass-through: a chain of pure, unpinned `SyncStage`s without
+    // cancellation is semantically `pipe(items).map(f1)….map(fk).collect()`
+    // — run it on the fused index core instead of the streaming
+    // infrastructure. `.ordered()` stays eligible: the pass-through output
+    // IS input order.
+    //
+    // A pinned `with_compute_workers` budget declines: the fused core has
+    // no notion of "cap stage concurrency on a larger pool" (same
+    // "explicit pin ⇒ no pass-through" policy as per-stage
+    // `SyncStageOptions::workers` pins).
+    if pipe.cancel.is_none() && !pipe.config.compute_workers_pinned {
+        let pool = pipe
+            .compute_pool
+            .as_ref()
+            .unwrap_or_else(|| ComputePool::global());
+        let items = std::mem::take(&mut pipe.items);
+        match pipe
+            .stages
+            .fuse_exec(FusedOp(Identity), items, pipe.config.workload, pool)
+        {
+            Ok(out) => return Ok(out),
+            // Chain not pass-through-eligible: restore the items and take
+            // the streaming path below.
+            Err(items) => pipe.items = items,
+        }
+    }
+    exec_stream::<S, I, O, O, VecCollector, R, M>(pipe, VecCollector, ordered)
+}
+
+/// `for_each` pass for per-item modes (never takes the fused pass-through —
+/// its drain runs on the calling thread).
+fn for_each_stream_pass<S, I, O, F, R, M: StreamMode>(
+    pipe: StreamPipe<S, I, O, R, M>,
+    f: F,
+    ordered: bool,
+) where
+    S: StageSpawn<I, Out = O>,
+    I: Send + Unpin + 'static,
+    O: Send + Unpin + 'static,
+    F: FnMut(O),
+    R: AsyncRuntime,
+{
+    exec_stream::<S, I, O, O, ForEachCollector<F>, R, M>(pipe, ForEachCollector { f }, ordered)
+        .expect("StreamPipe::for_each: failed to build async runtime (see run/try_run)");
+}
+
+/// Aggregation pass for per-item modes: the fused reduce attempt, then the
+/// streaming fallback with the [`ReducerCollector`]. `make_reducer` is
+/// invoked at most twice (once for the fused attempt by reference, once for
+/// the streaming terminal by value) — the reduce family's reducers are
+/// cheap views over user closures.
+fn reduce_stream_pass<S, I, O, Red, R, M: StreamMode>(
+    mut pipe: StreamPipe<S, I, O, R, M>,
+    ordered: bool,
+    make_reducer: impl Fn() -> Red,
+) -> std::io::Result<Red::Acc>
+where
+    S: StageSpawn<I, Out = O>,
+    I: Send + Unpin + 'static,
+    O: Send + Unpin + 'static,
+    Red: Reducer<O>,
+    Red::Acc: 'static,
+    R: AsyncRuntime,
+{
+    if pipe.cancel.is_none() && !pipe.config.compute_workers_pinned {
+        let pool = pipe
+            .compute_pool
+            .as_ref()
+            .unwrap_or_else(|| ComputePool::global());
+        let items = std::mem::take(&mut pipe.items);
+        match pipe.stages.fuse_exec_reduce(
+            FusedOp(Identity),
+            &make_reducer(),
+            items,
+            pipe.config.workload,
+            pool,
+        ) {
+            Ok(acc) => return Ok(acc),
+            Err(items) => pipe.items = items,
+        }
+    }
+    exec_stream::<S, I, O, O, ReducerCollector<Red>, R, M>(
+        pipe,
+        ReducerCollector {
+            reducer: make_reducer(),
+        },
+        ordered,
+    )
+}
+
+/// Collecting pass for [`Grouped`] chains: ordered drain over group
+/// payloads with the flattening collector. No fused attempt — the chain
+/// contains an expansion by construction (`fuse_exec` declines it).
+fn run_grouped_pass<S, I, O, R>(pipe: StreamPipe<S, I, O, R, Grouped>) -> std::io::Result<Vec<O>>
+where
+    S: StageSpawn<I, Out = Vec<O>>,
+    I: Send + Unpin + 'static,
+    O: Send + Unpin + 'static,
+    R: AsyncRuntime,
+{
+    exec_stream::<S, I, Vec<O>, O, FlatVecCollector, R, Grouped>(pipe, FlatVecCollector, true)
+}
+
+/// `for_each` pass for [`Grouped`] chains.
+fn for_each_grouped_pass<S, I, O, F, R>(pipe: StreamPipe<S, I, O, R, Grouped>, f: F)
+where
+    S: StageSpawn<I, Out = Vec<O>>,
+    I: Send + Unpin + 'static,
+    O: Send + Unpin + 'static,
+    F: FnMut(O),
+    R: AsyncRuntime,
+{
+    exec_stream::<S, I, Vec<O>, O, FlatForEachCollector<F>, R, Grouped>(
+        pipe,
+        FlatForEachCollector { f },
+        true,
+    )
+    .expect("StreamPipe::for_each: failed to build async runtime (see run/try_run)");
+}
+
+/// Aggregation pass for [`Grouped`] chains — no fused attempt (see
+/// [`run_grouped_pass`]).
+fn reduce_grouped_pass<S, I, O, Red, R>(
+    pipe: StreamPipe<S, I, O, R, Grouped>,
+    reducer: Red,
+) -> std::io::Result<Red::Acc>
+where
+    S: StageSpawn<I, Out = Vec<O>>,
+    I: Send + Unpin + 'static,
+    O: Send + Unpin + 'static,
+    Red: Reducer<O>,
+    Red::Acc: 'static,
+    R: AsyncRuntime,
+{
+    exec_stream::<S, I, Vec<O>, O, FlatReducerCollector<Red>, R, Grouped>(
+        pipe,
+        FlatReducerCollector { reducer },
+        true,
+    )
+}
+
+// ── Unordered run family ──
+
+impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R, Unordered>
 where
     S: StageSpawn<I, Out = O>,
     I: Send + Unpin + 'static,
     O: Send + Unpin + 'static,
 {
-    /// Execute the streaming pipeline and collect results into a `Vec<O>`.
-    ///
-    /// Feeds `items` through the stage chain (channels between each stage),
-    /// optionally reorders by sequence tag if `.ordered()` was called, and
-    /// drains the final receiver into a `Vec`.
+    /// Execute the streaming pipeline and collect results into a `Vec<O>`
+    /// in completion order (see [`StreamPipe::ordered`] for input order).
     ///
     /// # Fused pass-through
     ///
@@ -4267,13 +6075,11 @@ where
     /// mid-run, the feeder stops feeding, every stage worker stops once its
     /// current item is done, and the collector drains what already crossed
     /// the channels. The output is silently truncated: a cancelled run is
-    /// indistinguishable from a run whose input was simply shorter (with
-    /// `.ordered()` the result is still in input order — a prefix of
-    /// unknown length). To distinguish the two, use
-    /// [`run_checked`](Self::run_checked), which reports
-    /// [`RunOutcome::Cancelled { emitted }`](crate::RunOutcome) after the
-    /// drain (one token read, no hot-path cost). Every terminal shares the
-    /// silent-truncation contract ([`for_each`](Self::for_each),
+    /// indistinguishable from a run whose input was simply shorter. To
+    /// distinguish the two, use [`run_checked`](Self::run_checked), which
+    /// reports [`RunOutcome::Cancelled { emitted }`](crate::RunOutcome)
+    /// after the drain (one token read, no hot-path cost). Every terminal
+    /// shares the silent-truncation contract ([`for_each`](Self::for_each),
     /// [`reduce`](Self::reduce), …); the non-collecting terminals have no
     /// checked twin — count in your own closure if truncation matters
     /// there.
@@ -4299,21 +6105,16 @@ where
     /// Panics in the caller-side sink of [`for_each`](Self::for_each) and
     /// the fold/reduce combinators propagate normally (they run on the
     /// calling thread), as do panics in the input iterator (collected by
-    /// [`stream`](crate::stream) before any topology exists).
-    ///
-    /// Additionally, panics if `.ordered()` is combined with `.expand()`
-    /// (expand fan-out shares the parent's sequence number, which the
-    /// reorder buffer cannot re-sequence — detected by the
-    /// `StageSpawn::has_expand` walk), if the async runtime cannot be
-    /// constructed
+    /// [`stream`](crate::stream) before any topology exists), or if the
+    /// async runtime cannot be constructed
     /// (e.g. OS thread/resource limits), or if `run()` is invoked inside an
     /// async context on a chain with an async stage (e.g. from a tokio/axum
     /// handler) — the terminal drives its collector via
-    /// [`AsyncRuntime::block_on`](crate::AsyncRuntime::block_on), which cannot
-    /// block a thread that is running async tasks; wrap the call in
-    /// `tokio::task::spawn_blocking` instead. To handle runtime construction
-    /// failure gracefully, use [`try_run`](Self::try_run) or pass a pre-built
-    /// backend via [`with_async_pool`](Self::with_async_pool).
+    /// [`AsyncRuntime::block_on`](crate::AsyncRuntime::block_on), which
+    /// cannot block a thread that is running async tasks; wrap the call in
+    /// `tokio::task::spawn_blocking` instead. To handle runtime
+    /// construction failure gracefully, use [`try_run`](Self::try_run) or
+    /// pass a pre-built backend via [`with_async_pool`](Self::with_async_pool).
     pub fn run(self) -> Vec<O> {
         self.try_run().expect(
             "StreamPipe::run: failed to build async runtime (OS resource limit? pass a custom \
@@ -4345,8 +6146,7 @@ where
     ///
     /// Without `.ordered()`, `f` sees items in completion order. With
     /// `.ordered()`, items are re-sequenced through a [`ReorderBuffer`] in
-    /// input order first (note: `.ordered()` + `.expand()` still panics, same
-    /// as [`run`](Self::run)).
+    /// input order first.
     ///
     /// `f` runs on the calling thread, so it needs no `Send`/`'static`
     /// bounds — accumulate into local state directly, no atomics required.
@@ -4371,8 +6171,7 @@ where
     where
         F: FnMut(O),
     {
-        self.try_exec(ForEachCollector { f })
-            .expect("StreamPipe::for_each: failed to build async runtime (see run/try_run)");
+        for_each_stream_pass(self, f, false);
     }
 
     /// Execute the streaming pipeline and reduce the outputs into a single
@@ -4392,34 +6191,12 @@ where
     /// # Panics
     ///
     /// Same contract as [`run`](Self::run).
-    pub fn reduce<F>(mut self, op: F) -> Option<O>
+    pub fn reduce<F>(self, op: F) -> Option<O>
     where
         F: Fn(O, O) -> O + Send + Sync + 'static,
     {
-        if self.cancel.is_none() && !self.config.compute_workers_pinned {
-            let pool = self
-                .compute_pool
-                .as_ref()
-                .unwrap_or_else(|| ComputePool::global());
-            let items = std::mem::take(&mut self.items);
-            // `&op` keeps the streaming fallback below able to use `op`.
-            match self.stages.fuse_exec_reduce(
-                FusedOp(Identity),
-                &OptionReducer(&op),
-                items,
-                self.config.workload,
-                pool,
-            ) {
-                Ok(acc) => return acc,
-                // Chain not pass-through-eligible: restore the items and
-                // take the streaming path below.
-                Err(items) => self.items = items,
-            }
-        }
-        self.try_exec(ReducerCollector {
-            reducer: OptionReducer(&op),
-        })
-        .expect("StreamPipe::reduce: failed to build async runtime (see run/try_run)")
+        reduce_stream_pass(self, false, || OptionReducer(&op))
+            .expect("StreamPipe::reduce: failed to build async runtime (see run/try_run)")
     }
 
     /// Execute the streaming pipeline, folding outputs into an accumulator
@@ -4431,41 +6208,16 @@ where
     /// # Panics
     ///
     /// Same contract as [`run`](Self::run).
-    pub fn fold<A, F, C>(mut self, init: A, f: F, combine: C) -> A
+    pub fn fold<A, F, C>(self, init: A, f: F, combine: C) -> A
     where
         A: Clone + Send + Sync + 'static,
         F: Fn(A, O) -> A + Send + Sync + 'static,
         C: Fn(A, A) -> A + Send + Sync + 'static,
     {
-        if self.cancel.is_none() && !self.config.compute_workers_pinned {
-            let pool = self
-                .compute_pool
-                .as_ref()
-                .unwrap_or_else(|| ComputePool::global());
-            let items = std::mem::take(&mut self.items);
-            // `&f` / `&combine` keep the streaming fallback able to use them.
-            let reducer = FoldReducer {
-                init: init.clone(),
-                f: &f,
-                combine: &combine,
-            };
-            match self.stages.fuse_exec_reduce(
-                FusedOp(Identity),
-                &reducer,
-                items,
-                self.config.workload,
-                pool,
-            ) {
-                Ok(acc) => return acc,
-                Err(items) => self.items = items,
-            }
-        }
-        self.try_exec(ReducerCollector {
-            reducer: FoldReducer {
-                init,
-                f: &f,
-                combine: &combine,
-            },
+        reduce_stream_pass(self, false, || FoldReducer {
+            init: init.clone(),
+            f: &f,
+            combine: &combine,
         })
         .expect("StreamPipe::fold: failed to build async runtime (see run/try_run)")
     }
@@ -4477,31 +6229,12 @@ where
     /// # Panics
     ///
     /// Same contract as [`run`](Self::run).
-    pub fn sum(mut self) -> O
+    pub fn sum(self) -> O
     where
         O: std::iter::Sum,
     {
-        if self.cancel.is_none() && !self.config.compute_workers_pinned {
-            let pool = self
-                .compute_pool
-                .as_ref()
-                .unwrap_or_else(|| ComputePool::global());
-            let items = std::mem::take(&mut self.items);
-            match self.stages.fuse_exec_reduce(
-                FusedOp(Identity),
-                &SumReducer::<O>(PhantomData),
-                items,
-                self.config.workload,
-                pool,
-            ) {
-                Ok(acc) => return acc,
-                Err(items) => self.items = items,
-            }
-        }
-        self.try_exec(ReducerCollector {
-            reducer: SumReducer::<O>(PhantomData),
-        })
-        .expect("StreamPipe::sum: failed to build async runtime (see run/try_run)")
+        reduce_stream_pass(self, false, || SumReducer::<O>(PhantomData))
+            .expect("StreamPipe::sum: failed to build async runtime (see run/try_run)")
     }
 
     /// Execute the streaming pipeline and count the outputs — no output
@@ -4510,28 +6243,9 @@ where
     /// # Panics
     ///
     /// Same contract as [`run`](Self::run).
-    pub fn count(mut self) -> usize {
-        if self.cancel.is_none() && !self.config.compute_workers_pinned {
-            let pool = self
-                .compute_pool
-                .as_ref()
-                .unwrap_or_else(|| ComputePool::global());
-            let items = std::mem::take(&mut self.items);
-            match self.stages.fuse_exec_reduce(
-                FusedOp(Identity),
-                &CountReducer,
-                items,
-                self.config.workload,
-                pool,
-            ) {
-                Ok(acc) => return acc,
-                Err(items) => self.items = items,
-            }
-        }
-        self.try_exec(ReducerCollector {
-            reducer: CountReducer,
-        })
-        .expect("StreamPipe::count: failed to build async runtime (see run/try_run)")
+    pub fn count(self) -> usize {
+        reduce_stream_pass(self, false, || CountReducer)
+            .expect("StreamPipe::count: failed to build async runtime (see run/try_run)")
     }
 
     /// Execute the streaming pipeline and return the minimum output —
@@ -4564,16 +6278,13 @@ where
     /// construction error instead of panicking.
     ///
     /// The only recoverable failure today is async runtime construction
-    /// (e.g. OS thread/resource limits). Programming errors —
-    /// `.ordered()` + `.expand()`, panics inside stage closures, feeder-thread
-    /// join failures — still panic, matching the contract of every other
-    /// youpipe terminal (`.collect()`, `.for_each()`).
+    /// (e.g. OS thread/resource limits). Programming errors — panics inside
+    /// stage closures, feeder-thread join failures — still panic, matching
+    /// the contract of every other youpipe terminal (`.collect()`,
+    /// `.for_each()`).
     ///
     /// ```rust
     /// # use youpipe::prelude::*;
-    /// // Equivalent to `.run()` for sync chains — the Result matters when
-    /// // the chain contains `.stage_async(..)` and runtime construction
-    /// // might fail.
     /// let r: Vec<i32> = (0..100)
     ///     .stream()
     ///     .stage(|x: i32| x + 1)
@@ -4587,37 +6298,8 @@ where
     /// Same panic contract as [`run`](Self::run) — including the stage-panic
     /// transport described there — except that async-runtime construction
     /// failure is returned as `Err` instead of panicking.
-    pub fn try_run(mut self) -> std::io::Result<Vec<O>> {
-        // Fused pass-through: a chain of pure, unpinned `SyncStage`s without
-        // cancellation is semantically `pipe(items).map(f1)….map(fk).collect()`
-        // — run it on the fused index core instead of the streaming
-        // infrastructure (feeder job, k channels, stage workers, seq tagging,
-        // collector drain). `.ordered()` stays eligible: the pass-through
-        // output IS input order, exactly the `ordered()` contract.
-        //
-        // A pinned `with_compute_workers` budget declines: the fused core has
-        // no notion of "cap stage concurrency on a larger pool" — the
-        // streaming path is the only one that honours the cap without paying
-        // ~ms transient-pool construction per `run()`. Same "explicit pin ⇒
-        // no pass-through" policy as per-stage `SyncStageOptions::workers`
-        // pins.
-        if self.cancel.is_none() && !self.config.compute_workers_pinned {
-            let pool = self
-                .compute_pool
-                .as_ref()
-                .unwrap_or_else(|| ComputePool::global());
-            let items = std::mem::take(&mut self.items);
-            match self
-                .stages
-                .fuse_exec(FusedOp(Identity), items, self.config.workload, pool)
-            {
-                Ok(out) => return Ok(out),
-                // Chain not pass-through-eligible: restore the items and take
-                // the streaming path below.
-                Err(items) => self.items = items,
-            }
-        }
-        self.try_exec(VecCollector)
+    pub fn try_run(self) -> std::io::Result<Vec<O>> {
+        run_stream_pass(self, false)
     }
 
     /// Execute the pipeline and report whether it completed or was
@@ -4673,90 +6355,301 @@ where
         let emitted = out.len();
         Ok(RunOutcome::classify(out, emitted, token.as_ref()))
     }
+}
 
-    /// Shared execution core: spawn the chain, feed the items, and hand the
-    /// final receiver to a [`Terminal`] sink.
-    // The only fallible path is the async-pool acquisition (`ctx
-    // .acquire_async()`), which exists solely under `tokio-runtime`; without
-    // that feature every branch is infallible and the `Result` looks like a
-    // needless wrap. The signature stays fallible for the shared public API
-    // (`try_run` returns `io::Result`).
-    #[cfg_attr(not(feature = "tokio-runtime"), allow(clippy::unnecessary_wraps))]
-    fn try_exec<T: Terminal<O>>(self, terminal: T) -> std::io::Result<T::Out> {
-        let n = self.items.len();
-        if n == 0 {
-            return Ok(terminal.drain_empty());
-        }
-        // `expand` produces multiple outputs sharing one parent seq, but the
-        // `ReorderBuffer` (`.ordered()`) is single-item-per-seq — the collision
-        // silently drops data. Reject the combination loudly instead.
-        assert!(
-            !(self.ordered && self.stages.has_expand()),
-            "`.ordered()` is incompatible with `.expand()`: expand fan-out shares the parent \
-             sequence number, which the ReorderBuffer cannot re-sequence. Drop `.ordered()` \
-             (completion order is still correct) or replace `expand` with a 1:1 `stage`."
-        );
-        let Self {
-            items,
-            stages,
-            config,
-            cancel,
-            compute_pool,
-            #[cfg(feature = "tokio-runtime")]
-            async_pool,
-            ordered,
-            reorder_window,
-            _marker,
-        } = self;
+// ── Ordered run family ──
 
-        // Admission/lease resolution (pool jobs vs dedicated threads, the
-        // per-stage worker division): `resolve_admission` keeps the
-        // liveness-invariant comments next to the arithmetic that maintains
-        // them.
-        let Admission {
-            pool,
-            lease,
-            dedicated_threads,
-            per_stage_parallelism,
-            worker_slots_left,
-            stages_left,
-        } = resolve_admission(&stages.stage_budget(), &config, compute_pool.as_ref(), n);
-        let has_async_stage = stages.has_async_stage();
-        let ctx: StreamCtx<'_, R> = StreamCtx {
-            config: &config,
-            cancel,
-            n,
-            per_stage_parallelism,
-            dedicated_threads,
-            has_async_stage,
-            terminal_policy: TermPolicy::from_env(),
-            lease,
-            worker_slots_left: Cell::new(worker_slots_left),
-            stages_left: Cell::new(stages_left),
-            in_flight: Cell::new(0),
-            compute_pool: Some(pool),
-            #[cfg(feature = "tokio-runtime")]
-            async_pool,
-            #[cfg(feature = "tokio-runtime")]
-            cached_pool: OnceLock::new(),
-            #[cfg(feature = "tokio-runtime")]
-            async_panic: OnceLock::new(),
-            _marker: PhantomData,
-        };
+impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R, Ordered>
+where
+    S: StageSpawn<I, Out = O>,
+    I: Send + Unpin + 'static,
+    O: Send + Unpin + 'static,
+{
+    /// [`StreamPipe::run`] with the ordered drain: the collector
+    /// re-sequences outputs into input order through a [`ReorderBuffer`].
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::run`].
+    pub fn run(self) -> Vec<O> {
+        self.try_run().expect(
+            "StreamPipe::run: failed to build async runtime (OS resource limit? pass a custom \
+             backend via with_async_pool, or use try_run to handle the failure)",
+        )
+    }
 
-        // Warm the lazily-built async runtime (when the chain needs one)
-        // BEFORE spawning it: the OnceLock caches this result, so every
-        // `acquire_async().expect(..)` inside the spawn walk (bridges, async
-        // consumers) is guaranteed to read an `Ok` and can never panic — a
-        // construction failure (e.g. OS thread limits) surfaces here as
-        // `try_run`'s `Err` instead of aborting a half-spawned pipeline.
-        #[cfg(feature = "tokio-runtime")]
-        if has_async_stage {
-            ctx.acquire_async()?;
-        }
+    /// Alias for [`run`](Self::run) — see [`StreamPipe::collect`].
+    pub fn collect(self) -> Vec<O> {
+        self.run()
+    }
 
-        let (final_rx, feeder) = route_feeder(stages, items, &ctx);
-        drain_terminal(terminal, final_rx, feeder, ordered, reorder_window, &ctx)
+    /// [`StreamPipe::for_each`] in input order.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::for_each`].
+    pub fn for_each<F>(self, f: F)
+    where
+        F: FnMut(O),
+    {
+        for_each_stream_pass(self, f, true);
+    }
+
+    /// [`StreamPipe::reduce`] over the input-ordered drain.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::reduce`].
+    pub fn reduce<F>(self, op: F) -> Option<O>
+    where
+        F: Fn(O, O) -> O + Send + Sync + 'static,
+    {
+        reduce_stream_pass(self, true, || OptionReducer(&op))
+            .expect("StreamPipe::reduce: failed to build async runtime (see run/try_run)")
+    }
+
+    /// [`StreamPipe::fold`] over the input-ordered drain.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::fold`].
+    pub fn fold<A, F, C>(self, init: A, f: F, combine: C) -> A
+    where
+        A: Clone + Send + Sync + 'static,
+        F: Fn(A, O) -> A + Send + Sync + 'static,
+        C: Fn(A, A) -> A + Send + Sync + 'static,
+    {
+        reduce_stream_pass(self, true, || FoldReducer {
+            init: init.clone(),
+            f: &f,
+            combine: &combine,
+        })
+        .expect("StreamPipe::fold: failed to build async runtime (see run/try_run)")
+    }
+
+    /// [`StreamPipe::sum`] over the input-ordered drain.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::sum`].
+    pub fn sum(self) -> O
+    where
+        O: std::iter::Sum,
+    {
+        reduce_stream_pass(self, true, || SumReducer::<O>(PhantomData))
+            .expect("StreamPipe::sum: failed to build async runtime (see run/try_run)")
+    }
+
+    /// [`StreamPipe::count`] over the input-ordered drain.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::count`].
+    pub fn count(self) -> usize {
+        reduce_stream_pass(self, true, || CountReducer)
+            .expect("StreamPipe::count: failed to build async runtime (see run/try_run)")
+    }
+
+    /// [`StreamPipe::min`] over the input-ordered drain.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::min`].
+    pub fn min(self) -> Option<O>
+    where
+        O: Ord,
+    {
+        self.reduce(Ord::min)
+    }
+
+    /// [`StreamPipe::max`] over the input-ordered drain.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::max`].
+    pub fn max(self) -> Option<O>
+    where
+        O: Ord,
+    {
+        self.reduce(Ord::max)
+    }
+
+    /// [`StreamPipe::try_run`] with the ordered drain (the fused
+    /// pass-through, when eligible, is already input-ordered).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::try_run`].
+    pub fn try_run(self) -> std::io::Result<Vec<O>> {
+        run_stream_pass(self, true)
+    }
+
+    /// [`StreamPipe::run_checked`] with the ordered drain.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::run_checked`].
+    pub fn run_checked(self) -> RunOutcome<Vec<O>> {
+        self.try_run_checked()
+            .expect("StreamPipe::run_checked: failed to build async runtime (see run/try_run)")
+    }
+
+    /// [`StreamPipe::try_run_checked`] with the ordered drain.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::try_run_checked`].
+    pub fn try_run_checked(self) -> std::io::Result<RunOutcome<Vec<O>>> {
+        let token = self.cancel.clone();
+        let out = self.try_run()?;
+        let emitted = out.len();
+        Ok(RunOutcome::classify(out, emitted, token.as_ref()))
+    }
+}
+
+// ── Grouped run family ──
+
+impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R, Grouped>
+where
+    S: StageSpawn<I, Out = Vec<O>>,
+    I: Send + Unpin + 'static,
+    O: Send + Unpin + 'static,
+{
+    /// Execute the ordered expansion chain and collect the flattened
+    /// outputs into a `Vec<O>` in input order — groups in seq order,
+    /// elements in expansion order within each group. Empty groups
+    /// contribute nothing but still advance the reorder position.
+    ///
+    /// No fused pass-through exists on this path: the chain contains an
+    /// expansion by construction (see [`StreamPipe::ordered`]).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::run`] (the streaming tier applies —
+    /// a panicking expand/stage closure aborts the process; a panicking
+    /// `stage_async` closure re-raises on the caller).
+    pub fn run(self) -> Vec<O> {
+        self.try_run().expect(
+            "StreamPipe::run: failed to build async runtime (OS resource limit? pass a custom \
+             backend via with_async_pool, or use try_run to handle the failure)",
+        )
+    }
+
+    /// Alias for [`run`](Self::run) — see [`StreamPipe::collect`].
+    pub fn collect(self) -> Vec<O> {
+        self.run()
+    }
+
+    /// [`StreamPipe::for_each`] over the flattened, input-ordered outputs.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::for_each`].
+    pub fn for_each<F>(self, f: F)
+    where
+        F: FnMut(O),
+    {
+        for_each_grouped_pass(self, f);
+    }
+
+    /// [`StreamPipe::reduce`] over the flattened, input-ordered outputs.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::reduce`].
+    pub fn reduce<F>(self, op: F) -> Option<O>
+    where
+        F: Fn(O, O) -> O + Send + Sync + 'static,
+    {
+        reduce_grouped_pass(self, OptionReducer(&op))
+            .expect("StreamPipe::reduce: failed to build async runtime (see run/try_run)")
+    }
+
+    /// [`StreamPipe::fold`] over the flattened, input-ordered outputs.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::fold`].
+    pub fn fold<A, F, C>(self, init: A, f: F, combine: C) -> A
+    where
+        A: Clone + Send + Sync + 'static,
+        F: Fn(A, O) -> A + Send + Sync + 'static,
+        C: Fn(A, A) -> A + Send + Sync + 'static,
+    {
+        reduce_grouped_pass(self, FoldReducer {
+            init,
+            f: &f,
+            combine: &combine,
+        })
+        .expect("StreamPipe::fold: failed to build async runtime (see run/try_run)")
+    }
+
+    /// [`StreamPipe::sum`] over the flattened, input-ordered outputs.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::sum`].
+    pub fn sum(self) -> O
+    where
+        O: std::iter::Sum,
+    {
+        reduce_grouped_pass(self, SumReducer::<O>(PhantomData))
+            .expect("StreamPipe::sum: failed to build async runtime (see run/try_run)")
+    }
+
+    /// [`StreamPipe::count`] over the flattened, input-ordered outputs.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::count`].
+    pub fn count(self) -> usize {
+        reduce_grouped_pass(self, CountReducer)
+            .expect("StreamPipe::count: failed to build async runtime (see run/try_run)")
+    }
+
+    /// [`StreamPipe::min`] over the flattened, input-ordered outputs.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::min`].
+    pub fn min(self) -> Option<O>
+    where
+        O: Ord,
+    {
+        self.reduce(Ord::min)
+    }
+
+    /// [`StreamPipe::try_run`] on the ordered expansion chain (no fused
+    /// pass-through — see [`run`](Self::run)).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::try_run`].
+    pub fn try_run(self) -> std::io::Result<Vec<O>> {
+        run_grouped_pass(self)
+    }
+
+    /// [`StreamPipe::run_checked`] on the ordered expansion chain —
+    /// `emitted` counts flattened items exactly.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::run_checked`].
+    pub fn run_checked(self) -> RunOutcome<Vec<O>> {
+        self.try_run_checked()
+            .expect("StreamPipe::run_checked: failed to build async runtime (see run/try_run)")
+    }
+
+    /// [`StreamPipe::try_run_checked`] on the ordered expansion chain.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::try_run_checked`].
+    pub fn try_run_checked(self) -> std::io::Result<RunOutcome<Vec<O>>> {
+        let token = self.cancel.clone();
+        let out = self.try_run()?;
+        let emitted = out.len();
+        Ok(RunOutcome::classify(out, emitted, token.as_ref()))
     }
 }
 

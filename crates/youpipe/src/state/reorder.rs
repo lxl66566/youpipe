@@ -156,10 +156,11 @@ impl<T> ReorderBuffer<T> {
         let mut idx = (seq as usize) & self.mask;
         if self.slots[idx].tag != UNOCCUPIED {
             if self.slots[idx].tag == tag {
-                // Duplicate seq (single-item-per-seq contract, e.g. `expand`
-                // combined with `ordered` — rejected by the streaming
-                // runner, but this is a public type). The older item is
-                // dropped and counted, keeping the collector's
+                // Duplicate seq (single-item-per-seq contract). The streaming
+                // engines cannot produce one (the feeder assigns seqs once
+                // and ordered expansions travel as whole-group messages),
+                // but this is a public type. The older item is dropped and
+                // counted, keeping the collector's
                 // `emitted + dropped == expected` accounting closed.
                 debug_assert!(
                     false,

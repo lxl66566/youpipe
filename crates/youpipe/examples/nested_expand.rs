@@ -2,9 +2,10 @@
 //! rayon's `flat_map` and std's `flat_map`.
 //!
 //! `.expand(f)` lets a stage produce a `Vec<N>` per input item — useful for
-//! tokenising, log expansion, generating candidates, etc. Each expanded item
-//! inherits the parent's sequence tag so `.ordered()` restores per-input
-//! grouping in the output.
+//! tokenising, log expansion, generating candidates, etc. For input-order
+//! output call `.ordered()` *before* `.expand()` — each expansion group then
+//! travels as one channel message (empty groups included; see
+//! `StreamPipe::ordered`).
 //!
 //! ```text
 //! cargo run --example nested_expand
@@ -32,9 +33,9 @@ fn main() {
     let inputs: Vec<i32> = (0..N_INPUTS).collect();
 
     // ── youpipe: stream().expand().stage().run() ──
-    // Unordered — items arrive in completion order. (Ordered mode assumes a
-    // 1-to-1 input↔output mapping for its sequence-tag reorder buffer; expand
-    // produces 1-to-N which doesn't fit that model.)
+    // Unordered — items arrive in completion order. (Ordered mode requires
+    // `.ordered()` before `.expand()`: the per-item fan-out shares one seq
+    // across N messages, so the ordered flavour carries whole groups.)
     let yp_start = Instant::now();
     let mut yp_result = inputs
         .clone()

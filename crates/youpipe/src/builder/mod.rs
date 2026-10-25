@@ -4,9 +4,10 @@ mod typed;
 
 pub use config::{FilterCollectMode, PipelineConfig, Workload};
 pub use typed::{
-    AsyncStageOptions, FenceOptions, Filter, FusedStage, FusedTryStage, Identity, InfallibleChain,
-    MapErr, Pipe, PipeRef, RangePipe, StageMarker, StreamPipe, StreamStart, SyncMap,
-    SyncStageOptions, TryMap, TryPipe, TryPipeRef, pipe, pipe_range, pipe_ref, stream,
+    AsyncStageOptions, FenceOptions, Filter, FusedStage, FusedTryStage, Grouped, Identity,
+    InfallibleChain, MapErr, Ordered, Pipe, PipeRef, RangePipe, StageMarker, StreamPipe,
+    StreamStart, SyncMap, SyncStageOptions, TryMap, TryPipe, TryPipeRef, Unordered, pipe,
+    pipe_range, pipe_ref, stream,
 };
 // `pub(crate)` re-export so `crate::scope::ScopedPipe` can drive the same
 // `fused_collect_scoped` machinery as `Pipe::collect`, but with `'env`

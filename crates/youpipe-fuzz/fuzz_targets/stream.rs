@@ -108,8 +108,9 @@ fuzz_target!(|data: &[u8]| {
     let n = r.pick(33);
     let items: Vec<u64> = (0..n).map(|_| r.u64()).collect();
 
-    // Templates with expand are ineligible for ordered collection (documented
-    // panic) — fold them onto the ordered-compatible set: exactly the
+    // Templates with expand are ineligible for ordered collection (a
+    // compile-time rejection since todo #5: `.ordered()` after `.expand()`
+    // does not typecheck) — fold them onto the ordered-compatible set: exactly the
     // templates whose body calls `.ordered()`. The historical `r.pick(5) % 2`
     // fold selected {0, 1}, keeping template 1 (`expand_emit`) under
     // `finish`'s exact-order assertion even though its body never requests

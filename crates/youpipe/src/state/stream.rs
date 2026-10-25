@@ -35,9 +35,11 @@ pub(crate) enum OrderedAccounting<'a> {
 /// iff it exceeds the maximum live span `max_arrived_seq − next_expected`.
 /// For the streaming collectors that span is bounded by `n − 1`:
 ///
-/// 1. The single feeder assigns seqs `0..n-1` in input order, each exactly once (`ordered` +
-///    `expand` is rejected up front; cancellation only stops the feeder early, shrinking the fed
-///    prefix; a fired cancel token additionally exempts the equality accounting).
+/// 1. The single feeder assigns seqs `0..n-1` in input order, each exactly once (an ordered
+///    `expand` carries whole GROUP payloads — one message, one slot, one seq per input item, empty
+///    groups included — so the single-insert-per-seq premise survives expansion; cancellation only
+///    stops the feeder early, shrinking the fed prefix; a fired cancel token additionally exempts
+///    the equality accounting).
 /// 2. `next_expected == m` implies seq `m` was never *inserted* — inserting `m` flushes the
 ///    contiguous run through `m` immediately. So when any `s > m` is inserted, every seq in `[m,
 ///    s)` is still inside the pipeline, in the collector's batch scratch, or already occupying a

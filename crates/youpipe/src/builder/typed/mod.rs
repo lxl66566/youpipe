@@ -20,7 +20,10 @@ pub(crate) use self::traits::{CountReducer, OptionReducer, SumReducer};
 pub use self::{
     borrowed::{PipeRef, TryPipeRef, pipe_ref},
     fused::{Pipe, RangePipe, TryPipe, pipe, pipe_range},
-    stream::{AsyncStageOptions, FenceOptions, StreamPipe, StreamStart, SyncStageOptions, stream},
+    stream::{
+        AsyncStageOptions, FenceOptions, Grouped, Ordered, StreamPipe, StreamStart,
+        SyncStageOptions, Unordered, stream,
+    },
     traits::{
         Filter, FusedStage, FusedTryStage, Identity, InfallibleChain, MapErr, StageMarker, SyncMap,
         TryMap,

@@ -924,18 +924,235 @@ fn test_stream_expand() {
     assert_eq!(result, expected);
 }
 
+// ── Ordered expansion (todo #5: batched group payloads) ──
+//
+// `.ordered()` *before* `.expand()` switches the chain to group payloads:
+// one `(seq, Vec<N>)` message per input item, so empty groups are
+// expressible and the ReorderBuffer (one slot per group) restores input
+// order exactly. `.ordered()` *after* `.expand()` no longer compiles
+// (the former runtime panic — see `StreamPipe::ordered`).
+
 #[test]
-#[should_panic(expected = "incompatible with `.expand()`")]
-fn test_stream_expand_ordered_rejected() {
-    // expand + ordered() is rejected: expand fan-out shares the parent seq,
-    // which the single-item-per-seq ReorderBuffer cannot handle. See the
-    // `StageSpawn::has_expand` doc and the panic message in `run`.
-    let items: Vec<i32> = (0..10).collect();
-    let _ = stream(items)
-        .expand(|x: i32| vec![x, x * 10])
-        .stage(|x: i32| x + 1)
+fn test_stream_ordered_expand() {
+    // Groups in input order, elements in expansion order within a group.
+    let r: Vec<u64> = stream(0..10u64)
         .ordered()
+        .expand_emit(|x: u64, out: &mut Vec<u64>| {
+            out.push(x * 10);
+            out.push(x * 10 + 1);
+        })
         .run();
+    let expected: Vec<u64> = (0..10u64).flat_map(|x| [x * 10, x * 10 + 1]).collect();
+    assert_eq!(r, expected);
+}
+
+#[test]
+fn test_stream_ordered_expand_empty_groups() {
+    // Leading (0,1), consecutive-middle (5,6) and trailing (10,11) empty
+    // groups: each is an empty-Vec message that must advance the reorder
+    // position without stalling the drain or dropping neighbours — the
+    // case no per-item tagging can express (todo #5's blocker).
+    let r: Vec<u64> = stream(0..12u64)
+        .ordered()
+        .expand_emit(|x: u64, out: &mut Vec<u64>| {
+            if x % 5 >= 2 {
+                out.push(x);
+                out.push(x * 10);
+            }
+        })
+        .run();
+    let expected: Vec<u64> = (0..12u64)
+        .filter(|x| x % 5 >= 2)
+        .flat_map(|x| [x, x * 10])
+        .collect();
+    assert_eq!(r, expected);
+
+    // Every group empty: all-empty messages, clean EOF, empty output.
+    let r: Vec<u64> = stream(0..8u64)
+        .ordered()
+        .expand_emit(|_x: u64, _out: &mut Vec<u64>| {})
+        .run();
+    assert_eq!(r, Vec::<u64>::new());
+}
+
+#[test]
+fn test_stream_ordered_expand_nested() {
+    // Two expand levels (both with empty groups): the global order is the
+    // (seq, sub1, sub2) lexicographic flattening — nesting must not need
+    // any sub-tagging.
+    let r: Vec<u64> = stream(0..10u64)
+        .ordered()
+        .expand_emit(|x: u64, out: &mut Vec<u64>| {
+            if x % 3 != 0 {
+                out.push(x);
+                out.push(x + 100);
+            }
+        })
+        .expand_emit(|y: u64, out: &mut Vec<u64>| {
+            if y % 2 == 0 {
+                out.push(y);
+                out.push(y + 1000);
+            }
+        })
+        .run();
+    let expected: Vec<u64> = (0..10u64)
+        .filter(|x| x % 3 != 0)
+        .flat_map(|x| [x, x + 100])
+        .filter(|y| y % 2 == 0)
+        .flat_map(|y| [y, y + 1000])
+        .collect();
+    assert_eq!(r, expected);
+}
+
+#[test]
+fn test_stream_ordered_expand_interleaved_workers() {
+    // Later inputs are cheaper, so high seqs overtake low ones at the
+    // terminal under any worker scheduling; the ordered drain must still
+    // emit strictly in input order (groups never interleave partially).
+    let n: u64 = if cfg!(miri) {
+        24
+    } else {
+        512
+    };
+    let divisor: u64 = if cfg!(miri) {
+        8
+    } else {
+        1
+    };
+    let r: Vec<u64> = stream(0..n)
+        .ordered()
+        .expand_emit(move |x: u64, out: &mut Vec<u64>| {
+            let mut s = x;
+            for _ in 0..((n - x) * 64 / divisor) {
+                s = s.wrapping_mul(3).wrapping_add(1);
+            }
+            std::hint::black_box(s);
+            out.push(x);
+            out.push(x.wrapping_mul(10));
+        })
+        .run();
+    let expected: Vec<u64> = (0..n).flat_map(|x| [x, x * 10]).collect();
+    assert_eq!(r, expected);
+}
+
+#[test]
+fn test_stream_ordered_expand_downstream_chain() {
+    // Per-item stage before `.ordered()`, elementwise stage and a fence
+    // after the expand (group payloads): the fence forwards whole groups
+    // opaquely, the grouped stage maps elementwise, order holds end to end.
+    use std::num::NonZeroUsize;
+
+    let r: Vec<u64> = stream(0..16u64)
+        .stage(|x: u64| x * 2)
+        .ordered()
+        .expand_emit(|x: u64, out: &mut Vec<u64>| {
+            if x % 4 != 0 {
+                out.push(x);
+                out.push(x + 1);
+            }
+        })
+        .stage(|y: u64| y + 100)
+        .fence(FenceMode::Chunked(NonZeroUsize::new(4).unwrap()))
+        .stage(|z: u64| z * 10)
+        .run();
+    let expected: Vec<u64> = (0..16u64)
+        .map(|x| x * 2)
+        .filter(|x| x % 4 != 0)
+        .flat_map(|x| [x, x + 1])
+        .map(|y| (y + 100) * 10)
+        .collect();
+    assert_eq!(r, expected);
+
+    // Aggregation terminals flatten the groups in input order.
+    let count = stream(0..10u64)
+        .ordered()
+        .expand_emit(|x: u64, out: &mut Vec<u64>| {
+            if x % 2 == 0 {
+                out.push(x);
+            }
+        })
+        .count();
+    assert_eq!(count, 5);
+}
+
+#[test]
+fn test_stream_ordered_expand_run_checked_cancel() {
+    // Cancel fires mid-expansion (from inside a worker closure): the run
+    // reports Cancelled with emitted == partial.len() exactly, and the
+    // ordered partial output is an in-order subsequence of the full
+    // expansion with every delivered group complete (a missing group's seq
+    // may be absent — cancellation truncates at group granularity).
+    use youpipe::{CancellationToken, RunOutcome};
+
+    let token = CancellationToken::new();
+    let fired = token.clone();
+    let n: u64 = if cfg!(miri) {
+        24
+    } else {
+        4096
+    };
+    let out = stream(0..n)
+        .with_cancel(token)
+        .ordered()
+        .expand_emit(move |x: u64, out: &mut Vec<u64>| {
+            if x == n / 2 {
+                fired.cancel();
+            }
+            out.push(x);
+            out.push(x.wrapping_mul(10));
+        })
+        .run_checked();
+    let expected: Vec<u64> = (0..n).flat_map(|x| [x, x * 10]).collect();
+    match out {
+        RunOutcome::Completed(all) => {
+            assert_eq!(all.len(), expected.len());
+        },
+        RunOutcome::Cancelled { partial, emitted } => {
+            assert_eq!(emitted, partial.len());
+            assert!(partial.len() < expected.len());
+            // In-order subsequence: two-pointer walk.
+            let mut it = expected.iter();
+            for item in &partial {
+                assert!(
+                    it.any(|e| e == item),
+                    "partial output {item} not an in-order subsequence of the full expansion"
+                );
+            }
+            // Group completeness: an emitted x implies its pair x*10
+            // follows adjacently.
+            for pair in partial.chunks(2) {
+                assert_eq!(pair.len(), 2);
+                assert_eq!(pair[0].wrapping_mul(10), pair[1]);
+            }
+        },
+    }
+}
+
+#[cfg(feature = "tokio-runtime")]
+#[test]
+fn test_stream_ordered_expand_stage_async() {
+    // Grouped async stage after an ordered expand: each task maps a whole
+    // group elementwise (order preserved), the collector flattens.
+    let n: u64 = if cfg!(miri) {
+        8
+    } else {
+        128
+    };
+    let r: Vec<u64> = stream(0..n)
+        .ordered()
+        .expand_emit(|x: u64, out: &mut Vec<u64>| {
+            if x % 2 == 0 {
+                out.push(x);
+                out.push(x + 1);
+            }
+        })
+        .stage_async(|y: u64| async move { y * 10 })
+        .run();
+    let expected: Vec<u64> = (0..n)
+        .filter(|x| x % 2 == 0)
+        .flat_map(|x| [x * 10, (x + 1) * 10])
+        .collect();
+    assert_eq!(r, expected);
 }
 
 // ── Async stage regression coverage (gated by tokio-runtime) ──

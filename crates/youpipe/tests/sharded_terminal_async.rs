@@ -84,6 +84,25 @@ fn sharded_async_terminal_semantics() {
         .run();
     assert_eq!(got, expected);
 
+    // ── Ordered expand into the async terminal (todo #5): group payloads
+    //    through the async consumer fan-out and the sharded async terminal. ──
+    let got = stream(0..n_aux() as u64)
+        .with_cancel(inert_cancel())
+        .ordered()
+        .expand_emit(|x: u64, out: &mut Vec<u64>| {
+            if x % 2 == 0 {
+                out.push(x);
+                out.push(x.wrapping_add(1));
+            }
+        })
+        .stage_async(|y: u64| async move { y.wrapping_mul(11).wrapping_add(3) })
+        .run();
+    let expected: Vec<u64> = (0..n_aux() as u64)
+        .filter(|x| x % 2 == 0)
+        .flat_map(|x| [x * 11 + 3, (x + 1) * 11 + 3])
+        .collect();
+    assert_eq!(got, expected, "ordered expand through the async terminal");
+
     // ── Expand upstream of the async terminal ──
     let mut got = stream(0..n_aux() as u64)
         .expand_emit(|x: u64, out: &mut Vec<u64>| {
