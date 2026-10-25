@@ -108,9 +108,10 @@ construction failures — node panics still unwind.
 
 **Validation.** `run()` checks the topology before starting and panics,
 naming the offending node: cycles, a non-source node with no inbound edge, a
-source with an inbound edge, a sink with an outbound edge, duplicate node
-names, duplicate edges. Type mismatches are already compile errors at
-`g.edge(..)`.
+non-sink node with no outbound edge (its worker would exit after one batch
+and truncate the upstream run), a source with an inbound edge, a sink with
+an outbound edge, duplicate node names, duplicate edges. Type mismatches are
+already compile errors at `g.edge(..)`.
 
 **Deadlock safety.** Node workers run on the compute pool by default, but a
 pool too narrow to host every blocked worker automatically falls back to

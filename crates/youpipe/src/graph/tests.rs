@@ -39,6 +39,20 @@ fn rejects_orphan_node() {
     g.run();
 }
 
+/// A non-sink node with no outgoing edge: its worker would exit after the
+/// first claim batch (zero open output edges already read as "every edge
+/// closed") and silently truncate the upstream run.
+#[test]
+#[should_panic(expected = "node `dead` requires at least one outgoing edge")]
+fn rejects_dangling_node() {
+    let mut g = graph();
+    let src = g.source("s", 0..8u32);
+    let dead = g.node("dead", |x: u32| x);
+    let snk = g.sink("out", |_: u32| {});
+    g.edge(src, dead).edge(src, snk);
+    g.run();
+}
+
 /// A source with an incoming edge is a topology contradiction. Built with
 /// unit-typed items so the handle types interlock.
 #[test]

@@ -564,6 +564,23 @@ fn validation_rejects_sink_with_outbound() {
 }
 
 #[test]
+fn validation_rejects_dangling_node() {
+    catch_panic_asserting(
+        || {
+            let mut g = graph();
+            let src = g.source("load", 0..10u64);
+            // `dead` consumes but feeds nothing; without the check its
+            // worker exits after one claim batch and truncates the run.
+            let dead = g.node("dead", |x: u64| x);
+            let term = g.sink("out", |_x: u64| {});
+            g.edge(src, dead).edge(src, term);
+            g.run();
+        },
+        &["dead", "outgoing"],
+    );
+}
+
+#[test]
 fn validation_rejects_duplicate_name() {
     catch_panic_asserting(
         || {

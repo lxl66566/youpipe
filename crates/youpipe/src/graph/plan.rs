@@ -133,10 +133,11 @@ impl GraphPlan {
     ///
     /// Reports every violation at once so one `run()` surfaces the whole
     /// malformed graph instead of one error per iteration: cycles, non-source
-    /// nodes without incoming edges, sources with incoming edges, sinks with
-    /// outgoing edges, duplicate node names and duplicate edges. Item-type
-    /// mistakes are impossible here — `edge()` rejects them at compile time —
-    /// so a runtime error list is the correct layering.
+    /// nodes without incoming edges, non-sink nodes without outgoing edges,
+    /// sources with incoming edges, sinks with outgoing edges, duplicate node
+    /// names and duplicate edges. Item-type mistakes are impossible here —
+    /// `edge()` rejects them at compile time — so a runtime error list is the
+    /// correct layering.
     ///
     /// Kahn's algorithm doubles as the cycle detector: when fewer nodes than
     /// registered reach in-degree zero, the remainder sits on a cycle. The
@@ -186,6 +187,17 @@ impl GraphPlan {
             }
             if node.kind == NodeKind::Sink && out_deg[i] > 0 {
                 errors.push(format!("sink `{}` must not have outgoing edges", node.name));
+            }
+            if node.kind != NodeKind::Sink && out_deg[i] == 0 {
+                // A producer with no consumer exits after its first claim
+                // batch (zero open output edges already reads as "every edge
+                // closed") and truncates the whole upstream run — reject it
+                // at validation instead of dropping data silently.
+                errors.push(format!(
+                    "node `{}` requires at least one outgoing edge (unconsumed output truncates \
+                     the upstream run)",
+                    node.name
+                ));
             }
         }
 
