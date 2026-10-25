@@ -2,6 +2,8 @@
 // statics moved to `handoff/mod.rs` (their readers live there too).
 #[cfg(feature = "tokio-runtime")]
 use std::sync::OnceLock;
+#[cfg(feature = "tokio-runtime")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     cell::Cell,
     marker::PhantomData,
@@ -116,6 +118,119 @@ fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
 /// `pub(crate)`: shared by the graph engine (same first-wins re-raise
 /// contract there).
 pub(crate) type PanicSlot = Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>;
+
+/// Bounds how long the terminal drain waits for the last async task's
+/// final poll to return (see [`TaskSettleGate`]). Generous by design: the
+/// wait is bounded by one unwind tail (microseconds to low milliseconds),
+/// so hitting this cap means drop glue is blocking mid-unwind — proceed
+/// with the best-effort slot read rather than fail the run.
+#[cfg(feature = "tokio-runtime")]
+const SETTLE_BOUND: Duration = Duration::from_secs(30);
+
+/// Counts a streaming run's async tasks that have not yet returned from
+/// their final poll — the happens-before the EOF-gated drain needs against
+/// the panic-swallow race (todo #23).
+///
+/// When a task's future panics mid-poll, the unwind drops the generator's
+/// state (locals *and captures*, including the task's channel sender)
+/// **before** the payload reaches `CatchTaskPanic`'s `catch_unwind`. The
+/// sender drop can close the output channel and release the collector
+/// while `record_panic` has not run yet — the drain would read an empty
+/// slot and `run()` would return truncated output with no error signal
+/// (verified by unwind-order probe, 2026-10-25: a generator's captures
+/// drop during the unwind, before the catch observes the payload).
+///
+/// The drain instead waits for `outstanding == 0` before the final slot
+/// read: at EOF every sender is dropped, so every task is *in or past* its
+/// final poll — each settles (record first, then decrement) within one
+/// unwind tail. No-panic runs pay one atomic load (the counter is already
+/// zero); tasks pay one fetch_add on their first poll and one fetch_sub at
+/// their final `Poll::Ready` — per task, not per item or per poll.
+#[cfg(feature = "tokio-runtime")]
+pub(crate) struct TaskSettleGate {
+    /// Tasks whose final poll has not returned `Ready` yet. `SeqCst`: the
+    /// drain must observe every increment (spawned task) that could still
+    /// contribute a sender drop, and the settle-after-record ordering on
+    /// the panic path.
+    outstanding: AtomicUsize,
+    /// Condvar pair; locked only on the last task's settle and by a drain
+    /// that actually has to wait (no-panic runs never touch it).
+    lock: std::sync::Mutex<()>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(feature = "tokio-runtime")]
+impl TaskSettleGate {
+    fn new() -> Self {
+        Self {
+            outstanding: AtomicUsize::new(0),
+            lock: std::sync::Mutex::new(()),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// One task entered its first poll (per task, called once by the
+    /// wrapper). Counting at first poll — not at spawn — keeps the counter
+    /// balanced even if the spawn site itself panics.
+    fn task_started(&self) {
+        self.outstanding.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// One task's final poll returned `Ready`. On the panic path this runs
+    /// strictly after `record_panic`, so a waiter that observes zero is
+    /// guaranteed to observe the recorded payload.
+    fn task_settled(&self) {
+        if self.outstanding.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // Last task: wake a parked drain. The lock pairs with the
+            // waiter's check-under-lock so the notify cannot be lost.
+            let _guard = self
+                .lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Block until every task settled or [`SETTLE_BOUND`] elapses. Returns
+    /// `false` only on the degenerate timeout (blocking drop glue);
+    /// callers then proceed with their best-effort read.
+    fn wait_settled(&self) -> bool {
+        if self.outstanding.load(Ordering::SeqCst) == 0 {
+            return true;
+        }
+        let deadline = Instant::now() + SETTLE_BOUND;
+        let mut guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if self.outstanding.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (g, _) = self
+                .cv
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard = g;
+        }
+    }
+}
+
+/// Per-run async-task panic bookkeeping behind `StreamCtx::async_panic`:
+/// the first-wins payload slot plus the settle gate ordering the terminal
+/// drain against it (todo #23). One allocation per run, created on first
+/// async spawn.
+#[cfg(feature = "tokio-runtime")]
+pub(crate) struct AsyncTaskPanics {
+    pub(crate) slot: PanicSlot,
+    /// `Arc` so each task's wrapper can share it without cloning the
+    /// whole bookkeeping.
+    pub(crate) settle: Arc<TaskSettleGate>,
+}
 
 /// Pool-capacity lease covering one streaming run's channel-parking jobs
 /// (non-inline feeder + sync/expand stage workers).
@@ -2046,11 +2161,13 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     #[cfg(feature = "tokio-runtime")]
     pub(crate) cached_pool: OnceLock<std::io::Result<R>>,
     /// First panic recorded by this run's async stage tasks
-    /// ([`CatchTaskPanic`]); re-raised on the caller by the terminal drain
-    /// (`drain_terminal`) after the collector returns. `OnceLock`: sync-only runs never touch it
+    /// ([`CatchTaskPanic`]), plus the settle gate ordering the terminal
+    /// drain against the record (todo #23); the payload is re-raised on
+    /// the caller by the terminal drain (`drain_terminal`) after the
+    /// collector returns. `OnceLock`: sync-only runs never touch it
     /// and pay no allocation.
     #[cfg(feature = "tokio-runtime")]
-    pub(crate) async_panic: OnceLock<PanicSlot>,
+    pub(crate) async_panic: OnceLock<Arc<AsyncTaskPanics>>,
     /// Carries the backend type `R` even when no backend feature is enabled
     /// (then the `async_pool` / `cached_pool` fields don't exist, so `R`
     /// would otherwise be an unused type parameter). Zero-sized at runtime.
@@ -2278,14 +2395,17 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
         }
     }
 
-    /// This run's async-task panic slot, created on first use (see
-    /// [`Self::async_panic`]).
+    /// This run's async-task panic bookkeeping, created on first use (see
+    /// [`Self::async_panic`]). The `Arc` is cloned per spawning site;
+    /// each consumer task takes a slot clone and the gate `Arc`.
     #[cfg(feature = "tokio-runtime")]
-    pub(crate) fn async_panic_slot(&self) -> PanicSlot {
-        Arc::clone(
-            self.async_panic
-                .get_or_init(|| Arc::new(std::sync::Mutex::new(None))),
-        )
+    pub(crate) fn async_task_panics(&self) -> Arc<AsyncTaskPanics> {
+        Arc::clone(self.async_panic.get_or_init(|| {
+            Arc::new(AsyncTaskPanics {
+                slot: PanicSlot::new(std::sync::Mutex::new(None)),
+                settle: Arc::new(TaskSettleGate::new()),
+            })
+        }))
     }
 }
 
@@ -3609,14 +3729,27 @@ where
 /// consumer task (0-item output).
 ///
 /// Wrapping the whole task (not just the `f(item)` await) keeps the
-/// payload's ordering edge to the collector simply "task ended" (payload is
-/// recorded before the task's channel ends drop, so the channel-close that
-/// releases the collector happens after the store), and `catch_unwind`
-/// around a poll is a no-op on the happy path (table-based unwinding).
+/// payload's ordering edge to the collector simply "task ended", and
+/// `catch_unwind` around a poll is a no-op on the happy path (table-based
+/// unwinding).
+///
+/// Ordering caveat (todo #23, the panic-swallow race): on the panic path
+/// the payload reaches this catch **after** the unwind has already dropped
+/// the generator's state — locals and captures, including the task's
+/// channel sender — so the channel-close that releases the collector is
+/// *not* ordered after `record_panic`. The EOF-gated terminal drain must
+/// therefore wait on [`TaskSettleGate`] before reading the slot (this
+/// wrapper settles the gate, record first, on every `Poll::Ready` exit).
 #[cfg(feature = "tokio-runtime")]
 struct CatchTaskPanic<F> {
     fut: F,
     slot: PanicSlot,
+    settle: Arc<TaskSettleGate>,
+    /// Whether this task already entered the settle gate (first poll).
+    /// `Cell`: the wrapper only needs `Send`, not `Sync` (one poller at a
+    /// time); avoids a re-count if a misbehaving runtime re-polls after
+    /// `Ready`.
+    counted: Cell<bool>,
 }
 
 #[cfg(feature = "tokio-runtime")]
@@ -3625,14 +3758,26 @@ impl<F: Future<Output = ()>> Future for CatchTaskPanic<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         // SAFETY: `fut` is structurally pinned — it is never moved out of
-        // this wrapper; `slot` has no pinned-field sensitivity.
+        // this wrapper; the other fields have no pinned-field sensitivity.
         let this = unsafe { self.get_unchecked_mut() };
+        if !this.counted.get() {
+            this.counted.set(true);
+            this.settle.task_started();
+        }
         // SAFETY: pinned projection of `fut` per its structural pinning.
         let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fut.poll(cx))) {
-            Ok(poll) => poll,
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(())) => {
+                this.settle.task_settled();
+                Poll::Ready(())
+            },
             Err(payload) => {
+                // Record strictly before settling: a drain observing
+                // `outstanding == 0` is then guaranteed the payload is
+                // already stored.
                 record_panic(&this.slot, payload);
+                this.settle.task_settled();
                 Poll::Ready(())
             },
         }
@@ -3852,12 +3997,13 @@ fn spawn_async_terminal_tasks<F, In, M, Fut, R, I>(
     let pool = ctx.acquire_async().expect("failed to build async runtime");
     let f = Arc::new(f);
     let cancel = ctx.cancel.clone();
-    let fail = ctx.async_panic_slot();
+    let panics = ctx.async_task_panics();
     for tx in senders {
         let f = f.clone();
         let rx = a_in_rx.clone();
         let c = cancel.clone();
-        let slot = fail.clone();
+        let slot = Arc::clone(&panics.slot);
+        let settle = Arc::clone(&panics.settle);
         // Spawn via the runtime-agnostic backend. `pool.spawn` is the explicit
         // spawn — it does not depend on a TLS current-runtime context, so no
         // `enter()` guard is needed (a future non-tokio backend's scoped-tls
@@ -3883,6 +4029,8 @@ fn spawn_async_terminal_tasks<F, In, M, Fut, R, I>(
                 }
             },
             slot,
+            settle,
+            counted: Cell::new(false),
         });
     }
     drop(a_in_rx);
@@ -7001,8 +7149,12 @@ where
         Ok(Err(e)) => return Err(e),
         Err(drain_panic) => {
             #[cfg(feature = "tokio-runtime")]
-            if let Some(slot) = ctx.async_panic.get() {
-                resume_stored_panic(slot);
+            if let Some(panics) = ctx.async_panic.get() {
+                // Wait out any in-flight unwind before reading: the drain
+                // panicking (dev accounting) must not beat a pending
+                // `record_panic` and mask the real payload.
+                panics.settle.wait_settled();
+                resume_stored_panic(&panics.slot);
             }
             std::panic::resume_unwind(drain_panic)
         },
@@ -7010,8 +7162,13 @@ where
 
     feeder.finish();
     #[cfg(feature = "tokio-runtime")]
-    if let Some(slot) = ctx.async_panic.get() {
-        resume_stored_panic(slot);
+    if let Some(panics) = ctx.async_panic.get() {
+        // todo #23: EOF only proves every sender dropped — on the panic
+        // path the sender drops *inside* the unwind, before the payload
+        // reaches `CatchTaskPanic`'s catch. Wait for every task's final
+        // poll to return (record first, settle after) before the read.
+        panics.settle.wait_settled();
+        resume_stored_panic(&panics.slot);
     }
     Ok(results)
 }
@@ -7095,6 +7252,101 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// todo #23 regression (deterministic): the drain must observe a task
+    /// panic that is recorded *after* its channel sender dropped. On the
+    /// real engine the unwind drops the panicking generator's state —
+    /// sender first, payload to the catch later — so an EOF-gated drain
+    /// reading the slot at the sender-drop edge swallows the panic. Here
+    /// the unwind tail is simulated with a fixed stall: the "sender
+    /// dropped" edge fires, the record lands `stall` later, and the settle
+    /// gate must bridge the two. Pre-fix, the equivalent immediate read at
+    /// the edge (asserted below for documentation) observed the empty slot
+    /// — the exact swallow the 2026-10-25 stakeout caught 15/1365 runs.
+    #[cfg(all(test, feature = "tokio-runtime"))]
+    #[test]
+    fn settle_gate_orders_record_after_sender_drop() {
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::mpsc,
+            task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+        };
+
+        /// Stand-in for the panicking task body: announces the sender-drop
+        /// (EOF) edge, stalls — widening the unwind window from
+        /// nanoseconds to a fixed delay — then panics.
+        struct BoomAfterDrop {
+            dropped: mpsc::Sender<()>,
+            stall: Duration,
+        }
+        impl Future for BoomAfterDrop {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                let this = self.get_mut();
+                this.dropped.send(()).expect("drop signal");
+                std::thread::sleep(this.stall);
+                panic!("task boom");
+            }
+        }
+
+        fn noop_waker() -> Waker {
+            fn clone(_: *const ()) -> RawWaker {
+                RawWaker::new(std::ptr::null(), &VTABLE)
+            }
+            fn noop(_: *const ()) {}
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+            // SAFETY: the vtable's functions are all no-ops; the data
+            // pointer is never dereferenced.
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        }
+
+        let stall = Duration::from_millis(if cfg!(miri) {
+            10
+        } else {
+            100
+        });
+        let (tx_dropped, rx_dropped) = mpsc::channel();
+        let slot: PanicSlot = Arc::new(std::sync::Mutex::new(None));
+        let gate = Arc::new(TaskSettleGate::new());
+        let mut task = CatchTaskPanic {
+            fut: BoomAfterDrop {
+                dropped: tx_dropped,
+                stall,
+            },
+            slot: Arc::clone(&slot),
+            settle: Arc::clone(&gate),
+            counted: Cell::new(false),
+        };
+        let poller = std::thread::spawn(move || {
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            // Catches the boom inside the wrapper; settles the gate after
+            // recording.
+            let _ = Pin::new(&mut task).poll(&mut cx);
+        });
+        rx_dropped
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sender-drop edge must fire");
+        // Pre-fix face (documented): the immediate read at the EOF edge
+        // sees the empty slot — the record is `stall` away.
+        assert!(
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "stall must keep the record pending at the EOF edge"
+        );
+        // The fix: the drain waits for every task's final poll before
+        // reading, so the payload is guaranteed visible.
+        assert!(gate.wait_settled(), "settle must complete within the bound");
+        let recorded = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        assert!(recorded.is_some(), "payload must be recorded once settled");
+        poller.join().unwrap();
+    }
 
     /// The sync and async sharded-terminal flags are independent inputs
     /// (`YOUPIPE_SHARDED_TERM` / `YOUPIPE_SHARDED_TERM_ASYNC`): the async

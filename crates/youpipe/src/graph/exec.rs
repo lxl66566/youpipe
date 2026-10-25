@@ -727,6 +727,11 @@ pub(crate) fn run_graph<R: AsyncRuntime>(builder: GraphBuilder<R>) -> std::io::R
         (node.spawn)(&core, run.workers[u], inputs, outputs);
     }
 
+    // `done` is decremented only after each task's `CatchPanic` wrapper
+    // resolves (see `spawn_task`), so this wait is strictly ordered after
+    // any `record_panic` — the graph drain is completion-gated, never
+    // channel-EOF-gated, and is immune to the stream engine's
+    // record-vs-unwind race (todo #23, `TaskSettleGate` there).
     core.done.wait();
     resume_stored_panic(&core.panic);
     Ok(())

@@ -379,6 +379,12 @@ where
 /// the runtime with the unobserved JoinHandle — the graph counterpart of
 /// the stream engine's `CatchTaskPanic`. `GraphCore::spawn_task` appends the
 /// completion accounting after this wrapper resolves.
+///
+/// No settle gate needed here (unlike `CatchTaskPanic`, todo #23): the
+/// unwind drops the task's senders before the payload reaches this catch,
+/// but the graph drain waits on `GraphCore::done` — decremented only after
+/// this wrapper resolves, i.e. strictly after the record — never on
+/// channel-close EOF, so the swallow race cannot manifest.
 pub(crate) struct CatchPanic<F> {
     fut: F,
     slot: PanicSlot,

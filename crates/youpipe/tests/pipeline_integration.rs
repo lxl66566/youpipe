@@ -1312,16 +1312,39 @@ fn test_async_first_all_downstream_kinds() {
 
 // ── Streaming terminal inside an async context ──
 
-/// Silence the default panic hook around a closure that is expected to panic,
-/// assert the message contains every `expected` fragment, and restore the
-/// hook. Keeps expected-panic tests from printing scary backtraces.
+/// Silence panic printing around a closure that is expected to panic,
+/// then assert the message contains every `expected` fragment. Assertion
+/// is on the captured payload only — the hook never affects propagation.
+///
+/// Parallel-test robustness (2026-10-25 stakeout lesson): a
+/// take_hook/set_hook pair races every concurrent user of the global hook
+/// — a parallel test's restore can strand a no-op hook process-wide, so
+/// every face of a failure could print nothing and triage lost its
+/// signals. Instead the FIRST caller installs one filtering hook that
+/// defers to the default unless a suppression counter is held; calls only
+/// toggle the counter, so the default hook is never unseated.
 #[cfg(feature = "tokio-runtime")]
 fn catch_panic_asserting<F: FnOnce()>(f: F, expected: &[&str]) {
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    use std::sync::{
+        Once,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    static HOOK: Once = Once::new();
+    static SUPPRESS: AtomicUsize = AtomicUsize::new(0);
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if SUPPRESS.load(Ordering::SeqCst) == 0 {
+                default(info);
+            }
+        }));
+    });
+
+    SUPPRESS.fetch_add(1, Ordering::SeqCst);
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
         .expect_err("closure was expected to panic but returned");
-    std::panic::set_hook(prev_hook);
+    SUPPRESS.fetch_sub(1, Ordering::SeqCst);
     let msg = payload
         .downcast_ref::<String>()
         .cloned()
