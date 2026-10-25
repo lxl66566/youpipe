@@ -477,9 +477,15 @@ fn push_items<I: Send + 'static>(
 /// The detached paths wrap the push loop in `catch_unwind` (an uncaught panic
 /// in a pool job would abort the process via the worker's `AbortIfPanic`) and
 /// store the payload; [`Feeder::finish`] re-raises it on the caller after
-/// the collect returns. The payload store happens before the sender drops
-/// (closing the channel), and the close is what releases the collector, so
-/// the caller always observes the payload.
+/// the collect returns. Ordering caveat (the todo #23 fallacy, pinned here
+/// by the r13 audit): the unwind drops the closure-owned `feeder_tx` —
+/// closing the channel — BEFORE `catch_unwind` hands back the payload, so
+/// the store is NOT ordered before the close. What keeps the re-raise
+/// reliable is indirect: the feeder's close releases the stage workers
+/// (EOF), not the caller's collector, and their drain-then-drop cascade is
+/// far longer than the unwind tail; the detached loop also runs no user
+/// code (the iterator was collected before any topology exists), so a
+/// panic here implies an internal channel failure, not a user payload.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn feed_items<I: Send + 'static>(
     pool: &ComputePool,

@@ -20,7 +20,8 @@ let r: Result<Vec<i32>, ParseError> = input
 Short-circuit semantics: with parallel execution, the first `Err` *observed*
 by any worker aborts the run; items already in flight are discarded, and that
 error is returned. Panics inside stages still propagate as panics — they are
-not routed through `Result`.
+not routed through `Result`, and a panic outranks an in-flight `Err`: it is
+re-raised on the caller even when the `Err` was recorded first.
 
 ## Mixing fallible and infallible stages
 
