@@ -13,9 +13,10 @@ whole chain. Three pipeline engines cover different regimes:
   async IO, cancellation, fences, 1-to-N expansion, and more. Pure sync
   chains (`.stage()`s only, unpinned) auto-fuse onto the fused core at
   `.run()`/`.collect()` — fused performance with the streaming API.
-- `graph()` — runtime DAG orchestration for non-linear topologies: broadcast
-  fan-out, fair fan-in joins, multiple sources and sinks, with sync CPU
-  nodes and async IO nodes mixed freely in one graph.
+- `graph()` — runtime DAG orchestration for non-linear topologies: fair
+  fan-in joins, multiple sources and sinks, with sync CPU nodes and async IO
+  nodes mixed freely in one graph. Outputs move by default (no `Clone`
+  bound); broadcast fan-out is an explicit per-node opt-in.
 
 A rayon-style work-stealing scheduler (`st3` LIFO deque + packed atomic
 sleep counters) handles balanced and unbalanced loads. `scope()` supports
@@ -48,7 +49,7 @@ let r: Vec<u64> = (0..1000).stream()
 
 // runtime DAG: broadcast to two branches, join them back, sink the union
 let mut g = youpipe::graph();
-let src = g.source("load", 0..1000u64);
+let src = g.source_broadcast("load", 0..1000u64);
 let a = g.node("hash", |x: u64| x * 2);
 let b = g.node_async("meta", |x: u64| async move { fetch(x).await });
 let join = g.node("join", |x: u64| x);

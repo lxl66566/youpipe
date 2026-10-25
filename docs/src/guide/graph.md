@@ -44,7 +44,7 @@ Nodes are values: `g.edge(from, to)` connects two `NodeHandle`s (they are
 use youpipe::graph;
 
 let mut g = graph();
-let src = g.source("load", 0..1_000u64);
+let src = g.source_broadcast("load", 0..1_000u64); // clone to both branches
 let a = g.node("double", |x: u64| x * 2);
 let b = g.node("plus", |x: u64| x + 1_000);
 let join = g.node("join", |x: u64| x); // fan-in
@@ -97,10 +97,16 @@ containing a collect sink must run through a `run_collect` variant: plain
 
 ## Semantics
 
-**Fan-out is broadcast.** Every outbound edge of a node receives a **clone**
-of each item — the output type must be `Clone`. For large payloads wrap them
-in `Arc<T>` (one refcount bump per edge instead of a deep copy) or share
-`Arc<[T]>`/bytes.
+**Fan-out is opt-in broadcast.** By default every producer — `source`,
+`source_async`, `node`, `node_expand`, `node_async` — delivers each item by
+**move** to its single outgoing edge: no `Clone` bound on the item type, and
+a second outgoing edge is a validation error at `run()`. The `_broadcast`
+registrations (`source_broadcast`, `source_async_broadcast`,
+`node_broadcast`, `node_expand_broadcast`, `node_async_broadcast`) clone
+each item to every open outgoing edge instead: those require `T: Clone` and
+accept any out-degree. For large broadcast payloads wrap them in `Arc<T>`
+(one refcount bump per edge instead of a deep copy) or share `Arc<[T]>`/
+bytes.
 
 **Fan-in requires one element type.** A node with several inbound edges is
 consumed fairly (round-robin) over those edges; all inbound edges must carry
@@ -138,9 +144,10 @@ construction failures — node panics still unwind.
 **Validation.** `run()` checks the topology before starting and panics,
 naming the offending node: cycles, a non-source node with no inbound edge, a
 non-sink node with no outbound edge (its worker would exit after one batch
-and truncate the upstream run), a source with an inbound edge, a sink with
-an outbound edge, duplicate node names, duplicate edges. Type mismatches are
-already compile errors at `g.edge(..)`.
+and truncate the upstream run), a move-only producer with more than one
+outbound edge (use a `_broadcast` registration to fan out), a source with an
+inbound edge, a sink with an outbound edge, duplicate node names, duplicate
+edges. Type mismatches are already compile errors at `g.edge(..)`.
 
 **Deadlock safety.** Node workers run on the compute pool by default, but a
 pool too narrow to host every blocked worker automatically falls back to
@@ -163,13 +170,14 @@ Graph-level knobs (same semantics as the stream engine):
 | `with_runtime(..)` | switch the `AsyncRuntime` backend type |
 
 Every node method has a `_with` twin carrying the per-node options
-(`node_with` / `node_expand_with` / `node_async_with`, the same split as the
-stream engine's `stage` / `stage_with`) — most importantly the node's worker
-count. The default is **automatic**: the pool budget is split across the
-graph's nodes (at least one worker each). Pin a node's `workers` when you
-know better — e.g. 1 for a cheap ordering-sensitive stage, several for the
-hot node of the graph; async nodes' concurrency follows the stream engine's
-`io_concurrency` budget.
+(`node_with` / `node_expand_with` / `node_async_with` and their
+`_broadcast` counterparts, the same split as the stream engine's `stage` /
+`stage_with`) — most importantly the node's worker count. The default is
+**automatic**: the pool budget is split across the graph's nodes (at least
+one worker each). Pin a node's `workers` when you know better — e.g. 1 for
+a cheap ordering-sensitive stage, several for the hot node of the graph;
+async nodes' concurrency follows the stream engine's `io_concurrency`
+budget.
 
 For heavy items remember the broadcast clone: prefer `Arc` payloads on
 fan-out (or `pipe`-style ownership when no fan-out is involved). Pool and

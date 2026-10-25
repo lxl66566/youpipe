@@ -11,8 +11,9 @@ youpipe 是一个高性能、数据优先、支持混合 CPU 负载与流式异�
 - `StreamPipe` — 基于通道的流式处理，覆盖融合无法处理的场景：异步 IO、
   Cancellation、fence、一对多展开等。纯同步链（仅 `.stage()`、无 pin）在
   `.run()`/`.collect()` 时自动融合到 fused 核心执行——用 streaming API 拿到 fused 性能。
-- `graph()` — 运行期 DAG 编排，覆盖非线性拓扑：fan-out 广播、fan-in 公平
-  汇聚、多源多汇，同步 CPU 节点与异步 IO 节点可在同一张图中混用。
+- `graph()` — 运行期 DAG 编排，覆盖非线性拓扑：fan-in 公平汇聚、多源多汇，
+  同步 CPU 节点与异步 IO 节点可在同一张图中混用。输出默认以 move 交付
+  （无 `Clone` 约束）；广播 fan-out 需按节点显式选择。
 
 工作窃取调度器采用 rayon 风格的 `st3` LIFO 双端队列 + 紧凑原子休眠计数器，
 兼顾均衡与不均衡负载。`scope()` 支持借用栈上局部数据的非 `'static` 闭包。
@@ -44,7 +45,7 @@ let r: Vec<u64> = (0..1000).stream()
 
 // 运行期 DAG：广播到两个分支，再汇聚回一个节点，汇点接收两路全集
 let mut g = youpipe::graph();
-let src = g.source("load", 0..1000u64);
+let src = g.source_broadcast("load", 0..1000u64);
 let a = g.node("hash", |x: u64| x * 2);
 let b = g.node_async("meta", |x: u64| async move { fetch(x).await });
 let join = g.node("join", |x: u64| x);

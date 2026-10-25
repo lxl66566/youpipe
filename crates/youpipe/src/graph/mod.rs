@@ -15,8 +15,18 @@
 //! [`GraphBuilder::edge`] interlocks the two handles — `up: NodeHandle<UpIn,
 //! T>` against `down: NodeHandle<T, DownOut>` — so an item-type mismatch is
 //! a compile error while the topology stays runtime data. The remaining
-//! mistakes (cycles, dangling nodes, duplicate names or edges) are pure
-//! runtime data and reported together by `run()`'s validation pass.
+//! mistakes (cycles, dangling nodes, move-only producers with several
+//! outgoing edges, duplicate names or edges) are pure runtime data and
+//! reported together by `run()`'s validation pass.
+//!
+//! # Move by default, broadcast by opt-in
+//!
+//! Every producer delivers each item by **move** into its single outgoing
+//! edge — no `Clone` bound on the item type — and a second outgoing edge is
+//! a validation error. The `_broadcast` registrations
+//! ([`node_broadcast`](GraphBuilder::node_broadcast),
+//! [`source_broadcast`](GraphBuilder::source_broadcast), …) clone each item
+//! to every open outgoing edge instead: `Clone` bound, any out-degree.
 
 use std::{
     any::Any,
@@ -105,7 +115,7 @@ pub struct Collect;
 /// // Diamond: load -> hash -> (fast, slow) -> merge -> collected output
 /// let mut g = graph();
 /// let src = g.source("load", 0..1_000u64);
-/// let hash = g.node("hash", |x: u64| x.wrapping_mul(2_654_435_761));
+/// let hash = g.node_broadcast("hash", |x: u64| x.wrapping_mul(2_654_435_761));
 /// let fast = g.node("fast", |x: u64| x / 2);
 /// let slow = g.node("slow", |x: u64| x * 3);
 /// let merge = g.sink_collect("merge");
@@ -174,10 +184,38 @@ impl GraphBuilder<DefaultRuntime> {
 /// Spawn-step placeholder until the execution engines land; replaced by the
 /// per-kind spawn closures in `exec` / `async_exec`.
 impl<R: AsyncRuntime> GraphBuilder<R> {
-    /// Iterator source: a single feeder pulls `iter` and broadcasts each item
-    /// to every outgoing edge (hence `T: Clone`; wrap bulky payloads in
-    /// `Arc` for cheap fan-out).
+    /// Iterator source: a single feeder pulls `iter` and moves each item
+    /// into the source's single outgoing edge (no `Clone` bound). To feed
+    /// several consumers use [`source_broadcast`](Self::source_broadcast).
     pub fn source<T, I>(&mut self, name: impl Into<Arc<str>>, iter: I) -> NodeHandle<(), T>
+    where
+        T: Send + Unpin + 'static,
+        I: IntoIterator<Item = T> + Send + 'static,
+        // The single feeder job pulls the iterator on another thread.
+        I::IntoIter: Send + 'static,
+    {
+        let id = self.plan.push_node(
+            name.into(),
+            plan::NodeKind::Source,
+            plan::Fanout::Move,
+            plan::NodeOpts::default(),
+            exec::source_spawn::<T, I, fanin::Unicast<T>>(iter),
+        );
+        NodeHandle {
+            id,
+            marker: PhantomData,
+        }
+    }
+
+    /// Broadcast variant of [`source`](Self::source): a single feeder pulls
+    /// `iter` and clones each item to every open outgoing edge, so the item
+    /// type carries the `Clone` bound and any out-degree is valid (wrap
+    /// bulky payloads in `Arc` for cheap fan-out).
+    pub fn source_broadcast<T, I>(
+        &mut self,
+        name: impl Into<Arc<str>>,
+        iter: I,
+    ) -> NodeHandle<(), T>
     where
         T: Send + Clone + Unpin + 'static,
         I: IntoIterator<Item = T> + Send + 'static,
@@ -187,6 +225,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
         let id = self.plan.push_node(
             name.into(),
             plan::NodeKind::Source,
+            plan::Fanout::Broadcast,
             plan::NodeOpts::default(),
             exec::source_spawn::<T, I, fanin::Broadcast<T>>(iter),
         );
@@ -198,8 +237,37 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
 
     /// Pull-based async source: one runtime task calls `f` repeatedly;
     /// `None` ends the stream. Runs on the async runtime backend; the
-    /// downstream edge carries an async sender.
+    /// downstream edge carries an async sender. Moves each item into the
+    /// source's single outgoing edge (no `Clone` bound); for several
+    /// consumers use
+    /// [`source_async_broadcast`](Self::source_async_broadcast).
     pub fn source_async<T, F, Fut>(&mut self, name: impl Into<Arc<str>>, f: F) -> NodeHandle<(), T>
+    where
+        T: Send + Unpin + 'static,
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<T>> + Send,
+    {
+        let id = self.plan.push_node(
+            name.into(),
+            plan::NodeKind::SourceAsync,
+            plan::Fanout::Move,
+            plan::NodeOpts::default(),
+            async_exec::source_async_spawn::<T, F, Fut, async_exec::AsyncUnicast<T>>(f),
+        );
+        NodeHandle {
+            id,
+            marker: PhantomData,
+        }
+    }
+
+    /// Broadcast variant of [`source_async`](Self::source_async): one
+    /// runtime task calls `f` repeatedly, cloning each item to every open
+    /// outgoing edge (`Clone` bound, any out-degree).
+    pub fn source_async_broadcast<T, F, Fut>(
+        &mut self,
+        name: impl Into<Arc<str>>,
+        f: F,
+    ) -> NodeHandle<(), T>
     where
         T: Send + Clone + Unpin + 'static,
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -208,6 +276,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
         let id = self.plan.push_node(
             name.into(),
             plan::NodeKind::SourceAsync,
+            plan::Fanout::Broadcast,
             plan::NodeOpts::default(),
             async_exec::source_async_spawn::<T, F, Fut, async_exec::AsyncBroadcast<T>>(f),
         );
@@ -217,14 +286,15 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
         }
     }
 
-    /// Sync CPU node: `f: Fn(I) -> O` runs on the ComputePool. `O: Clone` is
-    /// the broadcast fan-out requirement (paid even on single-output nodes,
-    /// keeping the rule simple). Multiple workers (see [`NodeOptions`])
-    /// share every input edge and every output edge.
+    /// Sync CPU node: `f: Fn(I) -> O` runs on the ComputePool. The output
+    /// moves into the node's single outgoing edge — no `Clone` bound on `O`;
+    /// to fan one output out to several consumers use
+    /// [`node_broadcast`](Self::node_broadcast). Multiple workers (see
+    /// [`NodeOptions`]) share every input edge and the output edge.
     pub fn node<I, O, F>(&mut self, name: impl Into<Arc<str>>, f: F) -> NodeHandle<I, O>
     where
         I: Send + Unpin + 'static,
-        O: Send + Clone + Unpin + 'static,
+        O: Send + Unpin + 'static,
         F: Fn(I) -> O + Send + Sync + 'static,
     {
         self.node_with(name, NodeOptions::new(), f)
@@ -239,6 +309,49 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     ) -> NodeHandle<I, O>
     where
         I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        F: Fn(I) -> O + Send + Sync + 'static,
+    {
+        let name: Arc<str> = name.into();
+        let id = self.plan.push_node(
+            Arc::clone(&name),
+            plan::NodeKind::Sync,
+            plan::Fanout::Move,
+            plan::NodeOpts {
+                workers: opts.workers,
+                buffer: opts.buffer,
+                io_concurrency: None,
+            },
+            exec::node_spawn::<I, O, F, fanin::Unicast<O>>(name, f),
+        );
+        NodeHandle {
+            id,
+            marker: PhantomData,
+        }
+    }
+
+    /// Broadcast variant of [`node`](Self::node): every open outgoing edge
+    /// receives a clone of each output, so `O` carries the `Clone` bound and
+    /// any out-degree is valid (wrap bulky payloads in `Arc` for cheap
+    /// fan-out).
+    pub fn node_broadcast<I, O, F>(&mut self, name: impl Into<Arc<str>>, f: F) -> NodeHandle<I, O>
+    where
+        I: Send + Unpin + 'static,
+        O: Send + Clone + Unpin + 'static,
+        F: Fn(I) -> O + Send + Sync + 'static,
+    {
+        self.node_broadcast_with(name, NodeOptions::new(), f)
+    }
+
+    /// [`Self::node_broadcast`] with per-node tuning — see [`NodeOptions`].
+    pub fn node_broadcast_with<I, O, F>(
+        &mut self,
+        name: impl Into<Arc<str>>,
+        opts: NodeOptions,
+        f: F,
+    ) -> NodeHandle<I, O>
+    where
+        I: Send + Unpin + 'static,
         O: Send + Clone + Unpin + 'static,
         F: Fn(I) -> O + Send + Sync + 'static,
     {
@@ -246,6 +359,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
         let id = self.plan.push_node(
             Arc::clone(&name),
             plan::NodeKind::Sync,
+            plan::Fanout::Broadcast,
             plan::NodeOpts {
                 workers: opts.workers,
                 buffer: opts.buffer,
@@ -261,12 +375,14 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
 
     /// Sync one-to-many node: `f` expands one input into zero or more
     /// outputs by pushing into a per-worker reused scratch `Vec` (zero
-    /// steady-state allocation). Each expanded item is broadcast to every
-    /// outgoing edge like a [`node`](Self::node) output.
+    /// steady-state allocation). Each expanded item moves into the node's
+    /// single outgoing edge like a [`node`](Self::node) output; for several
+    /// consumers use
+    /// [`node_expand_broadcast`](Self::node_expand_broadcast).
     pub fn node_expand<I, O, F>(&mut self, name: impl Into<Arc<str>>, f: F) -> NodeHandle<I, O>
     where
         I: Send + Unpin + 'static,
-        O: Send + Clone + Unpin + 'static,
+        O: Send + Unpin + 'static,
         F: Fn(I, &mut Vec<O>) + Send + Sync + 'static,
     {
         self.node_expand_with(name, NodeOptions::new(), f)
@@ -281,6 +397,53 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     ) -> NodeHandle<I, O>
     where
         I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        F: Fn(I, &mut Vec<O>) + Send + Sync + 'static,
+    {
+        let name: Arc<str> = name.into();
+        let id = self.plan.push_node(
+            Arc::clone(&name),
+            plan::NodeKind::Expand,
+            plan::Fanout::Move,
+            plan::NodeOpts {
+                workers: opts.workers,
+                buffer: opts.buffer,
+                io_concurrency: None,
+            },
+            exec::expand_node_spawn::<I, O, F, fanin::Unicast<O>>(name, f),
+        );
+        NodeHandle {
+            id,
+            marker: PhantomData,
+        }
+    }
+
+    /// Broadcast variant of [`node_expand`](Self::node_expand): every open
+    /// outgoing edge receives a clone of each expanded output (`Clone`
+    /// bound, any out-degree).
+    pub fn node_expand_broadcast<I, O, F>(
+        &mut self,
+        name: impl Into<Arc<str>>,
+        f: F,
+    ) -> NodeHandle<I, O>
+    where
+        I: Send + Unpin + 'static,
+        O: Send + Clone + Unpin + 'static,
+        F: Fn(I, &mut Vec<O>) + Send + Sync + 'static,
+    {
+        self.node_expand_broadcast_with(name, NodeOptions::new(), f)
+    }
+
+    /// [`Self::node_expand_broadcast`] with per-node tuning — see
+    /// [`NodeOptions`].
+    pub fn node_expand_broadcast_with<I, O, F>(
+        &mut self,
+        name: impl Into<Arc<str>>,
+        opts: NodeOptions,
+        f: F,
+    ) -> NodeHandle<I, O>
+    where
+        I: Send + Unpin + 'static,
         O: Send + Clone + Unpin + 'static,
         F: Fn(I, &mut Vec<O>) + Send + Sync + 'static,
     {
@@ -288,6 +451,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
         let id = self.plan.push_node(
             Arc::clone(&name),
             plan::NodeKind::Expand,
+            plan::Fanout::Broadcast,
             plan::NodeOpts {
                 workers: opts.workers,
                 buffer: opts.buffer,
@@ -303,13 +467,15 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
 
     /// Async IO node: `f: Fn(I) -> Future<Output = O>` runs as
     /// `io_concurrency` concurrent tasks on the async runtime backend (see
-    /// [`AsyncNodeOptions`]). Gated behind the `tokio-runtime` feature like
-    /// the stream engine's async stage API.
+    /// [`AsyncNodeOptions`]). The output moves into the node's single
+    /// outgoing edge (no `Clone` bound); for several consumers use
+    /// [`node_async_broadcast`](Self::node_async_broadcast). Gated behind
+    /// the `tokio-runtime` feature like the stream engine's async stage API.
     #[cfg(feature = "tokio-runtime")]
     pub fn node_async<I, O, F, Fut>(&mut self, name: impl Into<Arc<str>>, f: F) -> NodeHandle<I, O>
     where
         I: Send + Unpin + 'static,
-        O: Send + Clone + Unpin + 'static,
+        O: Send + Unpin + 'static,
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = O> + Send,
     {
@@ -327,6 +493,57 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     ) -> NodeHandle<I, O>
     where
         I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        F: Fn(I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = O> + Send,
+    {
+        let name: Arc<str> = name.into();
+        let id = self.plan.push_node(
+            Arc::clone(&name),
+            plan::NodeKind::Async,
+            plan::Fanout::Move,
+            plan::NodeOpts {
+                workers: None,
+                buffer: opts.buffer,
+                io_concurrency: opts.io_concurrency,
+            },
+            async_exec::node_async_spawn::<I, O, F, Fut, async_exec::AsyncUnicast<O>>(name, f),
+        );
+        NodeHandle {
+            id,
+            marker: PhantomData,
+        }
+    }
+
+    /// Broadcast variant of [`node_async`](Self::node_async): every open
+    /// outgoing edge receives a clone of each output (`Clone` bound, any
+    /// out-degree). Gated behind the `tokio-runtime` feature.
+    #[cfg(feature = "tokio-runtime")]
+    pub fn node_async_broadcast<I, O, F, Fut>(
+        &mut self,
+        name: impl Into<Arc<str>>,
+        f: F,
+    ) -> NodeHandle<I, O>
+    where
+        I: Send + Unpin + 'static,
+        O: Send + Clone + Unpin + 'static,
+        F: Fn(I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = O> + Send,
+    {
+        self.node_async_broadcast_with(name, AsyncNodeOptions::new(), f)
+    }
+
+    /// [`Self::node_async_broadcast`] with per-node tuning — see
+    /// [`AsyncNodeOptions`]. Gated behind the `tokio-runtime` feature.
+    #[cfg(feature = "tokio-runtime")]
+    pub fn node_async_broadcast_with<I, O, F, Fut>(
+        &mut self,
+        name: impl Into<Arc<str>>,
+        opts: AsyncNodeOptions,
+        f: F,
+    ) -> NodeHandle<I, O>
+    where
+        I: Send + Unpin + 'static,
         O: Send + Clone + Unpin + 'static,
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = O> + Send,
@@ -335,6 +552,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
         let id = self.plan.push_node(
             Arc::clone(&name),
             plan::NodeKind::Async,
+            plan::Fanout::Broadcast,
             plan::NodeOpts {
                 workers: None,
                 buffer: opts.buffer,
@@ -359,6 +577,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
         let id = self.plan.push_node(
             Arc::clone(&name),
             plan::NodeKind::Sink,
+            plan::Fanout::Move,
             plan::NodeOpts::default(),
             exec::sink_spawn::<I, F>(name, f),
         );
@@ -391,6 +610,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
         let id = self.plan.push_node(
             Arc::clone(&name),
             plan::NodeKind::Sink,
+            plan::Fanout::Move,
             plan::NodeOpts::default(),
             exec::collect_spawn::<T>(Arc::clone(&buf)),
         );
@@ -408,13 +628,17 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     /// the two handles (compile-time check); the `(up_id, down_id)` pair is
     /// recorded as runtime data. Duplicate node pairs are rejected at
     /// `run()`-time validation.
+    ///
+    /// The edge never clones — the item's `Clone` bound (if any) comes from
+    /// the producing node's registration: `_broadcast` variants require it,
+    /// the move-only defaults do not.
     pub fn edge<UpIn, T, DownOut>(
         &mut self,
         up: NodeHandle<UpIn, T>,
         down: NodeHandle<T, DownOut>,
     ) -> &mut Self
     where
-        T: Send + Clone + Unpin + 'static,
+        T: Send + Unpin + 'static,
     {
         let up_async = self.plan.nodes[up.id].kind.is_async();
         let down_async = self.plan.nodes[down.id].kind.is_async();

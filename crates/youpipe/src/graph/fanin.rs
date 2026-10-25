@@ -328,6 +328,34 @@ pub(crate) trait Delivery<T: Send + 'static>: Send + 'static {
     fn send_batch(&mut self, batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) -> bool;
 }
 
+/// Single-edge delivery: the counterpart of [`Broadcast`] for producers
+/// registered without a `_broadcast` variant. Each item moves into the
+/// node's one outgoing edge — no clones, so the item type carries no
+/// `Clone` bound. The out-degree-1 invariant is validated at `run()`
+/// before any worker spawns; a mismatch inside `new` is an internal bug.
+pub(crate) struct Unicast<T: Send + 'static> {
+    tx: SyncSender<T>,
+}
+
+impl<T: Send + 'static> Delivery<T> for Unicast<T> {
+    fn new(txs: Vec<SyncSender<T>>) -> Self {
+        let [tx]: [SyncSender<T>; 1] = txs
+            .try_into()
+            .ok()
+            .expect("move producer has exactly one outgoing edge (validated)");
+        Self { tx }
+    }
+
+    fn send(&mut self, item: T) -> bool {
+        self.tx.send(item).is_ok()
+    }
+
+    fn send_batch(&mut self, batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) -> bool {
+        stage_batch(batch, staged);
+        flush_staged(&self.tx, staged)
+    }
+}
+
 /// Broadcast fan-out over one node's output edges, owned by ONE worker (each
 /// worker clones every edge sender). Every open edge receives a clone of the
 /// item; the last surviving edge gets the owned item — one clone saved per

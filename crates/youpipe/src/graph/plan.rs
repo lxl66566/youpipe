@@ -72,6 +72,17 @@ impl NodeKind {
     }
 }
 
+/// Output-side capability of one node, fixed at registration: `Move`
+/// producers deliver each item to their single outgoing edge (no `Clone`
+/// bound on the item type; validation caps the out-degree at one),
+/// `Broadcast` producers clone to every open edge (any out-degree, `Clone`
+/// bound). Sinks have no outputs and register as `Move`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fanout {
+    Move,
+    Broadcast,
+}
+
 /// Per-node option pins captured at registration; unset fields fall back to
 /// the run-level budget / buffer resolution (see `exec::run_graph`).
 #[derive(Default)]
@@ -86,11 +97,12 @@ pub(crate) struct NodeOpts {
     pub(crate) io_concurrency: Option<NonZeroUsize>,
 }
 
-/// One registered node: name, kind, option pins and the type-erased spawn
-/// step built at registration.
+/// One registered node: name, kind, fanout capability, option pins and the
+/// type-erased spawn step built at registration.
 pub(crate) struct NodePlan {
     pub(crate) name: Arc<str>,
     pub(crate) kind: NodeKind,
+    pub(crate) fanout: Fanout,
     pub(crate) opts: NodeOpts,
     pub(crate) spawn: SpawnStep,
 }
@@ -116,6 +128,7 @@ impl GraphPlan {
         &mut self,
         name: Arc<str>,
         kind: NodeKind,
+        fanout: Fanout,
         opts: NodeOpts,
         spawn: SpawnStep,
     ) -> usize {
@@ -123,6 +136,7 @@ impl GraphPlan {
         self.nodes.push(NodePlan {
             name,
             kind,
+            fanout,
             opts,
             spawn,
         });
@@ -134,6 +148,8 @@ impl GraphPlan {
     /// Reports every violation at once so one `run()` surfaces the whole
     /// malformed graph instead of one error per iteration: cycles, non-source
     /// nodes without incoming edges, non-sink nodes without outgoing edges,
+    /// move-registered producers with more than one outgoing edge (delivery
+    /// would have to clone, which the registration promised not to require),
     /// sources with incoming edges, sinks with outgoing edges, duplicate node
     /// names and duplicate edges. Item-type mistakes are impossible here —
     /// `edge()` rejects them at compile time — so a runtime error list is the
@@ -199,6 +215,13 @@ impl GraphPlan {
                     node.name
                 ));
             }
+            if node.fanout == Fanout::Move && out_deg[i] > 1 {
+                errors.push(format!(
+                    "move-only node `{}` must not have {} outgoing edges; use a `_broadcast` \
+                     registration to fan out",
+                    node.name, out_deg[i]
+                ));
+            }
         }
 
         // Kahn topological sort (FIFO: registration-stable, sources first).
@@ -250,7 +273,7 @@ impl GraphPlan {
 /// task — see `async_exec::bridge`).
 pub(crate) fn make_connector<T>(up_async: bool, down_async: bool) -> EdgeConnector
 where
-    T: Send + Clone + Unpin + 'static,
+    T: Send + Unpin + 'static,
 {
     Box::new(move |core: &GraphCore, buffer: usize| {
         // Annotated so the arms' heterogeneous concrete tuples coerce to the

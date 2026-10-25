@@ -133,7 +133,7 @@ fn diamond_broadcast_conservation() {
     let (b_count, b_sum) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicU64::new(0)));
 
     let mut g = graph();
-    let src = g.source("load", 0..n);
+    let src = g.source_broadcast("load", 0..n);
     let a = g.node("double", {
         let (count, sum) = (a_count.clone(), a_sum.clone());
         move |x: u64| {
@@ -212,7 +212,7 @@ fn multi_sink_broadcast() {
     let n = n_items(5_000);
     let mut g = graph();
     let src = g.source("load", 0..n);
-    let m = g.node("scale", |x: u64| x.wrapping_mul(3));
+    let m = g.node_broadcast("scale", |x: u64| x.wrapping_mul(3));
     let (seen_a, sink_a) = collector_sink::<u64>();
     let (seen_b, sink_b) = collector_sink::<u64>();
     let sa = g.sink("out-a", sink_a);
@@ -276,7 +276,7 @@ fn node_expand_count_conservation() {
 fn async_diamond_broadcast() {
     let n = n_items(200);
     let mut g = graph();
-    let src = g.source("load", 0..n);
+    let src = g.source_broadcast("load", 0..n);
     let a = g.node("double", |x: u64| x.wrapping_mul(2));
     let b = g.node_async("fetch", |x: u64| async move {
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -568,7 +568,7 @@ fn validation_rejects_dangling_node() {
     catch_panic_asserting(
         || {
             let mut g = graph();
-            let src = g.source("load", 0..10u64);
+            let src = g.source_broadcast("load", 0..10u64);
             // `dead` consumes but feeds nothing; without the check its
             // worker exits after one claim batch and truncates the run.
             let dead = g.node("dead", |x: u64| x);
@@ -623,7 +623,7 @@ fn validation_rejects_duplicate_edge() {
 fn narrow_compute_pool_no_deadlock() {
     let n: u64 = 5_000;
     let mut g = graph();
-    let src = g.source("load", 0..n);
+    let src = g.source_broadcast("load", 0..n);
     let scale = g.node("scale", |x: u64| x.wrapping_mul(3));
     let shift = g.node("shift", |x: u64| x.wrapping_add(1));
     let split = g.node_expand("split", |x: u64, out: &mut Vec<u64>| {
@@ -675,7 +675,7 @@ fn custom_compute_pool_runs() {
 fn collect_sink_end_to_end() {
     let n = n_items(6_000);
     let mut g = graph();
-    let src = g.source("load", 0..n);
+    let src = g.source_broadcast("load", 0..n);
     let a = g.node("double", |x: u64| x * 2);
     let b = g.node("plus", |x: u64| x + 1);
     let term = g.sink_collect("out");

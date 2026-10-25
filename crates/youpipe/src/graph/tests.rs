@@ -15,6 +15,11 @@ fn n_items(native: u64) -> u64 {
     }
 }
 
+/// A deliberately non-`Clone` payload: flowing through the move
+/// registrations is a compile-time property, so the tests below prove the
+/// `Clone` bound is broadcast-only.
+struct Opaque(u64);
+
 /// Two nodes in a cycle never reach in-degree zero; the panic names them.
 #[test]
 #[should_panic(expected = "cycle detected")]
@@ -46,10 +51,25 @@ fn rejects_orphan_node() {
 #[should_panic(expected = "node `dead` requires at least one outgoing edge")]
 fn rejects_dangling_node() {
     let mut g = graph();
-    let src = g.source("s", 0..8u32);
+    let src = g.source_broadcast("s", 0..8u32);
     let dead = g.node("dead", |x: u32| x);
     let snk = g.sink("out", |_: u32| {});
     g.edge(src, dead).edge(src, snk);
+    g.run();
+}
+
+/// A move-registration with several outgoing edges would have to clone —
+/// which the registration promised not to require — so validation rejects
+/// it and names the `_broadcast` escape hatch.
+#[test]
+#[should_panic(expected = "move-only node `split` must not have 2 outgoing edges")]
+fn move_node_rejects_fan_out() {
+    let mut g = graph();
+    let src = g.source("s", 0..8u32);
+    let split = g.node("split", |x: u32| x);
+    let a = g.sink("a", |_: u32| {});
+    let b = g.sink("b", |_: u32| {});
+    g.edge(src, split).edge(split, a).edge(split, b);
     g.run();
 }
 
@@ -162,7 +182,7 @@ fn diamond_broadcast_then_fan_in() {
     let acc_sum = Arc::clone(&total);
     let mut g = graph();
     let src = g.source("src", 0..n);
-    let split = g.node("split", |x: u64| x);
+    let split = g.node_broadcast("split", |x: u64| x);
     let a = g.node("a", |x: u64| x * 10);
     let b = g.node("b", |x: u64| x + 1);
     let out = g.sink("out", move |x: u64| {
@@ -218,7 +238,7 @@ fn broadcast_conservation_two_sinks() {
     let a2 = Arc::clone(&t2);
     let mut g = graph();
     let src = g.source("src", 0..n);
-    let m = g.node("m", |x: u64| x + 7);
+    let m = g.node_broadcast("m", |x: u64| x + 7);
     let out1 = g.sink("out1", move |x: u64| {
         a1.fetch_add(x, Ordering::Relaxed);
     });
@@ -259,6 +279,28 @@ fn expand_node_multiplies_and_filters() {
         total.load(Ordering::Relaxed),
         (0..n).filter(|x| x % 2 == 0).map(|x| x * 3).sum::<u64>()
     );
+}
+
+/// A non-`Clone` payload through every move registration (`source`, `node`,
+/// `node_expand`, `sink_collect`): the graph compiles — the `Clone` bound is
+/// broadcast-only — and conserves items end to end.
+#[test]
+fn non_clone_items_flow_through_move_registrations() {
+    let n = n_items(4_000u64);
+    let mut g = graph();
+    let src = g.source("src", (0..n).map(Opaque));
+    let tag = g.node("tag", |x: Opaque| Opaque(x.0.wrapping_add(1)));
+    let expand = g.node_expand("expand", |x: Opaque, out: &mut Vec<Opaque>| {
+        let doubled = x.0.wrapping_mul(2);
+        out.push(x);
+        out.push(Opaque(doubled));
+    });
+    let out = g.sink_collect("out");
+    g.edge(src, tag).edge(tag, expand).edge(expand, out);
+    let items = g.run_collect(out);
+    let expect: u64 = (0..n).map(|x| 3 * (x + 1)).sum();
+    assert_eq!(items.len(), 2 * usize::try_from(n).unwrap());
+    assert_eq!(items.iter().map(|x| x.0).sum::<u64>(), expect);
 }
 
 /// Multi-worker nodes over a shared MPMC input with per-worker batch-claim
@@ -418,7 +460,7 @@ fn collect_sink_accumulates_fan_in() {
     let n = n_items(4_000u64);
     let mut g = graph();
     let src = g.source("src", 0..n);
-    let split = g.node("split", |x: u64| x);
+    let split = g.node_broadcast("split", |x: u64| x);
     let a = g.node("a", |x: u64| x * 10);
     let b = g.node("b", |x: u64| x + 1);
     let out = g.sink_collect("out");
@@ -479,7 +521,7 @@ fn plain_run_rejects_collect_sink() {
 #[should_panic(expected = "collect sink(s) `kept` dropped their items")]
 fn uncollected_collect_sink_panics() {
     let mut g = graph();
-    let src = g.source("src", 0..8u32);
+    let src = g.source_broadcast("src", 0..8u32);
     let dropped = g.sink_collect("taken");
     let kept = g.sink_collect("kept");
     g.edge(src, dropped).edge(src, kept);
@@ -610,6 +652,35 @@ fn async_mixed_chain_conserves() {
     );
 }
 
+/// The async move path drops the `Clone` bound too: a non-`Clone` payload
+/// through `source` -> `node_async` -> `sink_collect` compiles and conserves.
+#[cfg(feature = "tokio-runtime")]
+// miri (windows): building the tokio runtime registers an IOCP handle,
+// which the interpreter cannot execute; Linux miri (epoll) stays covered.
+#[cfg_attr(all(miri, target_os = "windows"), ignore)]
+#[test]
+fn non_clone_items_flow_through_async_move_node() {
+    let n = n_items(1_500u64);
+    let mut g = graph();
+    let src = g.source("src", (0..n).map(Opaque));
+    let io = g.node_async_with(
+        "io",
+        AsyncNodeOptions::new().io_concurrency(4),
+        |x: Opaque| async move {
+            tokio::task::yield_now().await;
+            Opaque(x.0.wrapping_add(5))
+        },
+    );
+    let out = g.sink_collect("out");
+    g.edge(src, io).edge(io, out);
+    let items = g.run_collect(out);
+    assert_eq!(items.len(), usize::try_from(n).unwrap());
+    assert_eq!(
+        items.iter().map(|x| x.0).sum::<u64>(),
+        (0..n).map(|x| x + 5).sum::<u64>()
+    );
+}
+
 /// Pull-based async source: `f` drives the stream until `None`; conservation
 /// at the sink.
 #[cfg(feature = "tokio-runtime")]
@@ -687,7 +758,7 @@ fn mixed_diamond_async_and_sync_branches() {
     let acc_sum = Arc::clone(&total);
     let mut g = graph();
     let src = g.source("src", 0..n);
-    let split = g.node("split", |x: u64| x);
+    let split = g.node_broadcast("split", |x: u64| x);
     let io = g.node_async_with(
         "io",
         AsyncNodeOptions::new().io_concurrency(8),

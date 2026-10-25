@@ -38,7 +38,7 @@ fn hash(x: u64) -> u64 {
 
 fn main() {
     let mut g = graph();
-    let src = g.source("load", 0..SIZE);
+    let src = g.source_broadcast("load", 0..SIZE);
 
     // Sync branch: CPU hash on the work-stealing compute pool.
     let hashed = g.node("hash", |x: u64| hash(x));

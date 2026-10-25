@@ -144,7 +144,7 @@ fn run_diamond_graph(v: Vec<u64>, cheap: bool) -> u64 {
     };
     let mut g = graph();
     let src = g.source("src", v);
-    let hash = g.node("hash", stage);
+    let hash = g.node_broadcast("hash", stage);
     let fast = g.node("fast", stage);
     let slow = g.node("slow", stage);
     let merge = g.node("merge", bump);

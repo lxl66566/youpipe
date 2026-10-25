@@ -207,6 +207,32 @@ pub(crate) trait AsyncDelivery<T: Send + Unpin + 'static>: Send + 'static {
     fn send(&mut self, item: T) -> impl Future<Output = bool> + Send;
 }
 
+/// Single-edge delivery: the async counterpart of [`AsyncBroadcast`] for
+/// producers registered without a `_broadcast` variant. Each item moves
+/// into the node's one outgoing edge — no clones, no `Clone` bound. The
+/// out-degree-1 invariant is validated at `run()` before any task spawns.
+pub(crate) struct AsyncUnicast<T: Send + Unpin + 'static> {
+    tx: AsyncSender<T>,
+    slot: WakerSlot,
+}
+
+impl<T: Send + Unpin + 'static> AsyncDelivery<T> for AsyncUnicast<T> {
+    fn new(txs: Vec<AsyncSender<T>>) -> Self {
+        let [tx]: [AsyncSender<T>; 1] = txs
+            .try_into()
+            .ok()
+            .expect("move producer has exactly one outgoing edge (validated)");
+        Self {
+            tx,
+            slot: WakerSlot::new(),
+        }
+    }
+
+    async fn send(&mut self, item: T) -> bool {
+        self.tx.send_cached(item, &mut self.slot).await.is_ok()
+    }
+}
+
 /// Broadcast fan-out over one async node's output edges, owned by ONE task.
 /// Every open edge receives a clone; the last surviving edge gets the owned
 /// item. A closed edge (send resolves `Err`) drops out of the active set —
