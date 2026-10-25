@@ -7151,9 +7151,20 @@ where
     })) {
         Ok(Ok(results)) => results,
         // Runtime acquisition failure inside the closure: report it as
-        // the run's `Err`, exactly as the bare `?` did.
-        Ok(Err(e)) => return Err(e),
+        // the run's `Err`, exactly as the bare `?` did — but only after
+        // `feeder.finish()`: a stored feeder panic is the root cause and
+        // outranks the secondary `io::Err` (todo #24), the same
+        // panic-outranks-`Err` policy as the fused path.
+        Ok(Err(e)) => {
+            feeder.finish();
+            return Err(e);
+        },
         Err(drain_panic) => {
+            // Root-cause precedence, in the EOF path's order (todo #24):
+            // a stored feeder payload outranks the drain's own panic
+            // (which is often the secondary accounting assertion), then
+            // the async slot outranks both.
+            feeder.finish();
             #[cfg(feature = "tokio-runtime")]
             if let Some(panics) = ctx.async_panic.get() {
                 // Wait out any in-flight unwind before reading: the drain
@@ -7647,6 +7658,129 @@ mod tests {
             v
         });
         assert_eq!(got, vec![0, 1, 2, 3]);
+    }
+
+    /// Shared body of the two todo #24 regressions below: a feeder whose
+    /// slot already holds a payload (the detached loop itself runs no user
+    /// code, so a real feeder payload is not injectable through `run()`).
+    fn feeder_with_payload(marker: &'static str) -> Feeder {
+        Feeder::Pool(PanicSlot::new(std::sync::Mutex::new(Some(
+            Box::new(marker) as Box<dyn std::any::Any + Send>,
+        ))))
+    }
+
+    /// todo #24 regression (drain-panic arm): a stored feeder payload must
+    /// outrank the drain's own panic — the re-raise order is
+    /// feeder/async slot first, `resume_unwind(drain_panic)` last, so the
+    /// caller sees the root cause instead of the secondary panic.
+    #[test]
+    fn drain_terminal_drain_panic_resumes_feeder_payload_first() {
+        let cfg = PipelineConfig::default();
+        let ctx = StreamCtx::<DefaultRuntime> {
+            config: &cfg,
+            cancel: None,
+            n: 1,
+            per_stage_parallelism: 1,
+            dedicated_threads: false,
+            has_async_stage: false,
+            terminal_policy: TermPolicy {
+                sharded: false,
+                sharded_async: false,
+                chain_floor: None,
+            },
+            lease: None,
+            worker_slots_left: Cell::new(0),
+            stages_left: Cell::new(0),
+            in_flight: Cell::new(0),
+            compute_pool: None,
+            #[cfg(feature = "tokio-runtime")]
+            async_pool: None,
+            #[cfg(feature = "tokio-runtime")]
+            cached_pool: OnceLock::new(),
+            #[cfg(feature = "tokio-runtime")]
+            async_panic: OnceLock::new(),
+            _marker: PhantomData,
+        };
+        let (tx, rx) = channel::<(u64, u8)>(2);
+        tx.send((0, 0)).expect("feed one item");
+        drop(tx);
+        // A user `for_each` closure panicking on the drain thread — the
+        // `drain_terminal` doc's "any other drain panic" case.
+        let terminal = ForEachCollector {
+            f: |_: u8| panic!("drain boom"),
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drain_terminal(
+                terminal,
+                FinalRx::Sync(rx),
+                feeder_with_payload("feeder boom"),
+                false,
+                None,
+                &ctx,
+            )
+        }));
+        let payload = result.expect_err("feeder payload must win over the drain panic");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("feeder boom")
+        );
+    }
+
+    /// todo #24 regression (acquisition-failure arm): the
+    /// runtime-acquisition early return must re-raise a stored feeder
+    /// payload instead of silently dropping it behind the `io::Err`. The
+    /// cached pool is poisoned so `acquire_async` fails deterministically;
+    /// the drain never runs, which is exactly the early-exit shape.
+    #[cfg(all(test, feature = "tokio-runtime"))]
+    #[test]
+    fn drain_terminal_acquire_err_resumes_feeder_payload_first() {
+        use crate::runtime::TokioPool;
+
+        let cfg = PipelineConfig::default();
+        let ctx = StreamCtx::<TokioPool> {
+            config: &cfg,
+            cancel: None,
+            n: 1,
+            per_stage_parallelism: 1,
+            dedicated_threads: false,
+            has_async_stage: false,
+            terminal_policy: TermPolicy {
+                sharded: false,
+                sharded_async: false,
+                chain_floor: None,
+            },
+            lease: None,
+            worker_slots_left: Cell::new(0),
+            stages_left: Cell::new(0),
+            in_flight: Cell::new(0),
+            compute_pool: None,
+            async_pool: None,
+            cached_pool: OnceLock::new(),
+            async_panic: OnceLock::new(),
+            _marker: PhantomData,
+        };
+        ctx.cached_pool
+            .set(Err(std::io::Error::other("no runtime")))
+            .expect("poison the cached pool once");
+        let (tx, rx) = async_channel::<(u64, u8)>(2);
+        drop(tx);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drain_terminal::<_, u8, TokioPool>(
+                ForEachCollector {
+                    f: |_: u8| unreachable!("drain must not run"),
+                },
+                FinalRx::Async(rx),
+                feeder_with_payload("feeder boom"),
+                false,
+                None,
+                &ctx,
+            )
+        }));
+        let payload = result.expect_err("feeder payload must win over the io::Err");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some("feeder boom")
+        );
     }
 
     #[test]
