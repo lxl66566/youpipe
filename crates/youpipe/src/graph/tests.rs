@@ -901,3 +901,161 @@ fn with_async_pool_and_with_runtime_backends() {
         (0..500u64).map(|x| x * 2).sum::<u64>()
     );
 }
+
+/// `node_expand_broadcast`: every expanded output is cloned to every open
+/// outgoing edge — each sink independently sees the full expansion (the
+/// broadcast counterpart of `expand_node_multiplies_and_filters`).
+#[test]
+fn expand_broadcast_clones_every_expanded_item() {
+    let n = n_items(4_000u64);
+    let c1 = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+    let c2 = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+    let a1 = Arc::clone(&c1);
+    let a2 = Arc::clone(&c2);
+    let mut g = graph();
+    let src = g.source("src", 0..n);
+    let expand = g.node_expand_broadcast("expand", |x: u64, out: &mut Vec<u64>| {
+        if x % 2 == 0 {
+            out.push(x);
+            out.push(x * 2);
+        }
+    });
+    let out1 = g.sink("out1", move |x: u64| {
+        a1.0.fetch_add(1, Ordering::Relaxed);
+        a1.1.fetch_add(x, Ordering::Relaxed);
+    });
+    let out2 = g.sink("out2", move |x: u64| {
+        a2.0.fetch_add(1, Ordering::Relaxed);
+        a2.1.fetch_add(x, Ordering::Relaxed);
+    });
+    g.edge(src, expand).edge(expand, out1).edge(expand, out2);
+    g.run();
+    let per_sink = n; // n/2 even inputs x 2 outputs
+    let expected: u64 = (0..n).filter(|x| x % 2 == 0).map(|x| x * 3).sum();
+    for c in [&c1, &c2] {
+        assert_eq!(c.0.load(Ordering::Relaxed), per_sink);
+        assert_eq!(c.1.load(Ordering::Relaxed), expected);
+    }
+}
+
+/// A panicking source iterator (user code inside the feeder job) re-raises
+/// on the run caller after the drain — the feeder wrapper's
+/// record-cancel-drain-raise chain.
+#[test]
+fn feeder_panic_propagates_to_run_caller() {
+    let n = n_items(10_000u64);
+    // Relative to `n` (miri scales it down): the boom point must sit inside
+    // the stream or the panic never fires.
+    let boom_at = n / 20;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut g = graph();
+        let src = g.source(
+            "src",
+            (0..n).map(move |x| {
+                assert!(x < boom_at, "feeder boom at {x}");
+                x
+            }),
+        );
+        let out = g.sink("out", |_: u64| {});
+        g.edge(src, out);
+        g.run();
+    }));
+    let payload = result.expect_err("feeder panic must propagate out of run()");
+    let msg = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(ToString::to_string))
+        .unwrap_or_default();
+    assert!(msg.contains("feeder boom at"), "unexpected payload: {msg}");
+}
+
+/// The async broadcast registrations together: `source_async_broadcast`
+/// clones each pulled item to every consumer and `node_async_broadcast`
+/// clones each task output to every open edge. The topology also crosses
+/// every mixed connector flavour: async→async (`gen`→`io`), async→sync
+/// bridges (`gen`→`cpu`, `io`→both sinks).
+#[cfg(feature = "tokio-runtime")]
+// miri (windows): building the tokio runtime registers an IOCP handle,
+// which the interpreter cannot execute; Linux miri (epoll) stays covered.
+#[cfg_attr(all(miri, target_os = "windows"), ignore)]
+#[test]
+fn async_broadcast_source_and_node_conserve() {
+    let n = n_items(1_500u64);
+    let produced = Arc::new(AtomicU64::new(0));
+    let probe = Arc::clone(&produced);
+    let out_a = Arc::new((AtomicU64::new(0), AtomicU64::new(0))); // io only
+    let out_b = Arc::new((AtomicU64::new(0), AtomicU64::new(0))); // io + cpu
+    let aa = Arc::clone(&out_a);
+    let ab = Arc::clone(&out_b);
+    let mut g = graph();
+    let generator = g.source_async_broadcast("gen", move || {
+        let next = probe.fetch_add(1, Ordering::Relaxed);
+        async move { (next < n).then_some(next) }
+    });
+    let io = g.node_async_broadcast_with(
+        "io",
+        AsyncNodeOptions::new().io_concurrency(4),
+        |x: u64| async move {
+            tokio::task::yield_now().await;
+            x * 2
+        },
+    );
+    let cpu = g.node("cpu", |x: u64| x + 1);
+    let sink_a = g.sink("out_a", move |x: u64| {
+        aa.0.fetch_add(1, Ordering::Relaxed);
+        aa.1.fetch_add(x, Ordering::Relaxed);
+    });
+    let sink_b = g.sink("out_b", move |x: u64| {
+        ab.0.fetch_add(1, Ordering::Relaxed);
+        ab.1.fetch_add(x, Ordering::Relaxed);
+    });
+    g.edge(generator, io);
+    g.edge(generator, cpu);
+    g.edge(io, sink_a);
+    g.edge(io, sink_b);
+    g.edge(cpu, sink_b);
+    g.run();
+    assert_eq!(out_a.0.load(Ordering::Relaxed), n);
+    assert_eq!(
+        out_a.1.load(Ordering::Relaxed),
+        (0..n).map(|x| x * 2).sum::<u64>()
+    );
+    assert_eq!(out_b.0.load(Ordering::Relaxed), 2 * n);
+    assert_eq!(
+        out_b.1.load(Ordering::Relaxed),
+        (0..n).map(|x| x * 2).sum::<u64>() + (0..n).map(|x| x + 1).sum::<u64>()
+    );
+    assert_eq!(produced.load(Ordering::Relaxed), n + 1); // one None poll past the end
+}
+
+/// Cancellation with a live async-to-sync bridge in the path: the run must
+/// return normally (the bridge's token check exits its forward loop and the
+/// rings close; a lost close would hang the drain).
+#[cfg(feature = "tokio-runtime")]
+// miri (windows): building the tokio runtime registers an IOCP handle,
+// which the interpreter cannot execute; Linux miri (epoll) stays covered.
+#[cfg_attr(all(miri, target_os = "windows"), ignore)]
+#[test]
+fn cancel_through_async_to_sync_bridge_returns() {
+    let token = CancellationToken::new();
+    let fire = token.clone();
+    let count = Arc::new(AtomicU64::new(0));
+    let acc = Arc::clone(&count);
+    let mut g = graph();
+    let src = g.source_async("gen", || async move { Some(0u64) }); // bounded by the token
+    let m = g.node("m", |x: u64| x + 1); // async→sync: the bridge edge
+    let out = g.sink("out", move |_: u64| {
+        let n = acc.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1_000 {
+            fire.cancel();
+        }
+    });
+    g.edge(src, m).edge(m, out);
+    g.with_cancel(token).run();
+    let seen = count.load(Ordering::Relaxed);
+    assert!(seen >= 1_000, "sink must see the trigger items: {seen}");
+    assert!(
+        seen < 100_000,
+        "cancel must stop the bridged stream: {seen}"
+    );
+}
