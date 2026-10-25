@@ -2,14 +2,13 @@
 //!
 //! Maintained fork of `criterion-perf-events` v0.4.0 — see `Cargo.toml` for
 //! the list of changes on top of upstream (criterion 0.8, process-wide
-//! per-thread counters). Linux only.
+//! per-thread counters, perf-event backend). Linux only.
 //!
 //! # Example
 //!
 //! ```rust
 //! use criterion::{criterion_group, criterion_main, Criterion};
-//! use criterion_perf_counters::Perf;
-//! use perfcnt::linux::{HardwareEventType as Hardware, PerfCounterBuilderLinux as Builder};
+//! use criterion_perf_counters::{HardwareEvent, Perf};
 //!
 //! fn bench(c: &mut Criterion<Perf>) {
 //!     let mut group = c.benchmark_group("fibonacci");
@@ -19,10 +18,7 @@
 //!
 //! criterion_group!(
 //!     name = my_bench;
-//!     config = Criterion::default().with_measurement(Perf::with_event_name(
-//!         || Builder::from_hardware_event(Hardware::Instructions),
-//!         "instructions",
-//!     ));
+//!     config = Criterion::default().with_measurement(Perf::new(HardwareEvent::Instructions));
 //!     targets = bench
 //! );
 //! criterion_main!(my_bench);
@@ -45,14 +41,15 @@
 //! multiplies the overhead by thousands and inflates the counts; prefer
 //! plain `b.iter` (or a batched `BatchSize`) with perf events.
 //!
-//! Counters default to user-space-only attribution if the builder sets
-//! `exclude_kernel()`/`exclude_hv()` (required for unprivileged use at
-//! `kernel.perf_event_paranoid >= 2`); what to exclude is fully controlled
-//! by the caller-supplied builder factory.
+//! Counters are opened user-space-only (`exclude_kernel` + `exclude_hv`,
+//! the backend's defaults): required for unprivileged use at
+//! `kernel.perf_event_paranoid >= 2`, and it keeps interrupt/timer noise
+//! out of the counts — at the price of not counting syscall/kernel work.
 
 use std::{
     cell::RefCell,
     collections::HashMap,
+    io,
     time::{Duration, Instant},
 };
 
@@ -60,10 +57,7 @@ use criterion::{
     Throughput,
     measurement::{Measurement, ValueFormatter},
 };
-use perfcnt::{
-    AbstractPerfCounter,
-    linux::{PerfCounter, PerfCounterBuilderLinux},
-};
+use perf_event::{Builder, Counter, events::Hardware as Hw};
 
 /// Lower bound between thread rescans. Persistent pools spawn their workers
 /// during (unmeasured) warm-up, so a scan at the first window of each
@@ -72,55 +66,89 @@ use perfcnt::{
 /// every window of `iter_batched`-style callers.
 const THREAD_RESCAN_INTERVAL: Duration = Duration::from_millis(100);
 
+/// The hardware event a [`Perf`] measurement counts. The PERF_TYPE_HARDWARE
+/// subset that is stable across x86/ARM and useful for bench reporting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HardwareEvent {
+    /// Retired instructions (frequency-invariant work metric).
+    Instructions,
+    /// Elapsed CPU cycles.
+    CpuCycles,
+    /// Cycles at a fixed reference frequency (frequency-invariant time).
+    RefCpuCycles,
+    /// Last-level cache misses.
+    CacheMisses,
+    /// Retired branch instructions.
+    BranchInstructions,
+    /// Mispredicted branches.
+    BranchMisses,
+}
+
+impl HardwareEvent {
+    /// Canonical short name for criterion reports and axis labels.
+    pub const fn report_name(self) -> &'static str {
+        match self {
+            HardwareEvent::Instructions => "instructions",
+            HardwareEvent::CpuCycles => "cycles",
+            HardwareEvent::RefCpuCycles => "ref-cycles",
+            HardwareEvent::CacheMisses => "cache-misses",
+            HardwareEvent::BranchInstructions => "branches",
+            HardwareEvent::BranchMisses => "branch-misses",
+        }
+    }
+
+    /// Open a fresh counter for this event, attached to the thread `tid`.
+    ///
+    /// The `perf_event::Builder` defaults are load-bearing: the counter
+    /// starts *disabled* (warm-up must not leak into the first measurement
+    /// window) and excludes kernel and hypervisor time (user-space-only
+    /// attribution, see the module docs).
+    fn open_for(self, tid: i32) -> io::Result<Counter> {
+        let hw = match self {
+            HardwareEvent::Instructions => Hw::INSTRUCTIONS,
+            HardwareEvent::CpuCycles => Hw::CPU_CYCLES,
+            HardwareEvent::RefCpuCycles => Hw::REF_CPU_CYCLES,
+            HardwareEvent::CacheMisses => Hw::CACHE_MISSES,
+            HardwareEvent::BranchInstructions => Hw::BRANCH_INSTRUCTIONS,
+            HardwareEvent::BranchMisses => Hw::BRANCH_MISSES,
+        };
+        Builder::new().kind(hw).observe_pid(tid).build()
+    }
+}
+
 /// `Perf` implements `criterion::measurement::Measurement` so it can be used
-/// in criterion to measure perf events. Create a struct via `Perf::new()` or
-/// `Perf::with_event_name()`.
-///
-/// The builder is passed as a *factory* because one counter must be opened
-/// per measured thread (`PerfCounterBuilderLinux` is consumed by `finish()`
-/// and cannot be cloned through its public API).
+/// in criterion to measure perf events. Create it via `Perf::new()` with the
+/// selected [`HardwareEvent`].
 pub struct Perf {
-    make_builder: Box<dyn Fn() -> PerfCounterBuilderLinux + Send>,
-    counters: RefCell<HashMap<i32, PerfCounter>>,
+    event: HardwareEvent,
+    counters: RefCell<HashMap<i32, Counter>>,
     last_scan: RefCell<Option<Instant>>,
     formatter: PerfFormatter,
 }
 
 impl Perf {
-    /// Creates a new criterion measurement plugin that measures perf events
-    /// across all threads of the process.
+    /// Creates a new criterion measurement plugin that measures the given
+    /// hardware event across all threads of the process.
     ///
-    /// # Arguments
+    /// # Panics
     ///
-    /// * `make_builder` - Factory for a `PerfCounterBuilderLinux` (from the crate perfcnt)
-    ///   configured for the selected counter. Called once per discovered thread.
-    ///
-    /// # Remarks
-    ///
-    /// Should only fail if you select a counter that is not available on
-    /// your system or you do not have the necessary access rights; the panic
-    /// message points at `kernel.perf_event_paranoid` in that case.
-    pub fn new(make_builder: impl Fn() -> PerfCounterBuilderLinux + Send + 'static) -> Perf {
-        Perf::with_event_name(make_builder, "events")
-    }
-
-    /// Like [`Perf::new`], but names the event in criterion's reports
-    /// (e.g. `"instructions"` instead of a generic `"events"`).
-    pub fn with_event_name(
-        make_builder: impl Fn() -> PerfCounterBuilderLinux + Send + 'static,
-        event_name: &'static str,
-    ) -> Perf {
+    /// Panics at the first measurement window if no counter can be opened
+    /// (event unsupported by the CPU, or insufficient access rights); the
+    /// panic message points at `kernel.perf_event_paranoid` in that case.
+    pub fn new(event: HardwareEvent) -> Perf {
         Perf {
-            make_builder: Box::new(make_builder),
+            event,
             counters: RefCell::new(HashMap::new()),
             last_scan: RefCell::new(None),
-            formatter: PerfFormatter { event_name },
+            formatter: PerfFormatter {
+                event_name: event.report_name(),
+            },
         }
     }
 
     /// Open counters for tasks that appeared since the last scan and return
     /// the set of open counters.
-    fn counters(&self) -> std::cell::RefMut<'_, HashMap<i32, PerfCounter>> {
+    fn counters(&self) -> std::cell::RefMut<'_, HashMap<i32, Counter>> {
         let rescan = match *self.last_scan.borrow() {
             Some(t) => t.elapsed() >= THREAD_RESCAN_INTERVAL,
             None => true,
@@ -135,15 +163,14 @@ impl Perf {
                 // The task may exit between the readdir and the open; that
                 // race is expected and the thread's counts are simply not
                 // representable then.
-                if let Ok(counter) = (self.make_builder)().for_pid(tid).disable().finish() {
+                if let Ok(counter) = self.event.open_for(tid) {
                     counters.insert(tid, counter);
                 }
             }
             if counters.is_empty() {
                 panic!(
                     "no perf counter could be opened — check kernel.perf_event_paranoid (>= 2 \
-                     requires exclude_kernel/exclude_hv on the builder) and \
-                     kernel.perf_event_access sysctl"
+                     requires user-space-only counters) and kernel.perf_event_access sysctl"
                 );
             }
         }
@@ -153,13 +180,13 @@ impl Perf {
     fn sum_all(&self) -> u64 {
         let mut counters = self.counters.borrow_mut();
         let mut total = 0;
-        // Stop → read → reset: the reset keeps the next window independent of
-        // everything counted before it. A failing counter belongs to a task
-        // that exited mid-window; drop it (and its uncountable remainder)
-        // rather than aborting the benchmark.
+        // Disable → read → reset: the reset keeps the next window independent
+        // of everything counted before it. A failing counter belongs to a
+        // task that exited mid-window; drop it (and its uncountable
+        // remainder) rather than aborting the benchmark.
         counters.retain(|_, counter| {
             match (|| {
-                counter.stop().ok()?;
+                counter.disable().ok()?;
                 let v = counter.read().ok()?;
                 counter.reset().ok()?;
                 Some(v)
@@ -184,13 +211,13 @@ impl Measurement for Perf {
         if counters.is_empty() {
             panic!(
                 "no perf counter could be opened — check kernel.perf_event_paranoid (>= 2 \
-                 requires exclude_kernel/exclude_hv on the builder)"
+                 requires user-space-only counters)"
             );
         }
         for counter in counters.values_mut() {
             // A task can exit between our scan and this enable; its counter
             // is stale and gets dropped at the next end().
-            let _ = counter.start();
+            let _ = counter.enable();
         }
     }
 

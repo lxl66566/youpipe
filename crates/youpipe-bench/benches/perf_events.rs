@@ -51,8 +51,7 @@ mod common;
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, measurement::Measurement};
-use criterion_perf_counters::Perf;
-use perfcnt::linux::{HardwareEventType as HW, PerfCounterBuilderLinux as Builder};
+use criterion_perf_counters::{HardwareEvent as HW, Perf};
 use rayon::prelude::*;
 
 fn cpu_work(x: u64) -> u64 {
@@ -131,16 +130,14 @@ fn bench_lightweight<M: Measurement>(c: &mut Criterion<M>) {
 /// Map a `PERF_EVENT` name to a hardware event; `walltime` (handled by
 /// `main`) switches the whole bench back to criterion's clock so the same
 /// code can be measured under both methodologies for a drift A/B.
-fn hardware_event(name: &str) -> Result<(HW, &'static str), String> {
-    // The second tuple element is the canonical report name ('static on
-    // purpose: criterion's ValueFormatter stores it).
-    let (hw, canonical) = match name {
-        "instructions" => (HW::Instructions, "instructions"),
-        "cycles" => (HW::CPUCycles, "cycles"),
-        "ref-cycles" => (HW::RefCPUCycles, "ref-cycles"),
-        "cache-misses" => (HW::CacheMisses, "cache-misses"),
-        "branch-misses" => (HW::BranchMisses, "branch-misses"),
-        "branches" => (HW::BranchInstructions, "branches"),
+fn hardware_event(name: &str) -> Result<HW, String> {
+    let hw = match name {
+        "instructions" => HW::Instructions,
+        "cycles" => HW::CpuCycles,
+        "ref-cycles" => HW::RefCpuCycles,
+        "cache-misses" => HW::CacheMisses,
+        "branch-misses" => HW::BranchMisses,
+        "branches" => HW::BranchInstructions,
         other => {
             return Err(format!(
                 "unknown PERF_EVENT `{other}` (expected one of \
@@ -148,20 +145,7 @@ fn hardware_event(name: &str) -> Result<(HW, &'static str), String> {
             ))
         },
     };
-    Ok((hw, canonical))
-}
-
-/// Build the per-thread counter template for `hw`.
-///
-/// User-space-only attribution (`exclude_kernel` + `exclude_hv`): required
-/// for unprivileged counters at `kernel.perf_event_paranoid >= 2`, and it
-/// keeps interrupt/timer noise out of the counts (see module docs). The
-/// fork opens each counter disabled, so the warm-up phase never leaks into
-/// the first measurement window.
-fn make_builder(hw: HW) -> Builder {
-    let mut builder = Builder::from_hardware_event(hw);
-    builder.exclude_kernel().exclude_hv();
-    builder
+    Ok(hw)
 }
 
 fn run<M: Measurement>(mut c: Criterion<M>) {
@@ -174,8 +158,8 @@ fn main() {
     match event.as_str() {
         "walltime" => run(common::criterion().configure_from_args()),
         ev => match hardware_event(ev) {
-            Ok((hw, name)) => run(common::criterion()
-                .with_measurement(Perf::with_event_name(move || make_builder(hw), name))
+            Ok(hw) => run(common::criterion()
+                .with_measurement(Perf::new(hw))
                 .configure_from_args()),
             Err(msg) => panic!("{msg}"),
         },

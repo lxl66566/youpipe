@@ -13,6 +13,10 @@ Maintained fork of
 
 - **criterion 0.8.** The `Measurement`/`ValueFormatter` trait shapes are
   unchanged, so this is a version bump plus the API gaps below.
+- **perf-event backend** (was: perfcnt, unmaintained, nom v4
+  future-incompat). Counters are opened per task through
+  [perf-event](https://crates.io/crates/perf-event) 0.4, always
+  user-space-only and disabled at open (both are the backend's defaults).
 - **Process-wide per-thread counters.** Upstream opens a single counter on
   the calling thread, so for any workload that runs on other threads (thread
   pools, async runtimes) it measures only the coordinator loop. This fork
@@ -29,13 +33,11 @@ Maintained fork of
 [dev-dependencies]
 criterion = "0.8"
 youpipe-criterion-perf-counters = "0.5"
-perfcnt = "0.8"
 ```
 
 ```rust
 use criterion::{criterion_group, criterion_main, Criterion};
-use criterion_perf_counters::Perf;
-use perfcnt::linux::{HardwareEventType as Hardware, PerfCounterBuilderLinux as Builder};
+use criterion_perf_counters::{HardwareEvent, Perf};
 
 fn bench(c: &mut Criterion<Perf>) {
     let mut group = c.benchmark_group("fibonacci");
@@ -45,26 +47,16 @@ fn bench(c: &mut Criterion<Perf>) {
 
 criterion_group!(
     name = my_bench;
-    config = Criterion::default().with_measurement(Perf::with_event_name(
-        || Builder::from_hardware_event(Hardware::Instructions),
-        "instructions",
-    ));
+    config = Criterion::default().with_measurement(Perf::new(HardwareEvent::Instructions));
     targets = bench
 );
 criterion_main!(my_bench);
 ```
 
-The builder factory is called once per discovered thread, so set your
-attribution flags there:
-
-```rust
-let mut builder = Builder::from_hardware_event(Hardware::Instructions);
-builder.exclude_kernel().exclude_hv(); // user-space only
-```
-
-`exclude_kernel()` + `exclude_hv()` is required for unprivileged use at
-`kernel.perf_event_paranoid >= 2` and keeps interrupt/timer noise out of
-the counts (at the price of not counting syscall/kernel work).
+Counters are always opened user-space-only (`exclude_kernel` +
+`exclude_hv`): required for unprivileged use at
+`kernel.perf_event_paranoid >= 2`, and it keeps interrupt/timer noise out
+of the counts (at the price of not counting syscall/kernel work).
 
 ## Counting semantics and measurement-window cost
 

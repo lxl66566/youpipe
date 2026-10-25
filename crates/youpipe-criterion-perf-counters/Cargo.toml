@@ -16,6 +16,14 @@
 #     (criterion 0.8 added both variants; upstream matches no longer
 #     compile) and an `event_name` field so reports say "instructions"
 #     instead of a hardcoded "cycles".
+#   * backend swap perfcnt -> perf-event 0.4 (2026-10-26, todo #15): perfcnt
+#     is unmaintained and its nom v4 dependency is future-incompat (a future
+#     rustc will refuse to compile it); only ~7 perfcnt API points were in
+#     use, all covered by perf-event (observe_pid per task, counters start
+#     disabled, enable/disable/read/reset, exclude_kernel/exclude_hv are the
+#     backend's defaults). The public builder-factory API (which existed
+#     because perfcnt's builder cannot be cloned) became the `HardwareEvent`
+#     enum; backend types no longer leak.
 #
 # The package is renamed to the `youpipe-` prefix (workspace convention,
 # youpipe/st3 already have it); the lib target keeps the name
@@ -38,7 +46,7 @@ name = "criterion_perf_counters"
 
 [dependencies]
 criterion = { workspace = true }
-perfcnt   = "0.8"
+perf-event = "0.4"
 
 # Fork: sources stay diffable with upstream (no inline allow-churn), so the
 # workspace's pedantic lint set is deliberately not inherited here.

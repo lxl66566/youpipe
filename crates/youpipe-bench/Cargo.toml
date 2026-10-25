@@ -1,5 +1,5 @@
 # Lab bench crate: every opt-in benchmark tool that needs heavyweight deps
-# (perfcnt/nom4, zstd, aes-gcm) or a non-criterion shape lives here, in ONE
+# (perf-event, zstd, aes-gcm) or a non-criterion shape lives here, in ONE
 # package, instead of one crate per bench. Out of `default-members`, so the
 # plain `cargo build/test/clippy` at the workspace root never compiles any of
 # it; every target is selected explicitly:
@@ -9,7 +9,7 @@
 #   cargo run    -p youpipe-bench --bin hotpath-profile --features hotpath
 #
 # (Why not benches/ in the main crate: `dev-dependencies` cannot be optional,
-# so a root bench target would drag perfcnt + zstd + aes-gcm into every
+# so a root bench target would drag perf-event + zstd + aes-gcm into every
 # `cargo bench` of the main suite, even when unused.)
 #
 # Methodology and recorded results: docs/src/dev/benchmarks.md.
@@ -61,7 +61,6 @@ zstd      = "0.13"
 [dev-dependencies]
 criterion               = { workspace = true }
 criterion-perf-counters = { package = "youpipe-criterion-perf-counters", path = "../youpipe-criterion-perf-counters" }
-perfcnt                 = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }

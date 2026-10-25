@@ -1,7 +1,7 @@
 # youpipe-bench
 
 Opt-in lab benches for maintainers — everything that needs heavyweight deps
-(perfcnt, zstd, aes-gcm) or a non-criterion shape, collected in ONE crate so
+(perf-event, zstd, aes-gcm) or a non-criterion shape, collected in ONE crate so
 the workspace doesn't carry one package per bench. Not in `default-members`:
 plain `cargo build/test/clippy` at the workspace root never compiles any of
 this; every target is selected explicitly with `-p youpipe-bench`.

@@ -17,7 +17,7 @@ members         = [
 exclude         = ["crates/youpipe-fuzz"]
 # Plain `cargo build/test/clippy` at the root covers only the library crates;
 # the vendored forks and the bench crates are opt-in via `-p` / `--workspace`
-# (they pull heavyweight deps: aes-gcm, zstd, perfcnt, valgrind runner, ...).
+# (they pull heavyweight deps: aes-gcm, zstd, perf-event, valgrind runner, ...).
 default-members = ["crates/youpipe", "crates/youpipe-sys"]
 
 # Shared metadata for the crates on the publish train. The vendored source
