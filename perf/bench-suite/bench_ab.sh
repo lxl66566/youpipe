@@ -163,6 +163,14 @@ for spec in "${SIDE_REVS[@]}"; do
     fi
 done
 
+# ── env guard: a CARGO_TARGET_DIR inherited from the launching shell makes
+#    every side's `cargo bench --no-run` build into ONE shared dir — the
+#    later side's binary overwrites the earlier side's at the same path, and
+#    every round then runs the LAST side's binary on both labels (found
+#    2026-10-26: an r15 recompile A/B came back with byte-identical behavior
+#    on both sides). Each side must build in its own worktree target dir.
+unset CARGO_TARGET_DIR
+
 # ── materialize each side exactly once per outdir; refresh on rev change.
 # Worktrees persist across runs so appended rounds reuse the build.
 materialize() {
