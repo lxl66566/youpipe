@@ -181,8 +181,9 @@ impl GraphBuilder<DefaultRuntime> {
     }
 }
 
-/// Spawn-step placeholder until the execution engines land; replaced by the
-/// per-kind spawn closures in `exec` / `async_exec`.
+/// Registration, wiring and terminals of the typed DAG builder: the node
+/// methods build the type-erased spawn steps (`exec` / `async_exec`) at the
+/// call site where the item types are still known.
 impl<R: AsyncRuntime> GraphBuilder<R> {
     /// Iterator source: a single feeder pulls `iter` and moves each item
     /// into the source's single outgoing edge (no `Clone` bound). To feed

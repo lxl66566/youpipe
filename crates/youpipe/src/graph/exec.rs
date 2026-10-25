@@ -166,8 +166,6 @@ impl GraphCore {
     /// Spawn one async task on the runtime backend. The body's panics are
     /// caught at the poll boundary by `async_exec::catch_panic` (record +
     /// cancel), so this site only handles the completion accounting.
-    // Called by the async execution engine (next commit).
-    #[allow(dead_code)]
     pub(crate) fn spawn_task<F>(&self, fut: F)
     where
         F: Future<Output = ()> + Send + 'static,

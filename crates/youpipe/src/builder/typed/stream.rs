@@ -2063,6 +2063,8 @@ pub(crate) struct TermPolicy {
     /// fans its output channel into per-worker SPSC shards.
     sharded: bool,
     /// `YOUPIPE_SHARDED_TERM_ASYNC`: the falsified async-sharded flavour.
+    // Read only on the async terminal paths (tokio-runtime).
+    #[cfg_attr(not(feature = "tokio-runtime"), allow(dead_code))]
     sharded_async: bool,
     /// `YOUPIPE_ASYNC_CHAIN_FLOOR`: async-tailed chains lift their unpinned
     /// stage-output channel capacities (see `stage_buffer`). `None` = the

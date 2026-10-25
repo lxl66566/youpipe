@@ -87,13 +87,8 @@ pub(crate) enum Fanout {
 /// the run-level budget / buffer resolution (see `exec::run_graph`).
 #[derive(Default)]
 pub(crate) struct NodeOpts {
-    // Read by the worker-budget / buffer resolution landing with the sync
-    // execution engine.
-    #[allow(dead_code)]
     pub(crate) workers: Option<NonZeroUsize>,
-    #[allow(dead_code)]
     pub(crate) buffer: Option<NonZeroUsize>,
-    #[allow(dead_code)]
     pub(crate) io_concurrency: Option<NonZeroUsize>,
 }
 
