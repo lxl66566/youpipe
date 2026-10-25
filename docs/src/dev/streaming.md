@@ -180,7 +180,48 @@ Capacity contract: because of the bitmask mapping, two *live* (un-flushed) `seq`
 
 Window sizing (`state::stream::OrderedWindow`): the streaming collectors pre-size the window to the pipeline's in-flight occupancy (Σ channel buffers + Σ worker batch claims, accumulated during the spawn walk via `StreamCtx::note_in_flight`; floored at 1 Ki) and let it grow up to `next_pow2(n)`. The ceiling is the sound span bound: the single feeder assigns `0..n-1` exactly once, and `next_expected == m` implies seq `m` was never inserted (inserting it flushes through it), so the live span never exceeds `n - 1`. No smaller bound is sound: instantaneous occupancy constrains the coexistence of buffered items, it does not bound the cumulative reorder span — a preempted worker holds one item while everything flows past, and overtaking needs only transient co-residency in one stage's worker set. Measured: span ~2 M at occupancy ~900 (n = 2 M, default buffers, 32 workers, seq 0 sleeping 400 ms; the old 1 Mi clamp dropped ~1 M items), and span routinely reaches 30–60 % of n even without pathological stragglers, so growth is a normal path — occupancy only sizes the preallocation. Memory stays proportional to the *observed* span: in-order runs never allocate, well-behaved runs allocate ~occupancy, a real straggler grows toward the `n`-sized ceiling. `StreamPipe::with_reorder_window` pins the ceiling explicitly for callers that must bound memory, accepting counted drops beyond it.
 
-Drop observability: a drop (span overflow at the pinned `max_capacity`, or a duplicate `seq` from an `expand` misuse) drops the older item, counts it in `ReorderBuffer::dropped`, and the duplicate arm trips a `debug_assert` at the drop site. The ordered collectors validate `emitted + dropped == expected` after the drain in debug builds (a fired cancel token exempts the equality — a cancelled run legitimately emits fewer items); release builds keep only the counter. With the default auto window the drop arm is unreachable (span ≤ n − 1 < `next_pow2(n)`).
+Drop observability: a drop (span overflow at the pinned `max_capacity`, or a duplicate `seq` from a public-API misuse) drops the older item, counts it in `ReorderBuffer::dropped`, and the duplicate arm trips a `debug_assert` at the drop site. The ordered collectors validate `emitted + dropped == expected` after the drain in debug builds (a fired cancel token exempts the equality — a cancelled run legitimately emits fewer items); release builds keep only the counter. With the default auto window the drop arm is unreachable (span ≤ n − 1 < `next_pow2(n)`).
+
+### Ordered expansion (group payloads, todo #5)
+
+`.ordered()` *before* `.expand()` switches the chain to group payloads:
+every channel slot downstream of the expansion holds `(seq, Vec<N>)` — ONE
+message per input item. That is the only sound shape: with per-item
+messages an empty expansion group has no message to carry its completion
+(a `(seq, sub, end)` tag can only mark a group's last entry), so from the
+first empty group on the collector could not advance the prefix flush and
+would degrade to whole-stream buffering plus silent window drops; and a
+bounded 3-field tag cannot express the `(seq, sub₁, sub₂)` order of
+nested expands at all. One-message-per-seq makes the `ReorderBuffer`
+correct as-is: a group (empty or not) is one slot, the
+`emitted + dropped == n` accounting counts groups (= input items), and a
+flushed empty group emits nothing while still advancing `next_expected`.
+
+Mechanics: the grouped nodes reuse the per-message sync stage core
+(`spawn_stage_fanout`) with element-adapted closures —
+`OrderedExpandStage` (per-item in → group out; the transition node),
+`GroupedExpandStage` (each input-group element expands into the SAME
+output group), `GroupedStage` / `GroupedAsyncStage` (elementwise maps,
+the async one adapting into the shared consumer fan-out). Worker loops,
+claim sharing, tx batching and the cancel observation point are the plain
+stage's; cancel granularity is the group message (= that stage's input
+item). The terminal drains re-sequence groups then flatten
+(`FlatVecCollector` family); the sharded terminals shard group messages
+exactly like items, EOF by shard aggregation unchanged.
+
+Allocation: one fresh `Vec` per input item (empty group = `Vec::new()`,
+no allocation) — the cost class of the owned-`Vec` `expand` API, buying
+one channel slot per input item instead of one per output item. The
+unordered `expand_emit` keeps its zero-alloc scratch. In-flight estimates
+count messages, not elements (the reorder-window pre-size is a hint only;
+growth carries correctness).
+
+Ordering selection is a typestate (`StreamMode`: `Unordered` / `Ordered` /
+`Grouped`): `.ordered()` requires an expand-free chain (`ExpandFree`), so
+the pre-2026-10 runtime rejection (`has_expand`) is now a compile error;
+the fused pass-through stays eligible for `Ordered` pure-`stage` chains.
+Design record: core-types.md "Ordered expansion — group payloads".
+
 
 ## Fences (`FenceMode`)
 

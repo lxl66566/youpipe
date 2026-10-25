@@ -9,8 +9,9 @@
 //! `flat_map_iter`, the owned API of `flat_map`.
 //!
 //! Matrix: fan-out ∈ {4, 64} × cost ∈ {cheap, cpu} at one size anchor
-//! (10 K inputs). Throughput counts **output** elements so the fan-out axis
-//! compares equal work per row.
+//! (10 K inputs), plus an `ordered_push` cheap-cost row per fan-out — the
+//! todo #5 grouped-payload canary. Throughput counts **output** elements so
+//! the fan-out axis compares equal work per row.
 
 mod common;
 
@@ -97,6 +98,35 @@ fn bench_expand_heavy(c: &mut Criterion) {
                     );
                 },
             );
+
+            // Ordered canary (todo #5): `.ordered().expand_emit` carries
+            // each expansion group as one channel message (fresh `Vec` per
+            // input item, ReorderBuffer re-sequencing at group granularity).
+            // Cheap cost only — the point is a standing number for the
+            // grouped path's shape, not the full cost matrix.
+            if cost_label == "cheap" {
+                group.bench_with_input(
+                    BenchmarkId::new(format!("ordered_push/fanout={fanout}"), SIZE),
+                    &data,
+                    |b, data| {
+                        b.iter_batched(
+                            || warm_clone(data),
+                            |v| {
+                                let r: Vec<u64> = stream(v)
+                                    .ordered()
+                                    .expand_emit(move |x, out: &mut Vec<u64>| {
+                                        for i in 0..fanout {
+                                            out.push(f(x.wrapping_add(i)));
+                                        }
+                                    })
+                                    .run();
+                                bb(r)
+                            },
+                            BatchSize::PerIteration,
+                        );
+                    },
+                );
+            }
 
             group.bench_with_input(
                 BenchmarkId::new(

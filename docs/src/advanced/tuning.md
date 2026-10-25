@@ -257,8 +257,10 @@ buffers tighten backpressure (less peak memory); large ones absorb bursts.
 
 `.run()` collects in completion order — no reorder cost. `.ordered()` tags
 each item with a sequence number and buffers through a `ReorderBuffer`; pay
-it only when the consumer needs input order. `.ordered()` plus `.expand()`
-panics (1-to-N breaks the single-sequence assumption).
+it only when the consumer needs input order. Ordered expansion requires
+`.ordered()` *before* `.expand()` (after it: compile error) and then carries
+each group as one message — one `Vec` allocation per input item, fewer and
+larger channel slots than the per-item fan-out.
 
 Fences trade throughput for semantics. The default (overlapping stages) is
 fastest; add `FenceMode::Barrier` when a stage needs the upstream fully

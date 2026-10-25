@@ -28,7 +28,10 @@ oversized pool instead ([pools](../advanced/pools.md)).
 
 `.run()` (alias `.collect()`, matching [`pipe()`](pipe.md) chains) returns a
 `Vec` in **completion order**; `.ordered()` restores input
-order via a reorder pass. The reorder window pre-sizes to the pipeline's
+order via a reorder pass. `.ordered()` is a typestate: call it anywhere on a
+chain without `.expand()` (calling it after `.expand()` is a compile error —
+see [Expansion and cancellation](#expansion-and-cancellation)). The reorder
+window pre-sizes to the pipeline's
 in-flight occupancy and grows on demand up to `next_pow2(n)` — correct for
 any per-item latency skew, with memory proportional to the observed reorder
 span (see [internals](../dev/streaming.md#ordered-output-statereorderrs)).
@@ -88,9 +91,10 @@ upstream stage sooner.
 
 ## Expansion and cancellation
 
-`.expand(f)` is a 1-to-N stage (`Fn(O) -> Vec<N>`, like `flat_map`). Note:
-`.expand()` combined with `.ordered()` panics — the reorder buffer assumes a
-1-to-1 item mapping.
+`.expand(f)` is a 1-to-N stage (`Fn(O) -> Vec<N>`, like `flat_map`). Its
+outputs travel as individual channel messages sharing the parent's sequence
+tag, so `.ordered()` *after* `.expand()` is a compile error — no
+re-sequencing can order one seq fanned out to N messages.
 
 ```rust
 use youpipe::prelude::*;
@@ -102,6 +106,25 @@ let words: Vec<String> = lines.stream()
     .expand(|line: String| line.split_whitespace().map(String::from).collect())
     .run();
 assert_eq!(words.len(), 3);
+```
+
+For **ordered** expansion call `.ordered()` *before* `.expand()` — the
+whole expansion group of one input then travels as a single
+`(seq, Vec<N>)` message (an empty expansion is an empty message, so empty
+groups are correct; stages after it map groups elementwise; nested expands
+flatten into one group). It costs one `Vec` per input item — the grouped
+channels carry the allocation by design:
+
+```rust
+use youpipe::prelude::*;
+
+let lines: Vec<String> = vec!["a b".into(), String::new(), "c".into()];
+// Input order with an empty group in the middle: ["a", "b", "c"].
+let words: Vec<String> = lines.stream()
+    .ordered()
+    .expand(|line: String| line.split_whitespace().map(String::from).collect())
+    .run();
+assert_eq!(words, ["a", "b", "c"]);
 ```
 
 `.expand(f)` allocates one `Vec` per input item. For expand-heavy loads the

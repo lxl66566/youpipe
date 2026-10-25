@@ -392,10 +392,11 @@ chain via builder methods and assemble a channel topology at `.run()` time:
 ```rust
 stream(items)                       // StreamPipe<StreamStart, I, I>
     .stage(|x| f(x))                //   → SyncStage (compute pool workers)
-    .expand(|x| vec![...])          //   → ExpandStage (1-to-N)
+    .ordered()                      // restore input order via ReorderBuffer
+                                    //   (typestate; must precede .expand())
+    .expand(|x| vec![...])          //   → ordered expansion: group payloads
     .fence(FenceMode::Chunked(k))   //   → FenceLink (batching barrier thread)
     .stage_async(|x| async { .. })  //   → AsyncStage (tokio tasks, M:N)
-    .ordered()                      // restore input order via ReorderBuffer
     .with_cancel(token)             // cooperative cancellation
     .run()                          // execute → Vec<O>
 ```
@@ -404,11 +405,11 @@ stream(items)                       // StreamPipe<StreamStart, I, I>
 | --------------------- | ------------------------------------------------------------------------- |
 | `.stage(f)`           | `parallelism` compute-pool workers pull, apply `f`, forward               |
 | `.stage_with(opts,f)` | same, with `opts.workers` / `opts.buffer` pinning that stage (`SyncStageOptions`) |
-| `.expand(f)`          | like `.stage` but each input → `Vec<N>` outputs (inherits parent's `seq`) |
+| `.expand(f)`          | 1-to-N. Unordered: per-item messages sharing the parent's `seq`. After `.ordered()`: one `(seq, Vec<N>)` group message per input (see below) |
 | `.fence(mode)`        | dedicated forwarder thread batching between adjacent stages               |
 | `.stage_async(f)`     | `io_concurrency` tokio tasks on the async runtime (M:N)                   |
 | `.stage_async_with(o,f)` | same, with `o.io_concurrency` / `o.buffer` pinning that stage (`AsyncStageOptions`) |
-| `.ordered()`          | feeder tags each item with `seq`; collector reorders via `ReorderBuffer`  |
+| `.ordered()`          | feeder tags each item with `seq`; collector reorders via `ReorderBuffer`. Typestate (expand-free chains only) |
 | `.with_cancel(token)` | feeder/workers/bridges check `is_cancelled()` per iteration               |
 | `.for_each(f)`        | side-effect terminal: drains item-by-item, no output `Vec` materialised   |
 
@@ -448,6 +449,76 @@ semantics: every count/capacity setter (`StageOptions`-family, pipeline-level
 treated `0` as either silent-unpin or silent `max(1)`; they now panic at
 build time via `PipelineConfig::require_nonzero` (`with_compute_workers`'
 upper clamp to `MAX_COMPUTE_WORKERS` stays — that one is deliberate).
+
+#### Ordered expansion — group payloads and the ordering typestate (2026-10, ex-todo #5)
+
+`ordered` + `expand` used to be rejected at run time (the `has_expand`
+walk): the per-item fan-out shares one seq across N channel messages while
+the `ReorderBuffer` is single-item-per-seq. The 2026-10 design analysis
+closed three constraints before implementation:
+
+1. **Empty groups cannot carry a signal in any per-item tagging.** A
+   `(seq, sub, end_of_group)` tag can only attach to a group's *last*
+   entry; an empty expansion has no entry, so from the first empty group on
+   the collector cannot advance the prefix flush — it degrades to
+   buffering the whole remaining stream, and a fixed reorder window
+   silently drops items.
+2. **Multi-level expand needs the full path**: the global order of a
+   two-level expand is `(seq, sub₁, sub₂)` lexicographic; a bounded tag
+   loses `sub₁`.
+3. **E0207**: `Fn(I, &mut Vec<N>)` does not constrain `N` in argument
+   position — `N` must ride the node struct (`ExpandStage<Prev, F, N>`
+   already did this).
+
+The landed design carries **the group as the payload**: downstream of an
+ordered expand every channel slot holds `(seq, Vec<N>)` — ONE message per
+input item. One seq maps to exactly one message (an empty group is an
+empty message, which still advances the collector), nested expands append
+into the same output group (flattening — no sub-tag exists), and the
+`ReorderBuffer` is reused as-is at group granularity, its
+`emitted + dropped == n` accounting intact (`n` counts input items =
+groups).
+
+**Typestate, not a dual API.** Batched-vs-per-item changes channel *slot
+types*, so the selector must be compile-time anyway; a parallel
+`expand_ordered` method would leave the invalid `.expand()….ordered()`
+shape alive as a runtime panic. `StreamPipe` gained a fifth defaulted,
+sealed type parameter `M: StreamMode`:
+
+- `Unordered` (default): today's path unchanged (per-item expand, no
+  reorder). `.ordered()` here requires an expand-free chain (the sealed
+  `ExpandFree` trait over the chain nodes), which turns
+  `.expand()….ordered()` into a compile error at the `.ordered()` call —
+  `has_expand` and the runtime assert are gone.
+- `Ordered`: per-item payloads, ordered drains. `.expand()` builds
+  `OrderedExpandStage` and moves the pipe to `Grouped`. Pure `.stage()`
+  chains keep the fused pass-through (its output IS input order).
+- `Grouped`: group payloads. `.stage()` / `.stage_async()` map groups
+  elementwise (`GroupedStage` / `GroupedAsyncStage`), `.expand()` flattens
+  (`GroupedExpandStage`), fences forward whole groups opaquely
+  (`FenceLink` is payload-agnostic). The collector re-sequences groups
+  then flattens (`FlatVecCollector` and friends); `run_checked`'s
+  `emitted` counts flattened items exactly.
+
+Generic noise stays flat for the common path: the parameter defaults to
+`Unordered`, every unordered signature is unchanged, and the grouped nodes
+reuse the per-message sync stage core (`spawn_stage_fanout`) and the async
+consumer fan-out with element-adapted closures — no parallel worker loops
+to drift.
+
+Cost model (honest): the grouped channels carry one heap `Vec` per input
+item (`Vec::new()` for an empty group allocates nothing) — the cost class
+of the owned-`Vec` `expand` API — and buy one channel slot per input item
+instead of one per output item. The unordered `expand_emit` keeps its
+zero-alloc scratch shape. Cancel granularity is the group (the message IS
+that stage's input item, matching the "current item completes" contract).
+
+Canary: `expand_heavy/ordered_push` bench ids. Tests: the
+`test_stream_ordered_expand*` family in `pipeline_integration` (empty
+groups leading/consecutive/trailing/all-empty, nested flattening,
+interleaved multi-worker ordering, downstream stage + fence,
+`run_checked` cancellation with exact `emitted`, grouped async terminal)
+plus the grouped blocks of `sharded_terminal(_async).rs`.
 
 #### Async IO stages
 

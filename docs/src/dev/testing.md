@@ -203,9 +203,10 @@ Design notes:
   `try_recv_batch` (`claim_poll`, the sharded terminal), and the MPSC case
   drives the same batch-first / blocking-`recv`-fallback drain rhythm the
   sharded receiver uses.
-- Caller contracts the harness never violates: `.ordered()` + `.expand()`
-  (documented panic), and `ReorderBuffer`'s outstanding-window `< capacity`
-  precondition.
+- Caller contracts the harness never violates: `.ordered()` after
+  `.expand()` (a compile error since todo #5's typestate; the harness folds
+  ordered inputs onto expand-free templates), and `ReorderBuffer`'s
+  outstanding-window `< capacity` precondition.
 - `for_each` terminals assert multisets — rayon `par_iter().for_each` order
   semantics; `collect` and ordered `run` assert exact order.
 
@@ -230,7 +231,8 @@ Windows specifics:
 
 The `stream` target's ordered assertion fired on inputs decoding as
 `ordered=true` with the expand template. That template's body never calls
-`.ordered()` (expand + ordered is a documented panic), but the fold
+`.ordered()` (expand + ordered is rejected — a runtime panic then, a compile
+error since todo #5), but the fold
 `r.pick(5) % 2` mapped the ordered set onto `{0, 1}`, keeping the expand
 template under `finish`'s exact-order assertion — legitimate
 completion-order interleavings of an *unordered* pipeline were flagged as
