@@ -19,7 +19,7 @@
 #[cfg(feature = "tokio-runtime")]
 pub use crate::runtime::TokioPool;
 pub use crate::{
-    AsyncStageOptions, FenceOptions, FilterCollectMode, GraphBuilder, Grouped, Identity,
+    AsyncStageOptions, Collect, FenceOptions, FilterCollectMode, GraphBuilder, Grouped, Identity,
     NodeHandle, Ordered, Pipe, PipeRef, PipelineConfig, RangePipe, StreamPipe, StreamStart,
     SyncStageOptions, TryPipe, TryPipeRef, Unordered, Workload,
     executor::{ComputePool, compute::MAX_COMPUTE_WORKERS},

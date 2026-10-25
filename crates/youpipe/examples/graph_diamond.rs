@@ -15,18 +15,13 @@
 //!
 //! ```text
 //!                ┌─► hash (sync CPU) ─────────────┐
-//! load (src) ────┤                                ├──► join ──► persist (async IO) ──► out (sink)
+//! load (src) ────┤                                ├──► join ──► persist (async IO) ──► out (collect)
 //!                └─► fetch_meta (async IO) ──────┘
 //! ```
 //!
 //! `load` broadcasts every item to both branches (fan-out); `join` consumes
-//! both inbound edges with fair round-robin (fan-in); the sink observes the
-//! union — 2 items per input.
-
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+//! both inbound edges with fair round-robin (fan-in); the collect sink
+//! returns the union — 2 items per input — straight out of `run_collect`.
 
 use youpipe::graph;
 
@@ -42,9 +37,6 @@ fn hash(x: u64) -> u64 {
 }
 
 fn main() {
-    let sink_count = Arc::new(AtomicU64::new(0));
-    let sink_sum = Arc::new(AtomicU64::new(0));
-
     let mut g = graph();
     let src = g.source("load", 0..SIZE);
 
@@ -68,11 +60,7 @@ fn main() {
         x
     });
 
-    let (c, s) = (sink_count.clone(), sink_sum.clone());
-    let snk = g.sink("out", move |x: u64| {
-        c.fetch_add(1, Ordering::Relaxed);
-        s.fetch_add(x, Ordering::Relaxed);
-    });
+    let snk = g.sink_collect("out");
 
     g.edge(src, hashed);
     g.edge(src, fetched);
@@ -82,21 +70,25 @@ fn main() {
     g.edge(persisted, snk);
 
     let start = std::time::Instant::now();
-    g.run();
+    let out = g.run_collect(snk);
     let elapsed = start.elapsed();
 
     // Broadcast conservation: each of the SIZE inputs reaches both branches,
-    // so the sink observes exactly 2 × SIZE items.
-    let expect_sum: u64 = (0..SIZE).map(|x| hash(x) + x.wrapping_add(1)).sum();
+    // so the collect sink returns exactly 2 × SIZE items. Sums wrap (the
+    // full-range hash overflows u64 long before 2 × SIZE items).
+    let wrapping_sum = |items: &[u64]| items.iter().fold(0u64, |acc, x| acc.wrapping_add(*x));
+    let expect: u64 = (0..SIZE).fold(0u64, |acc, x| {
+        acc.wrapping_add(hash(x)).wrapping_add(x.wrapping_add(1))
+    });
     assert_eq!(
-        sink_count.load(Ordering::Relaxed),
-        2 * SIZE,
+        out.len(),
+        usize::try_from(2 * SIZE).unwrap(),
         "fan-out then fan-in must deliver every item to both branches"
     );
-    assert_eq!(sink_sum.load(Ordering::Relaxed), expect_sum);
+    assert_eq!(wrapping_sum(&out), expect);
 
     println!("Diamond graph over {SIZE} items (sync + async branches, joined)");
-    println!("  sink received {} items in {elapsed:.3?}", 2 * SIZE);
+    println!("  collected {} items in {elapsed:.3?}", 2 * SIZE);
     println!();
     println!("Both branches run concurrently: the async side sleeps on the");
     println!("runtime while the sync side hashes on the compute pool, and the");

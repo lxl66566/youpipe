@@ -355,8 +355,9 @@ fn cancel_returns_normally() {
 }
 
 /// `run_checked`: the same mid-stream cancellation observed through the
-/// outcome instead of a post-hoc token read. The graph engine has no
-/// collector (sinks are user nodes), so `emitted` stays 0 by contract.
+/// outcome instead of a post-hoc token read. Side-effect sinks keep no
+/// count, so `emitted` stays 0 by contract (collect sinks report it — see
+/// `run_collect_checked_reports_cancelled_partial`).
 #[test]
 fn run_checked_reports_cancelled() {
     let token = CancellationToken::new();
@@ -392,6 +393,97 @@ fn run_checked_completes() {
     let out = g.sink("out", |_: u64| {});
     g.edge(src, out);
     assert_eq!(g.run_checked(), RunOutcome::Completed(()));
+}
+
+// ── Collect sinks ──
+
+/// `sink_collect` + `run_collect` over a linear chain: the returned Vec
+/// carries every item (order follows delivery — compare as a multiset).
+#[test]
+fn collect_sink_returns_all_items() {
+    let n = n_items(8_000u64);
+    let mut g = graph();
+    let src = g.source("src", 0..n);
+    let double = g.node("double", |x: u64| x * 2);
+    let out = g.sink_collect("out");
+    g.edge(src, double).edge(double, out);
+    let mut items = g.run_collect(out);
+    items.sort_unstable();
+    assert_eq!(items, (0..n).map(|x| x * 2).collect::<Vec<_>>());
+}
+
+/// A collect sink at a fan-in point: every branch's items land in the Vec.
+#[test]
+fn collect_sink_accumulates_fan_in() {
+    let n = n_items(4_000u64);
+    let mut g = graph();
+    let src = g.source("src", 0..n);
+    let split = g.node("split", |x: u64| x);
+    let a = g.node("a", |x: u64| x * 10);
+    let b = g.node("b", |x: u64| x + 1);
+    let out = g.sink_collect("out");
+    g.edge(src, split)
+        .edge(split, a)
+        .edge(split, b)
+        .edge(a, out)
+        .edge(b, out);
+    let items = g.run_collect(out);
+    assert_eq!(items.len(), 2 * usize::try_from(n).unwrap());
+    assert_eq!(
+        items.iter().sum::<u64>(),
+        (0..n).map(|x| x * 10).sum::<u64>() + (0..n).map(|x| x + 1).sum::<u64>()
+    );
+}
+
+/// `run_collect_checked` on a mid-stream cancellation: the partial Vec comes
+/// back and `emitted` counts it (the side-effect `run_checked` cannot).
+#[test]
+fn run_collect_checked_reports_cancelled_partial() {
+    let token = CancellationToken::new();
+    let fire = token.clone();
+    let n = 10_000_000u64;
+    let mut g = graph();
+    let src = g.source("src", 0..n);
+    let gate = g.node("gate", move |x: u64| {
+        if x == 2_000 {
+            fire.cancel();
+        }
+        x
+    });
+    let out = g.sink_collect("out");
+    g.edge(src, gate).edge(gate, out);
+    let outcome = g.with_cancel(token).run_collect_checked(out);
+    let RunOutcome::Cancelled { partial, emitted } = outcome else {
+        panic!("mid-stream cancel must report Cancelled: {outcome:?}")
+    };
+    assert_eq!(emitted, partial.len());
+    assert!(!partial.is_empty(), "trigger items must reach the sink");
+    assert!(usize::try_from(n).unwrap() > partial.len());
+}
+
+/// Plain `run` on a graph with a collect sink panics instead of dropping
+/// the collected items silently.
+#[test]
+#[should_panic(expected = "collect sink(s) `out` dropped their items")]
+fn plain_run_rejects_collect_sink() {
+    let mut g = graph();
+    let src = g.source("src", 0..8u32);
+    let out = g.sink_collect("out");
+    g.edge(src, out);
+    g.run();
+}
+
+/// A second collect sink whose handle was not passed to `run_collect`
+/// panics (its items would otherwise drop silently).
+#[test]
+#[should_panic(expected = "collect sink(s) `kept` dropped their items")]
+fn uncollected_collect_sink_panics() {
+    let mut g = graph();
+    let src = g.source("src", 0..8u32);
+    let dropped = g.sink_collect("taken");
+    let kept = g.sink_collect("kept");
+    g.edge(src, dropped).edge(src, kept);
+    g.run_collect(dropped);
 }
 
 /// A panicking node re-raises on the run caller after the drain (first panic

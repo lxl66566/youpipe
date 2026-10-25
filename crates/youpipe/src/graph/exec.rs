@@ -400,6 +400,38 @@ fn sink_worker<I, F>(
     }
 }
 
+/// The collect-sink worker (see `GraphBuilder::sink_collect`): fair fan-in
+/// claim, push the claimed items into the shared output Vec — one lock per
+/// claim batch. The terminal reads the Vec only after the run drained, so
+/// the lock is uncontended; taking it under the same mutex also orders the
+/// reads after the worker's last push.
+fn collect_worker<T>(
+    buf: &Arc<Mutex<Vec<T>>>,
+    mut fanin: FanIn<T>,
+    cancel: Option<&CancellationToken>,
+    claim_cap: usize,
+) where
+    T: Send + 'static,
+{
+    let mut spin = RoundSpin::new(crate::handoff::spin_anchor_us());
+    let mut scratch: Vec<T> = Vec::with_capacity(claim_cap.max(1));
+    loop {
+        let claimed = fanin.claim(&mut scratch, claim_cap, &mut spin);
+        if claimed == 0 {
+            return;
+        }
+        let mut out = buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for item in scratch.drain(..) {
+            if cancel_active(cancel) {
+                return;
+            }
+            out.push(item);
+        }
+    }
+}
+
 // ── Spawn steps (called from the builder's registration methods) ──
 
 /// Downcast one endpoint bundle to the concrete channel type the node
@@ -509,6 +541,25 @@ where
             let fanin = FanIn::new(rxs);
             let cancel = core.cancel.clone();
             core.dispatch_job(move || sink_worker(&*f, fanin, Some(&cancel), claim_cap));
+        },
+    )
+}
+
+/// Type-erased spawn step for one collect sink (see
+/// `GraphBuilder::sink_collect`): exactly one worker pushing into the shared
+/// buffer the terminal extracts after the drain.
+pub(crate) fn collect_spawn<T>(buf: Arc<Mutex<Vec<T>>>) -> SpawnStep
+where
+    T: Send + 'static,
+{
+    Box::new(
+        move |core: &GraphCore, _workers: usize, inputs: Vec<Erased>, _outputs: Vec<Erased>| {
+            let rxs = downcast_endpoints::<SyncReceiver<T>>(inputs, "inputs", "collect sink");
+            let claim_cap = GraphCore::claim_cap(1);
+            let cancel = core.cancel.clone();
+            core.dispatch_job(move || {
+                collect_worker(&buf, FanIn::new(rxs), Some(&cancel), claim_cap);
+            });
         },
     )
 }
@@ -635,12 +686,33 @@ pub(crate) fn run_graph<R: AsyncRuntime>(builder: GraphBuilder<R>) -> std::io::R
         Ok(order) => order,
         Err(errors) => panic!("graph validation failed: {}", errors.join("; ")),
     };
+    // Collect-sink buffers not extracted by a `run_collect` terminal would
+    // drop their items silently; a taken slot is `None` (see `take_output`).
+    let uncollected: Vec<&str> = builder
+        .outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.is_some())
+        .map(|(id, _)| &*builder.plan.nodes[id].name)
+        .collect();
+    if !uncollected.is_empty() {
+        let names = uncollected
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        panic!(
+            "graph run: collect sink(s) {names} dropped their items; pass each handle to \
+             run_collect (or a try_/_checked variant)"
+        );
+    }
     let GraphBuilder {
         plan,
         config,
         cancel,
         compute_pool,
         async_pool,
+        ..
     } = builder;
     if plan.nodes.is_empty() {
         return Ok(());

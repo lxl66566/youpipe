@@ -55,7 +55,7 @@ pub(crate) enum NodeKind {
     /// only under the `tokio-runtime` feature.
     #[cfg_attr(not(feature = "tokio-runtime"), allow(dead_code))]
     Async,
-    /// Side-effect terminal: exactly one sync worker.
+    /// Side-effect or collecting terminal: exactly one sync worker.
     Sink,
 }
 

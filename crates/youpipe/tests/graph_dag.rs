@@ -668,3 +668,20 @@ fn custom_compute_pool_runs() {
     expect.sort_unstable();
     assert_eq!(got, expect);
 }
+
+/// `sink_collect` + `run_collect`: the engine's data outlet — no shared
+/// state in user closures; fan-in items all land in the returned Vec.
+#[test]
+fn collect_sink_end_to_end() {
+    let n = n_items(6_000);
+    let mut g = graph();
+    let src = g.source("load", 0..n);
+    let a = g.node("double", |x: u64| x * 2);
+    let b = g.node("plus", |x: u64| x + 1);
+    let term = g.sink_collect("out");
+    g.edge(src, a).edge(src, b).edge(a, term).edge(b, term);
+    let items = g.run_collect(term);
+    assert_eq!(items.len(), 2 * usize::try_from(n).unwrap());
+    let expect_sum: u64 = (0..n).map(|x| 2 * x + x + 1).sum();
+    assert_eq!(items.iter().copied().sum::<u64>(), expect_sum);
+}

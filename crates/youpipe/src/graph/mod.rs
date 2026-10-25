@@ -18,7 +18,12 @@
 //! mistakes (cycles, dangling nodes, duplicate names or edges) are pure
 //! runtime data and reported together by `run()`'s validation pass.
 
-use std::{future::Future, marker::PhantomData, sync::Arc};
+use std::{
+    any::Any,
+    future::Future,
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     builder::PipelineConfig,
@@ -85,40 +90,38 @@ impl<I, O> std::fmt::Debug for NodeHandle<I, O> {
     }
 }
 
+/// Output-position marker of a [`GraphBuilder::sink_collect`] node: the
+/// handle is `NodeHandle<T, Collect>`, and only such a handle fits
+/// [`GraphBuilder::run_collect`] — side-effect [`GraphBuilder::sink`]
+/// handles (`NodeHandle<T, ()>`) are rejected at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Collect;
+
 /// Entry point for a typed DAG pipeline.
 ///
 /// ```
-/// use std::sync::{
-///     Arc,
-///     atomic::{AtomicU64, Ordering},
-/// };
-///
 /// use youpipe::graph;
 ///
-/// // Diamond: load -> hash -> (fast, slow) -> merge -> out
+/// // Diamond: load -> hash -> (fast, slow) -> merge -> collected output
 /// let mut g = graph();
 /// let src = g.source("load", 0..1_000u64);
 /// let hash = g.node("hash", |x: u64| x.wrapping_mul(2_654_435_761));
 /// let fast = g.node("fast", |x: u64| x / 2);
 /// let slow = g.node("slow", |x: u64| x * 3);
-/// let total = Arc::new(AtomicU64::new(0));
-/// let acc = Arc::clone(&total);
-/// let out = g.sink("out", move |x: u64| {
-///     acc.fetch_add(x, Ordering::Relaxed);
-/// });
+/// let merge = g.sink_collect("merge");
 /// g.edge(src, hash)
 ///     .edge(hash, fast)
 ///     .edge(hash, slow)
-///     .edge(fast, out)
-///     .edge(slow, out);
-/// g.run();
+///     .edge(fast, merge)
+///     .edge(slow, merge);
+/// let out = g.run_collect(merge);
 /// let expected: u64 = (0..1_000u64)
 ///     .map(|x| {
 ///         let h = x.wrapping_mul(2_654_435_761);
 ///         h / 2 + h * 3
 ///     })
 ///     .sum();
-/// assert_eq!(total.load(Ordering::Relaxed), expected);
+/// assert_eq!(out.iter().sum::<u64>(), expected);
 /// ```
 #[must_use]
 pub fn graph() -> GraphBuilder<DefaultRuntime> {
@@ -128,6 +131,7 @@ pub fn graph() -> GraphBuilder<DefaultRuntime> {
         cancel: None,
         compute_pool: None,
         async_pool: None,
+        outputs: Vec::new(),
     }
 }
 
@@ -141,6 +145,9 @@ pub struct GraphBuilder<R: AsyncRuntime = DefaultRuntime> {
     pub(crate) cancel: Option<CancellationToken>,
     pub(crate) compute_pool: Option<ComputePool>,
     pub(crate) async_pool: Option<R>,
+    /// Shared collect-sink buffers indexed by node id (`None` for
+    /// non-collect nodes and for the one a `run_collect` terminal took).
+    pub(crate) outputs: Vec<Option<Box<dyn Any + Send>>>,
 }
 
 impl GraphBuilder<DefaultRuntime> {
@@ -159,6 +166,7 @@ impl GraphBuilder<DefaultRuntime> {
             cancel: self.cancel,
             compute_pool: self.compute_pool,
             async_pool: None,
+            outputs: self.outputs,
         }
     }
 }
@@ -360,6 +368,42 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
         }
     }
 
+    /// Collecting sink: accumulates every item that reaches the node into a
+    /// `Vec` returned by [`run_collect`](Self::run_collect). Like
+    /// [`sink`](Self::sink) fixed at one worker; the handle's output marker
+    /// is [`Collect`] so only a collect-sink handle fits `run_collect`.
+    ///
+    /// Item order follows delivery order (multi-worker upstreams interleave);
+    /// sort at the call site when order matters.
+    ///
+    /// # Panics
+    ///
+    /// A graph containing a collect sink must be run through
+    /// [`run_collect`](Self::run_collect) or one of its `try_`/`_checked`
+    /// variants; a plain [`run`](Self::run) panics instead of silently
+    /// dropping the collected items.
+    pub fn sink_collect<T>(&mut self, name: impl Into<Arc<str>>) -> NodeHandle<T, Collect>
+    where
+        T: Send + Unpin + 'static,
+    {
+        let name: Arc<str> = name.into();
+        let buf: Arc<Mutex<Vec<T>>> = Arc::new(Mutex::new(Vec::new()));
+        let id = self.plan.push_node(
+            Arc::clone(&name),
+            plan::NodeKind::Sink,
+            plan::NodeOpts::default(),
+            exec::collect_spawn::<T>(Arc::clone(&buf)),
+        );
+        if self.outputs.len() <= id {
+            self.outputs.resize_with(id + 1, || None);
+        }
+        self.outputs[id] = Some(Box::new(buf));
+        NodeHandle {
+            id,
+            marker: PhantomData,
+        }
+    }
+
     /// Connect `up`'s output to `down`'s input. The item type is pinned by
     /// the two handles (compile-time check); the `(up_id, down_id)` pair is
     /// recorded as runtime data. Duplicate node pairs are rejected at
@@ -471,11 +515,11 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     /// Identical execution to [`run`](Self::run) (same validation panics,
     /// same panic re-raising — a node panic unwinds the caller before any
     /// outcome exists); the only addition is one token read after every sink
-    /// drained. The graph engine has no collector (sinks are user nodes), so
-    /// the outcome is `RunOutcome<()>`: a cancelled run reports
-    /// [`Cancelled`](RunOutcome::Cancelled) with `emitted == 0` — count in
-    /// the sink if the partial count matters. With no token attached the
-    /// outcome is always [`Completed`](RunOutcome::Completed).
+    /// drained. Side-effect sinks keep no count, so the outcome is
+    /// `RunOutcome<()>` with `emitted == 0` — for a counted partial use a
+    /// collect sink with [`run_collect_checked`](Self::run_collect_checked).
+    /// With no token attached the outcome is always
+    /// [`Completed`](RunOutcome::Completed).
     ///
     /// # Panics
     ///
@@ -494,10 +538,104 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     pub fn try_run_checked(self) -> std::io::Result<RunOutcome<()>> {
         let token = self.cancel.clone();
         exec::run_graph(self)?;
-        // `emitted == 0`: no collector exists — sinks are user nodes (see
+        // `emitted == 0`: side-effect sinks keep no count (see
         // `run_checked`). A worker panic cancels the token too, but
         // `run_graph` re-raises it above, so this read only sees user
         // cancellation.
         Ok(RunOutcome::classify((), 0, token.as_ref()))
     }
+
+    /// Run to whole-graph EOF and return the collect sink's accumulated
+    /// items. `try_run_collect` / `run_collect_checked` /
+    /// `try_run_collect_checked` follow the [`run`](Self::run) family's
+    /// naming.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`run`](Self::run); additionally the graph must not
+    /// contain another collect sink whose handle was not passed here (its
+    /// items would drop silently).
+    pub fn run_collect<T>(self, sink: NodeHandle<T, Collect>) -> Vec<T>
+    where
+        T: 'static,
+    {
+        self.try_run_collect(sink)
+            .expect("graph run: failed to build async runtime (see try_run_collect)")
+    }
+
+    /// [`run_collect`](Self::run_collect) returning the async-runtime
+    /// construction error instead of panicking.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`try_run`](Self::try_run).
+    pub fn try_run_collect<T>(mut self, sink: NodeHandle<T, Collect>) -> std::io::Result<Vec<T>>
+    where
+        T: 'static,
+    {
+        let buf = self.take_output::<T>(sink.id);
+        exec::run_graph(self)?;
+        Ok(take_items(&buf))
+    }
+
+    /// [`run_collect`](Self::run_collect) with the cancelled/completed
+    /// outcome: `emitted` counts the items the collect sink received before
+    /// the drain (`emitted == partial.len()`).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`run_collect`](Self::run_collect).
+    pub fn run_collect_checked<T>(self, sink: NodeHandle<T, Collect>) -> RunOutcome<Vec<T>>
+    where
+        T: 'static,
+    {
+        self.try_run_collect_checked(sink)
+            .expect("graph run: failed to build async runtime (see try_run_collect)")
+    }
+
+    /// Fallible counterpart to [`run_collect_checked`](Self::run_collect_checked).
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`try_run`](Self::try_run).
+    pub fn try_run_collect_checked<T>(
+        mut self,
+        sink: NodeHandle<T, Collect>,
+    ) -> std::io::Result<RunOutcome<Vec<T>>>
+    where
+        T: 'static,
+    {
+        let token = self.cancel.clone();
+        let buf = self.take_output::<T>(sink.id);
+        exec::run_graph(self)?;
+        let items = take_items(&buf);
+        let emitted = items.len();
+        Ok(RunOutcome::classify(items, emitted, token.as_ref()))
+    }
+
+    /// Take the shared buffer of the collect sink `id`, clearing its slot so
+    /// the run's uncollected-collector check does not fire for it.
+    fn take_output<T: 'static>(&mut self, id: usize) -> Arc<Mutex<Vec<T>>> {
+        let slot = self
+            .outputs
+            .get_mut(id)
+            .and_then(Option::take)
+            .unwrap_or_else(|| panic!("graph: node {id} is not a collect-sink handle"));
+        let buf: Arc<Mutex<Vec<T>>> = *slot
+            .downcast()
+            .expect("graph: internal type mismatch on a collect-sink buffer");
+        buf
+    }
+}
+
+/// Move the accumulated items out of a collect-sink buffer. `mem::take` under
+/// the lock works even while a finished worker's `Arc` clone is still
+/// dropping: the worker released the mutex before decrementing the run's
+/// completion counter, so the lock observes every push.
+fn take_items<T>(buf: &Arc<Mutex<Vec<T>>>) -> Vec<T> {
+    std::mem::take(
+        &mut *buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }

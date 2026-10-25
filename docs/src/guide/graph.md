@@ -67,6 +67,34 @@ diamond mixing sync and async branches.
 [`examples/graph_diamond.rs`]:
 https://github.com/lxl66566/youpipe/blob/main/crates/youpipe/examples/graph_diamond.rs
 
+## Collecting output
+
+`g.sink_collect("out")` registers a sink that accumulates every item
+reaching it; `g.run_collect(handle)` runs the graph and returns the `Vec` —
+the engine's data outlet, no shared counters in user closures:
+
+```rust
+use youpipe::graph;
+
+let mut g = graph();
+let src = g.source("load", 0..1_000u64);
+let double = g.node("double", |x: u64| x * 2);
+let out = g.sink_collect("out");
+g.edge(src, double).edge(double, out);
+let items: Vec<u64> = g.run_collect(out);
+assert_eq!(items.len(), 1_000);
+```
+
+Only a collect-sink handle fits `run_collect` (the handle's output type is
+the `Collect` marker — side-effect `sink` handles are `NodeHandle<T, ()>`
+and fail to compile there). `try_run_collect` returns the async-runtime
+construction error instead of panicking; `run_collect_checked` /
+`try_run_collect_checked` report `Completed` vs `Cancelled` with the partial
+`Vec` and a real `emitted` count. Item order follows delivery order
+(multi-worker upstreams interleave) — sort when order matters. A graph
+containing a collect sink must run through a `run_collect` variant: plain
+`run()` panics instead of silently dropping the collected items.
+
 ## Semantics
 
 **Fan-out is broadcast.** Every outbound edge of a node receives a **clone**
@@ -90,7 +118,7 @@ edges and propagate closure downstream; `run()` returns once every sink has
 seen every upstream close.
 
 **Cancellation.** `with_cancel(token)` checks the
-[`CancellationToken`](https://docs.rs/youpipe/latest/youpipe/struct.CancellationToken.html)
+[`CancellationToken`](https://docs.rs/youpipe/latest/youpipe/struct_CancellationToken.html)
 on every node between claim batches — the batched data plane checks once per
 claim batch, so up to one batch per worker can still be accepted after
 `token.cancel()`; per-item paths check per item. An accepted batch is mapped
@@ -99,8 +127,9 @@ rings instead of dropping, so what a sink receives never depends on ring
 pressure. `run()` returns promptly with the partial output
 (your sinks keep whatever they already consumed). `run_checked()` reports the
 difference instead: `RunOutcome::Completed(())` versus
-`RunOutcome::Cancelled` — the graph engine has no collector, so its `emitted`
-is always 0; count in the sink if the partial count matters.
+`RunOutcome::Cancelled` — side-effect sinks keep no count, so its `emitted`
+is always 0; a collect sink observed through `run_collect_checked` reports
+the partial `Vec` with `emitted == partial.len()`.
 
 **Panics.** The first node panic is re-raised in the `run()` caller's thread
 with the original payload. `try_run()` returns `io::Error` only for runtime

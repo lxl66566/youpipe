@@ -52,9 +52,9 @@ let src = g.source("load", 0..1000u64);
 let a = g.node("hash", |x: u64| x * 2);
 let b = g.node_async("meta", |x: u64| async move { fetch(x).await });
 let join = g.node("join", |x: u64| x);
-let snk = g.sink("out", |x: u64| { /* side effect */ });
-g.edge(src, a).edge(src, b).edge(a, join).edge(b, join).edge(join, snk);
-g.run();
+let out = g.sink_collect("out");
+g.edge(src, a).edge(src, b).edge(a, join).edge(b, join).edge(join, out);
+let union: Vec<u64> = g.run_collect(out);
 ```
 
 For index-shaped work (`0..n`), `pipe_range(0..n)` skips input materialization
