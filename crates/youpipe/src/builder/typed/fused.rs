@@ -3080,6 +3080,15 @@ const BALANCED_OVERSPLIT: usize = 4;
 /// tail-latency insurance on a skewed workload (the adaptive `Balanced`
 /// path would drop to `1` below [`LOW_OVERSPLIT_ITEMS_PER_THREAD`]).
 ///
+/// 64 since 2026-10 (was 32; the 8→32 step's monotone trend held):
+/// same-binary A/B on `zstd_shape` n=2000 (6 seeds × 3 interleaved rounds,
+/// drift-cancelled vs same-pass rayon) — uniform −5.5 %, capped −1.7 %,
+/// heavy-tail −1.4 %; at n=4000 only uniform still moves (−2.4 %). The
+/// mechanism is the same fine-grained-stealing face 8→32 bought: the depth
+/// budget reaches log2(n), so leaves bottom out at single items. Costs one
+/// more tree level on the cheap side (cpu_unbalanced n=5000; readings in
+/// dev/scheduler.md "UNBALANCED_OVERSPLIT").
+///
 /// Runtime-overridable (`YOUPIPE_OVERSPLIT`) so A/B benchmarks compare the
 /// same binary — compile-time flips change code layout enough on their own
 /// to swing tight benchmarks by tens of percent.
@@ -3089,7 +3098,7 @@ fn unbalanced_oversplit() -> usize {
         std::env::var("YOUPIPE_OVERSPLIT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(32)
+            .unwrap_or(64)
     })
 }
 

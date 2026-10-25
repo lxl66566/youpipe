@@ -2106,10 +2106,10 @@ fn test_hybrid_dispatch_spin_wait_stress() {
 
 #[test]
 fn test_workload_custom_correctness() {
-    // Custom oversplit produces identical results across factors 1..=32 —
+    // Custom oversplit produces identical results across factors 1..=64 —
     // the split granularity must never affect the output.
     let expected: Vec<u64> = (0..10_000).map(|x| x * 3 + 1).collect();
-    for factor in [1usize, 2, 7, 16, 32] {
+    for factor in [1usize, 2, 7, 16, 32, 64] {
         let r: Vec<u64> = pipe(0..10_000)
             .with_workload(Workload::Custom(NonZeroUsize::new(factor).unwrap()))
             .map(|x: u64| x * 3 + 1)

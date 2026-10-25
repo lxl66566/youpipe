@@ -15,11 +15,11 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 
 ## Performance
 
-### 2. [P1] zstd_shape residual gap (capped/uniform behind)
+### 2. ~~[P1] zstd_shape residual gap (capped/uniform behind)~~ (landed)
 
-- Status: the wide-tier boundary 64→48 has landed (scheduler.md "Wide-tier boundary scan"; the heavy-tail n=3000 vs-rayon gap tightened to +2.5%); the opt-in `ComputePool::new_pinned` has reclaimed most of the residual from the wake-landing side (capped −6.1…−6.9%, uniform −4.0…−4.6%, scheduler.md "Worker affinity"). Residual: capped +1…+2%, uniform +4…+6%, and heavy-tail n=2000 (narrow) ~+1% still behind rayon; the default-path (no pinning) residual needs re-estimation under the pinning-gate caliber.
-- Direction: the capped-shape residual is heavy-tail spread (4.2 pt), not a mean shift — consider reordering entries within chunks, or a third tier; cost-EMA-style adaptation is twice falsified (dead-ends.md), do not take the runtime-cost-estimation route again.
-- Verification: `zstd_shape` all shapes × multiple seeds (`ZSTD_SEEDS`/`ZSTD_SHAPE_NS` grid passed through); the cheap-side tiers, checked arithmetically, do not move with the boundary (cpu_unbalanced n=200/5000, neither crosses 48).
+- Closed 2026-10-26 (r15): the residual decomposed cleanly in a 4-side same-binary screen (`YOUPIPE_OVERSPLIT`/`YOUPIPE_CHUNK_SLACK`/`YOUPIPE_PIN_WORKERS`, n=2000, 6 seeds, 3 interleaved rounds, drift-cancelled vs same-pass rayon). The default-path residual that session was uniform +10.8%, capped +3.9% (4.1 pt seed spread), heavy-tail +1.3% (22 pt spread). `UNBALANCED_OVERSPLIT` 32→64 landed (uniform −5.5%, capped −1.7%, heavy-tail −1.4%; readings and the n=4000 confirmation in scheduler.md "`UNBALANCED_OVERSPLIT` 32 → 64"); the remainder is wake/placement — the pin column reproduced the `new_pinned` readings (−8.1% uniform), which stay the opt-in answer for default-path users.
+- Both suggested directions falsified: within-chunk reorder is provably void for iid cost draws (index-only information; every fixed item→chunk permutation is exchangeable — see the scheduler.md note), and a third slack tier has no supporting scan point (the [42, 63) items/chunk band's two measured endpoints are monotone; forced wide at 42 re-measured neutral for the third time).
+- Verification: `ZSTD_SEEDS`/`ZSTD_SHAPE_NS` grids; cheap-side guard re-measured under the flip (cpu_unbalanced n=5000, one extra tree level; n=200 arithmetically unchanged).
 
 ### 3. [P1] fused inter-batch park/wake occupancy loss (default-path residual)
 
