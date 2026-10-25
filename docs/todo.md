@@ -27,10 +27,10 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 - Direction: tail-straggler refinement — finer-grained oversplit of the final segment (dynamic; not the cost-EMA route, which is falsified; limited residual value, only +1.5% @2M under the new caliber). Do not lengthen the global spin window and do not build time-window or quiescence-gated keep-warm (both falsified, see dead-ends.md).
 - Verification: `cpu_balanced` 1M/2M/4M isolated A/B + `horizontal-counters` (youpipe-bench) to re-check task-clock / ctx-switch / migration.
 
-### 4. [P2] throughput collapse of streaming async shapes (residual ~1%)
+### 4. ~~[P2] throughput collapse of streaming async shapes~~ (landed)
 
-- Status: `YOUPIPE_ASYNC_CHAIN_FLOOR` (on by default, 2026-10-22) resolved the main body — the async chain's unpinned channels (stage outputs + the feeder ring) are floored to `min(n, 16384)` slots (an 8 MiB/ring byte budget), taking the async2 deep-soak slow runs from 18–30/120 to 0/120 (release-gate binary 21/96 → 2/96); terminal-only decoupling and the necessity of `buffer = n` are both falsified (dead-ends.md; the landing record is in [streaming.md](src/dev/streaming.md) "Async-chain capacity floor — resolution" and the same-named section of [attribution.md](src/dev/benchmarks/attribution.md)).
-- Residual: under the final gate the on side still shows ~1% slow runs (2/216, a single-process sporadic). If reproducible, candidates: raise the floor to the 64K tier (64K also read 0/48 in the sweep), or the combination surface with `YOUPIPE_SPIN_ANCHOR`.
+- The main body landed 2026-10-22 as `YOUPIPE_ASYNC_CHAIN_FLOOR` (terminal-only decoupling and the necessity of `buffer = n` both falsified, dead-ends.md; landing record in [streaming.md](src/dev/streaming.md) "Async-chain capacity floor — resolution" and [attribution.md](src/dev/benchmarks/attribution.md)).
+- The residual landed (closed) 2026-10-25 (r12): the ~1% sporadic slow runs reproduced (10/2160 at the 16K default, 0.46%, 95% CI 0.22–0.85) and the tier A/B promoted the default to `ASYNC_CHAIN_FLOOR_SLOTS = 65536` — 0/2160 slow runs, mid-tail 50–100 ms 38 → 1, pooled mean −6%, and the criterion A/B found `async0_cheap/100K` −30.7% stable (binary×env crossover ruled out layout), every other async family noise. One corner cost accepted: +2.4% fast-mode median on the zero-CPU forensic probe (L3-vs-L2 ring recycling), with the knob growing an explicit-tier escape (`=16384` reproduces the old default). Record: [attribution.md](src/dev/benchmarks/attribution.md) "Floor-tier promotion".
 
 ### 5. ~~[P1] `ordered()` + `expand()`: the batched-payload design~~ (landed)
 

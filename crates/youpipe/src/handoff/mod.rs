@@ -114,13 +114,21 @@ pub(crate) fn sharded_term_async_enabled() -> bool {
 // Default ON (promoted with the A/B above: async2 soak 0/120 collapsed
 // runs vs 18-30/120 off, async0_cheap/100K −41.8 %, every async shape
 // 9/9 dominant, all sync families inert noise). "0" recovers the unfloored
-// sizing.
+// sizing; a decimal slot count overrides the tier ("16384" reproduces the
+// 2026-10-22..25 default — kept for the zero-CPU latency corner where the
+// 1 MiB/ring L3 recycling costs ~2 % fast-mode median).
 
-/// Slot floor for the lifted channels: the smallest sweep value with zero
-/// collapsed runs (async2 @100K, 4 processes x 12 runs per cell; 16K and
-/// 64K both clean, 16K keeps the eager allocation at 256 KB/slot-ring for
-/// u64 payloads).
-pub(crate) const ASYNC_CHAIN_FLOOR_SLOTS: usize = 16384;
+/// Slot floor for the lifted channels. 2026-10-22 landed at 16K (the
+/// smallest sweep value with zero collapsed runs, 4 proc x 12 runs per
+/// cell; 64K also read clean but kept a bigger eager allocation); promoted
+/// to the 64K tier 2026-10-25 by a tier A/B (todo #4 residual): async2
+/// deep-soak slow runs 10/2160 -> 0/2160 and mean -6%, async0_cheap/100K
+/// -30% stable (the async-only chain's single mixed ring stays
+/// backpressure-bound at 16K), every other async family noise, pure-sync
+/// chains inert. The one cost: +2% fast-mode median on the zero-CPU
+/// forensic probe only (1 MiB/ring recycles through L3 where 256 KiB
+/// stayed inside one core's L2) — invisible on every cpu-bearing shape.
+pub(crate) const ASYNC_CHAIN_FLOOR_SLOTS: usize = 65536;
 
 /// Byte budget for the lift: bounded rings allocate every slot up front,
 /// so one lifted ring costs `cap x size_of::<SLOT>()` bytes. Beyond the
@@ -128,17 +136,27 @@ pub(crate) const ASYNC_CHAIN_FLOOR_SLOTS: usize = 16384;
 /// wake-RTT pathology anyway (per-item work dwarfs the ~1-2 µs RTT).
 pub(crate) const ASYNC_CHAIN_FLOOR_BYTES: usize = 8 << 20;
 
-static ASYNC_CHAIN_FLOOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static ASYNC_CHAIN_FLOOR: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
 
-pub(crate) fn async_chain_floor_enabled() -> bool {
+/// Resolved floor tier: `None` = the knob is off (unfloored sizing),
+/// `Some(slots)` = lift to `min(n, slots)` (byte-clamped per ring).
+/// Values: unset/`"1"` = on at the `ASYNC_CHAIN_FLOOR_SLOTS` tier, `"0"` =
+/// off, a decimal `>= 2` = on at that explicit slot count (the tier A/B
+/// caliber; `1` stays boolean so the bool reading cannot silently become a
+/// one-slot floor).
+pub(crate) fn async_chain_floor_slots() -> Option<usize> {
     *ASYNC_CHAIN_FLOOR.get_or_init(|| match std::env::var("YOUPIPE_ASYNC_CHAIN_FLOOR") {
-        Ok(v) if v == "1" || v.is_empty() => true,
-        Ok(v) if v == "0" => false,
-        Ok(other) => panic!(
-            "YOUPIPE_ASYNC_CHAIN_FLOOR: invalid value {other:?} (leave unset or use \"0\"/\"1\")"
-        ),
+        Ok(v) if v == "1" || v.is_empty() => Some(ASYNC_CHAIN_FLOOR_SLOTS),
+        Ok(v) if v == "0" => None,
+        Ok(other) => match other.parse::<usize>() {
+            Ok(n) if n >= 2 => Some(n),
+            _ => panic!(
+                "YOUPIPE_ASYNC_CHAIN_FLOOR: invalid value {other:?} (leave unset or use \"0\" \
+                 \"1\", or an explicit slot count >= 2)"
+            ),
+        },
         // Unset = the default-on policy (see the knob comment above).
-        Err(_) => true,
+        Err(_) => Some(ASYNC_CHAIN_FLOOR_SLOTS),
     })
 }
 

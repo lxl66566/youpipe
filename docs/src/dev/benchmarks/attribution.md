@@ -201,6 +201,23 @@ Criterion A/B (`bench_ab.sh -E`, 3 interleaved rounds, same binary, off=`"0"` vs
 
 The eager-allocation cost of the lift is bounded: 16K slots × 16 B = 256 KB per u64 ring, and the 8 MiB byte budget declines the lift entirely for payloads above ~500 B/slot, where per-item work dwarfs the ~1–2 µs wake RTT that drives the pathology anyway.
 
+## Floor-tier promotion: 16K → 64K (2026-10-25, todo #4 residual)
+
+The final-gate residual (~1 % slow runs, 2/216) was re-measured and the 64K tier decided on the same binary — the knob temporarily accepted an explicit decimal slot count (unset = the 16K tier at the time), so both sides were one build reading `YOUPIPE_ASYNC_CHAIN_FLOOR` per process.
+
+**Slow-run rate (convoy-probe async2 @100K, deep-soak caliber — fresh process per cell, sides alternating with the leading side flipped on even rounds, `taskset 1-31`, 180 processes × 12 back-to-back runs per side = 2160 runs/side):**
+
+| side | slow > 100 ms | mid-tail 50–100 ms | pooled med | pooled mean | proc-med mean |
+| --- | --- | --- | --- | --- | --- |
+| 16K (unset) | 10/2160 = 0.46 % (Poisson 95 % 0.22–0.85) | 38/2160 | 19.89 ms | 21.42 ms | 19.88 |
+| 64K (`=65536`) | **0/2160** (95 % ≤ 0.14) | 1/2160 | 20.31 ms | **20.14 ms** | 20.32 |
+
+The residual reproduces (10 vs 0, Fisher p ≈ 0.001) and 64K eliminates it — including the whole 50–100 ms mid-tail: the slow mode is capacity-graded, not binary. Pooled with the 2026-10-22 gate the 16K rate is 12/2376 = 0.51 %. The 16K fast-mode median is slightly better (19.89 vs 20.31, paired per-proc medians +0.42 ms, sign test p = 4×10⁻⁶) — but the 16K side's own tail costs more than that saves: the pooled mean is −6.0 % at 64K, and per-run-index means favor 64K at 10 of 12 indices.
+
+**Throughput A/B (criterion, `bench_ab.sh -E` same-binary env sides 16k=`1` vs 64k=`65536`, 3 interleaved per-id rounds, `sharded_term_async` + `sync_fuse` async rows):** `async0_cheap/100K` **−30.7 % stable 9/9** (42.68 → 29.57 ms) — the async-only chain's single mixed ring stays backpressure-bound at the 16K floor; every other row noise (async1 family −3.6…+4.3 %, async_pair_cpu ±1 %, and the 1K rows are a pure control: both tiers clamp to `min(n, ·)` = 1000 slots). A 2×2 crossover falsification (both worktree binaries × both env values, interleaved) confirmed the delta follows the env, not the binary (16K-binary: 42.7/32.4 ms, 64K-binary: 43.5/29.8 ms, per floor=16K/64K) — not a code-layout artifact, the trap this caliber exists for.
+
+**Verdict: promoted (`ASYNC_CHAIN_FLOOR_SLOTS = 65536`).** The promotion bar was "median cost within noise": by the criterion verdict caliber (median-of-rounds) every family is noise-or-better and one canonical family wins 30 %; the only median regression is the zero-CPU forensic probe's fast mode (+2.4 %), whose tail-adjusted aggregate still favors 64K and whose medians read flat (19.0 vs 19.1) in the 2026-10-22 sweep session — a corner effect, consistent with the 1 MiB ring recycling through L3 where the 16K tier's 256 KiB stayed inside one core's L2 (unmeasured directly; the cpu-bearing shapes hide it). Memory cost: 4× the eager ring allocation on async chains only (1 MiB vs 256 KiB per lifted ring for u64 slots), still byte-clamped at 8 MiB per ring — the clamp's payload threshold moves from ~512 B to ~128 B/slot, above which the lift declines exactly as before. The knob kept the explicit-tier escape (`=16384` reproduces the old default for the zero-CPU latency corner).
+
 ## v0.7.0 release regression check (2026-10-23)
 
 Full-suite interleaved A/B, `v0.6.1` (0ddc9c2) vs the 0.7.0 tip: 11 criterion targets × 3 rounds × 2 sides (graph_shapes has no v0.6.1 counterpart, the engine is new in 0.7.0), taskset 1-31. The 0.7.0 defaults — sharded+batch terminals, the async-chain capacity floor, stream tx batching — show up as real, family-wide improvements: `sync_fuse` cancel/pair families −30…−91 % (async_pair_cpu_split/100K −91.4 %), `sharded_term` −34…−88 % (workers2_cpu/100K −78.5 %), `sharded_term_async` async0/1@100K −23…−42 %, `expand_heavy` fanout rows −44…−51 %, `stream_pipeline/with_fence` −21…−40 %, `channel_throughput/youpipe_mpmc`/`std_mpsc_unbounded` dominant wins. Every flag resolved as artifact; no semantic regression remains:

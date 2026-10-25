@@ -1944,8 +1944,9 @@ pub(crate) struct TermPolicy {
     /// `YOUPIPE_SHARDED_TERM_ASYNC`: the falsified async-sharded flavour.
     sharded_async: bool,
     /// `YOUPIPE_ASYNC_CHAIN_FLOOR`: async-tailed chains lift their unpinned
-    /// stage-output channel capacities (see `stage_buffer`).
-    chain_floor: bool,
+    /// stage-output channel capacities (see `stage_buffer`). `None` = the
+    /// knob is off; `Some(slots)` = the floor tier.
+    chain_floor: Option<usize>,
 }
 
 impl TermPolicy {
@@ -1953,7 +1954,7 @@ impl TermPolicy {
         Self {
             sharded: crate::handoff::sharded_term_enabled(),
             sharded_async: crate::handoff::sharded_term_async_enabled(),
-            chain_floor: crate::handoff::async_chain_floor_enabled(),
+            chain_floor: crate::handoff::async_chain_floor_slots(),
         }
     }
 }
@@ -2194,15 +2195,14 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     /// (`YOUPIPE_ASYNC_CHAIN_FLOOR`; see [`Self::stage_buffer`]). Generic
     /// over the channel's full slot type for the byte clamp.
     fn async_chain_floor<SLOT>(&self, buffer: usize) -> usize {
-        if !self.has_async_stage || !self.terminal_policy.chain_floor {
+        let Some(floor) = self.terminal_policy.chain_floor else {
+            return buffer;
+        };
+        if !self.has_async_stage {
             return buffer;
         }
         let budget_slots = crate::handoff::ASYNC_CHAIN_FLOOR_BYTES / size_of::<SLOT>().max(1);
-        buffer.max(
-            self.n
-                .min(crate::handoff::ASYNC_CHAIN_FLOOR_SLOTS)
-                .min(budget_slots.max(1)),
-        )
+        buffer.max(self.n.min(floor).min(budget_slots.max(1)))
     }
 
     /// Resolve a stage's output-channel capacity: the stage's explicit
@@ -7118,7 +7118,7 @@ mod tests {
             terminal_policy: TermPolicy {
                 sharded: sync,
                 sharded_async: async_,
-                chain_floor: false,
+                chain_floor: None,
             },
             lease: None,
             worker_slots_left: Cell::new(0),
@@ -7152,7 +7152,7 @@ mod tests {
 
         let cfg = PipelineConfig::default(); // buffer_size 256
         let pool = TokioPool::build(1).expect("build test runtime");
-        let ctx = |n: usize, floor: bool, has_async: bool| StreamCtx::<TokioPool> {
+        let ctx = |n: usize, floor: Option<usize>, has_async: bool| StreamCtx::<TokioPool> {
             config: &cfg,
             cancel: None,
             n,
@@ -7176,33 +7176,39 @@ mod tests {
         };
         // Knob off, or a pure-sync chain: the floored default.
         assert_eq!(
-            ctx(100_000, false, true).stage_buffer::<(u64, u64)>(None, 8),
+            ctx(100_000, None, true).stage_buffer::<(u64, u64)>(None, 8),
             256
         );
         assert_eq!(
-            ctx(100_000, true, false).stage_buffer::<(u64, u64)>(None, 8),
+            ctx(100_000, Some(1024), false).stage_buffer::<(u64, u64)>(None, 8),
             256
         );
-        // Knob on, async chain: lifted to the slot floor.
+        // Knob on, async chain: lifted to the slot floor — the default tier
+        // and an explicit env tier take the same path.
         assert_eq!(
-            ctx(100_000, true, true).stage_buffer::<(u64, u64)>(None, 8),
+            ctx(100_000, Some(crate::handoff::ASYNC_CHAIN_FLOOR_SLOTS), true)
+                .stage_buffer::<(u64, u64)>(None, 8),
             crate::handoff::ASYNC_CHAIN_FLOOR_SLOTS
+        );
+        assert_eq!(
+            ctx(100_000, Some(65536), true).stage_buffer::<(u64, u64)>(None, 8),
+            65536
         );
         // Small run: the lift never exceeds `n`.
         assert_eq!(
-            ctx(1_000, true, true).stage_buffer::<(u64, u64)>(None, 8),
+            ctx(1_000, Some(65536), true).stage_buffer::<(u64, u64)>(None, 8),
             1_000
         );
         // Byte budget: 1 KiB payloads clamp the floor to
         // 8 MiB / 1032 B ≈ 8123 slots (still above the 256 default).
         assert_eq!(
-            ctx(100_000, true, true).stage_buffer::<(u64, [u8; 1024])>(None, 8),
+            ctx(100_000, Some(65536), true).stage_buffer::<(u64, [u8; 1024])>(None, 8),
             crate::handoff::ASYNC_CHAIN_FLOOR_BYTES / size_of::<(u64, [u8; 1024])>()
         );
         // Explicit pin: the caller's exact backpressure request, verbatim.
         let pin = NonZeroUsize::new(16).unwrap();
         assert_eq!(
-            ctx(100_000, true, true).stage_buffer::<(u64, u64)>(Some(pin), 8),
+            ctx(100_000, Some(65536), true).stage_buffer::<(u64, u64)>(Some(pin), 8),
             16
         );
     }
@@ -7354,7 +7360,7 @@ mod tests {
             terminal_policy: TermPolicy {
                 sharded: false,
                 sharded_async: false,
-                chain_floor: false,
+                chain_floor: None,
             },
             lease: None,
             worker_slots_left: Cell::new(0),
