@@ -10,6 +10,12 @@ perf/verify/loom.sh            # youpipe + vendored queue + crossfire + st3 mode
 perf/verify/linkcheck.sh       # mdbook intra-book link targets (docs/src)
 ```
 
+Of these, `linkcheck.sh` runs in CI verbatim (first step of the Test
+workflow's PR gate and before the Docs workflow's `mdbook build`); the CI
+miri/loom jobs run reduced target lists of `miri.sh`/`loom.sh` (see
+`.github/workflows/test.yml`), so the local scripts remain the
+authoritative full runs.
+
 The `youpipe-sys` crate (workspace member `crates/youpipe-sys`) provides a
 unified `Mutex`/`Condvar`/atomics API via
 `cfg`:

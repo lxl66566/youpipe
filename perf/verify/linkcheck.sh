@@ -6,7 +6,9 @@
 # from the source without the renderer (both slug styles are on record, e.g.
 # `#youpipe_async_chain_floor-async-chain-capacity-floor-streaming`), and the
 # 2026-10-20 one-off scan showed file targets are the actionable breakage
-# class. Replaces that one-off scan; wire into CI when the repo grows one.
+# class. Replaces that one-off scan. Wired into CI since 2026-10-26 (todo
+# #15): first step of the Test workflow (PR gate, fails fast before any
+# toolchain setup) and a pre-build step of the Docs workflow (Pages deploy).
 #
 # Usage: perf/verify/linkcheck.sh   (exit 0 = clean, exit 1 + list otherwise)
 set -euo pipefail

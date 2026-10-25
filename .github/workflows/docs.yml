@@ -25,6 +25,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: mdbook@0.5
+      - run: perf/verify/linkcheck.sh
       - run: mdbook build docs
       - uses: actions/upload-pages-artifact@v3
         with:
