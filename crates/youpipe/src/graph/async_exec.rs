@@ -1,5 +1,5 @@
 //! Async execution for the typed DAG engine: async-node task bodies, the
-//! async source task, the async fan-in / broadcast helpers, the
+//! async source task, the async fan-in / delivery helpers, the
 //! panic-catching future wrapper and the async-to-sync bridge.
 //!
 //! Every task's panic is caught at the poll boundary by [`CatchPanic`]
@@ -195,6 +195,18 @@ impl<F: Future + Unpin> Future for FirstReady<F> {
     }
 }
 
+/// One async producer task's output-side delivery strategy — the async twin
+/// of [`Delivery`](super::fanin::Delivery). Task bodies are generic over it;
+/// the RPITIT `+ Send` bound carries through the spawned task futures.
+pub(crate) trait AsyncDelivery<T: Send + Unpin + 'static>: Send + 'static {
+    /// Build one task's handle from the node's output senders (each task
+    /// receives its own clone of every sender).
+    fn new(txs: Vec<AsyncSender<T>>) -> Self;
+    /// Deliver one item. Returns `false` when every edge has closed (the
+    /// caller's task exits).
+    fn send(&mut self, item: T) -> impl Future<Output = bool> + Send;
+}
+
 /// Broadcast fan-out over one async node's output edges, owned by ONE task.
 /// Every open edge receives a clone; the last surviving edge gets the owned
 /// item. A closed edge (send resolves `Err`) drops out of the active set —
@@ -205,15 +217,15 @@ pub(crate) struct AsyncBroadcast<T: Send + Unpin + 'static> {
     slots: Vec<WakerSlot>,
 }
 
-impl<T: Send + Clone + Unpin + 'static> AsyncBroadcast<T> {
-    pub(crate) fn new(txs: Vec<AsyncSender<T>>) -> Self {
+impl<T: Send + Clone + Unpin + 'static> AsyncDelivery<T> for AsyncBroadcast<T> {
+    fn new(txs: Vec<AsyncSender<T>>) -> Self {
         let slots = (0..txs.len()).map(|_| WakerSlot::new()).collect();
         Self { txs, slots }
     }
 
     /// Deliver one item to every open edge. Returns `false` when every edge
     /// has closed (the caller's task exits).
-    pub(crate) async fn send(&mut self, item: T) -> bool {
+    async fn send(&mut self, item: T) -> bool {
         let mut i = 0;
         while i + 1 < self.txs.len() {
             if self.txs[i]
@@ -243,19 +255,20 @@ impl<T: Send + Clone + Unpin + 'static> AsyncBroadcast<T> {
     }
 }
 
-/// One async node task: fair fan-in claim, run the future, broadcast the
-/// output. The tasks of one node share the closure behind one `Arc` (call
-/// syntax auto-derefs it).
-async fn async_node_task<I, O, F, Fut>(
+/// One async node task: fair fan-in claim, run the future, deliver the
+/// output through the node's [`AsyncDelivery`] strategy. The tasks of one
+/// node share the closure behind one `Arc` (call syntax auto-derefs it).
+async fn async_node_task<I, O, F, Fut, D>(
     f: Arc<F>,
     mut fanin: AsyncFanIn<I>,
-    mut out: AsyncBroadcast<O>,
+    mut out: D,
     cancel: CancellationToken,
 ) where
     I: Send + Unpin + 'static,
-    O: Send + Clone + Unpin + 'static,
+    O: Send + Unpin + 'static,
     F: Fn(I) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = O>,
+    D: AsyncDelivery<O>,
 {
     loop {
         let Some(item) = fanin.claim().await else {
@@ -271,13 +284,14 @@ async fn async_node_task<I, O, F, Fut>(
     }
 }
 
-/// The async source task: call `f` until `None` (EOF), broadcasting each
-/// item to every open edge.
-async fn async_source_task<T, F, Fut>(f: F, mut out: AsyncBroadcast<T>, cancel: CancellationToken)
+/// The async source task: call `f` until `None` (EOF), delivering each item
+/// through the source's [`AsyncDelivery`] strategy.
+async fn async_source_task<T, F, Fut, D>(f: F, mut out: D, cancel: CancellationToken)
 where
-    T: Send + Clone + Unpin + 'static,
+    T: Send + Unpin + 'static,
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Option<T>>,
+    D: AsyncDelivery<T>,
 {
     loop {
         if cancel_active(Some(&cancel)) {
@@ -330,33 +344,36 @@ where
 }
 
 /// Type-erased spawn step for one async source (see
-/// `GraphBuilder::source_async`): a single runtime task, no inputs.
-pub(crate) fn source_async_spawn<T, F, Fut>(f: F) -> SpawnStep
+/// `GraphBuilder::source_async`): a single runtime task, no inputs,
+/// delivering through `D`.
+pub(crate) fn source_async_spawn<T, F, Fut, D>(f: F) -> SpawnStep
 where
-    T: Send + Clone + Unpin + 'static,
+    T: Send + Unpin + 'static,
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Option<T>> + Send,
+    D: AsyncDelivery<T>,
 {
     Box::new(move |core: &GraphCore, _workers: usize, _inputs, outputs| {
         let txs = downcast_endpoints::<AsyncSender<T>>(outputs, "outputs", "async source");
         let cancel = core.cancel.clone();
         core.spawn_task(async move {
-            async_source_task(f, AsyncBroadcast::new(txs), cancel).await;
+            async_source_task(f, D::new(txs), cancel).await;
         });
     })
 }
 
-/// Type-erased spawn step for one async IO node (see
-/// `GraphBuilder::node_async`): `tasks` runtime tasks sharing the input
-/// receivers and output senders.
+/// Type-erased spawn step for one async IO node (see `GraphBuilder::node_async`):
+/// `tasks` runtime tasks sharing the input receivers and output senders,
+/// delivering through `D`.
 // Called only from `node_async`, which requires the `tokio-runtime` feature.
 #[cfg_attr(not(feature = "tokio-runtime"), allow(dead_code))]
-pub(crate) fn node_async_spawn<I, O, F, Fut>(name: Arc<str>, f: F) -> SpawnStep
+pub(crate) fn node_async_spawn<I, O, F, Fut, D>(name: Arc<str>, f: F) -> SpawnStep
 where
     I: Send + Unpin + 'static,
-    O: Send + Clone + Unpin + 'static,
+    O: Send + Unpin + 'static,
     F: Fn(I) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = O> + Send,
+    D: AsyncDelivery<O>,
 {
     Box::new(move |core: &GraphCore, tasks: usize, inputs, outputs| {
         let rxs = downcast_endpoints::<AsyncReceiver<I>>(inputs, "inputs", &name);
@@ -365,7 +382,7 @@ where
         for _ in 0..tasks {
             let f = Arc::clone(&f);
             let fanin = AsyncFanIn::new(rxs.clone());
-            let out = AsyncBroadcast::new(txs.clone());
+            let out = D::new(txs.clone());
             let cancel = core.cancel.clone();
             core.spawn_task(async move {
                 async_node_task(f, fanin, out, cancel).await;

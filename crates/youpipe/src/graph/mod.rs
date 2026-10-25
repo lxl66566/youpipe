@@ -188,7 +188,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             name.into(),
             plan::NodeKind::Source,
             plan::NodeOpts::default(),
-            exec::source_spawn::<T, I>(iter),
+            exec::source_spawn::<T, I, fanin::Broadcast<T>>(iter),
         );
         NodeHandle {
             id,
@@ -209,7 +209,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             name.into(),
             plan::NodeKind::SourceAsync,
             plan::NodeOpts::default(),
-            async_exec::source_async_spawn::<T, F, Fut>(f),
+            async_exec::source_async_spawn::<T, F, Fut, async_exec::AsyncBroadcast<T>>(f),
         );
         NodeHandle {
             id,
@@ -251,7 +251,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
                 buffer: opts.buffer,
                 io_concurrency: None,
             },
-            exec::node_spawn::<I, O, F>(name, f),
+            exec::node_spawn::<I, O, F, fanin::Broadcast<O>>(name, f),
         );
         NodeHandle {
             id,
@@ -293,7 +293,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
                 buffer: opts.buffer,
                 io_concurrency: None,
             },
-            exec::expand_node_spawn::<I, O, F>(name, f),
+            exec::expand_node_spawn::<I, O, F, fanin::Broadcast<O>>(name, f),
         );
         NodeHandle {
             id,
@@ -340,7 +340,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
                 buffer: opts.buffer,
                 io_concurrency: opts.io_concurrency,
             },
-            async_exec::node_async_spawn::<I, O, F, Fut>(name, f),
+            async_exec::node_async_spawn::<I, O, F, Fut, async_exec::AsyncBroadcast<O>>(name, f),
         );
         NodeHandle {
             id,

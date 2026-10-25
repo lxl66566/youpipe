@@ -10,7 +10,7 @@ use std::{
 
 use super::{
     GraphBuilder,
-    fanin::{Broadcast, FanIn, RoundSpin},
+    fanin::{Delivery, FanIn, RoundSpin},
     plan::{EdgeConnector, Erased, GraphPlan, NodeKind, NodeOpts, SpawnStep},
 };
 use crate::{
@@ -201,18 +201,19 @@ impl GraphCore {
 
 // ── Worker bodies ──
 
-/// Source feeder: pull the iterator and broadcast each item to every open
-/// edge. Single worker per source.
+/// Source feeder: pull the iterator and deliver each item to every open
+/// edge through the node's [`Delivery`] strategy. Single worker per source.
 ///
 /// With the tx-batch knob on, items are staged in `cap`-sized batches and
 /// each edge takes one `try_send_batch` per free run (`send_batch`); the
 /// per-item path below is the knob-off baseline. Cancel acceptance is per
 /// staged batch in the batched arm (the check precedes the send), per item
 /// in the baseline; delivery itself never consults the token.
-fn source_feeder_worker<T, I>(iter: I, mut out: Broadcast<T>, cancel: Option<&CancellationToken>)
+fn source_feeder_worker<T, I, D>(iter: I, mut out: D, cancel: Option<&CancellationToken>)
 where
-    T: Send + Clone + 'static,
+    T: Send + 'static,
     I: Iterator<Item = T> + Send + 'static,
+    D: Delivery<T>,
 {
     let cap = if super::fanin::graph_tx_batch() {
         crate::handoff::batch_recv_cap()
@@ -253,12 +254,12 @@ where
     }
 }
 
-/// One sync node worker: fair fan-in claim, map, broadcast. Exits on EOF
-/// (every input closed), cancel, or every output edge closed. With the
-/// tx-batch knob on the mapped claim batch is staged and flushed per edge
-/// with one `try_send_batch` per free run (single-item claims —
-/// `claim_cap == 0` — keep the per-item send: staging a 1-item batch only
-/// adds moves).
+/// One sync node worker: fair fan-in claim, map, deliver through the node's
+/// [`Delivery`] strategy. Exits on EOF (every input closed), cancel, or
+/// every output edge closed. With the tx-batch knob on the mapped claim
+/// batch is staged and flushed per edge with one `try_send_batch` per free
+/// run (single-item claims — `claim_cap == 0` — keep the per-item send:
+/// staging a 1-item batch only adds moves).
 ///
 /// Cancel acceptance is per claim batch in the batched arm (the token check
 /// precedes the batch's mapping, so up to `claim_cap` items can be accepted
@@ -266,16 +267,17 @@ where
 /// item is always delivered — the sends never consult the token — so the
 /// emitted set is independent of ring pressure (todo #21, the stream
 /// engine's contract).
-fn node_worker<I, O, F>(
+fn node_worker<I, O, F, D>(
     f: &F,
     mut fanin: FanIn<I>,
-    mut out: Broadcast<O>,
+    mut out: D,
     cancel: Option<&CancellationToken>,
     claim_cap: usize,
 ) where
     I: Send + 'static,
-    O: Send + Clone + 'static,
+    O: Send + 'static,
     F: Fn(I) -> O + Send + Sync,
+    D: Delivery<O>,
 {
     let tx_batch = super::fanin::graph_tx_batch() && claim_cap > 0;
     let mut spin = RoundSpin::new(crate::handoff::spin_anchor_us());
@@ -311,20 +313,21 @@ fn node_worker<I, O, F>(
 
 /// One expansion node worker: like [`node_worker`] but each input expands
 /// into zero or more outputs pushed into a reused per-worker scratch `Vec`
-/// (zero steady-state allocation), each broadcast downstream. The batched
-/// arm flushes the staged outputs whenever they reach the batch cap — an
-/// expansion's fan-out must not force the staging buffer to grow with the
-/// whole claim batch's expansion.
-fn expand_worker<I, O, F>(
+/// (zero steady-state allocation), each delivered downstream through the
+/// node's [`Delivery`] strategy. The batched arm flushes the staged outputs
+/// whenever they reach the batch cap — an expansion's fan-out must not
+/// force the staging buffer to grow with the whole claim batch's expansion.
+fn expand_worker<I, O, F, D>(
     f: &F,
     mut fanin: FanIn<I>,
-    mut out: Broadcast<O>,
+    mut out: D,
     cancel: Option<&CancellationToken>,
     claim_cap: usize,
 ) where
     I: Send + 'static,
-    O: Send + Clone + 'static,
+    O: Send + 'static,
     F: Fn(I, &mut Vec<O>) + Send + Sync,
+    D: Delivery<O>,
 {
     let tx_batch = super::fanin::graph_tx_batch() && claim_cap > 0;
     let flush_cap = crate::handoff::batch_recv_cap().max(claim_cap).max(1);
@@ -456,14 +459,16 @@ pub(crate) fn downcast_endpoints<T: 'static>(
 }
 
 /// Type-erased spawn step for one iterator source (see
-/// `GraphBuilder::source`): a single feeder job, no inputs.
-pub(crate) fn source_spawn<T, I>(iter: I) -> SpawnStep
+/// `GraphBuilder::source`): a single feeder job, no inputs, delivering
+/// through `D`.
+pub(crate) fn source_spawn<T, I, D>(iter: I) -> SpawnStep
 where
-    T: Send + Clone + Unpin + 'static,
+    T: Send + Unpin + 'static,
     I: IntoIterator<Item = T>,
     // The feeder job runs on a pool worker / dedicated thread; the iterator
     // crosses the thread boundary once.
     I::IntoIter: Send + 'static,
+    D: Delivery<T>,
 {
     // Convert up front so the Send bound is carried by the iterator itself.
     let iter = iter.into_iter();
@@ -472,18 +477,20 @@ where
             let txs = downcast_endpoints::<SyncSender<T>>(outputs, "outputs", "source");
             let cancel = core.cancel.clone();
             core.dispatch_job(move || {
-                source_feeder_worker(iter, Broadcast::new(txs), Some(&cancel));
+                source_feeder_worker(iter, D::new(txs), Some(&cancel));
             });
         },
     )
 }
 
-/// Type-erased spawn step for one sync node (see `GraphBuilder::node`).
-pub(crate) fn node_spawn<I, O, F>(name: Arc<str>, f: F) -> SpawnStep
+/// Type-erased spawn step for one sync node (see `GraphBuilder::node`),
+/// delivering through `D`.
+pub(crate) fn node_spawn<I, O, F, D>(name: Arc<str>, f: F) -> SpawnStep
 where
     I: Send + 'static,
-    O: Send + Clone + 'static,
+    O: Send + 'static,
     F: Fn(I) -> O + Send + Sync + 'static,
+    D: Delivery<O>,
 {
     Box::new(
         move |core: &GraphCore, workers: usize, inputs: Vec<Erased>, outputs: Vec<Erased>| {
@@ -494,7 +501,7 @@ where
             core.dispatch_jobs((0..workers).map(|_| {
                 let f = Arc::clone(&f);
                 let fanin = FanIn::new(rxs.clone());
-                let out = Broadcast::new(txs.clone());
+                let out = D::new(txs.clone());
                 let cancel = core.cancel.clone();
                 move || node_worker(&*f, fanin, out, Some(&cancel), claim_cap)
             }));
@@ -502,12 +509,14 @@ where
     )
 }
 
-/// Type-erased spawn step for one expansion node (see `GraphBuilder::node_expand`).
-pub(crate) fn expand_node_spawn<I, O, F>(name: Arc<str>, f: F) -> SpawnStep
+/// Type-erased spawn step for one expansion node (see
+/// `GraphBuilder::node_expand`), delivering through `D`.
+pub(crate) fn expand_node_spawn<I, O, F, D>(name: Arc<str>, f: F) -> SpawnStep
 where
     I: Send + 'static,
-    O: Send + Clone + 'static,
+    O: Send + 'static,
     F: Fn(I, &mut Vec<O>) + Send + Sync + 'static,
+    D: Delivery<O>,
 {
     Box::new(
         move |core: &GraphCore, workers: usize, inputs: Vec<Erased>, outputs: Vec<Erased>| {
@@ -518,7 +527,7 @@ where
             core.dispatch_jobs((0..workers).map(|_| {
                 let f = Arc::clone(&f);
                 let fanin = FanIn::new(rxs.clone());
-                let out = Broadcast::new(txs.clone());
+                let out = D::new(txs.clone());
                 let cancel = core.cancel.clone();
                 move || expand_worker(&*f, fanin, out, Some(&cancel), claim_cap)
             }));

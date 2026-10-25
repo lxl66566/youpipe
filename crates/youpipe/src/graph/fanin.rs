@@ -1,6 +1,7 @@
 //! Sync-node fan-in and fan-out primitives: the fair round-robin aggregation
 //! over a node's input edges, the activity-gated pre-anchor backoff, and the
-//! broadcast helper that fans one output out to every edge of a node.
+//! [`Delivery`] strategies that hand one worker's outputs to the node's
+//! outgoing edges ([`Broadcast`] clones to every edge).
 
 use std::{
     mem::MaybeUninit,
@@ -313,6 +314,20 @@ impl RoundSpin {
     }
 }
 
+/// One producer's output-side delivery strategy, owned by ONE worker: the
+/// worker bodies are generic over it — one source, per-strategy
+/// monomorphization, no dynamic dispatch on the hot path.
+pub(crate) trait Delivery<T: Send + 'static>: Send + 'static {
+    /// Build one worker's handle from the node's output senders (each worker
+    /// receives its own clone of every sender).
+    fn new(txs: Vec<SyncSender<T>>) -> Self;
+    /// Deliver one item. Returns `false` when every edge has closed (the
+    /// caller's worker exits).
+    fn send(&mut self, item: T) -> bool;
+    /// Batched delivery (the tx-batch knob's path); same `false` contract.
+    fn send_batch(&mut self, batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) -> bool;
+}
+
 /// Broadcast fan-out over one node's output edges, owned by ONE worker (each
 /// worker clones every edge sender). Every open edge receives a clone of the
 /// item; the last surviving edge gets the owned item — one clone saved per
@@ -323,14 +338,14 @@ pub(crate) struct Broadcast<T: Send + 'static> {
     txs: Vec<SyncSender<T>>,
 }
 
-impl<T: Send + Clone + 'static> Broadcast<T> {
-    pub(crate) fn new(txs: Vec<SyncSender<T>>) -> Self {
+impl<T: Send + Clone + 'static> Delivery<T> for Broadcast<T> {
+    fn new(txs: Vec<SyncSender<T>>) -> Self {
         Self { txs }
     }
 
     /// Deliver one item to every open edge. Returns `false` when every edge
     /// has closed (the caller's worker exits).
-    pub(crate) fn send(&mut self, item: T) -> bool {
+    fn send(&mut self, item: T) -> bool {
         let mut i = 0;
         while i + 1 < self.txs.len() {
             if self.txs[i].send(item.clone()).is_err() {
@@ -380,16 +395,12 @@ impl<T: Send + Clone + 'static> Broadcast<T> {
     /// never depends on ring pressure. A closed edge still drops its unsent
     /// remainder (`assume_init_drop` — a `Vec<MaybeUninit<_>>` drop would
     /// skip the destructors).
-    pub(crate) fn send_batch(
-        &mut self,
-        batch: &mut Vec<T>,
-        staged: &mut Vec<MaybeUninit<T>>,
-    ) -> bool {
+    fn send_batch(&mut self, batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) -> bool {
         let mut i = 0;
         while i + 1 < self.txs.len() {
             staged.clear();
             staged.extend(batch.iter().cloned().map(MaybeUninit::new));
-            if self.flush_edge(i, staged) {
+            if flush_staged(&self.txs[i], staged) {
                 i += 1;
             } else {
                 self.txs.swap_remove(i);
@@ -400,31 +411,30 @@ impl<T: Send + Clone + 'static> Broadcast<T> {
         }
         let last = self.txs.len() - 1;
         stage_batch(batch, staged);
-        if !self.flush_edge(last, staged) {
+        if !flush_staged(&self.txs[last], staged) {
             self.txs.swap_remove(last);
         }
         !self.txs.is_empty()
     }
+}
 
-    /// Flush one fully-initialized `staged` batch through edge `i`: the
-    /// free prefix goes out with one `try_send_batch`, the remainder
-    /// per-item (parking at most once per full ring, cancellation-blind —
-    /// see [`send_batch`](Self::send_batch)). Returns whether the edge
-    /// survived.
-    fn flush_edge(&self, i: usize, staged: &mut [MaybeUninit<T>]) -> bool {
-        let sent = self.txs[i].try_send_batch(staged);
-        let mut j = sent;
-        while j < staged.len() {
-            // SAFETY: only [..j) was moved out; slot `j` is still initialized.
-            let item = unsafe { staged[j].assume_init_read() };
-            j += 1;
-            if self.txs[i].send(item).is_err() {
-                drop_staged(&mut staged[j..]);
-                return false;
-            }
+/// Flush one fully-initialized `staged` batch through one edge: the free
+/// prefix goes out with one `try_send_batch`, the remainder per item
+/// (parking at most once per full ring, cancellation-blind — see
+/// [`Broadcast::send_batch`]). Returns whether the edge survived.
+fn flush_staged<T: Send + 'static>(tx: &SyncSender<T>, staged: &mut [MaybeUninit<T>]) -> bool {
+    let sent = tx.try_send_batch(staged);
+    let mut j = sent;
+    while j < staged.len() {
+        // SAFETY: only [..j) was moved out; slot `j` is still initialized.
+        let item = unsafe { staged[j].assume_init_read() };
+        j += 1;
+        if tx.send(item).is_err() {
+            drop_staged(&mut staged[j..]);
+            return false;
         }
-        true
     }
+    true
 }
 
 /// Run the destructors of every still-initialized slot — the explicit-drop
