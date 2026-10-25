@@ -49,9 +49,9 @@ let r: Vec<u64> = (0..1000).stream()
 // runtime DAG: broadcast to two branches, join them back, sink the union
 let mut g = youpipe::graph();
 let src = g.source("load", 0..1000u64);
-let a = g.node("hash", Default::default(), |x: u64| x * 2);
-let b = g.node_async("meta", Default::default(), |x: u64| async move { fetch(x).await });
-let join = g.node("join", Default::default(), |x: u64| x);
+let a = g.node("hash", |x: u64| x * 2);
+let b = g.node_async("meta", |x: u64| async move { fetch(x).await });
+let join = g.node("join", |x: u64| x);
 let snk = g.sink("out", |x: u64| { /* side effect */ });
 g.edge(src, a).edge(src, b).edge(a, join).edge(b, join).edge(join, snk);
 g.run();

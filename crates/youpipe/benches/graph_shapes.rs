@@ -39,7 +39,7 @@ use std::{
 };
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use youpipe::{CancellationToken, NodeOptions, graph, stream};
+use youpipe::{CancellationToken, graph, stream};
 
 /// Per-item CPU cost of each cpu node, aligned with `mixed_load`'s
 /// `youpipe_stream_cpu` anchor (50 mul-add rounds ≈ tens of ns).
@@ -105,8 +105,8 @@ fn run_chain_graph(v: Vec<u64>, cheap: bool) -> u64 {
             bb(cpu_work(x))
         }
     };
-    let a = g.node("a", NodeOptions::default(), stage);
-    let b = g.node("b", NodeOptions::default(), stage);
+    let a = g.node("a", stage);
+    let b = g.node("b", stage);
     let out = g.sink("out", move |x: u64| {
         acc.fetch_add(x, Ordering::Relaxed);
     });
@@ -144,10 +144,10 @@ fn run_diamond_graph(v: Vec<u64>, cheap: bool) -> u64 {
     };
     let mut g = graph();
     let src = g.source("src", v);
-    let hash = g.node("hash", NodeOptions::default(), stage);
-    let fast = g.node("fast", NodeOptions::default(), stage);
-    let slow = g.node("slow", NodeOptions::default(), stage);
-    let merge = g.node("merge", NodeOptions::default(), bump);
+    let hash = g.node("hash", stage);
+    let fast = g.node("fast", stage);
+    let slow = g.node("slow", stage);
+    let merge = g.node("merge", bump);
     let out = g.sink("out", move |x: u64| {
         acc.fetch_add(x, Ordering::Relaxed);
     });
@@ -187,7 +187,7 @@ fn run_fanin_graph(v1: Vec<u64>, v2: Vec<u64>) -> u64 {
     let mut g = graph();
     let s1 = g.source("s1", v1);
     let s2 = g.source("s2", v2);
-    let m = g.node("m", NodeOptions::default(), bump);
+    let m = g.node("m", bump);
     let out = g.sink("out", move |x: u64| {
         acc.fetch_add(x, Ordering::Relaxed);
     });

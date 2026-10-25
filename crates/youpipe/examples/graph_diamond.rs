@@ -28,7 +28,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use youpipe::{AsyncNodeOptions, NodeOptions, graph};
+use youpipe::graph;
 
 const SIZE: u64 = 2_000;
 
@@ -49,32 +49,24 @@ fn main() {
     let src = g.source("load", 0..SIZE);
 
     // Sync branch: CPU hash on the work-stealing compute pool.
-    let hashed = g.node("hash", NodeOptions::default(), |x: u64| hash(x));
+    let hashed = g.node("hash", |x: u64| hash(x));
 
     // Async branch: simulated IO wait on the tokio runtime (M:N tasks).
-    let fetched = g.node_async(
-        "fetch_meta",
-        AsyncNodeOptions::default(),
-        |x: u64| async move {
-            if x % 10 == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
-            x.wrapping_add(1)
-        },
-    );
+    let fetched = g.node_async("fetch_meta", |x: u64| async move {
+        if x % 10 == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        x.wrapping_add(1)
+    });
 
     // Fan-in: `join` round-robins over both inbound edges (same element type).
-    let join = g.node("join", NodeOptions::default(), |x: u64| x);
+    let join = g.node("join", |x: u64| x);
 
     // Async sink-side node: simulated durable write.
-    let persisted = g.node_async(
-        "persist",
-        AsyncNodeOptions::default(),
-        |x: u64| async move {
-            tokio::time::sleep(std::time::Duration::from_micros(100)).await;
-            x
-        },
-    );
+    let persisted = g.node_async("persist", |x: u64| async move {
+        tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+        x
+    });
 
     let (c, s) = (sink_count.clone(), sink_sum.clone());
     let snk = g.sink("out", move |x: u64| {

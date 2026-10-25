@@ -25,8 +25,8 @@ use youpipe::{NodeHandle, graph};
 
 let mut g = graph();
 let src: NodeHandle<(), u32> = g.source("load", 0..10_000);        // iterator source
-let cpu = g.node("hash", Default::default(), |x: u32| x.wrapping_mul(3)); // sync node
-let exp = g.node_expand("split", Default::default(), |x: u32, out: &mut Vec<u32>| {
+let cpu = g.node("hash", |x: u32| x.wrapping_mul(3));              // sync node
+let exp = g.node_expand("split", |x: u32, out: &mut Vec<u32>| {
     out.push(x);
     out.push(x + 1);                                                 // 1-to-N node
 });
@@ -45,9 +45,9 @@ use youpipe::graph;
 
 let mut g = graph();
 let src = g.source("load", 0..1_000u64);
-let a = g.node("double", Default::default(), |x: u64| x * 2);
-let b = g.node("plus", Default::default(), |x: u64| x + 1_000);
-let join = g.node("join", Default::default(), |x: u64| x); // fan-in
+let a = g.node("double", |x: u64| x * 2);
+let b = g.node("plus", |x: u64| x + 1_000);
+let join = g.node("join", |x: u64| x); // fan-in
 let snk = g.sink("out", |x: u64| { /* ... */ });
 g.edge(src, a);
 g.edge(src, b);            // fan-out: broadcast to both branches
@@ -132,13 +132,14 @@ Graph-level knobs (same semantics as the stream engine):
 | `with_async_pool(pool)` | reuse an `AsyncRuntime` pool across runs |
 | `with_runtime(..)` | switch the `AsyncRuntime` backend type |
 
-Every node takes an options argument (the `Default::default()` above). It
-carries the per-node knobs with the same semantics as the stream engine's
-stage options — most importantly the node's worker count. The default is
-**automatic**: the pool budget is split across the graph's nodes (at least
-one worker each). Pin a node's `workers` when you know better — e.g. 1 for a
-cheap ordering-sensitive stage, several for the hot node of the graph; async
-nodes' concurrency follows the stream engine's `io_concurrency` budget.
+Every node method has a `_with` twin carrying the per-node options
+(`node_with` / `node_expand_with` / `node_async_with`, the same split as the
+stream engine's `stage` / `stage_with`) — most importantly the node's worker
+count. The default is **automatic**: the pool budget is split across the
+graph's nodes (at least one worker each). Pin a node's `workers` when you
+know better — e.g. 1 for a cheap ordering-sensitive stage, several for the
+hot node of the graph; async nodes' concurrency follows the stream engine's
+`io_concurrency` budget.
 
 For heavy items remember the broadcast clone: prefer `Arc` payloads on
 fan-out (or `pipe`-style ownership when no fan-out is involved). Pool and

@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use youpipe::{AsyncNodeOptions, CancellationToken, ComputePool, NodeHandle, NodeOptions, graph};
+use youpipe::{CancellationToken, ComputePool, NodeHandle, NodeOptions, graph};
 
 /// Miri interprets every spawned thread; scale item counts down but keep the
 /// same dispatch paths per item (same convention as `pipeline_integration.rs`).
@@ -72,12 +72,8 @@ fn linear_graph_item_conservation() {
     let n = n_items(10_000);
     let mut g = graph();
     let src: NodeHandle<(), u64> = g.source("load", 0..n);
-    let a = g.node("triple", NodeOptions::default(), |x: u64| {
-        x.wrapping_mul(3).wrapping_add(1)
-    });
-    let b = g.node("mix", NodeOptions::default(), |x: u64| {
-        x.wrapping_mul(31).wrapping_add(7)
-    });
+    let a = g.node("triple", |x: u64| x.wrapping_mul(3).wrapping_add(1));
+    let b = g.node("mix", |x: u64| x.wrapping_mul(31).wrapping_add(7));
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(src, a).edge(a, b).edge(b, term);
@@ -106,7 +102,7 @@ fn linear_graph_item_conservation() {
 fn empty_source_produces_nothing() {
     let mut g = graph();
     let src = g.source("load", 0..0u64);
-    let n = g.node("proc", NodeOptions::default(), |x: u64| x + 1);
+    let n = g.node("proc", |x: u64| x + 1);
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(src, n).edge(n, term);
@@ -138,7 +134,7 @@ fn diamond_broadcast_conservation() {
 
     let mut g = graph();
     let src = g.source("load", 0..n);
-    let a = g.node("double", NodeOptions::default(), {
+    let a = g.node("double", {
         let (count, sum) = (a_count.clone(), a_sum.clone());
         move |x: u64| {
             count.fetch_add(1, Ordering::Relaxed);
@@ -147,7 +143,7 @@ fn diamond_broadcast_conservation() {
             y
         }
     });
-    let b = g.node("plus", NodeOptions::default(), {
+    let b = g.node("plus", {
         let (count, sum) = (b_count.clone(), b_sum.clone());
         move |x: u64| {
             count.fetch_add(1, Ordering::Relaxed);
@@ -156,7 +152,7 @@ fn diamond_broadcast_conservation() {
             y
         }
     });
-    let join = g.node("join", NodeOptions::default(), |x: u64| x);
+    let join = g.node("join", |x: u64| x);
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(src, a);
@@ -195,7 +191,7 @@ fn multi_source_fan_in_single_sink() {
     let mut g = graph();
     let left = g.source("left", 0..n1);
     let right = g.source("right", n1..n1 + n2);
-    let m = g.node("shift", NodeOptions::default(), |x: u64| x + 1);
+    let m = g.node("shift", |x: u64| x + 1);
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(left, m);
@@ -216,7 +212,7 @@ fn multi_sink_broadcast() {
     let n = n_items(5_000);
     let mut g = graph();
     let src = g.source("load", 0..n);
-    let m = g.node("scale", NodeOptions::default(), |x: u64| x.wrapping_mul(3));
+    let m = g.node("scale", |x: u64| x.wrapping_mul(3));
     let (seen_a, sink_a) = collector_sink::<u64>();
     let (seen_b, sink_b) = collector_sink::<u64>();
     let sa = g.sink("out-a", sink_a);
@@ -245,14 +241,10 @@ fn node_expand_count_conservation() {
     let n = n_items(5_000);
     let mut g = graph();
     let src = g.source("load", 0..n);
-    let exp = g.node_expand(
-        "split",
-        NodeOptions::default(),
-        |x: u64, out: &mut Vec<u64>| {
-            out.push(x);
-            out.push(x.wrapping_add(1));
-        },
-    );
+    let exp = g.node_expand("split", |x: u64, out: &mut Vec<u64>| {
+        out.push(x);
+        out.push(x.wrapping_add(1));
+    });
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(src, exp).edge(exp, term);
@@ -285,12 +277,12 @@ fn async_diamond_broadcast() {
     let n = n_items(200);
     let mut g = graph();
     let src = g.source("load", 0..n);
-    let a = g.node("double", NodeOptions::default(), |x: u64| x.wrapping_mul(2));
-    let b = g.node_async("fetch", AsyncNodeOptions::default(), |x: u64| async move {
+    let a = g.node("double", |x: u64| x.wrapping_mul(2));
+    let b = g.node_async("fetch", |x: u64| async move {
         tokio::time::sleep(Duration::from_millis(1)).await;
         x.wrapping_add(1000)
     });
-    let join = g.node("join", NodeOptions::default(), |x: u64| x);
+    let join = g.node("join", |x: u64| x);
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(src, a);
@@ -320,16 +312,12 @@ fn sync_async_sync_bridge_chain() {
     let n = n_items(1_000);
     let mut g = graph();
     let src = g.source("load", 0..n);
-    let s1 = g.node("bump", NodeOptions::default(), |x: u64| x + 1);
-    let io = g.node_async(
-        "persist",
-        AsyncNodeOptions::default(),
-        |x: u64| async move {
-            tokio::time::sleep(Duration::from_micros(50)).await;
-            x.wrapping_mul(10)
-        },
-    );
-    let s2 = g.node("tag", NodeOptions::default(), |x: u64| x.wrapping_add(7));
+    let s1 = g.node("bump", |x: u64| x + 1);
+    let io = g.node_async("persist", |x: u64| async move {
+        tokio::time::sleep(Duration::from_micros(50)).await;
+        x.wrapping_mul(10)
+    });
+    let s2 = g.node("tag", |x: u64| x.wrapping_add(7));
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(src, s1).edge(s1, io).edge(io, s2).edge(s2, term);
@@ -368,7 +356,7 @@ fn source_async_eof_stops() {
             }
         }
     });
-    let m = g.node("shift", NodeOptions::default(), |x: u64| x + 1);
+    let m = g.node("shift", |x: u64| x + 1);
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(src, m).edge(m, term);
@@ -393,7 +381,7 @@ fn cancel_mid_run_truncates() {
     let token = CancellationToken::new();
     let mut g = graph();
     let src = g.source("load", 0..n);
-    let slow = g.node("slow", NodeOptions::default(), |x: u64| {
+    let slow = g.node("slow", |x: u64| {
         thread::sleep(Duration::from_micros(50));
         x
     });
@@ -439,8 +427,8 @@ fn cancel_mid_run_tight_rings_drains() {
     let mut g = graph();
     let src = g.source("load", 0..n);
     let tight = NodeOptions::new().buffer(1);
-    let a = g.node("a", tight, |x: u64| x.wrapping_mul(3).wrapping_add(1));
-    let b = g.node("b", tight, |x: u64| x.wrapping_add(1));
+    let a = g.node_with("a", tight, |x: u64| x.wrapping_mul(3).wrapping_add(1));
+    let b = g.node_with("b", tight, |x: u64| x.wrapping_add(1));
     let (seen, sink) = collector_sink::<u64>();
     let out = g.sink("out", sink);
     g.edge(src, a).edge(a, b).edge(b, out);
@@ -479,7 +467,7 @@ fn prefired_cancel_returns_quickly() {
     token.cancel();
     let mut g = graph();
     let src = g.source("load", 0..n);
-    let m = g.node("proc", NodeOptions::default(), |x: u64| x + 1);
+    let m = g.node("proc", |x: u64| x + 1);
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(src, m).edge(m, term);
@@ -503,7 +491,7 @@ fn node_panic_propagates_to_caller() {
         move || {
             let mut g = graph();
             let src = g.source("load", 0..n);
-            let bad = g.node("boom", NodeOptions::default(), move |x: u64| {
+            let bad = g.node("boom", move |x: u64| {
                 assert!(x != boom_at, "graph node boom at {x}");
                 x
             });
@@ -525,8 +513,8 @@ fn validation_rejects_cycle() {
         || {
             let mut g = graph();
             let src = g.source("load", 0..10u64);
-            let a = g.node("hop-a", NodeOptions::default(), |x: u64| x);
-            let b = g.node("hop-b", NodeOptions::default(), |x: u64| x);
+            let a = g.node("hop-a", |x: u64| x);
+            let b = g.node("hop-b", |x: u64| x);
             let term = g.sink("out", |_x: u64| {});
             g.edge(src, a);
             g.edge(a, b).edge(b, a); // cycle a → b → a
@@ -543,12 +531,12 @@ fn validation_rejects_missing_inbound() {
         || {
             let mut g = graph();
             let src = g.source("load", 0..10u64);
-            let m = g.node("proc", NodeOptions::default(), |x: u64| x + 1);
+            let m = g.node("proc", |x: u64| x + 1);
             let term = g.sink("out", |_x: u64| {});
             g.edge(src, m).edge(m, term);
             // `orphan` is a non-source with no inbound edge (its handle is
             // unused by design).
-            g.node("orphan", NodeOptions::default(), |x: u64| x + 2);
+            g.node("orphan", |x: u64| x + 2);
             g.run();
         },
         &["orphan"],
@@ -561,12 +549,12 @@ fn validation_rejects_sink_with_outbound() {
         || {
             let mut g = graph();
             let src = g.source("load", 0..10u64);
-            let m = g.node("work", NodeOptions::default(), |x: u64| x + 1);
+            let m = g.node("work", |x: u64| x + 1);
             let term = g.sink("term", |_x: u64| {});
             // The sink's outbound edge type-checks only against a `()`-input
             // node (a sink's Out is `()`), so the rejection below is the
             // runtime validation, not the type system.
-            let tail = g.node("tail", NodeOptions::default(), |(): ()| 0u64);
+            let tail = g.node("tail", |(): ()| 0u64);
             g.edge(src, m).edge(m, term);
             g.edge(term, tail); // sinks must be leaves
             g.run();
@@ -581,8 +569,8 @@ fn validation_rejects_duplicate_name() {
         || {
             let mut g = graph();
             let src = g.source("load", 0..10u64);
-            let a = g.node("dup", NodeOptions::default(), |x: u64| x + 1);
-            let b = g.node("dup", NodeOptions::default(), |x: u64| x + 2);
+            let a = g.node("dup", |x: u64| x + 1);
+            let b = g.node("dup", |x: u64| x + 2);
             let term = g.sink("out", |_x: u64| {});
             g.edge(src, a).edge(a, b).edge(b, term);
             g.run();
@@ -597,7 +585,7 @@ fn validation_rejects_duplicate_edge() {
         || {
             let mut g = graph();
             let src = g.source("dedup-src", 0..10u64);
-            let m = g.node("dedup-node", NodeOptions::default(), |x: u64| x + 1);
+            let m = g.node("dedup-node", |x: u64| x + 1);
             let term = g.sink("out", |_x: u64| {});
             g.edge(src, m);
             g.edge(src, m); // same edge twice
@@ -619,17 +607,13 @@ fn narrow_compute_pool_no_deadlock() {
     let n: u64 = 5_000;
     let mut g = graph();
     let src = g.source("load", 0..n);
-    let scale = g.node("scale", NodeOptions::default(), |x: u64| x.wrapping_mul(3));
-    let shift = g.node("shift", NodeOptions::default(), |x: u64| x.wrapping_add(1));
-    let split = g.node_expand(
-        "split",
-        NodeOptions::default(),
-        |x: u64, out: &mut Vec<u64>| {
-            out.push(x);
-            out.push(x.wrapping_add(1));
-        },
-    );
-    let join = g.node("join", NodeOptions::default(), |x: u64| x);
+    let scale = g.node("scale", |x: u64| x.wrapping_mul(3));
+    let shift = g.node("shift", |x: u64| x.wrapping_add(1));
+    let split = g.node_expand("split", |x: u64, out: &mut Vec<u64>| {
+        out.push(x);
+        out.push(x.wrapping_add(1));
+    });
+    let join = g.node("join", |x: u64| x);
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(src, scale);
@@ -654,9 +638,7 @@ fn custom_compute_pool_runs() {
     let pool = ComputePool::new(2);
     let mut g = graph();
     let src = g.source("load", 0..n);
-    let m = g.node("mix", NodeOptions::default(), |x: u64| {
-        x.wrapping_mul(5).wrapping_add(3)
-    });
+    let m = g.node("mix", |x: u64| x.wrapping_mul(5).wrapping_add(3));
     let (seen, sink) = collector_sink::<u64>();
     let term = g.sink("out", sink);
     g.edge(src, m).edge(m, term);

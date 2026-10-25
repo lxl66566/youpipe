@@ -21,8 +21,8 @@ fn n_items(native: u64) -> u64 {
 fn rejects_cycle() {
     let mut g = graph();
     let src = g.source("s", 0..8u32);
-    let a = g.node("a", Default::default(), |x: u32| x + 1);
-    let b = g.node("b", Default::default(), |x: u32| x + 2);
+    let a = g.node("a", |x: u32| x + 1);
+    let b = g.node("b", |x: u32| x + 2);
     g.edge(src, a).edge(a, b).edge(b, a);
     g.run();
 }
@@ -33,7 +33,7 @@ fn rejects_cycle() {
 fn rejects_orphan_node() {
     let mut g = graph();
     let _src = g.source("s", 0..8u32);
-    let orphan = g.node("orphan", Default::default(), |x: u32| x);
+    let orphan = g.node("orphan", |x: u32| x);
     let snk = g.sink("out", |_: u32| {});
     g.edge(orphan, snk);
     g.run();
@@ -68,7 +68,7 @@ fn rejects_sink_with_output() {
 fn rejects_duplicate_names() {
     let mut g = graph();
     let _a = g.source("dup", 0..8u32);
-    let _b = g.node("dup", Default::default(), |x: u32| x);
+    let _b = g.node("dup", |x: u32| x);
     g.run();
 }
 
@@ -77,7 +77,7 @@ fn rejects_duplicate_names() {
 fn rejects_duplicate_edge() {
     let mut g = graph();
     let src = g.source("s", 0..8u32);
-    let a = g.node("a", Default::default(), |x: u32| x);
+    let a = g.node("a", |x: u32| x);
     let out = g.sink("out", |_: u32| {});
     g.edge(src, a).edge(a, out).edge(a, out);
     g.run();
@@ -88,8 +88,8 @@ fn rejects_duplicate_edge() {
 fn reports_all_violations_at_once() {
     let mut g = graph();
     let _a = g.source("x", 0..8u32);
-    let _b = g.node("x", Default::default(), |v: u32| v);
-    let orphan = g.node("orphan", Default::default(), |v: u32| v);
+    let _b = g.node("x", |v: u32| v);
+    let orphan = g.node("orphan", |v: u32| v);
     g.edge(orphan, orphan);
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         g.run();
@@ -124,8 +124,8 @@ fn linear_chain_conserves_items() {
     let acc = Arc::clone(&total);
     let mut g = graph();
     let src = g.source("src", 0..n);
-    let double = g.node("double", Default::default(), |x: u64| x * 2);
-    let inc = g.node("inc", Default::default(), |x: u64| x + 1);
+    let double = g.node("double", |x: u64| x * 2);
+    let inc = g.node("inc", |x: u64| x + 1);
     let out = g.sink("out", move |x: u64| {
         acc.fetch_add(x, Ordering::Relaxed);
     });
@@ -148,9 +148,9 @@ fn diamond_broadcast_then_fan_in() {
     let acc_sum = Arc::clone(&total);
     let mut g = graph();
     let src = g.source("src", 0..n);
-    let split = g.node("split", Default::default(), |x: u64| x);
-    let a = g.node("a", Default::default(), |x: u64| x * 10);
-    let b = g.node("b", Default::default(), |x: u64| x + 1);
+    let split = g.node("split", |x: u64| x);
+    let a = g.node("a", |x: u64| x * 10);
+    let b = g.node("b", |x: u64| x + 1);
     let out = g.sink("out", move |x: u64| {
         acc_n.fetch_add(1, Ordering::Relaxed);
         acc_sum.fetch_add(x, Ordering::Relaxed);
@@ -180,7 +180,7 @@ fn multi_source_fan_in() {
     let mut g = graph();
     let s1 = g.source("s1", 0..n);
     let s2 = g.source("s2", (0..n).map(|x| x + 1_000_000));
-    let merge = g.node("merge", Default::default(), |x: u64| x);
+    let merge = g.node("merge", |x: u64| x);
     let out = g.sink("out", move |x: u64| {
         acc_n.fetch_add(1, Ordering::Relaxed);
         acc_sum.fetch_add(x, Ordering::Relaxed);
@@ -204,7 +204,7 @@ fn broadcast_conservation_two_sinks() {
     let a2 = Arc::clone(&t2);
     let mut g = graph();
     let src = g.source("src", 0..n);
-    let m = g.node("m", Default::default(), |x: u64| x + 7);
+    let m = g.node("m", |x: u64| x + 7);
     let out1 = g.sink("out1", move |x: u64| {
         a1.fetch_add(x, Ordering::Relaxed);
     });
@@ -228,16 +228,12 @@ fn expand_node_multiplies_and_filters() {
     let acc_sum = Arc::clone(&total);
     let mut g = graph();
     let src = g.source("src", 0..n);
-    let expand = g.node_expand(
-        "expand",
-        Default::default(),
-        |x: u64, out: &mut Vec<u64>| {
-            if x % 2 == 0 {
-                out.push(x);
-                out.push(x * 2);
-            }
-        },
-    );
+    let expand = g.node_expand("expand", |x: u64, out: &mut Vec<u64>| {
+        if x % 2 == 0 {
+            out.push(x);
+            out.push(x * 2);
+        }
+    });
     let out = g.sink("out", move |x: u64| {
         acc_n.fetch_add(1, Ordering::Relaxed);
         acc_sum.fetch_add(x, Ordering::Relaxed);
@@ -262,10 +258,10 @@ fn multi_worker_nodes_conserve() {
     let acc_sum = Arc::clone(&total);
     let mut g = graph();
     let src = g.source("src", 0..n);
-    let stage1 = g.node("s1", NodeOptions::new().workers(4), |x: u64| {
+    let stage1 = g.node_with("s1", NodeOptions::new().workers(4), |x: u64| {
         x.wrapping_mul(3)
     });
-    let stage2 = g.node("s2", NodeOptions::new().workers(3), |x: u64| x ^ 0xdead);
+    let stage2 = g.node_with("s2", NodeOptions::new().workers(3), |x: u64| x ^ 0xdead);
     let out = g.sink("out", move |x: u64| {
         acc_n.fetch_add(1, Ordering::Relaxed);
         acc_sum.fetch_add(x, Ordering::Relaxed);
@@ -297,10 +293,10 @@ fn narrow_pool_dedicated_fallback_completes() {
             let acc = Arc::clone(&total);
             let mut g = graph();
             let src = g.source("src", 0..n);
-            let a = g.node("a", NodeOptions::new().workers(4), |x: u64| {
+            let a = g.node_with("a", NodeOptions::new().workers(4), |x: u64| {
                 x.wrapping_mul(7)
             });
-            let b = g.node("b", NodeOptions::new().workers(4).buffer(2), |x: u64| {
+            let b = g.node_with("b", NodeOptions::new().workers(4).buffer(2), |x: u64| {
                 x.wrapping_add(11)
             });
             let out = g.sink("out", move |x: u64| {
@@ -330,7 +326,7 @@ fn cancel_returns_normally() {
     let acc = Arc::clone(&count);
     let mut g = graph();
     let src = g.source("src", (0..).take(10_000_000));
-    let m = g.node("m", Default::default(), |x: u64| x + 1);
+    let m = g.node("m", |x: u64| x + 1);
     let out = g.sink("out", move |_: u64| {
         let n = acc.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 2_000 {
@@ -397,7 +393,7 @@ fn node_panic_propagates_to_run_caller() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut g = graph();
         let src = g.source("src", 0..n);
-        let boom = g.node("boom", Default::default(), move |x: u64| {
+        let boom = g.node("boom", move |x: u64| {
             assert!(x < boom_at, "boom at {x}");
             x
         });
@@ -433,7 +429,7 @@ fn nested_run_inside_pool_worker_and_inside_node() {
         let acc = Arc::clone(&inner_total);
         let mut g = graph();
         let src = g.source("isrc", 0..2_000u64);
-        let m = g.node("im", Default::default(), |x: u64| x + 1);
+        let m = g.node("im", |x: u64| x + 1);
         let out = g.sink("iout", move |x: u64| {
             acc.fetch_add(x, Ordering::Relaxed);
         });
@@ -447,7 +443,7 @@ fn nested_run_inside_pool_worker_and_inside_node() {
         let acc2 = Arc::clone(&total);
         let mut g2 = graph();
         let src2 = g2.source("nsrc", 0..3_000u64);
-        let m2 = g2.node("nm", Default::default(), |x: u64| x * 2);
+        let m2 = g2.node("nm", |x: u64| x * 2);
         let out2 = g2.sink("nout", move |x: u64| {
             acc2.fetch_add(x, Ordering::Relaxed);
         });
@@ -482,10 +478,8 @@ fn async_mixed_chain_conserves() {
     let acc = Arc::clone(&total);
     let mut g = graph();
     let src = g.source("load", 0..n);
-    let hash = g.node("hash", Default::default(), |x: u64| {
-        x.wrapping_mul(2_654_435_761)
-    });
-    let io = g.node_async(
+    let hash = g.node("hash", |x: u64| x.wrapping_mul(2_654_435_761));
+    let io = g.node_async_with(
         "persist",
         AsyncNodeOptions::new().io_concurrency(16),
         |x: u64| async move {
@@ -493,7 +487,7 @@ fn async_mixed_chain_conserves() {
             x
         },
     );
-    let agg = g.node("agg", Default::default(), |x: u64| x / 2);
+    let agg = g.node("agg", |x: u64| x / 2);
     let out = g.sink("out", move |x: u64| {
         acc.fetch_add(x, Ordering::Relaxed);
     });
@@ -551,7 +545,7 @@ fn async_to_sync_bridge_feeds_sync_node() {
     let acc = Arc::clone(&total);
     let mut g = graph();
     let src = g.source("src", 0..n);
-    let io = g.node_async(
+    let io = g.node_async_with(
         "io",
         AsyncNodeOptions::new().io_concurrency(8),
         |x: u64| async move {
@@ -559,7 +553,7 @@ fn async_to_sync_bridge_feeds_sync_node() {
             x + 1
         },
     );
-    let sync_stage = g.node("after", Default::default(), |x: u64| x * 2);
+    let sync_stage = g.node("after", |x: u64| x * 2);
     let out = g.sink("out", move |x: u64| {
         acc.fetch_add(x, Ordering::Relaxed);
     });
@@ -587,8 +581,8 @@ fn mixed_diamond_async_and_sync_branches() {
     let acc_sum = Arc::clone(&total);
     let mut g = graph();
     let src = g.source("src", 0..n);
-    let split = g.node("split", Default::default(), |x: u64| x);
-    let io = g.node_async(
+    let split = g.node("split", |x: u64| x);
+    let io = g.node_async_with(
         "io",
         AsyncNodeOptions::new().io_concurrency(8),
         |x: u64| async move {
@@ -596,7 +590,7 @@ fn mixed_diamond_async_and_sync_branches() {
             x * 10
         },
     );
-    let cpu = g.node("cpu", Default::default(), |x: u64| x + 1);
+    let cpu = g.node("cpu", |x: u64| x + 1);
     let out = g.sink("out", move |x: u64| {
         acc_n.fetch_add(1, Ordering::Relaxed);
         acc_sum.fetch_add(x, Ordering::Relaxed);
@@ -629,7 +623,7 @@ fn async_node_panic_propagates_to_run_caller() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut g = graph();
         let src = g.source("src", 0..n);
-        let boom = g.node_async(
+        let boom = g.node_async_with(
             "boom",
             AsyncNodeOptions::new().io_concurrency(4),
             move |x: u64| async move {
@@ -695,7 +689,7 @@ fn with_async_pool_and_with_runtime_backends() {
         .with_runtime::<TokioPool>()
         .with_async_pool(shared.clone());
     let src = g.source("src", 0..500u64);
-    let io = g.node_async(
+    let io = g.node_async_with(
         "io",
         AsyncNodeOptions::new().io_concurrency(4),
         |x: u64| async move {
@@ -715,7 +709,7 @@ fn with_async_pool_and_with_runtime_backends() {
     let acc2 = Arc::clone(&total2);
     let mut g = graph().with_async_pool(shared);
     let src = g.source("src2", 0..500u64);
-    let io = g.node_async(
+    let io = g.node_async_with(
         "io2",
         AsyncNodeOptions::new().io_concurrency(4),
         |x: u64| async move { x * 2 },

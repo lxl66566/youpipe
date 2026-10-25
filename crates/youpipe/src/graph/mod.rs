@@ -33,23 +33,20 @@ mod fanin;
 mod plan;
 
 #[cfg(test)]
-// `Default::default()` for node options is the documented call shape (the
-// graph README example); pedantic prefers the named constructor.
-#[allow(clippy::default_trait_access)]
 mod tests;
 
 pub use crate::builder::{AsyncStageOptions, SyncStageOptions};
 
-/// Per-node tuning for sync graph nodes ([`GraphBuilder::node`] /
-/// [`GraphBuilder::node_expand`]): the streaming [`SyncStageOptions`] under
-/// its graph name. `workers` pins the node's ComputePool worker count
+/// Per-node tuning for sync graph nodes ([`GraphBuilder::node_with`] /
+/// [`GraphBuilder::node_expand_with`]): the streaming [`SyncStageOptions`]
+/// under its graph name. `workers` pins the node's ComputePool worker count
 /// (default: the run budget split evenly, every node at least one); `buffer`
 /// pins the capacity of every outgoing edge of the node (default: the
 /// configured `buffer_size` floored at the node's producer count × 4).
 pub type NodeOptions = SyncStageOptions;
 
-/// Per-node tuning for async graph nodes ([`GraphBuilder::node_async`]): the
-/// streaming [`AsyncStageOptions`] under its graph name. `io_concurrency`
+/// Per-node tuning for async graph nodes ([`GraphBuilder::node_async_with`]):
+/// the streaming [`AsyncStageOptions`] under its graph name. `io_concurrency`
 /// pins the node's concurrent task fan-out (default 128); `buffer` pins
 /// every outgoing edge's capacity as on [`NodeOptions`].
 pub type AsyncNodeOptions = AsyncStageOptions;
@@ -101,11 +98,9 @@ impl<I, O> std::fmt::Debug for NodeHandle<I, O> {
 /// // Diamond: load -> hash -> (fast, slow) -> merge -> out
 /// let mut g = graph();
 /// let src = g.source("load", 0..1_000u64);
-/// let hash = g.node("hash", Default::default(), |x: u64| {
-///     x.wrapping_mul(2654435761)
-/// });
-/// let fast = g.node("fast", Default::default(), |x: u64| x / 2);
-/// let slow = g.node("slow", Default::default(), |x: u64| x * 3);
+/// let hash = g.node("hash", |x: u64| x.wrapping_mul(2_654_435_761));
+/// let fast = g.node("fast", |x: u64| x / 2);
+/// let slow = g.node("slow", |x: u64| x * 3);
 /// let total = Arc::new(AtomicU64::new(0));
 /// let acc = Arc::clone(&total);
 /// let out = g.sink("out", move |x: u64| {
@@ -119,7 +114,7 @@ impl<I, O> std::fmt::Debug for NodeHandle<I, O> {
 /// g.run();
 /// let expected: u64 = (0..1_000u64)
 ///     .map(|x| {
-///         let h = x.wrapping_mul(2654435761);
+///         let h = x.wrapping_mul(2_654_435_761);
 ///         h / 2 + h * 3
 ///     })
 ///     .sum();
@@ -218,7 +213,17 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     /// the broadcast fan-out requirement (paid even on single-output nodes,
     /// keeping the rule simple). Multiple workers (see [`NodeOptions`])
     /// share every input edge and every output edge.
-    pub fn node<I, O, F>(
+    pub fn node<I, O, F>(&mut self, name: impl Into<Arc<str>>, f: F) -> NodeHandle<I, O>
+    where
+        I: Send + Unpin + 'static,
+        O: Send + Clone + Unpin + 'static,
+        F: Fn(I) -> O + Send + Sync + 'static,
+    {
+        self.node_with(name, NodeOptions::new(), f)
+    }
+
+    /// [`Self::node`] with per-node tuning — see [`NodeOptions`].
+    pub fn node_with<I, O, F>(
         &mut self,
         name: impl Into<Arc<str>>,
         opts: NodeOptions,
@@ -250,7 +255,17 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     /// outputs by pushing into a per-worker reused scratch `Vec` (zero
     /// steady-state allocation). Each expanded item is broadcast to every
     /// outgoing edge like a [`node`](Self::node) output.
-    pub fn node_expand<I, O, F>(
+    pub fn node_expand<I, O, F>(&mut self, name: impl Into<Arc<str>>, f: F) -> NodeHandle<I, O>
+    where
+        I: Send + Unpin + 'static,
+        O: Send + Clone + Unpin + 'static,
+        F: Fn(I, &mut Vec<O>) + Send + Sync + 'static,
+    {
+        self.node_expand_with(name, NodeOptions::new(), f)
+    }
+
+    /// [`Self::node_expand`] with per-node tuning — see [`NodeOptions`].
+    pub fn node_expand_with<I, O, F>(
         &mut self,
         name: impl Into<Arc<str>>,
         opts: NodeOptions,
@@ -283,7 +298,20 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     /// [`AsyncNodeOptions`]). Gated behind the `tokio-runtime` feature like
     /// the stream engine's async stage API.
     #[cfg(feature = "tokio-runtime")]
-    pub fn node_async<I, O, F, Fut>(
+    pub fn node_async<I, O, F, Fut>(&mut self, name: impl Into<Arc<str>>, f: F) -> NodeHandle<I, O>
+    where
+        I: Send + Unpin + 'static,
+        O: Send + Clone + Unpin + 'static,
+        F: Fn(I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = O> + Send,
+    {
+        self.node_async_with(name, AsyncNodeOptions::new(), f)
+    }
+
+    /// [`Self::node_async`] with per-node tuning — see
+    /// [`AsyncNodeOptions`]. Gated behind the `tokio-runtime` feature.
+    #[cfg(feature = "tokio-runtime")]
+    pub fn node_async_with<I, O, F, Fut>(
         &mut self,
         name: impl Into<Arc<str>>,
         opts: AsyncNodeOptions,
