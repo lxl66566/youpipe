@@ -236,14 +236,20 @@ impl WakerInner {
         self.set_seq(REG_STAMP.fetch_add(1, Ordering::SeqCst));
     }
 
+    // SeqCst on both ends of the seq: a re-arm happens inside some
+    // registry's mutex, and the cross-registry steal window is exactly the
+    // gap between this store and its visibility to a FOREIGN registry's
+    // fire — the store side is sequenced before the owner's commit CAS
+    // (SeqCst), so once that CAS is observed the seq must be too, provided
+    // the reader fences between the two loads (see `_fire_n`).
     #[inline(always)]
     pub fn get_seq(&self) -> u64 {
-        self.seq.load(Ordering::Relaxed)
+        self.seq.load(Ordering::SeqCst)
     }
 
     #[inline(always)]
     pub fn set_seq(&self, seq: u64) {
-        self.seq.store(seq, Ordering::Relaxed);
+        self.seq.store(seq, Ordering::SeqCst);
     }
 
     #[inline(always)]
@@ -367,9 +373,18 @@ impl WakerInner {
                 // nobody is waiting through it, pass the fire budget on.
                 return WakeResult::Skip;
             } else if state == WakerState::Waiting as u8 {
-                self.state.store(WakerState::Woken as u8, Ordering::SeqCst);
-                self.get_waker().wake_by_ref();
-                return WakeResult::Woken;
+                // CAS delivery: an unconditional store leaves a read-store
+                // gap the waiter's abandon + re-arm can slip through, and
+                // the Woken then stamps whatever episode it re-armed on — a
+                // phantom delivery on a foreign registry (the pop/wake
+                // migration steal). Fail closed: a lost race is a Skip, and
+                // the callers' accounting (RegistrySingle's retry,
+                // `_fire_n`'s handback) spends the event on another waiter.
+                if self.try_change_state(WakerState::Waiting, WakerState::Woken).is_ok() {
+                    self.get_waker().wake_by_ref();
+                    return WakeResult::Woken;
+                }
+                return WakeResult::Skip;
             } else {
                 match self.state.compare_exchange_weak(
                     WakerState::Init as u8,

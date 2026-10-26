@@ -10,6 +10,10 @@ use crate::waker::*;
 // loom has no compiler_fence; a full fence is its modeled superset.
 use loom::sync::atomic::fence as compiler_fence;
 #[cfg(feature = "loom")]
+// The strong fence the steal fix's read ordering needs (`_fire_n`); loom
+// models it directly.
+use loom::sync::atomic::fence as seqcst_fence;
+#[cfg(feature = "loom")]
 use loom::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 #[cfg(feature = "loom")]
 // loom's Mutex is the modeled equivalent; parking_lot's futex path is opaque to the model.
@@ -23,6 +27,11 @@ use smallvec::SmallVec;
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::fmt::Debug;
+#[cfg(not(feature = "loom"))]
+// Distinct from `compiler_fence` (the weak compiler-only barrier): the
+// steal fix requires a real SeqCst fence between the state read and the
+// seq read.
+use std::sync::atomic::fence as seqcst_fence;
 #[cfg(not(feature = "loom"))]
 use std::sync::atomic::{compiler_fence, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -619,7 +628,8 @@ impl RegistryMulti {
     ///
     /// Returns whether at least one committed wake landed (false: no
     /// Waiting-state waiter was woken — the queue held only Init/stale
-    /// entries or was empty).
+    /// entries or was empty, or every committed wake lost its delivery
+    /// race and was handed back).
     #[inline]
     fn _fire_n(&self, n: usize) -> bool {
         let mut remaining = n;
@@ -631,10 +641,12 @@ impl RegistryMulti {
             if flag == MULTI_EMPTY {
                 return landed;
             }
-            // (waker, consumed_event): `consumed_event` mirrors the per-item
-            // accounting — only a Waiting read at collection time spends an
-            // event; Init entries are the "wake and keep going" Next case.
-            let mut wakers: SmallVec<[(ArcWaker, bool); 8]> = SmallVec::new();
+            // (waker, consumed_event, entry_stamp): `consumed_event` mirrors
+            // the per-item accounting — only a Waiting read at collection
+            // time spends an event; Init entries are the "wake and keep
+            // going" Next case. The stamp rides along for the delivery-time
+            // revalidation after the wake.
+            let mut wakers: SmallVec<[(ArcWaker, bool, u64); 8]> = SmallVec::new();
             let mut exhausted = false;
             {
                 let mut guard = reg_lock(&self.inner);
@@ -649,15 +661,37 @@ impl RegistryMulti {
                         match guard.queue.pop_front() {
                             Some(entry) => {
                                 has_pop = true;
-                                if let Some(inner) = entry.upgrade_live() {
-                                    // Advisory read; wake() re-reads and
-                                    // CASes the node state as the authority.
-                                    let committed = inner._get_state(Ordering::Relaxed)
-                                        == WakerState::Waiting as u8;
-                                    if committed {
-                                        remaining -= 1;
+                                if let Some(inner) = entry.weak.upgrade() {
+                                    // Read order is load-bearing: state
+                                    // (SeqCst) first, then a SeqCst fence,
+                                    // then the seq match. A Waiting state
+                                    // means the node's owner committed an
+                                    // episode on SOME registry; every re-arm's
+                                    // `set_seq` (SeqCst) is sequenced before
+                                    // that commit's CAS (SeqCst), so the
+                                    // fence makes the seq read see any re-arm
+                                    // that preceded the observed Waiting — a
+                                    // stale entry from a PREVIOUS registry
+                                    // cannot match. Reading seq first (or
+                                    // without the fence) let a Waiting node
+                                    // present the old seq (the store lagging
+                                    // the CAS), spending this event on the
+                                    // waiter parked elsewhere and stranding
+                                    // the fresh waiter here — permanently
+                                    // when the stolen event is the last.
+                                    let state = inner.get_state();
+                                    seqcst_fence(Ordering::SeqCst);
+                                    if inner.get_seq() == entry.stamp {
+                                        let committed = state == WakerState::Waiting as u8;
+                                        if committed {
+                                            remaining -= 1;
+                                        }
+                                        wakers.push((
+                                            ArcWaker::from_arc(inner),
+                                            committed,
+                                            entry.stamp,
+                                        ));
                                     }
-                                    wakers.push((ArcWaker::from_arc(inner), committed));
                                 }
                             }
                             None => {
@@ -676,18 +710,32 @@ impl RegistryMulti {
             }
             // Wake outside the critical section, like the per-item fire().
             let mut wasted = 0;
-            for (waker, committed) in &wakers {
+            for (waker, committed, stamp) in &wakers {
                 let r = waker.wake();
                 trace_log!("wake {} {:?} {:?}", self._tag, waker, r);
-                if *committed && r == WakeResult::Skip {
-                    // The waiter abandoned between our state read and the
-                    // wake (timeout/cancel), so its wake landed on a
-                    // >=Woken node: hand the event it consumed back so the
-                    // loop collects another waiter — the batched mirror of
-                    // the per-item fire() continuing past a Skip.
-                    wasted += 1;
-                } else if *committed {
+                if !*committed {
+                    continue;
+                }
+                // Delivery-time revalidation. `committed` only proves the
+                // node was Waiting for THIS entry's episode at collection;
+                // the waiter can still abandon and re-arm on another
+                // registry before wake() runs, and that wake then lands on
+                // the foreign episode: wake() reports Woken (the Waiting it
+                // committed belongs to the new registration) and the event
+                // is spent without reaching any waiter of this registry —
+                // permanently stranding a fresh one when this is the last
+                // event. The stamp is the delivery proof: reset() re-arms
+                // with a fresh seq, so a post-wake mismatch means the Woken
+                // went to a different episode. Anything but
+                // Woken-on-same-stamp hands the event back for another
+                // collection round (the batched mirror of the per-item
+                // fire() continuing past a Skip); a rare false handback
+                // (the delivered waiter already re-armed before our seq
+                // read) costs one absorbed spurious wake, never a strand.
+                if r == WakeResult::Woken && waker.get_seq() == *stamp {
                     landed = true;
+                } else {
+                    wasted += 1;
                 }
             }
             remaining += wasted;
@@ -1881,6 +1929,159 @@ mod loom_tests {
             assert_eq!(b.get_state(), WakerState::Woken as u8);
             assert_eq!(reg.len(), 0);
             assert_eq!(reg.fire(), WakeResult::Next);
+        });
+    }
+
+    // Unbarriered twin of `loom_cross_registry_stale_entry_skipped_by_fire`
+    // with a fresh committed waiter on reg1. Pins the cross-registry steal
+    // fix: T1 leaves a stale reg1 entry and re-arms its node on reg2; one
+    // fire on reg1 must spend its event on the fresh waiter — never on the
+    // stale entry whose node is (or becomes) Waiting on reg2. The two reads
+    // that decide a steal are the entry's seq match and the node state; the
+    // fix orders them (state, fence, seq) with SeqCst, so observing the
+    // re-armed node's Waiting implies observing its newer seq. Pre-fix, the
+    // stale seq (a Relaxed store still in the owner's store buffer) could
+    // match while the SeqCst commit CAS was already visible — the event woke
+    // the waiter parked on the OTHER registry and stranded the fresh one;
+    // when the stolen event is the last, permanently (the 2026-09-28 hang
+    // shape).
+    #[test]
+    fn loom_stale_rearm_cannot_steal_committed_fire_unordered() {
+        loom::model(|| {
+            let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let reg2 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let committed3 = Arc::new(AtomicUsize::new(0));
+
+            let node = ArcWaker::new_blocking();
+
+            let t1 = {
+                let reg1 = reg1.clone();
+                let reg2 = reg2.clone();
+                let node = node.clone_node();
+                loom::thread::spawn(move || {
+                    reg1.reg_waker(&node);
+                    node.reset();
+                    reg2.reg_waker(&node);
+                    node.commit_waiting();
+                })
+            };
+
+            let t3 = {
+                let reg1 = reg1.clone();
+                let committed3 = committed3.clone();
+                loom::thread::spawn(move || {
+                    let other = ArcWaker::new_blocking();
+                    reg1.reg_waker(&other);
+                    other.commit_waiting();
+                    committed3.store(1, Ordering::SeqCst);
+                    other
+                })
+            };
+
+            // Only the fresh waiter is barriered; the re-arm races the fire.
+            wait_committed(&committed3);
+            assert_eq!(reg1.fire(), WakeResult::Woken);
+            let other = t3.join().unwrap();
+            assert_eq!(
+                other.get_state(),
+                WakerState::Woken as u8,
+                "the event must land on the fresh waiter, not the stale entry"
+            );
+            t1.join().unwrap();
+            // `node` legitimately ends in either state: Waiting (stale entry
+            // skipped) or Woken (the entry was popped while the node was
+            // still Init — Next, no event spent — and the out-of-lock wake
+            // landed after T1's commit, punching through the reg2 Waiting;
+            // the unpark-token analog, re-armed on the next registration).
+            let punched = node.get_state() == WakerState::Woken as u8;
+            assert!(punched || node.get_state() == WakerState::Waiting as u8);
+            let r = reg2.fire();
+            if punched {
+                // The punched-through Woken node spends no event (committed
+                // read false); the fire reports Next.
+                assert_eq!(r, WakeResult::Next);
+            } else {
+                assert_eq!(r, WakeResult::Woken);
+            }
+            assert_eq!(node.get_state(), WakerState::Woken as u8);
+            // The stale reg1 entry, if it survived both fires, is inert.
+            assert!(reg1.len() <= 1);
+        });
+    }
+
+    // Regression for the pop/wake migration steal (fork POC
+    // `loom_committed_waiter_migrated_between_pop_and_wake_steals_fire`,
+    // branch poc/migration-steal): T1 is a committed reg1 waiter when
+    // fire() pops its entry; the episode then dies (timeout analog) and
+    // the node re-arms on reg2, committing Waiting there before the wake
+    // reads the node. No weak memory is involved — the entry was valid at
+    // collection and every read sees current values — so this survives the
+    // SeqCst gate; closing it needs the CAS delivery in wake() plus the
+    // post-wake stamp revalidation in `_fire_n`: whenever the abandon wins
+    // the race, the event must be handed back and land on the fresh
+    // waiter.
+    #[test]
+    fn loom_wake_after_waiter_migration_redirects_to_fresh_waiter() {
+        loom::model(|| {
+            let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let reg2 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let committed3 = Arc::new(AtomicUsize::new(0));
+            // T1's episode outcome: 1 = abandon won (the wake had not landed
+            // when the episode died), 2 = a wake landed first (legitimate
+            // delivery to this episode).
+            let abandoned = Arc::new(AtomicUsize::new(0));
+
+            let node = ArcWaker::new_blocking();
+
+            let t1 = {
+                let reg1 = reg1.clone();
+                let reg2 = reg2.clone();
+                let abandoned = abandoned.clone();
+                let node = node.clone_node();
+                loom::thread::spawn(move || {
+                    reg1.reg_waker(&node);
+                    node.commit_waiting();
+                    let ok = node.abandon().is_ok();
+                    abandoned.store(if ok { 1 } else { 2 }, Ordering::SeqCst);
+                    node.reset();
+                    reg2.reg_waker(&node);
+                    node.commit_waiting();
+                })
+            };
+
+            let t3 = {
+                let reg1 = reg1.clone();
+                let committed3 = committed3.clone();
+                loom::thread::spawn(move || {
+                    let other = ArcWaker::new_blocking();
+                    reg1.reg_waker(&other);
+                    other.commit_waiting();
+                    committed3.store(1, Ordering::SeqCst);
+                    other
+                })
+            };
+
+            // Only the fresh waiter is barriered; the migration races the
+            // fire's pop-to-wake span.
+            wait_committed(&committed3);
+            assert_eq!(reg1.fire(), WakeResult::Woken);
+            let other = t3.join().unwrap();
+            t1.join().unwrap();
+            if abandoned.load(Ordering::SeqCst) == 1 {
+                // The episode died before any wake reached it; the event must
+                // have been redirected to the fresh waiter, not spent on the
+                // node's NEW episode on reg2.
+                assert_eq!(
+                    other.get_state(),
+                    WakerState::Woken as u8,
+                    "event spent on the migrated waiter, fresh waiter stranded"
+                );
+            }
+            // node ends Woken (legitimate delivery, redirected wake or the
+            // stamped steal) or Waiting (entry skipped); reg2's fire settles
+            // it to Woken either way.
+            let _ = reg2.fire();
+            assert_eq!(node.get_state(), WakerState::Woken as u8);
         });
     }
 }
