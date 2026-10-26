@@ -458,6 +458,54 @@ fn cancel_mid_run_tight_rings_drains() {
     );
 }
 
+/// Mid-run cancel where the pinned worker counts exceed a narrow pool (two
+/// 4-worker nodes on a 2-worker budget): the lease cannot fit, every worker
+/// takes the dedicated-thread fallback, and the cancel must still truncate
+/// and drain promptly — pinned multi-worker cancellation was an untested
+/// matrix corner (the r16 audit).
+#[test]
+#[cfg_attr(miri, ignore)] // wall-clock cancellation timing
+fn cancel_pinned_multi_worker_nodes_narrow_pool_drains() {
+    let n: u64 = 20_000;
+    let token = CancellationToken::new();
+    let mut g = graph();
+    let src = g.source("load", 0..n);
+    let pinned = NodeOptions::new().workers(4);
+    let a = g.node_with("a", pinned, |x: u64| {
+        thread::sleep(Duration::from_micros(50));
+        x.wrapping_mul(3).wrapping_add(1)
+    });
+    let b = g.node_with("b", pinned, |x: u64| x.wrapping_add(1));
+    let (seen, sink) = collector_sink::<u64>();
+    let out = g.sink("out", sink);
+    g.edge(src, a).edge(a, b).edge(b, out);
+    g = g.with_compute_workers(2).with_cancel(token.clone());
+    {
+        let token = token.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            token.cancel();
+        });
+    }
+
+    let start = Instant::now();
+    run_with_timeout("pinned narrow-pool cancel", move || g.run());
+
+    // Serial full-chain work is far above this bound (see
+    // `cancel_mid_run_truncates`); the cancel must drain the dedicated
+    // fallback threads, not park forever.
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "cancelled pinned narrow-pool run must drain quickly, took {:?}",
+        start.elapsed()
+    );
+    let got = seen.lock().unwrap().len();
+    assert!(
+        u64::try_from(got).unwrap() < n,
+        "cancelled run stopped early: {got}/{n}"
+    );
+}
+
 /// Pre-fired token: the run returns immediately with at most the in-flight
 /// items — no sleeps needed, so this stays miri-friendly.
 #[test]

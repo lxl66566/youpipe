@@ -921,6 +921,133 @@ fn async_node_panic_propagates_to_run_caller() {
     assert!(msg.contains("async boom at"), "unexpected payload: {msg}");
 }
 
+/// Panic in an async-node broadcast feeding several sinks: the payload
+/// still re-raises on the caller, the drain stays live (watchdog), and the
+/// delivered prefix is conserved — both sinks push FIFO prefixes of the
+/// same delivered sequence (a broadcast clone lands in every open ring),
+/// so the shorter observed multiset must be a prefix of the longer; items
+/// past the common prefix are ring leftovers each sink legitimately drops
+/// at the cancel. Side-effect sinks observe the partials: a panicking run
+/// re-raises before `run_collect` could return its buffers.
+#[cfg(feature = "tokio-runtime")]
+// miri (windows): building the tokio runtime registers an IOCP handle,
+// which the interpreter cannot execute; Linux miri (epoll) stays covered.
+#[cfg_attr(all(miri, target_os = "windows"), ignore)]
+#[test]
+fn async_broadcast_panic_multi_sink_conserves_partial() {
+    use crate::TokioPool;
+
+    let n = n_items(5_000u64);
+    // Relative trigger (miri scaling, see the test above).
+    let boom_at = n / 10;
+    let seen_a = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let seen_b = Arc::new(Mutex::new(Vec::<u64>::new()));
+    // Per-sink delivery counts, shared with the doomed tasks below.
+    let cnt_a = Arc::new(AtomicU64::new(0));
+    let cnt_b = Arc::new(AtomicU64::new(0));
+    let (acc_a, acc_b, sink_cnt_a, sink_cnt_b, boom_cnt_a, boom_cnt_b) = (
+        Arc::clone(&seen_a),
+        Arc::clone(&seen_b),
+        Arc::clone(&cnt_a),
+        Arc::clone(&cnt_b),
+        Arc::clone(&cnt_a),
+        Arc::clone(&cnt_b),
+    );
+    // Watchdog: a wedged drain (the class this corner guards) hangs the
+    // suite otherwise; the panicking thread still delivers via the dropped
+    // sender (mpsc contract, as in `narrow_pool_dedicated_fallback_completes`).
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let (panic_tx, panic_rx) = std::sync::mpsc::channel::<String>();
+    let handle = {
+        let rt = TokioPool::build(2).expect("test runtime");
+        std::thread::spawn(move || {
+            let mut g = graph().with_async_pool(rt);
+            let src = g.source("src", 0..n);
+            // A doomed item waits for real per-sink deliveries before
+            // panicking: tasks are polled concurrently and a delivery
+            // crosses two threads (runtime task -> ring -> pool sink
+            // worker), so under a contended machine the doom can otherwise
+            // beat every delivery and the partials below are legitimately
+            // empty. The threshold is reachable by construction (every
+            // non-doomed item clones into both sinks; the deadline only
+            // guards against a wedged run).
+            let want = boom_at.min(8);
+            let boom = g.node_async_broadcast("boom", move |x: u64| {
+                let (a, b) = (Arc::clone(&boom_cnt_a), Arc::clone(&boom_cnt_b));
+                async move {
+                    if x >= boom_at {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        while a.load(Ordering::Relaxed) < want || b.load(Ordering::Relaxed) < want {
+                            if std::time::Instant::now() > deadline {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                    }
+                    assert!(x < boom_at, "async broadcast boom at {x}");
+                    x.wrapping_mul(2)
+                }
+            });
+            let out_a = g.sink("out-a", move |x: u64| {
+                acc_a.lock().unwrap().push(x);
+                sink_cnt_a.fetch_add(1, Ordering::Relaxed);
+            });
+            let out_b = g.sink("out-b", move |x: u64| {
+                acc_b.lock().unwrap().push(x);
+                sink_cnt_b.fetch_add(1, Ordering::Relaxed);
+            });
+            g.edge(src, boom);
+            g.edge(boom, out_a).edge(boom, out_b);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.run()));
+            let _ = done_tx.send(());
+            if let Err(payload) = result {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(ToString::to_string))
+                    .unwrap_or_default();
+                let _ = panic_tx.send(msg);
+            }
+        })
+    };
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("async broadcast panic drain deadlocked");
+    let msg = panic_rx
+        .recv()
+        .expect("async broadcast panic must propagate out of run()");
+    assert!(
+        msg.contains("async broadcast boom at"),
+        "unexpected payload: {msg}"
+    );
+    handle.join().unwrap();
+    let mut a = std::mem::take(&mut *seen_a.lock().unwrap());
+    let mut b = std::mem::take(&mut *seen_b.lock().unwrap());
+    a.sort_unstable();
+    b.sort_unstable();
+    assert!(!a.is_empty(), "pre-boom deliveries must reach the sinks");
+    assert!(!b.is_empty(), "pre-boom deliveries must reach the sinks");
+    // Both sinks push FIFO prefixes of the same delivered sequence (each
+    // broadcast clone lands in both rings; sinks claim in ring order), so
+    // the shorter observed multiset must be a prefix of the longer — items
+    // beyond the common prefix are the asymmetric ring leftovers each sink
+    // dropped at the cancel, which the acceptance contract allows.
+    let (short, long) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    assert_eq!(
+        short[..],
+        long[..short.len()],
+        "both sinks observed the same delivered prefix"
+    );
+    for x in &a {
+        assert!(x % 2 == 0, "unexpected item {x}");
+    }
+}
+
 /// Cooperative cancellation of an async stream: the pull source stops at the
 /// token; `run` returns normally.
 #[cfg(feature = "tokio-runtime")]

@@ -333,7 +333,8 @@ extrapolation artifact).
 | async_waker_alloc     | 1 / 0                 | 169 s (miri /4 divisor added; was 238 s unscaled — the fixed floor-proof loop dominates) |
 | sharded_terminal      | 1 / 0                 | 48 s                          |
 | batch_recv            | 5 / 0                 | 30 s                          |
-| graph_dag             | 20 / 2                | 85 s                          |
+| graph_stream_diff     | 4 / 0                 | 59 s (added 2026-10-26, r16; both engines per fixture) |
+| graph_dag             | 20 / 4                | 85 s                          |
 | sharded_terminal_async| 1 / 0                 | 281 s (12 full async topologies; scenario count is the floor) |
 | compute_pool          | 5 / 0                 | 72 s (hybrid-driver test dominates) |
 | pipeline_integration  | 108 / 14              | **~31 min** (extrapolated ±50 %; heavy tier 55–76 s/test) |

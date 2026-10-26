@@ -66,7 +66,7 @@ else
              submit_batch_alloc filter_collect_panic pipe_range_alloc
              on_pool_nested pool_cache stream_reduce expand_alloc
              cancel_outcome async_waker_alloc sharded_terminal
-             batch_recv graph_dag sharded_terminal_async
+             batch_recv graph_stream_diff graph_dag sharded_terminal_async
              compute_pool pipeline_integration)
 fi
 
