@@ -13,7 +13,10 @@ use std::{
     any::Any,
     collections::{HashSet, VecDeque},
     num::NonZeroUsize,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use super::exec::GraphCore;
@@ -110,14 +113,49 @@ pub(crate) struct EdgePlan {
     pub(crate) connector: EdgeConnector,
 }
 
+/// Identity of one [`GraphBuilder`](super::GraphBuilder), stamped into every
+/// [`NodeHandle`](super::NodeHandle) it mints. Node ids are per-builder
+/// indices, so a foreign handle passed to another builder's `edge`/terminal
+/// would silently wire the wrong node or panic deep in the run walk; the
+/// stamp turns that misuse into an honest panic at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BuilderId(u64);
+
+fn next_builder_id() -> BuilderId {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    BuilderId(SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
 /// The runtime topology under construction.
-#[derive(Default)]
 pub(crate) struct GraphPlan {
     pub(crate) nodes: Vec<NodePlan>,
     pub(crate) edges: Vec<EdgePlan>,
+    /// Identity stamped into every handle minted from this plan (see
+    /// [`BuilderId`]); travels with the plan through `with_runtime`.
+    pub(crate) builder: BuilderId,
+}
+
+impl Default for GraphPlan {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            builder: next_builder_id(),
+        }
+    }
 }
 
 impl GraphPlan {
+    /// The typed handle for node `id`, stamped with this plan's builder
+    /// identity (sole constructor of handles — registration methods only).
+    pub(crate) fn handle<I, O>(&self, id: usize) -> super::NodeHandle<I, O> {
+        super::NodeHandle {
+            id,
+            builder: self.builder,
+            marker: std::marker::PhantomData,
+        }
+    }
+
     /// Append one node, returning its id (the index into `nodes`).
     pub(crate) fn push_node(
         &mut self,

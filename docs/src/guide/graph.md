@@ -87,13 +87,36 @@ assert_eq!(items.len(), 1_000);
 
 Only a collect-sink handle fits `run_collect` (the handle's output type is
 the `Collect` marker — side-effect `sink` handles are `NodeHandle<T, ()>`
-and fail to compile there). `try_run_collect` returns the async-runtime
-construction error instead of panicking; `run_collect_checked` /
-`try_run_collect_checked` report `Completed` vs `Cancelled` with the partial
-`Vec` and a real `emitted` count. Item order follows delivery order
-(multi-worker upstreams interleave) — sort when order matters. A graph
-containing a collect sink must run through a `run_collect` variant: plain
-`run()` panics instead of silently dropping the collected items.
+and fail to compile there). A graph with several collecting endpoints passes
+a tuple of handles (up to four) and receives one `Vec` per sink, tupled in
+handle order:
+
+```rust
+# use youpipe::graph;
+# let mut g = graph();
+# let src = g.source_broadcast("load", 0..1_000u64);
+# let a = g.node("a", |x: u64| x * 2);
+# let b = g.node("b", |x: u64| x + 1);
+# let out_a = g.sink_collect("out-a");
+# let out_b = g.sink_collect("out-b");
+# g.edge(src, a).edge(src, b);
+# g.edge(a, out_a).edge(b, out_b);
+let (evens, odds) = g.run_collect((out_a, out_b));
+```
+
+`try_run_collect` returns the async-runtime construction error instead of
+panicking; `run_collect_checked` / `try_run_collect_checked` report
+`Completed` vs `Cancelled` with the partial output and a real `emitted`
+count (the combined total across the claimed sinks). Item order follows
+delivery order (multi-worker upstreams interleave) — sort when order
+matters. A graph containing a collect sink must run through a
+`run_collect` variant claiming **every** collect handle: plain `run()`
+panics instead of silently dropping the collected items, and so does a
+`run_collect` that leaves a handle out.
+
+Handles are single-builder: ids index the minting builder's tables, so a
+handle passed to another builder's `edge` or terminal panics with a
+builder-mismatch message instead of wiring the wrong node.
 
 ## Semantics
 
@@ -135,7 +158,8 @@ pressure. `run()` returns promptly with the partial output
 difference instead: `RunOutcome::Completed(())` versus
 `RunOutcome::Cancelled` — side-effect sinks keep no count, so its `emitted`
 is always 0; a collect sink observed through `run_collect_checked` reports
-the partial `Vec` with `emitted == partial.len()`.
+the partial output with `emitted` counting every collected item (equal to
+`partial.len()` for a single sink, the sum across a handle tuple).
 
 **Panics.** The first node panic is re-raised in the `run()` caller's thread
 with the original payload. `try_run()` returns `io::Error` only for runtime

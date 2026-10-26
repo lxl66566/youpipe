@@ -55,11 +55,16 @@ topology from a compile-time chain to a runtime DAG: nodes register with
 `source` / `node` / `node_expand` / `node_async` / `sink`, `edge` connects
 two `NodeHandle`s with a compile-time type check, and `run()` validates the
 topology (cycles, dangling nodes, duplicate names/edges — errors name the
-node) before starting it. Producers deliver by **move** into their single
+node) before starting it. Handles are stamped with their minting builder's
+identity, so a handle passed to another builder's `edge`/terminal panics
+with a builder-mismatch message instead of wiring the wrong node (ids are
+per-builder indices). Producers deliver by **move** into their single
 outgoing edge (no `Clone` bound; a second edge is a validation error) and the
 `_broadcast` registrations opt into per-edge `Clone` at any out-degree;
-terminals are side-effect `sink`s or `sink_collect` accumulators whose `Vec`
-the `run_collect` family returns. It reuses both planes unchanged: the data
+terminals are side-effect `sink`s or `sink_collect` accumulators whose `Vec`s
+the `run_collect` family returns (a single handle, or a tuple of up to four
+for graphs with several collecting endpoints — one `Vec` each via the
+`CollectSet` trait). It reuses both planes unchanged: the data
 plane is the same crossfire MPMC channels (fan-out = one channel per outbound
 edge, move or clone per registration; fan-in = fair round-robin over the
 inbound edges, with the

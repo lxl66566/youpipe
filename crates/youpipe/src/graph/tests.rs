@@ -145,7 +145,7 @@ fn reports_all_violations_at_once() {
 // ── Sync end-to-end ──
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -526,6 +526,106 @@ fn uncollected_collect_sink_panics() {
     let kept = g.sink_collect("kept");
     g.edge(src, dropped).edge(src, kept);
     g.run_collect(dropped);
+}
+
+/// Two collecting endpoints in one graph: `run_collect` over a handle tuple
+/// returns each sink's items in tuple order, each with its own item type.
+#[test]
+fn multi_collect_tuple_returns_each_sink() {
+    let n = n_items(2_000u64);
+    let mut g = graph();
+    let src = g.source_broadcast("src", 0..n);
+    let a = g.node("a", |x: u64| x.wrapping_mul(10));
+    let b = g.node("b", |x: u64| format!("v{}", x + 1));
+    let out_a = g.sink_collect("out-a");
+    let out_b = g.sink_collect("out-b");
+    g.edge(src, a).edge(src, b);
+    g.edge(a, out_a).edge(b, out_b);
+    let (words, nums) = g.run_collect((out_b, out_a));
+    let n_usize = usize::try_from(n).unwrap();
+    assert_eq!(nums.len(), n_usize);
+    assert_eq!(
+        nums.iter().sum::<u64>(),
+        (0..n).map(|x| x * 10).sum::<u64>()
+    );
+    let mut words = words;
+    words.sort_unstable();
+    let mut expect: Vec<String> = (0..n).map(|x| format!("v{}", x + 1)).collect();
+    expect.sort_unstable();
+    assert_eq!(words, expect);
+}
+
+/// The `_checked` tuple terminal reports the combined item count across
+/// every claimed sink: `emitted` spans the whole tuple, not one sink
+/// (gate-canceled run for a deterministic partial, as
+/// `run_collect_checked_reports_cancelled_partial`).
+#[test]
+fn multi_collect_checked_emitted_is_combined_total() {
+    let token = CancellationToken::new();
+    let fire = token.clone();
+    let mut g = graph();
+    let src = g.source("src", 0..10_000_000u64);
+    let gate = g.node("gate", move |x: u64| {
+        if x == 2_000 {
+            fire.cancel();
+        }
+        x
+    });
+    let split = g.node_broadcast("split", |x: u64| x);
+    let out_a = g.sink_collect("out-a");
+    let out_b = g.sink_collect("out-b");
+    let out_c = g.sink_collect("out-c");
+    g.edge(src, gate).edge(gate, split);
+    g.edge(split, out_a).edge(split, out_b).edge(split, out_c);
+    let outcome = g
+        .with_cancel(token)
+        .run_collect_checked((out_a, out_b, out_c));
+    let RunOutcome::Cancelled {
+        partial: (a, b, c),
+        emitted,
+    } = outcome
+    else {
+        panic!("mid-stream cancel must report Cancelled: {outcome:?}")
+    };
+    assert_eq!(emitted, a.len() + b.len() + c.len());
+    assert!(
+        !a.is_empty() && !b.is_empty() && !c.is_empty(),
+        "trigger items must reach every sink"
+    );
+}
+
+/// A handle minted by one builder passed to another builder's `edge` is a
+/// wrong-node wiring (ids are per-builder indices); the stamp catches it at
+/// the call site.
+#[test]
+#[should_panic(expected = "node handle 0 was minted by another GraphBuilder")]
+fn edge_rejects_foreign_builder_handle() {
+    let mut g1 = graph();
+    let src1 = g1.source("src-1", 0..8u64);
+    let mut g2 = graph();
+    let n2 = g2.node("n-2", |x: u64| x);
+    let out2 = g2.sink("out-2", |_: u64| {});
+    g2.edge(src1, n2);
+    g2.edge(n2, out2);
+}
+
+/// The collect terminal carries the same stamp: a foreign collect handle
+/// panics with the builder-mismatch message, not an internal-bug report.
+#[test]
+#[should_panic(expected = "was minted by another GraphBuilder")]
+fn run_collect_rejects_foreign_builder_handle() {
+    let mut g1 = graph();
+    let src1 = g1.source("src-1", 0..8u64);
+    let out1 = g1.sink_collect("out-1");
+    g1.edge(src1, out1);
+
+    let mut g2 = graph();
+    let src2 = g2.source("src-2", 0..8u64);
+    let out2 = g2.sink_collect("out-2");
+    g2.edge(src2, out2);
+    // Same item type: pre-stamp this silently collected g2's buffer while
+    // g1's items dropped.
+    let _items: Vec<u64> = g2.run_collect(out1);
 }
 
 /// A panicking node re-raises on the run caller after the drain (first panic

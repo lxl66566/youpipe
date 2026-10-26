@@ -14,7 +14,10 @@
 //! Every [`NodeHandle<I, O>`] pins its endpoint item types and
 //! [`GraphBuilder::edge`] interlocks the two handles — `up: NodeHandle<UpIn,
 //! T>` against `down: NodeHandle<T, DownOut>` — so an item-type mismatch is
-//! a compile error while the topology stays runtime data. The remaining
+//! a compile error while the topology stays runtime data. Handles are
+//! stamped with their minting builder's identity, so a handle from another
+//! builder panics with a builder-mismatch message at `edge`/terminal time.
+//! The remaining
 //! mistakes (cycles, dangling nodes, move-only producers with several
 //! outgoing edges, duplicate names or edges) are pure runtime data and
 //! reported together by `run()`'s validation pass.
@@ -72,9 +75,15 @@ pub type AsyncNodeOptions = AsyncStageOptions;
 /// (output) are carried as `PhantomData<fn(I) -> O>` (covariant) so that
 /// [`GraphBuilder::edge`] can type-interlock the two endpoints at compile
 /// time. `Copy` — pass it to `edge` by value as often as needed.
+///
+/// The handle is stamped with its minting builder's identity: ids are
+/// per-builder indices, so passing a handle to another builder's
+/// `edge`/terminal panics with a builder-mismatch message instead of wiring
+/// the wrong node.
 pub struct NodeHandle<I, O> {
-    /// Index into `GraphPlan::nodes`; minted only by the owning builder.
+    /// Index into the minting builder's `GraphPlan::nodes`.
     id: usize,
+    builder: plan::BuilderId,
     marker: PhantomData<fn(I) -> O>,
 }
 
@@ -96,12 +105,15 @@ impl<I, O> Copy for NodeHandle<I, O> {}
 
 impl<I, O> std::fmt::Debug for NodeHandle<I, O> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NodeHandle").field("id", &self.id).finish()
+        f.debug_struct("NodeHandle")
+            .field("id", &self.id)
+            .field("builder", &self.builder)
+            .finish()
     }
 }
 
 /// Output-position marker of a [`GraphBuilder::sink_collect`] node: the
-/// handle is `NodeHandle<T, Collect>`, and only such a handle fits
+/// handle is `NodeHandle<T, Collect>`, and only such handles fit
 /// [`GraphBuilder::run_collect`] — side-effect [`GraphBuilder::sink`]
 /// handles (`NodeHandle<T, ()>`) are rejected at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,10 +214,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             plan::NodeOpts::default(),
             exec::source_spawn::<T, I, fanin::Unicast<T>>(iter),
         );
-        NodeHandle {
-            id,
-            marker: PhantomData,
-        }
+        self.plan.handle(id)
     }
 
     /// Broadcast variant of [`source`](Self::source): a single feeder pulls
@@ -230,10 +239,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             plan::NodeOpts::default(),
             exec::source_spawn::<T, I, fanin::Broadcast<T>>(iter),
         );
-        NodeHandle {
-            id,
-            marker: PhantomData,
-        }
+        self.plan.handle(id)
     }
 
     /// Pull-based async source: one runtime task calls `f` repeatedly;
@@ -255,10 +261,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             plan::NodeOpts::default(),
             async_exec::source_async_spawn::<T, F, Fut, async_exec::AsyncUnicast<T>>(f),
         );
-        NodeHandle {
-            id,
-            marker: PhantomData,
-        }
+        self.plan.handle(id)
     }
 
     /// Broadcast variant of [`source_async`](Self::source_async): one
@@ -281,10 +284,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             plan::NodeOpts::default(),
             async_exec::source_async_spawn::<T, F, Fut, async_exec::AsyncBroadcast<T>>(f),
         );
-        NodeHandle {
-            id,
-            marker: PhantomData,
-        }
+        self.plan.handle(id)
     }
 
     /// Sync CPU node: `f: Fn(I) -> O` runs on the ComputePool. The output
@@ -325,10 +325,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             },
             exec::node_spawn::<I, O, F, fanin::Unicast<O>>(name, f),
         );
-        NodeHandle {
-            id,
-            marker: PhantomData,
-        }
+        self.plan.handle(id)
     }
 
     /// Broadcast variant of [`node`](Self::node): every open outgoing edge
@@ -368,10 +365,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             },
             exec::node_spawn::<I, O, F, fanin::Broadcast<O>>(name, f),
         );
-        NodeHandle {
-            id,
-            marker: PhantomData,
-        }
+        self.plan.handle(id)
     }
 
     /// Sync one-to-many node: `f` expands one input into zero or more
@@ -413,10 +407,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             },
             exec::expand_node_spawn::<I, O, F, fanin::Unicast<O>>(name, f),
         );
-        NodeHandle {
-            id,
-            marker: PhantomData,
-        }
+        self.plan.handle(id)
     }
 
     /// Broadcast variant of [`node_expand`](Self::node_expand): every open
@@ -460,10 +451,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             },
             exec::expand_node_spawn::<I, O, F, fanin::Broadcast<O>>(name, f),
         );
-        NodeHandle {
-            id,
-            marker: PhantomData,
-        }
+        self.plan.handle(id)
     }
 
     /// Async IO node: `f: Fn(I) -> Future<Output = O>` runs as
@@ -510,10 +498,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             },
             async_exec::node_async_spawn::<I, O, F, Fut, async_exec::AsyncUnicast<O>>(name, f),
         );
-        NodeHandle {
-            id,
-            marker: PhantomData,
-        }
+        self.plan.handle(id)
     }
 
     /// Broadcast variant of [`node_async`](Self::node_async): every open
@@ -561,10 +546,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             },
             async_exec::node_async_spawn::<I, O, F, Fut, async_exec::AsyncBroadcast<O>>(name, f),
         );
-        NodeHandle {
-            id,
-            marker: PhantomData,
-        }
+        self.plan.handle(id)
     }
 
     /// Sink: side-effect consumer, fixed at one worker. For a multi-worker
@@ -582,16 +564,15 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             plan::NodeOpts::default(),
             exec::sink_spawn::<I, F>(name, f),
         );
-        NodeHandle {
-            id,
-            marker: PhantomData,
-        }
+        self.plan.handle(id)
     }
 
     /// Collecting sink: accumulates every item that reaches the node into a
     /// `Vec` returned by [`run_collect`](Self::run_collect). Like
     /// [`sink`](Self::sink) fixed at one worker; the handle's output marker
-    /// is [`Collect`] so only a collect-sink handle fits `run_collect`.
+    /// is [`Collect`] so only a collect-sink handle fits `run_collect` —
+    /// one handle, or a tuple of up to four when the graph has several
+    /// collecting endpoints.
     ///
     /// Item order follows delivery order (multi-worker upstreams interleave);
     /// sort at the call site when order matters.
@@ -619,10 +600,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             self.outputs.resize_with(id + 1, || None);
         }
         self.outputs[id] = Some(Box::new(buf));
-        NodeHandle {
-            id,
-            marker: PhantomData,
-        }
+        self.plan.handle(id)
     }
 
     /// Connect `up`'s output to `down`'s input. The item type is pinned by
@@ -641,6 +619,8 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     where
         T: Send + Unpin + 'static,
     {
+        self.check_owned(up.id, up.builder);
+        self.check_owned(down.id, down.builder);
         let up_async = self.plan.nodes[up.id].kind.is_async();
         let down_async = self.plan.nodes[down.id].kind.is_async();
         self.plan.edges.push(plan::EdgePlan {
@@ -649,6 +629,16 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             connector: plan::make_connector::<T>(up_async, down_async),
         });
         self
+    }
+
+    /// Cross-builder handle guard for every handle-consuming entry point
+    /// (see [`NodeHandle`]'s stamp): one integer compare on the cold
+    /// registration / terminal paths.
+    fn check_owned(&self, id: usize, builder: plan::BuilderId) {
+        assert!(
+            builder == self.plan.builder,
+            "graph: node handle {id} was minted by another GraphBuilder"
+        );
     }
 
     /// Attach a custom [`ComputePool`] for sync nodes and feeders (default:
@@ -770,21 +760,21 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
         Ok(RunOutcome::classify((), 0, token.as_ref()))
     }
 
-    /// Run to whole-graph EOF and return the collect sink's accumulated
-    /// items. `try_run_collect` / `run_collect_checked` /
+    /// Run to whole-graph EOF and return the claimed collect sinks'
+    /// accumulated items — one `Vec` per sink (`run_collect(h)`), tupled
+    /// like the handles for several (`run_collect((h1, h2))`, up to four;
+    /// `run_collect_checked` reports the sinks' combined `emitted`).
+    /// `try_run_collect` / `run_collect_checked` /
     /// `try_run_collect_checked` follow the [`run`](Self::run) family's
     /// naming.
     ///
     /// # Panics
     ///
-    /// Same contract as [`run`](Self::run); additionally the graph must not
-    /// contain another collect sink whose handle was not passed here (its
-    /// items would drop silently).
-    pub fn run_collect<T>(self, sink: NodeHandle<T, Collect>) -> Vec<T>
-    where
-        T: 'static,
-    {
-        self.try_run_collect(sink)
+    /// Same contract as [`run`](Self::run); additionally every collect sink
+    /// of the graph must be claimed here (a handle left out would drop its
+    /// items silently).
+    pub fn run_collect<S: CollectSet>(self, sinks: S) -> S::Items {
+        self.try_run_collect(sinks)
             .expect("graph run: failed to build async runtime (see try_run_collect)")
     }
 
@@ -794,27 +784,21 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     /// # Panics
     ///
     /// Same contract as [`try_run`](Self::try_run).
-    pub fn try_run_collect<T>(mut self, sink: NodeHandle<T, Collect>) -> std::io::Result<Vec<T>>
-    where
-        T: 'static,
-    {
-        let buf = self.take_output::<T>(sink.id);
+    pub fn try_run_collect<S: CollectSet>(mut self, sinks: S) -> std::io::Result<S::Items> {
+        let buffers = sinks.claim(&mut self);
         exec::run_graph(self)?;
-        Ok(take_items(&buf))
+        Ok(S::drain(buffers))
     }
 
     /// [`run_collect`](Self::run_collect) with the cancelled/completed
-    /// outcome: `emitted` counts the items the collect sink received before
-    /// the drain (`emitted == partial.len()`).
+    /// outcome: `emitted` counts the items every claimed sink received
+    /// before the drain (`emitted` is the combined total across sinks).
     ///
     /// # Panics
     ///
     /// Same contract as [`run_collect`](Self::run_collect).
-    pub fn run_collect_checked<T>(self, sink: NodeHandle<T, Collect>) -> RunOutcome<Vec<T>>
-    where
-        T: 'static,
-    {
-        self.try_run_collect_checked(sink)
+    pub fn run_collect_checked<S: CollectSet>(self, sinks: S) -> RunOutcome<S::Items> {
+        self.try_run_collect_checked(sinks)
             .expect("graph run: failed to build async runtime (see try_run_collect)")
     }
 
@@ -823,35 +807,96 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
     /// # Panics
     ///
     /// Same contract as [`try_run`](Self::try_run).
-    pub fn try_run_collect_checked<T>(
+    pub fn try_run_collect_checked<S: CollectSet>(
         mut self,
-        sink: NodeHandle<T, Collect>,
-    ) -> std::io::Result<RunOutcome<Vec<T>>>
-    where
-        T: 'static,
-    {
+        sinks: S,
+    ) -> std::io::Result<RunOutcome<S::Items>> {
         let token = self.cancel.clone();
-        let buf = self.take_output::<T>(sink.id);
+        let buffers = sinks.claim(&mut self);
         exec::run_graph(self)?;
-        let items = take_items(&buf);
-        let emitted = items.len();
+        let items = S::drain(buffers);
+        let emitted = S::emitted_total(&items);
         Ok(RunOutcome::classify(items, emitted, token.as_ref()))
     }
 
-    /// Take the shared buffer of the collect sink `id`, clearing its slot so
-    /// the run's uncollected-collector check does not fire for it.
-    fn take_output<T: 'static>(&mut self, id: usize) -> Arc<Mutex<Vec<T>>> {
+    /// Take the shared buffer of the collect sink `sink`, clearing its slot
+    /// so the run's uncollected-collector check does not fire for it.
+    fn take_output<T: 'static>(&mut self, sink: NodeHandle<T, Collect>) -> Arc<Mutex<Vec<T>>> {
+        self.check_owned(sink.id, sink.builder);
         let slot = self
             .outputs
-            .get_mut(id)
+            .get_mut(sink.id)
             .and_then(Option::take)
-            .unwrap_or_else(|| panic!("graph: node {id} is not a collect-sink handle"));
+            .unwrap_or_else(|| panic!("graph: node {} is not a collect-sink handle", sink.id));
         let buf: Arc<Mutex<Vec<T>>> = *slot
             .downcast()
             .expect("graph: internal type mismatch on a collect-sink buffer");
         buf
     }
 }
+
+/// The collect sinks one run terminal claims: a single collect-sink handle
+/// or a tuple of up to four, each claiming its sink's shared buffer before
+/// the run and draining it after ([`GraphBuilder::run_collect`] and
+/// variants are generic over this).
+pub trait CollectSet {
+    /// Drained items: one `Vec` per claimed sink, tupled like the handles.
+    type Items;
+    /// The claimed buffers ([`CollectSet::claim`]'s output, consumed by
+    /// [`CollectSet::drain`]).
+    type Buffers;
+    /// Claim every sink's buffer from `builder`, clearing each slot so the
+    /// run's uncollected-collector check passes for it. Runs before the
+    /// graph; a builder-mismatched or non-collect handle panics here.
+    fn claim<R: AsyncRuntime>(self, builder: &mut GraphBuilder<R>) -> Self::Buffers;
+    /// Take the accumulated items out of the claimed buffers.
+    fn drain(buffers: Self::Buffers) -> Self::Items;
+    /// Combined item count of the drained items (the `_checked` terminals'
+    /// `emitted`).
+    fn emitted_total(items: &Self::Items) -> usize;
+}
+
+impl<T: 'static> CollectSet for NodeHandle<T, Collect> {
+    type Buffers = Arc<Mutex<Vec<T>>>;
+    type Items = Vec<T>;
+
+    fn claim<R: AsyncRuntime>(self, builder: &mut GraphBuilder<R>) -> Self::Buffers {
+        builder.take_output(self)
+    }
+
+    fn drain(buffer: Self::Buffers) -> Self::Items {
+        take_items(&buffer)
+    }
+
+    fn emitted_total(items: &Self::Items) -> usize {
+        items.len()
+    }
+}
+
+macro_rules! collect_set_tuple {
+    ($(($T:ident, $idx:tt)),+) => {
+        impl<$($T: 'static),+> CollectSet for ($(NodeHandle<$T, Collect>,)+) {
+            type Items = ($(Vec<$T>,)+);
+            type Buffers = ($(Arc<Mutex<Vec<$T>>>,)+);
+
+            fn claim<R: AsyncRuntime>(self, builder: &mut GraphBuilder<R>) -> Self::Buffers {
+                ($(builder.take_output(self.$idx),)+)
+            }
+
+            fn drain(buffers: Self::Buffers) -> Self::Items {
+                ($(take_items(&buffers.$idx),)+)
+            }
+
+            fn emitted_total(items: &Self::Items) -> usize {
+                0 $(+ items.$idx.len())+
+            }
+        }
+    };
+}
+
+collect_set_tuple!((A, 0), (B, 1));
+collect_set_tuple!((A, 0), (B, 1), (C, 2));
+collect_set_tuple!((A, 0), (B, 1), (C, 2), (D, 3));
 
 /// Move the accumulated items out of a collect-sink buffer. `mem::take` under
 /// the lock works even while a finished worker's `Arc` clone is still

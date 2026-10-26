@@ -80,7 +80,9 @@ pub use executor::{ComputePool, compute::MAX_COMPUTE_WORKERS};
 // `graph` names the module (type namespace) and the entry function (value
 // namespace) — the same one-name pattern as the `stream` fn, which lives in
 // a module named after its engine.
-pub use graph::{AsyncNodeOptions, Collect, GraphBuilder, NodeHandle, NodeOptions, graph};
+pub use graph::{
+    AsyncNodeOptions, Collect, CollectSet, GraphBuilder, NodeHandle, NodeOptions, graph,
+};
 pub use handoff::{AsyncReceiver, AsyncSender, Receiver, Sender, async_channel, channel};
 #[cfg(feature = "tokio-runtime")]
 pub use runtime::TokioPool;
