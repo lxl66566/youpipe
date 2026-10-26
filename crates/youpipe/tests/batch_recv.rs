@@ -217,9 +217,12 @@ fn send_batch_claims_free_prefix_then_blocking_tail() {
             tx.send(i).unwrap();
         }
         let mut batch: Vec<MaybeUninit<u32>> = (10..14).map(MaybeUninit::new).collect();
-        assert_eq!(tx.try_send_batch(&mut batch), 1);
+        // SAFETY: `batch` holds initialized values; the sent prefix is
+        // never read again (the tail below starts past it).
+        assert_eq!(unsafe { tx.try_send_batch(&mut batch) }, 1);
         // full: nothing claimable, the unsent tail stays owned by the caller
-        assert_eq!(tx.try_send_batch(&mut batch[1..]), 0);
+        // SAFETY: as above; 0 sent, nothing moved out.
+        assert_eq!(unsafe { tx.try_send_batch(&mut batch[1..]) }, 0);
         // SAFETY: initialized above, still owned (not sent).
         let tail: Vec<u32> = batch[1..]
             .iter()

@@ -451,7 +451,9 @@ impl<T: Send + Clone + 'static> Delivery<T> for Broadcast<T> {
 /// (parking at most once per full ring, cancellation-blind — see
 /// [`Broadcast::send_batch`]). Returns whether the edge survived.
 fn flush_staged<T: Send + 'static>(tx: &SyncSender<T>, staged: &mut [MaybeUninit<T>]) -> bool {
-    let sent = tx.try_send_batch(staged);
+    // SAFETY: every staged slot is initialized (the callers stage fully
+    // initialized batches); the sent prefix is skipped below.
+    let sent = unsafe { tx.try_send_batch(staged) };
     let mut j = sent;
     while j < staged.len() {
         // SAFETY: only [..j) was moved out; slot `j` is still initialized.

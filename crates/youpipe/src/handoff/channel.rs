@@ -83,16 +83,24 @@ impl<T: Send + 'static> SyncSender<T> {
     }
 
     /// Non-blocking batch send of the longest free prefix of `buf`; returns
-    /// the count sent. `buf` must be fully initialized; the sent prefix is
-    /// moved out (do not read it again), the remainder stays owned by the
-    /// caller. Backpressure granularity is unchanged: callers fall back to
-    /// per-item blocking [`Self::send`] for the remainder, parking per item
-    /// exactly as the per-item path would.
+    /// the count sent. Backpressure granularity is unchanged: callers fall
+    /// back to per-item blocking [`Self::send`] for the remainder, parking
+    /// per item exactly as the per-item path would.
+    ///
+    /// # Safety
+    ///
+    /// Every slot of `buf` must be initialized on entry. The sent prefix
+    /// (the returned count's worth of slots) is moved out — reading or
+    /// dropping those slots again is undefined behavior; the remainder stays
+    /// initialized and owned by the caller.
     ///
     /// Probe caliber: one hotpath guard per *batch* (see
     /// [`SyncReceiver::try_recv_batch`]).
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "SyncSender"))]
-    pub fn try_send_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+    pub unsafe fn try_send_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        // SAFETY: the caller upholds the initialization/move-out contract
+        // (see `# Safety`); the crossfire call moves out exactly the sent
+        // prefix it reports.
         unsafe { self.tx.try_send_batch(buf) }
     }
 }
@@ -327,8 +335,15 @@ impl<T: Send + 'static> MpscSender<T> {
     /// Native-batch twin of [`SyncSender::try_send_batch`] (one `sender`
     /// CAS per free run on the MPSC ring; the per-worker sharded terminal
     /// rings are the default-on caller).
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`SyncSender::try_send_batch`]: every slot of `buf`
+    /// initialized on entry; the sent prefix is moved out and must not be
+    /// read or dropped again.
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscSender"))]
-    pub fn try_send_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+    pub unsafe fn try_send_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        // SAFETY: contract forwarded from the caller (see `# Safety`).
         unsafe { self.tx.try_send_batch(buf) }
     }
 }
@@ -345,8 +360,9 @@ impl<T: Send + 'static> SendItem<T> for MpscSender<T> {
     }
 
     #[inline]
-    fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
-        MpscSender::try_send_batch(self, values)
+    unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
+        // SAFETY: forwarded to the inherent method's contract.
+        unsafe { MpscSender::try_send_batch(self, values) }
     }
 }
 
@@ -629,10 +645,15 @@ pub trait SendItem<T>: Clone + Send + 'static {
 
     /// Non-blocking batch send of the longest sendable prefix of `values`;
     /// returns the count sent (0 = nothing sendable right now — full or
-    /// closed; fall back to per-item `send` to distinguish). Every slot is
-    /// initialized on entry; the sent prefix is moved out and the remainder
-    /// stays initialized. Default: per-item `try_send`, parking never.
-    fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
+    /// closed; fall back to per-item `send` to distinguish). Default:
+    /// per-item `try_send`, parking never.
+    ///
+    /// # Safety
+    ///
+    /// Every slot of `values` must be initialized on entry. The sent prefix
+    /// is moved out — reading or dropping those slots again is undefined
+    /// behavior; the remainder stays initialized and owned by the caller.
+    unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
         let mut n = 0;
         while n < values.len() {
             // SAFETY: only the sent prefix [..n) is ever moved out, so slot
@@ -673,7 +694,8 @@ pub trait SendItem<T>: Clone + Send + 'static {
             return true;
         }
         stage_batch(batch, staged);
-        let sent = self.try_send_batch(staged);
+        // SAFETY: `stage_batch` initialized every staged slot.
+        let sent = unsafe { self.try_send_batch(staged) };
         let mut j = sent;
         while j < staged.len() {
             // SAFETY: only [..j) was moved out (batch send or this loop);
@@ -704,8 +726,9 @@ impl<T: Send + 'static> SendItem<T> for SyncSender<T> {
     }
 
     #[inline]
-    fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
-        SyncSender::try_send_batch(self, values)
+    unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
+        // SAFETY: forwarded to the inherent method's contract.
+        unsafe { SyncSender::try_send_batch(self, values) }
     }
 }
 

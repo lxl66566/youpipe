@@ -94,29 +94,6 @@ Items from the 2026-10-20 three-way audit that were not scheduled into the adjac
 - Landed 2026-10-25 (r10): guide tuning-table wording fixed ("pin the compute-worker budget divided across sync nodes"); async_exec module doc deduplicated.
 - The `FanIn::anchor` scratch hoist is falsified: hoisting the per-episode `order` Vec into a FanIn field measured a stable regression on the @1K graph_shapes chain/diamond ids (+3.7…+6.3 %, dominance 0/25, side spreads <3 %, stream controls flat; the `Select` itself is not hoistable — its handlers borrow the receivers for the episode's lifetime). Left as a per-episode Vec with the measurement recorded at the allocation site; readings in [benchmarks/graph.md](src/dev/benchmarks/graph.md) "Any-of-N fan-in anchors" addendum.
 
-## Verification suite (coverage / duration)
+### 25. ~~[P2] handoff's public batch send methods carried unsafe memory contracts in safe signatures~~ (landed)
 
-### 18. [P0→closed] miri.sh default target list is stale — graph_dag and batch_recv uncovered
-
-- Status: **closed (2026-10-25)**. The default list now runs 13 more integration binaries, each measured in full under miri (durations in [testing.md](src/dev/testing.md) "Suite duration census"): graph_dag 85 s, batch_recv 30 s, cancel_outcome 63 s, sharded_terminal 48 s, sharded_terminal_async 281 s, expand_alloc 20 s (miri /8 added), pipe_range_alloc 12 s, filter_collect_panic 5 s, submit_batch_alloc 5 s, async_waker_alloc 169 s (miri /4 added), stream_reduce 10 s (miri /20 added), on_pool_nested 26 s, pool_cache 21 s — ≈13 min added. Four binaries stay out with reasons (inlined in miri.sh): hybrid_assist (only test is `#[cfg_attr(miri, ignore)]`), profile_guard (native config guard), ordered_window (size-pinned >1 Mi repro shapes; scaling vacates the assertion), stream_reduce_alloc (needs N ≥ 1<<17 for its ≥1 MiB counter signal → hours interpreted).
-- Residual: the projected default pass is ≈57 min until todo #19's pipeline_integration divisor work lands (that binary is still ~31 min of the total).
-
-### 19. ~~[P2] suite-duration trims (census 2026-10-25)~~ (landed)
-
-- Landed 2026-10-25 (r9): all five trims, measured before/after in
-  [testing.md](src/dev/testing.md) "After r9 trims (2026-10-25)".
-  hybrid_assist watchdog 2 s; stream_reduce_alloc `N` 1<<19; the
-  pipeline_integration miri heavy tier (10 fence/async/stress tests, the
-  census's "pin" family turned out to be `cfg_attr(miri, ignore)`d) and
-  the compute_pool hybrid-driver test with deepened `cfg!(miri)` divisors;
-  the bench sweep mode implemented as `bench_ab.sh --sweep`
-  (benchmarks/README.md "Exploratory sweeps"). No release-gate-only test
-  split was needed — divisors alone cut the heavy tier 565 s → 145 s.
-
-Baseline and methodology: [testing.md](src/dev/testing.md) "Suite duration census (2026-10-25)". Each line: trim → protection lost.
-
-- hybrid_assist `stress_streams_plus_assist_drivers`: fixed `sleep(Duration::from_secs(6))` watchdog → 2 s. Lost: 3× shorter soak window for the assist-driver interleaving (periodic panic/drop accounting still runs several rounds).
-- stream_reduce_alloc: `N = 1<<20` → `1<<19` (output Vec still 4 MiB, above the 1 MiB counter threshold — same detection classes). Lost: fewer items through the same aggregation shapes.
-- miri pipeline_integration (≈31 min of the ≈48 min full pass): heavy-tier fence/stress/pin tests measure 55–76 s each; deepen their `cfg!(miri)` divisors (graph_dag's /20 convention) or split the heaviest 3–5 into a release-gate-only target. Lost: fewer interpreted repetitions of interleaving classes whose park/wake cores are already exhaustively model-checked by loom.
-- miri compute_pool (72 s, dominated by `test_hybrid_driver_assists_when_workers_busy`): scale its miri iteration counts. Lost: fewer assist interleavings interpreted (Sleep/CountLatch/SleepMask are loom-covered; the interpretation adds UB detection, which the channel-side targets keep).
-- Bench full sweeps: 273 criterion ids ≈ 16 min per pass; sync_vs_rayon (88) + unbalanced (46) are 49 % of the grid. In exploratory sweeps skip the rayon/tokio drift-control ids and the middle size of 3-size families; keep both in interleaved A/B, where the verdict methodology needs them. Lost: cross-library drift visibility and size-axis coverage in sweep mode only (A/B unaffected).
+- Found by the r16 graph+handoff audit: `SyncSender::try_send_batch` / `MpscSender::try_send_batch` (and the `SendItem::try_send_batch` trait method, whose per-item default impl also reads the caller's slots) took `&mut [MaybeUninit<T>]` under a prose-only contract — misuse reads uninitialized memory with no `unsafe` at the call site. Landed 2026-10-26 (r16): all three are `unsafe fn` with `# Safety` docs (fully-initialized input; the sent prefix is moved out and must not be read or dropped again); the recv direction stays safe (it only writes; the caller does its own `set_len`). Crate callers unchanged in behavior, now with SAFETY annotations (`SendItem::send_batch`, graph `flush_staged`, stream `push_items`, batch_recv + fuzz targets).

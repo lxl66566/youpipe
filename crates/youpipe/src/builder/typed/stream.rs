@@ -405,9 +405,10 @@ fn push_items<I: Send + 'static>(
         if staged.is_empty() {
             return;
         }
-        // Contract (see `SyncSender::try_send_batch`): every staged slot
-        // was initialized just above; the returned prefix is moved out.
-        let sent = feeder_tx.try_send_batch(&mut staged);
+        // SAFETY: every staged slot was initialized just above; the sent
+        // prefix is moved out and skipped below (the `# Safety` contract of
+        // `SyncSender::try_send_batch`).
+        let sent = unsafe { feeder_tx.try_send_batch(&mut staged) };
         let mut i = sent;
         while i < staged.len() {
             // Cancel parity with the historical per-item loop: check before

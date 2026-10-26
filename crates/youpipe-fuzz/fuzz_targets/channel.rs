@@ -128,7 +128,9 @@ fn batch_interleaved(r: &mut Reader<'_>) {
                     slot.write(next + i as u64);
                 }
                 next += k as u64; // unsent values are skipped, never reused
-                let sent = tx.try_send_batch(&mut staging[..k]);
+                // SAFETY: staging[..k] was initialized just above; the sent
+                // prefix is never re-read (fresh values every iteration).
+                let sent = unsafe { tx.try_send_batch(&mut staging[..k]) };
                 assert_eq!(
                     sent,
                     (cap - model.len()).min(k),
