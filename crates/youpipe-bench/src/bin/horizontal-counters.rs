@@ -13,8 +13,13 @@
 //!   alignment / capacity and the containing VMA's `AnonHugePages` from `/proc/self/smaps`
 //!   (allocator / THP comparison).
 //!
-//! Usage:
+//! Usage (both forms run the same runner; the bench alias exists because
+//! "probe" muscle memory reaches for `cargo bench`, and a bench target
+//! without `harness = false` would silently compile this file as a libtest
+//! harness that rejects every flag below):
 //!   cargo run --release -p youpipe-bench --bin horizontal-counters -- \
+//!       --n 2000000,4000000 --reps 5 --duration-ms 700
+//!   cargo bench -p youpipe-bench --bench horizontal-counters -- \
 //!       --n 2000000,4000000 --reps 5 --duration-ms 700
 //!   ... --mode addr --n 4000000
 
@@ -246,6 +251,11 @@ fn parse_args() -> Config {
                 .unwrap_or_else(|| panic!("{a} requires a value"))
         };
         match a.as_str() {
+            // Cargo injects a mode flag when this file runs as a harness=false
+            // target: `cargo bench -- <args>` invokes `<bin> --bench <args>`
+            // (and `cargo test --bench ...` likewise). Drop it so the bench
+            // alias parses identically to `cargo run --bin`.
+            "--bench" | "--test" => {},
             "--n" => cfg.ns = val().split(',').map(|s| s.parse().expect("n")).collect(),
             "--reps" => cfg.reps = val().parse().expect("reps"),
             "--duration-ms" => {

@@ -34,6 +34,17 @@ required-features = ["hotpath"]
 [[bin]]
 name = "horizontal-counters"
 
+# Bench-profile alias over the same source: `cargo bench -p youpipe-bench
+# --bench horizontal-counters -- --n 2000000 --reps 5` runs the real runner.
+# `harness = false` is load-bearing: without it cargo compiles the file with
+# `--test` and every flag dies on the libtest getopts parser ("Unrecognized
+# option: 'n'", the r15 forensics trap) while the build itself still
+# succeeds — the failure reads like a stale-artifact problem but is not one.
+[[bench]]
+harness = false
+name    = "horizontal-counters"
+path    = "src/bin/horizontal-counters.rs"
+
 # Streaming convoy bistability forensics (todo P1 #4): one shape, many runs,
 # per-run wall + per-thread ctxt-switch deltas by thread group.
 [[bin]]
