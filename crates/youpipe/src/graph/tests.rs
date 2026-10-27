@@ -1178,9 +1178,8 @@ fn feeder_panic_propagates_to_run_caller() {
         let mut g = graph();
         let src = g.source(
             "src",
-            (0..n).map(move |x| {
+            (0..n).inspect(move |&x| {
                 assert!(x < boom_at, "feeder boom at {x}");
-                x
             }),
         );
         let out = g.sink("out", |_: u64| {});

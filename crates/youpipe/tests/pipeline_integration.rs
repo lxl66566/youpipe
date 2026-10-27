@@ -2893,6 +2893,7 @@ fn test_unbalanced_try_collect_err_drop_accounting() {
 /// All reduce terminals vs the sequential equivalent: owned + borrowed,
 /// filter chains, the fold/count conveniences, and the stream fuse path.
 #[test]
+#[allow(clippy::many_single_char_names)] // f/g contrast borrowed vs owned closures
 fn test_reduce_terminals_match_sequential() {
     use youpipe::pipe_ref;
     // Miri: every terminal variant still runs over the full pipeline; only
