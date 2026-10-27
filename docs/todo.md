@@ -16,6 +16,5 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 ### 14. [P1] pipeline_integration intermittent hang, residual (stream side)
 
 - Context: the graph-engine occurrences are root-caused and fixed (2026-10-23, [benchmarks/graph.md](src/dev/benchmarks/graph.md)); the crossfire waker fire-steal — both faces (§12.5 cross-registry stale entry, §12.6 pop/wake waiter migration) — is fixed in the fork, records in [dev/crossfire-waker-designs.md](src/dev/crossfire-waker-designs.md). Attribution for the 09-28 stream-side occurrence remains circumstantial (no runtime evidence).
-- Pending: the fire-path perf A/B of the waker fix (+1 SeqCst load +1 mfence per popped entry) under bench.lock.
 - Pending: the async face audit (async_rx/async_tx waker state machine) — the fix covers the shared `reg_waker`/`set_seq` steal surface async re-arms use.
 - Standing: run `perf/verify/hang-stakeout.sh` (forensics-before-kill) on the next sighting before touching the process.

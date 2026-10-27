@@ -1,12 +1,12 @@
 //use crate::collections::ArcCell;
 #[cfg(feature = "loom")]
 // Only the atomics are model-checked; Arc/Weak/Thread stay real.
-use loom::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use loom::sync::atomic::{AtomicU64, Ordering};
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::ops::Deref;
 #[cfg(not(feature = "loom"))]
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::*;
 use std::thread;
@@ -78,8 +78,7 @@ impl ArcWaker {
     #[inline(always)]
     pub fn new_async(ctx: &Context) -> Self {
         Self(Arc::new(WakerInner {
-            seq: AtomicU64::new(0),
-            state: AtomicU8::new(WakerState::Init as u8),
+            word: AtomicU64::new(0),
             waker: UnsafeCell::new(ThinWaker::Async(ctx.waker().clone())),
         }))
     }
@@ -87,8 +86,7 @@ impl ArcWaker {
     #[inline(always)]
     pub fn new_blocking() -> Self {
         Self(Arc::new(WakerInner {
-            seq: AtomicU64::new(0),
-            state: AtomicU8::new(WakerState::Init as u8),
+            word: AtomicU64::new(0),
             waker: UnsafeCell::new(ThinWaker::Blocking(thread::current())),
         }))
     }
@@ -137,14 +135,25 @@ loom::lazy_static! {
     pub(crate) static ref REG_STAMP: AtomicU64 = AtomicU64::new(1);
 }
 
+// The stamp lives in the upper 56 bits of the packed state word (see
+// `WakerInner`), so mints are masked to 56 bits. A stamp collision needs
+// 2^56 re-arms process-wide (~7.2e16; at 1e9 re-arms/s, ~2.2 years) — a
+// practical non-issue.
+pub(crate) const SEQ_MASK: u64 = (1 << 56) - 1;
+
+// `wake()` stamp sentinel for registries that replace (not append) their
+// waker slot on re-arm — RegistrySingle and SelectWakerWrapper: a stale
+// handle cannot outlive a re-arm, so no stamp gate is needed. Never a real
+// stamp: mints are masked to 56 bits.
+pub(crate) const NO_STAMP: u64 = u64::MAX;
+
 #[cfg(not(feature = "loom"))]
 thread_local! {
     // The blocking wake target is thread::current(), which never changes, so
     // the node lives per-thread and is only re-armed between episodes. The
     // ThinWaker handle is written once, before any publication.
     static BLOCKING_WAKER: Arc<WakerInner> = Arc::new(WakerInner {
-        seq: AtomicU64::new(0),
-        state: AtomicU8::new(WakerState::Init as u8),
+        word: AtomicU64::new(0),
         waker: UnsafeCell::new(ThinWaker::Blocking(thread::current())),
     });
 }
@@ -207,9 +216,34 @@ impl ThinWaker {
     }
 }
 
+// Packed state machine word: low 8 bits = `WakerState`, upper 56 bits = the
+// registration stamp (`seq`). Packing makes delivery and staleness single
+// atomic operations:
+//
+// * `wake()`'s CAS matches state AND stamp at once, so a waiter that
+//   abandoned and re-armed (fresh stamp) fails the CAS directly — a fire
+//   can never spend its event on a foreign episode (todo #14's pop/wake
+//   migration steal), with no post-wake revalidation.
+// * the commit CAS carries the stamp bits it read, so observing
+//   (Waiting, s) proves s is the stamp of the episode that committed — a
+//   stale queue entry from a previous registration (different stamp)
+//   cannot match, by coherence alone.
+// Stamp width: mints are masked to 56 bits (`SEQ_MASK`).
+#[inline(always)]
+fn pack(state: u8, seq: u64) -> u64 {
+    (state as u64) | (seq << 8)
+}
+#[inline(always)]
+fn state_of(word: u64) -> u8 {
+    (word & 0xFF) as u8
+}
+#[inline(always)]
+fn seq_of(word: u64) -> u64 {
+    word >> 8
+}
+
 pub struct WakerInner {
-    state: AtomicU8,
-    seq: AtomicU64,
+    word: AtomicU64,
     waker: UnsafeCell<ThinWaker>,
 }
 
@@ -229,27 +263,42 @@ impl WakerInner {
 
     #[inline(always)]
     pub fn reset(&self) {
-        // Cross-episode re-arm, published before any registry mutex: SeqCst.
-        self.state.store(WakerState::Init as u8, Ordering::SeqCst);
-        // New episode must change the seq (stale entries are matched by seq);
-        // RegistrySingle never stamps the node, so bump here.
-        self.set_seq(REG_STAMP.fetch_add(1, Ordering::SeqCst));
+        // Cross-episode re-arm: one store publishes (Init, fresh stamp).
+        // Release is enough: any stale reader that still sees the old word
+        // is corrected by the stamp CAS in `wake()` — a wake only lands on
+        // the episode its stamp names. The fresh stamp matters for
+        // registries that never re-stamp on registration (RegistrySingle),
+        // so a stale entry on a foreign RegistryMulti cannot match.
+        // New episode must change the seq (stale entries are matched by seq).
+        let seq = REG_STAMP.fetch_add(1, Ordering::SeqCst) & SEQ_MASK;
+        self.word.store(pack(WakerState::Init as u8, seq), Ordering::Release);
     }
 
-    // SeqCst on both ends of the seq: a re-arm happens inside some
-    // registry's mutex, and the cross-registry steal window is exactly the
-    // gap between this store and its visibility to a FOREIGN registry's
-    // fire — the store side is sequenced before the owner's commit CAS
-    // (SeqCst), so once that CAS is observed the seq must be too, provided
-    // the reader fences between the two loads (see `_fire_n`).
+    // Current stamp. SeqCst: the un-anchored readers (`close`'s
+    // `upgrade_live`, `_clear_wakers`) have no state load to pair with, so
+    // they take the stronger read.
     #[inline(always)]
     pub fn get_seq(&self) -> u64 {
-        self.seq.load(Ordering::SeqCst)
+        seq_of(self.word.load(Ordering::SeqCst))
     }
 
+    /// (state, seq) read together from the packed word. The pair is atomic:
+    /// a Waiting state arrives with the stamp of the episode whose commit
+    /// CAS wrote it — no fence or acquire chain is needed to correlate them.
+    #[inline(always)]
+    pub(crate) fn _get_state_seq(&self, order: Ordering) -> (u8, u64) {
+        let w = self.word.load(order);
+        (state_of(w), seq_of(w))
+    }
+
+    // Rewrite the stamp, preserving the state bits. Caller is the node's
+    // owner (inside the registry mutex); a concurrent stale-entry fire may
+    // lose its Woken stamp to this store — the F11 spurious-wake class,
+    // absorbed by the owner's next park.
     #[inline(always)]
     pub fn set_seq(&self, seq: u64) {
-        self.seq.store(seq, Ordering::SeqCst);
+        let w = self.word.load(Ordering::Acquire);
+        self.word.store(pack(state_of(w), seq), Ordering::Release);
     }
 
     #[inline(always)]
@@ -269,29 +318,40 @@ impl WakerInner {
 
     #[inline(always)]
     pub fn try_change_state(&self, cur: WakerState, new_state: WakerState) -> Result<(), u8> {
-        self.state.compare_exchange(
-            cur as u8,
-            new_state as u8,
-            Ordering::SeqCst,
-            Ordering::Acquire,
-        )?;
-        Ok(())
+        // Single attempt (callers retry at their own granularity); the
+        // stamp bits ride along unchanged.
+        let w = self.word.load(Ordering::Relaxed);
+        if state_of(w) == cur as u8 {
+            match self.word.compare_exchange(
+                w,
+                pack(new_state as u8, seq_of(w)),
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(cur_w) => return Err(state_of(cur_w)),
+            }
+        }
+        Err(state_of(w))
     }
 
     /// Retire a cleared (no longer registered) node for cross-episode
     /// reuse (youpipe P-4). SeqCst: the next registration (possibly on
     /// another thread after the slot moved) must observe it before it
     /// inspects the registry state machine — a stale `Init` read would
-    /// misroute into the "still registered" branch.
+    /// misroute into the "still registered" branch. The stamp is preserved
+    /// so foreign stale entries keep mismatching.
     #[inline(always)]
     pub fn retire(&self) {
-        self.state.store(WakerState::Reuse as u8, Ordering::SeqCst);
+        let w = self.word.load(Ordering::Acquire);
+        self.word.store(pack(WakerState::Reuse as u8, seq_of(w)), Ordering::SeqCst);
     }
 
     pub fn reset_init(&self) {
         // this is before we put into registry (which will extablish happen-before relationship),
-        // it safe to use Relaxed
-        self.state.store(WakerState::Init as u8, Ordering::Relaxed);
+        // it safe to use Relaxed. The stamp is preserved until the registration re-stamps.
+        let w = self.word.load(Ordering::Relaxed);
+        self.word.store(pack(WakerState::Init as u8, seq_of(w)), Ordering::Relaxed);
     }
 
     /// Return current status,
@@ -324,23 +384,23 @@ impl WakerInner {
         &self, condition: WakerState, target: WakerState,
     ) -> Result<u8, u8> {
         debug_assert!((condition as u8) < (target as u8));
-        // Save one load()
-        let mut state = condition as u8;
+        let mut w = self.word.load(Ordering::Relaxed);
         loop {
-            match self.state.compare_exchange_weak(
-                state,
-                target as u8,
+            let state = state_of(w);
+            if state > condition as u8 {
+                return Err(state);
+            }
+            match self.word.compare_exchange_weak(
+                w,
+                pack(target as u8, seq_of(w)),
                 Ordering::SeqCst,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
                     return Ok(state);
                 }
-                Err(s) => {
-                    if s > condition as u8 {
-                        return Err(s);
-                    }
-                    state = s;
+                Err(cur_w) => {
+                    w = cur_w;
                 }
             }
         }
@@ -348,47 +408,67 @@ impl WakerInner {
 
     #[inline(always)]
     pub fn _get_state(&self, order: Ordering) -> u8 {
-        self.state.load(order)
+        state_of(self.word.load(order))
     }
 
     #[inline(always)]
     pub fn get_state(&self) -> u8 {
-        self.state.load(Ordering::SeqCst)
+        state_of(self.word.load(Ordering::SeqCst))
     }
 
     #[inline(always)]
     pub fn get_state_relaxed(&self) -> u8 {
-        self.state.load(Ordering::Relaxed)
+        state_of(self.word.load(Ordering::Relaxed))
     }
 
-    /// Assume no lock
+    /// Assume no lock.
+    ///
+    /// `stamp` is the episode the caller's queue entry belongs to
+    /// (`QueueEntry::stamp`). The delivery CAS matches the packed
+    /// `(Waiting, stamp)` word, so a waiter that abandoned and re-armed
+    /// since the pop (fresh stamp) fails the CAS and the event is handed
+    /// back — the wake can never land on a foreign episode (todo #14's
+    /// pop/wake migration steal), with no post-wake revalidation.
+    /// `NO_STAMP` skips the gate for registries that replace (not append)
+    /// their slot on re-arm.
     #[inline(always)]
-    pub fn wake(&self) -> WakeResult {
+    pub fn wake(&self, stamp: u64) -> WakeResult {
         // This is after we get waker from waker_registry, which already happen before relationship.
         // both >= WakerState::Waiting is certain
-        let mut state = self.get_state_relaxed();
+        let mut w = self.word.load(Ordering::Relaxed);
         loop {
+            let state = state_of(w);
             if state >= WakerState::Woken as u8 || state == WakerState::Reuse as u8 {
                 // Reuse: retired node whose stale entry a late fire popped —
                 // nobody is waiting through it, pass the fire budget on.
                 return WakeResult::Skip;
             } else if state == WakerState::Waiting as u8 {
-                // CAS delivery: an unconditional store leaves a read-store
-                // gap the waiter's abandon + re-arm can slip through, and
-                // the Woken then stamps whatever episode it re-armed on — a
-                // phantom delivery on a foreign registry (the pop/wake
-                // migration steal). Fail closed: a lost race is a Skip, and
-                // the callers' accounting (RegistrySingle's retry,
-                // `_fire_n`'s handback) spends the event on another waiter.
-                if self.try_change_state(WakerState::Waiting, WakerState::Woken).is_ok() {
+                // Stamp gate + CAS delivery in one locked op: a mismatch
+                // means the waiter re-armed (or the entry is stale) — no
+                // event is spent, the caller hands it back.
+                if stamp != NO_STAMP && seq_of(w) != stamp {
+                    return WakeResult::Skip;
+                }
+                if self.word
+                    .compare_exchange(
+                        w,
+                        pack(WakerState::Woken as u8, seq_of(w)),
+                        Ordering::SeqCst,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
                     self.get_waker().wake_by_ref();
                     return WakeResult::Woken;
                 }
                 return WakeResult::Skip;
             } else {
-                match self.state.compare_exchange_weak(
-                    WakerState::Init as u8,
-                    WakerState::Woken as u8,
+                // Init: registered but not yet committed — wake and keep
+                // going (Next). The stamp does not gate this branch: the
+                // episode has not committed, so there is nothing to steal.
+                match self.word.compare_exchange_weak(
+                    w,
+                    pack(WakerState::Woken as u8, seq_of(w)),
                     Ordering::SeqCst,
                     Ordering::Acquire,
                 ) {
@@ -396,8 +476,8 @@ impl WakerInner {
                         self.get_waker().wake_by_ref();
                         return WakeResult::Next;
                     }
-                    Err(s) => {
-                        state = s;
+                    Err(cur) => {
+                        w = cur;
                     }
                 }
             }
@@ -523,7 +603,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&node), 2);
 
         // Next episode: same node, re-armed to Init even from Woken.
-        node.state.store(WakerState::Woken as u8, Ordering::SeqCst);
+        node.word.store(pack(WakerState::Woken as u8, 0), Ordering::SeqCst);
         let w2 = tl_blocking_waker();
         assert!(Arc::ptr_eq(&node, &w2.0));
         assert_eq!(Arc::strong_count(&node), 3); // TL slot + node + w2

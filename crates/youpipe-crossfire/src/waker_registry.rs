@@ -10,10 +10,6 @@ use crate::waker::*;
 // loom has no compiler_fence; a full fence is its modeled superset.
 use loom::sync::atomic::fence as compiler_fence;
 #[cfg(feature = "loom")]
-// The strong fence the steal fix's read ordering needs (`_fire_n`); loom
-// models it directly.
-use loom::sync::atomic::fence as seqcst_fence;
-#[cfg(feature = "loom")]
 use loom::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 #[cfg(feature = "loom")]
 // loom's Mutex is the modeled equivalent; parking_lot's futex path is opaque to the model.
@@ -27,11 +23,6 @@ use smallvec::SmallVec;
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::fmt::Debug;
-#[cfg(not(feature = "loom"))]
-// Distinct from `compiler_fence` (the weak compiler-only barrier): the
-// steal fix requires a real SeqCst fence between the state read and the
-// seq read.
-use std::sync::atomic::fence as seqcst_fence;
 #[cfg(not(feature = "loom"))]
 use std::sync::atomic::{compiler_fence, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -213,7 +204,7 @@ impl RegistrySingle {
         // a wake racing a cancel + re-arm can land as Skip and leave the new
         // episode parked forever once the event stream goes quiet.
         while let Some(waker) = self.cell.pop() {
-            let r = waker.wake();
+            let r = waker.wake(NO_STAMP);
             trace_log!("{} wake {:?} {:?}", self._tag, waker, r);
             if r != WakeResult::Skip {
                 break;
@@ -438,7 +429,7 @@ impl RegistryMulti {
         let weak = waker.weak();
         {
             let mut guard = reg_lock(&self.inner);
-            let seq = REG_STAMP.fetch_add(1, Ordering::Relaxed);
+            let seq = REG_STAMP.fetch_add(1, Ordering::Relaxed) & SEQ_MASK;
             guard.seq = seq;
             waker.set_seq(seq);
             if guard.queue.is_empty() {
@@ -662,26 +653,16 @@ impl RegistryMulti {
                             Some(entry) => {
                                 has_pop = true;
                                 if let Some(inner) = entry.weak.upgrade() {
-                                    // Read order is load-bearing: state
-                                    // (SeqCst) first, then a SeqCst fence,
-                                    // then the seq match. A Waiting state
-                                    // means the node's owner committed an
-                                    // episode on SOME registry; every re-arm's
-                                    // `set_seq` (SeqCst) is sequenced before
-                                    // that commit's CAS (SeqCst), so the
-                                    // fence makes the seq read see any re-arm
-                                    // that preceded the observed Waiting — a
-                                    // stale entry from a PREVIOUS registry
-                                    // cannot match. Reading seq first (or
-                                    // without the fence) let a Waiting node
-                                    // present the old seq (the store lagging
-                                    // the CAS), spending this event on the
-                                    // waiter parked elsewhere and stranding
-                                    // the fresh waiter here — permanently
-                                    // when the stolen event is the last.
-                                    let state = inner.get_state();
-                                    seqcst_fence(Ordering::SeqCst);
-                                    if inner.get_seq() == entry.stamp {
+                                    // One Acquire load of the packed word:
+                                    // (state, seq) is atomic, and the commit
+                                    // CAS carried the stamp bits it wrote,
+                                    // so a Waiting state arrives with the
+                                    // stamp of the episode that committed —
+                                    // a stale entry from a PREVIOUS
+                                    // registration (different stamp) cannot
+                                    // match, by coherence alone.
+                                    let (state, seq) = inner._get_state_seq(Ordering::Acquire);
+                                    if seq == entry.stamp {
                                         let committed = state == WakerState::Waiting as u8;
                                         if committed {
                                             remaining -= 1;
@@ -711,28 +692,20 @@ impl RegistryMulti {
             // Wake outside the critical section, like the per-item fire().
             let mut wasted = 0;
             for (waker, committed, stamp) in &wakers {
-                let r = waker.wake();
+                let r = waker.wake(*stamp);
                 trace_log!("wake {} {:?} {:?}", self._tag, waker, r);
                 if !*committed {
                     continue;
                 }
-                // Delivery-time revalidation. `committed` only proves the
-                // node was Waiting for THIS entry's episode at collection;
-                // the waiter can still abandon and re-arm on another
-                // registry before wake() runs, and that wake then lands on
-                // the foreign episode: wake() reports Woken (the Waiting it
-                // committed belongs to the new registration) and the event
-                // is spent without reaching any waiter of this registry —
-                // permanently stranding a fresh one when this is the last
-                // event. The stamp is the delivery proof: reset() re-arms
-                // with a fresh seq, so a post-wake mismatch means the Woken
-                // went to a different episode. Anything but
-                // Woken-on-same-stamp hands the event back for another
-                // collection round (the batched mirror of the per-item
-                // fire() continuing past a Skip); a rare false handback
-                // (the delivered waiter already re-armed before our seq
-                // read) costs one absorbed spurious wake, never a strand.
-                if r == WakeResult::Woken && waker.get_seq() == *stamp {
+                // The stamp CAS inside wake() is the delivery proof: Woken
+                // means the event reached exactly the episode `stamp` names
+                // (a waiter that re-armed since collection fails the CAS or
+                // mismatches the stamp upfront). Anything else (Skip on
+                // mismatch or a lost race, Next on a waiter that re-armed
+                // to Init) hands the event back for another collection
+                // round — the batched mirror of the per-item fire()
+                // continuing past a Skip.
+                if r == WakeResult::Woken {
                     landed = true;
                 } else {
                     wasted += 1;
@@ -991,7 +964,7 @@ impl SelectWakerWrapper {
         if let Some(waker) = self.0.cell.pop() {
             trace_log!("rx: wake select");
             self.0.hint.store(self.1, Ordering::Release);
-            waker.wake();
+            waker.wake(NO_STAMP);
         }
     }
 
@@ -1166,7 +1139,7 @@ mod tests {
 
         // fire()'s delayed second half: the stale handle's wake finally runs.
         // It flips the re-armed node to Woken and unparks.
-        assert_eq!(stale.wake(), WakeResult::Next);
+        assert_eq!(stale.wake(NO_STAMP), WakeResult::Next);
         let state = <RegistrySingle as Registry>::get_waker_state(&reg, &o_waker, Ordering::SeqCst);
         assert_eq!(
             state,
@@ -1192,7 +1165,7 @@ mod tests {
         // A second, complete fire: its first pop may observe the stale
         // Woken… but here the stale wake has not run yet, so the node is
         // Init and the fire delivers normally. Force the stale-first shape:
-        stale.wake(); // node -> Woken (as if an older fire just landed)
+        stale.wake(NO_STAMP); // node -> Woken (as if an older fire just landed)
                       // The complete fire must still wake the (re-armed) waiter instead of
                       // silently Skipping on the Woken node.
         reg.fire();
