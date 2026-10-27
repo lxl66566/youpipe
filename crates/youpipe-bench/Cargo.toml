@@ -25,6 +25,11 @@ publish                = false
 [[bin]]
 name = "file-encrypt"
 
+# Streaming convoy bistability forensics (todo P1 #4): one shape, many runs,
+# per-run wall + per-thread ctxt-switch deltas by thread group.
+[[bin]]
+name = "convoy-probe"
+
 [[bin]]
 name              = "hotpath-profile"
 required-features = ["hotpath"]
@@ -44,11 +49,6 @@ name = "horizontal-counters"
 harness = false
 name    = "horizontal-counters"
 path    = "src/bin/horizontal-counters.rs"
-
-# Streaming convoy bistability forensics (todo P1 #4): one shape, many runs,
-# per-run wall + per-thread ctxt-switch deltas by thread group.
-[[bin]]
-name = "convoy-probe"
 
 # ── perf-event counter bench (criterion driven by hardware counters) ──
 [[bench]]

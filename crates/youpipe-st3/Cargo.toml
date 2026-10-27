@@ -27,6 +27,7 @@ categories             = ["concurrency", "data-structures"]
 keywords               = ["bounded", "lock-free", "queue", "stack", "work-stealing"]
 autotests              = false
 autobenches            = false
+include                = ["/CHANGELOG.md", "/LICENSE-*", "/README.md", "/benches/**", "/src/**", "/tests/**"]
 
 [lib]
 name = "st3"

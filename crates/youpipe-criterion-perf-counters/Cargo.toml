@@ -45,7 +45,7 @@ publish                = false
 name = "criterion_perf_counters"
 
 [dependencies]
-criterion = { workspace = true }
+criterion  = { workspace = true }
 perf-event = "0.4"
 
 # Fork: sources stay diffable with upstream (no inline allow-churn), so the

@@ -29,11 +29,12 @@
 # every bench baseline once (open, see attribution.md 2026-10-23).
 [build]
 rustflags = [
-    "-C",
-    "panic=unwind",
-    "-C",
-    "llvm-args=-align-all-functions=5",
+  "-C",
+  "panic=unwind",
+  "-C",
+  "llvm-args=-align-all-functions=5",
 ]
+
 # Miri configuration.
 #
 # The global compute pool (`ComputePool::global()`, held in a `OnceLock`)
