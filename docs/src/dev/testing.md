@@ -12,6 +12,8 @@ perf/verify/loom.sh            # youpipe + vendored queue + crossfire + st3 mode
                               # (four independent blocks run concurrently;
                               #  LOOM_SERIAL=1 restores sequential execution)
 perf/verify/linkcheck.sh       # mdbook intra-book link targets (docs/src)
+perf/verify/full.sh            # one-shot release gate: native + miri + loom + bench
+                              # (--stage native,miri,... runs/ resumes a subset)
 ```
 
 Of these, `linkcheck.sh` runs in CI verbatim (first step of the Test
@@ -349,7 +351,36 @@ libtest-json` — requires `NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1` on nextest
 0.9.146 — miri from per-target subset runs under the miri.sh flag combo,
 bench ids from `cargo bench --no-run` + criterion `--list`). Trim proposals
 with their protection costs are todo #18/#19; numbers below are the
-baseline they trim against.
+baseline they trim against. The 2026-11-04 sections above and below carry
+the parallel-runner refresh measured on the Windows 32-core host.
+
+## Pre-release full suite (`perf/verify/full.sh`, 2026-11-04)
+
+One command for the whole release gate, staged so long stages can be
+run/resumed individually (`--stage native,miri,loom,bench`; each stage
+prints wall time, the summary aggregates, any failure exits nonzero):
+
+| stage  | contents                                                                 | Windows 32-core (2026-11-04, warm) |
+| ------ | ------------------------------------------------------------------------ | ---------------------------------- |
+| native | `cargo nextest run` (workspace, `-j 8`, `--retries 1 --no-fail-fast`) + `cargo test --doc` + clippy `-D warnings` (default features everywhere; the CI-parity `--all-features` clippy line runs on unix only — youpipe's hotpath feature pulls hotpath-cpu, which `compile_error!`s off macOS/Linux) | 10–13 s (514 tests + 92 doctests), 3/3 green |
+| miri   | `perf/verify/miri.sh` (nextest-parallel)                                 | ~470 s (rc=1: host-specific miri findings, see above) |
+| loom   | `perf/verify/loom.sh` (concurrent blocks)                                | 262–269 s                          |
+| bench  | `perf/bench-suite/bench-full.sh` (owned by perf/bench-suite; errors loudly when absent) | ~756 s end-to-end (build 164 + youpipe 465 + forks 127; horizontal/gungraun skip on this host with reasons) |
+
+The workspace nextest/clippy runs exclude youpipe-bench,
+youpipe-gungraun and youpipe-criterion-perf-counters — their perf-event /
+valgrind dependency chains are Linux-only (perf-event does not compile
+against Windows headers) and their outputs are not part of the wall-time
+gate (skip reasons printed by the script). Native runs at `-j 8`
+(`FULL_NATIVE_JOBS` to override) with `--retries 1 --no-fail-fast`:
+crossfire's spin-consumer MPSC batch tests starve under high process
+parallelism on a loaded shared Windows host ("consumer stalled" — the
+busy-poll budget trips while sibling processes starve its producer
+threads; always at -j 32, sporadically at -j 8 under colleague bench
+load). One retry absorbs that scheduler flake; deterministic failures
+still trip the gate. gungraun's Ir benches and
+youpipe-bench's one-shot bins stay opt-in manual runs (valgrind / perf
+counters / disk paths).
 
 ## Native (default members, debug)
 
@@ -564,9 +595,11 @@ drift anchors only (~187 of 246 kept).
 native + clippy ≈ 1 min · miri ≈ 32 min serial (lib ~9 ·
 pipeline_integration 6 · sharded_terminal_async ~4.7 · the other 18
 targets ~12), ~5–8 min projected at the 2026-11-04 nextest-parallel
-default (470 s measured on the Windows host) · loom ≈ 10–30 min ·
-benches ≥ 30 min for full sweeps (~3 min saved by
-`--sweep`). The levers and their
+default (470 s measured on the Windows host) · loom ≈ 10–30 min serial,
+st3-bound at ~4.5 min with the concurrent blocks · benches ≥ 30 min for
+full sweeps (~3 min saved by
+`--sweep`). `perf/verify/full.sh` chains it all with per-stage timing.
+The levers and their
 protection costs: todo #19 (landed 2026-10-25, see "After r9 trims"
 above); the miri.sh coverage gap discovered by the census (4 of 20
 integration binaries in the default target list): todo #18.
