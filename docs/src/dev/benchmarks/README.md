@@ -1,18 +1,26 @@
 # Benchmarks and Methodology
 
-> All numbers are from a 32-core AMD (Zen) Linux machine, criterion `--sample-size 30 --measurement-time 5` (the historical full-treatment config, see below), tables refreshed with the current quick config.
+> All numbers are from a 32-core AMD (Zen) Linux machine, criterion `--sample-size 30 --measurement-time 5` (the historical full-treatment config, see below), tables refreshed with the current default config.
 
 Caliber note: comparisons against rayon borrow the input on both sides (`pipe_ref(&data)` vs `par_iter`), the same warm slice, nothing cloned or freed inside the timed region, so no lifecycle-alignment tricks are needed. The engines that must take ownership (`pipe(v)`, `stream(v)`) rebuild the input in the untimed setup and pull it into cache (`warm_clone`): glibc's large `memcpy` uses non-temporal stores that bypass the cache, so a naive `data.clone()` arrives cold-from-RAM and measures allocator and memory latency instead of the framework. The `_owned_cold` variant in the lightweight group documents that one-shot cold cost.
 
-## Suite budget (quick config)
+## Suite budget (quick vs verdict)
 
-A full-suite pass with criterion's defaults costs over an hour. All bench targets share `crates/youpipe/benches/common/mod.rs`, which defaults to the verdict-proven interleaved-A/B regime: 20 samples, 1 s warm-up, 2 s measurement, about 3.5 s per bench id and a full suite of about 10 min including compile. The size axes live in the bench sources themselves: every group's hardcoded size list is its two anchors (regime endpoints; the dropped midpoints interpolate monotonically — each group's comment records which points were dropped and why, e.g. `sync_filter`'s 10K or `io_async`'s 500). Every knob is env-overridable without code edits, and the override applies to both sides of any A/B equally, so fairness is preserved:
+The timed suite runs at two sampling budgets, because its two jobs differ: a pre-release pass must cover every binary cheaply at smoke precision, while a verdict needs drift-cancelling interleaved rounds at full precision.
+
+- **verdict** — the default wired into `crates/youpipe/benches/common/mod.rs`: 20 samples, 1 s warm-up, 2 s measurement, ~3.5 s per bench id, ~14 min for the 246-id criterion grid (criterion's own defaults would cost >1 h). Driven by `bench_ab.sh`, which forces the same numbers through CLI flags so both sides of an A/B always measure identically. The size axes live in the bench sources themselves: every group's hardcoded size list is its two anchors (regime endpoints; the dropped midpoints interpolate monotonously — each group's comment records which points were dropped and why, e.g. `sync_filter`'s 10K or `io_async`'s 500).
+- **quick** — 10 samples, 0.5 s warm-up, 1 s measurement, ~1.9 s per id. `perf/bench-suite/bench-full.sh` applies it to the whole timed suite: the youpipe criterion binaries via the `BENCH_*` envs, the fork benches via criterion CLI flags (fork sources carry no env knobs and must stay diffable against their upstreams), `horizontal` at `--rounds 3`, and gungraun's default config when valgrind plus a version-matched `gungraun-runner` are on PATH (skipped with the reason printed otherwise). Measured 2026-11-04 on the 277-id pre-trim grid (dev box under background load; criterion's timing windows are fixed, so walls track the grid, not the load): youpipe ~8.9 min + fork ids (`concurrent-queue:bench` 35, `st3:benchmark` 15, `st3:micro` 18) ~2.1 min; the same-day grid trim (see testing.md "Bench grid trim") brings the youpipe pass to ~8 min — ~10 min of timed wall in total, plus a cold build.
 
 ```sh
+# quick tier, whole timed suite (--stage / --bench subset it)
+perf/bench-suite/bench-full.sh
+
 # full-treatment config for a single deep-dive bench
 BENCH_SAMPLE_SIZE=100 BENCH_WARMUP_MS=3000 BENCH_MEASUREMENT_MS=5000 \
     cargo bench --bench sync_vs_rayon -- youpipe_par_map/1000
 ```
+
+Every `BENCH_*` knob is env-overridable without code edits, and an override applies to both sides of any A/B equally, so fairness is preserved. The fork benches' budget is CLI-only; criterion (0.5 and 0.8 alike) parses `--warm-up-time` / `--measurement-time` as plain f64 seconds (`0.5`), not `500ms`. Quick-tier throughput reads are smoke-grade: never compare them across times or against verdict-tier numbers.
 
 For A/B verdicts use `perf/bench-suite` (interleaved rounds, CPU pinning, median-of-rounds comparison) rather than back-to-back full-group passes: the stream family has ±10 % inter-run drift, and the 100 K fused family is subject to the whole-group measurement trap documented in [attribution.md](attribution.md).
 

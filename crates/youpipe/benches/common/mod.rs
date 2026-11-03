@@ -17,6 +17,14 @@
 //!     cargo bench --bench sync_vs_rayon
 //! ```
 //!
+//! Two budgets are in active use (docs/src/dev/benchmarks/README.md
+//! "Suite budget"): this verdict default, and a quick tier — 10 samples,
+//! 0.5 s warm-up, 1 s measurement (~1.9 s per id) — which
+//! `perf/bench-suite/bench-full.sh` applies through these envs to sweep
+//! the whole timed suite (~10 min wall incl. the fork benches) before a
+//! release. Quick-tier reads are smoke-grade; verdicts stay on the
+//! interleaved A/B at this default.
+//!
 //! Fairness note: these knobs only change statistical resolution, never the
 //! benchmarked code path, and A/B runs always apply the same environment to
 //! both sides (perf/bench-suite does this by construction).
