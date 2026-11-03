@@ -95,7 +95,7 @@ The range-tree comments claimed "each surviving item moves exactly once"; in rea
 
 ### `filter_selectivity` group
 
-The `filter_selectivity` group (keep 10/50/90 %, borrowed caliber, 10K/100K) anchors the survival-rate axis, and the rayon rows double as drift controls for same-binary knob A/Bs.
+The `filter_selectivity` group (keep 10/90 %, borrowed caliber, 10K/100K) anchors the survival-rate axis, and the rayon rows double as drift controls for same-binary knob A/Bs. The 50 % midpoint was dropped from the grid (2026-11): it interpolated between the anchors and ~33 % lives in `sync_filter`.
 
 ### Count-then-place (`YOUPIPE_FILTER_COLLECT=ctp`, opt-in)
 
@@ -153,6 +153,9 @@ The aggregation terminals (`reduce`/`fold`/`sum`/`count`/`min`/`max` and the fal
 | 10K  | ~10.6 µs | ~12.7 µs | ~53.7 µs | ~3.0 µs  |
 | 100K | ~12.2 µs | ~46.6 µs | ~69.5 µs | ~29.4 µs |
 | 1M   | ~29.9 µs | ~235.7 µs| ~121.2 µs| ~293.0 µs|
+
+(The default grid has anchored 1K/1M since the 2026-11 trim; the 10K/100K
+midpoint rows above are the full-grid readings the landing A/B measured.)
 
 Vs the materialize-then-fold path: **−16 % @ 10K, −74 % @ 100K, −87 % @ 1M**; at 1K the reduce core medians +9.5 % with 18 % bimodal round spread (8.8/10.3 µs alternating, 2/5 rounds beat the old path), borderline noise below the size-gating threshold, no gating done. Vs rayon: **−74…−82 % at every size** (the cpu-heavy collect caliber narrows that, this is the lightweight end where the removed output buffer dominates). Owned input pays the fresh clone (~17.3 µs @ 10K, ~74.5 µs @ 100K), an identical lifecycle on every side of any owned A/B.
 

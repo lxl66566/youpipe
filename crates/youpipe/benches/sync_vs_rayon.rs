@@ -397,7 +397,9 @@ fn bench_filter_chain(c: &mut Criterion) {
     // fork/join tree even for off-pool callers. Watch this group when touching
     // the filter dispatch (hybrid ramp-up for filter chains).
     let mut group = c.benchmark_group("sync_filter");
-    for size in [1_000, 10_000, 100_000] {
+    // 1K / 100K anchors (10K midpoint dropped, same policy as
+    // `bench_par_map_vs_rayon`: the merge-tree cost is monotone in size).
+    for size in [1_000, 100_000] {
         let data: Vec<u64> = (0..size).collect();
 
         group.throughput(Throughput::Elements(size));
@@ -467,19 +469,19 @@ fn bench_filter_chain(c: &mut Criterion) {
 
 fn bench_filter_selectivity(c: &mut Criterion) {
     // Survival-rate shapes for the borrowed filter collect (the merge tree's
-    // output-side cost scales with survivor count; ~33% already exists as
-    // `sync_filter`). Anchors the low/mid/high ends for selectivity-sensitive
-    // experiments (e.g. the count-then-place knob). rayon rows double as
-    // drift controls in same-binary knob A/Bs.
+    // output-side cost scales with survivor count). Anchors the low/high ends
+    // for selectivity-sensitive experiments (e.g. the count-then-place knob):
+    // the keep50 midpoint interpolates between them and ~33% already exists
+    // as `sync_filter`'s %3==0 row, so it was dropped from the grid. rayon
+    // rows double as drift controls in same-binary knob A/Bs.
     type Pred = fn(&u64) -> bool;
     let mut group = c.benchmark_group("filter_selectivity");
     for size in [10_000, 100_000] {
         let data: Vec<u64> = (0..size).collect();
         // (name, keep-rate) — `keep90` inverts the predicate so the chain
         // shape (map / filter / map) stays identical across rates.
-        let shapes: [(&str, Pred); 3] = [
+        let shapes: [(&str, Pred); 2] = [
             ("keep10", |&x: &u64| x % 10 == 0),
-            ("keep50", |&x: &u64| x % 2 == 0),
             ("keep90", |&x: &u64| x % 10 != 0),
         ];
 
@@ -526,7 +528,11 @@ fn bench_filter_selectivity(c: &mut Criterion) {
 /// output-buffer cost dominates the story (cpu-heavy maps amortize it).
 fn bench_reduce_family(c: &mut Criterion) {
     let mut group = c.benchmark_group("sync_reduce");
-    for size in [1_000, 10_000, 100_000, 1_000_000] {
+    // 1K / 1M anchors: setup-dominated vs memory-bandwidth-bound, mirroring
+    // `sync_lightweight`'s span. The 10K/100K midpoints interpolate
+    // monotonically (the old-vs-new gap only grows with size) and were
+    // dropped to keep the full suite fast.
+    for size in [1_000, 1_000_000] {
         let data: Vec<u64> = (0..size).collect();
 
         group.throughput(Throughput::Elements(size));

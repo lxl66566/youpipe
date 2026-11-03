@@ -99,36 +99,9 @@ fn bench_stream_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_tokio_spawn_blocking(c: &mut Criterion) {
-    let mut group = c.benchmark_group("tokio_spawn_blocking");
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
-    // Single anchor at 1K: this group only documents tokio's per-spawn
-    // overhead ceiling; the same comparison (on identical data, against
-    // rayon) lives in `mixed_load`, which is the group A/B verdicts use.
-    {
-        let size = 1_000;
-        group.throughput(Throughput::Elements(size as u64));
-        group.bench_function(BenchmarkId::new("spawn_blocking_cpu", size), |b| {
-            b.iter(|| {
-                rt.block_on(async {
-                    let mut handles = Vec::with_capacity(size);
-                    for i in 0..size {
-                        handles.push(tokio::task::spawn_blocking(move || bb(cpu_work(i as u64))));
-                    }
-                    for h in handles {
-                        bb(h.await.unwrap());
-                    }
-                });
-            });
-        });
-    }
-    group.finish();
-}
-
 criterion_group! {
     name = benches;
     config = common::criterion();
-    targets = bench_stream_pipeline, bench_tokio_spawn_blocking
+    targets = bench_stream_pipeline
 }
 criterion_main!(benches);

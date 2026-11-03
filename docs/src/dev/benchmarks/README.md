@@ -6,7 +6,7 @@ Caliber note: comparisons against rayon borrow the input on both sides (`pipe_re
 
 ## Suite budget (quick config)
 
-A full-suite pass with criterion's defaults costs over an hour. All bench targets share `crates/youpipe/benches/common/mod.rs`, which defaults to the verdict-proven interleaved-A/B regime, 20 samples, 1 s warm-up, 2 s measurement, about 3.5 s per bench id and a full suite of about 10 min including compile, and shrinks each group's size axis to its two anchors (the dropped midpoints interpolate monotonically, see the group comments for specifics). Every knob is env-overridable without code edits, and the override applies to both sides of any A/B equally, so fairness is preserved:
+A full-suite pass with criterion's defaults costs over an hour. All bench targets share `crates/youpipe/benches/common/mod.rs`, which defaults to the verdict-proven interleaved-A/B regime: 20 samples, 1 s warm-up, 2 s measurement, about 3.5 s per bench id and a full suite of about 10 min including compile. The size axes live in the bench sources themselves: every group's hardcoded size list is its two anchors (regime endpoints; the dropped midpoints interpolate monotonically — each group's comment records which points were dropped and why, e.g. `sync_filter`'s 10K or `io_async`'s 500). Every knob is env-overridable without code edits, and the override applies to both sides of any A/B equally, so fairness is preserved:
 
 ```sh
 # full-treatment config for a single deep-dive bench
@@ -18,14 +18,14 @@ For A/B verdicts use `perf/bench-suite` (interleaved rounds, CPU pinning, median
 
 ### Exploratory sweeps (`--sweep`)
 
-When the goal is scanning one revision for hot ids rather than a verdict, part of the full 273-id grid is ballast: the rayon/tokio/sequential drift-control ids (24 bench call sites across the grid; `sync_vs_rayon` + `unbalanced` hold 49 % of all ids and roughly a third of those two are drift anchors) exist to catch cross-library drift *between the two sides of an A/B* — a single-sided sweep cannot read that signal — and >2-size families interpolate monotonously between their anchors. `bench_ab.sh --sweep -a wt` runs one side over the trimmed core (criterion `--list` + a python filter; ~220 of 273 ids, ~3 min off the ~16 min criterion pass) and prints a per-id median-of-rounds table at the end:
+When the goal is scanning one revision for hot ids rather than a verdict, part of the full 246-id grid is ballast: the rayon/tokio/sequential drift-control ids (30 bench call sites across the grid; `sync_vs_rayon` + `unbalanced` hold 48 % of all ids and about 42 % of those two are drift anchors) exist to catch cross-library drift *between the two sides of an A/B* — a single-sided sweep cannot read that signal — and >2-size families (only env-expanded grids such as `ZSTD_SHAPE_NS` now; the default grid is all two-anchor) interpolate monotonously between their anchors. `bench_ab.sh --sweep -a wt` runs one side over the trimmed core (criterion `--list` + a python filter; ~187 of 246 ids, minutes off the criterion pass) and prints a per-id median-of-rounds table at the end:
 
 ```sh
 perf/bench-suite/bench_ab.sh --sweep -a wt              # whole trimmed grid
 perf/bench-suite/bench_ab.sh --sweep -a wt -r 1 -B sync_vs_rayon   # one binary, one round
 ```
 
-What a sweep loses by design: cross-library drift visibility (no rayon/tokio anchors on any side) and the dropped midpoints of the few >2-size families. Never use `--sweep` for verdicts — `compare.py` needs both sides and the drift-control ids on them; the flag refuses explicit filters to keep the two modes from being mixed.
+What a sweep loses by design: cross-library drift visibility (no rayon/tokio anchors on any side) and the dropped midpoints of any env-expanded >2-size families. Never use `--sweep` for verdicts — `compare.py` needs both sides and the drift-control ids on them; the flag refuses explicit filters to keep the two modes from being mixed.
 
 ## Interleaved A/B tooling (`perf/bench-suite`)
 

@@ -390,7 +390,9 @@ range).
 mod.rs) ≈ **16 min for one full criterion pass**. The grid:
 sync_vs_rayon 88, unbalanced 46, sync_fuse 26, io_async 24, expand 16,
 graph_shapes 16, pool_reuse 12, sharded_term 12, channel_bench 10,
-async_vs_tokio 9, sharded_term_async 8, mixed_load 6. `horizontal` is a
+async_vs_tokio 9, sharded_term_async 8, mixed_load 6. (Superseded by the
+2026-11-04 grid trim below — current grid: 246 ids, per-binary counts
+there.) `horizontal` is a
 custom scenario harness (not criterion; 69 scenario×lib×n cells in the
 current results.json × 5 rounds × ~0.7 s measure ≈ 8–15 min a pass);
 youpipe-bench adds 4 one-shot bins (convoy-probe, file-encrypt,
@@ -443,6 +445,41 @@ Benches:
   (~220 of 273 ids), median-of-rounds readout; A/B mode untouched.
   Verified end-to-end on `channel_bench` (10/10 ids kept — the group has
   no drift anchors; note criterion's `--sample-size` minimum is 10).
+
+### Bench grid trim (2026-11-04)
+
+Default-grid de-duplication, 31 ids dropped (pre-trim actual 277 — the
+census's 273 predated two additions — → 246; ~1.5 min off the criterion
+pass). A/B verdict mode unaffected: `compare.py` joins on common ids and
+every family keeps its rayon/tokio/sequential drift anchors at both
+remaining sizes. Dropped, with the signal each row lost and why that is
+acceptable:
+
+- `sync_filter` 10K (4 ids): midpoint between the 1K/100K anchors, same
+  policy the file already applied to `sync_cpu_heavy` (merge-tree cost
+  monotone in size).
+- `sync_reduce` 10K + 100K (10 ids): midpoints of the 1K/1M span
+  (setup-dominated → memory-bandwidth-bound, mirroring `sync_lightweight`).
+  The old-path (`collect_sum`) divergence grows monotonically with size;
+  anchors bracket the crossover.
+- `filter_selectivity` keep50 (4 ids): midpoint of the survival-rate axis,
+  bracketed by keep10/keep90 and neighboured by `sync_filter`'s ~33 % row.
+- `io_async_pure`/`io_async_mixed` 500 (8 ids): same latency-dominated
+  regime as the 200 anchor (≤ 1 item per consumer at io_concurrency 512);
+  2000 keeps the steady-state regime. Sleep-bound ids, so ~28 s of the
+  saving.
+- `pool_reuse` 10K (4 ids): pool share shrinks monotonically with batch
+  size; 1K (lifecycle-dominated) and 100K (share vanished) bracket it.
+- `tokio_spawn_blocking/spawn_blocking_cpu/1000` (1 id): duplicated the
+  tokio spawn-blocking ceiling row that `mixed_load` keeps at 1K *and*
+  100K (its own comment pointed there as the canonical location).
+
+Post-trim grid: sync_vs_rayon 72, unbalanced 46, sync_fuse 26, io_async 16,
+expand 18, graph_shapes 16, pool_reuse 8, sharded_term 12, channel_bench 10,
+async_vs_tokio 8, sharded_term_async 8, mixed_load 6 (246 total). Every
+default-grid family is now two-anchor in the source size lists (the
+group comments record the dropped midpoints); `--sweep` therefore trims
+drift anchors only (~187 of 246 kept).
 
 ## Where the time goes
 

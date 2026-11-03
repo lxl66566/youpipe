@@ -15,10 +15,13 @@ Simulated IO uses `tokio::time::sleep` (90% × 1 ms, 10% × 8 ms tail), a wait t
 
 ### Pure IO (`io_async_pure`)
 
+Grid anchors: 200 (latency-dominated) and 2000 (steady-state); the 500
+midpoint was dropped from the grid in the 2026-11 trim (same regime as
+200, interpolated; see testing.md "Bench grid trim").
+
 | Size | youpipe_async | youpipe_blocking | youpipe_blocking_oversub | tokio_async_native | tokio_spawn_blocking |
 | ---- | ------------- | ---------------- | ------------------------ | ------------------ | -------------------- |
 | 200  | ~9.21 ms      | ~16.52 ms        | ~9.11 ms                 | ~9.16 ms           | ~8.39 ms             |
-| 500  | ~9.38 ms      | ~34.72 ms        | ~8.52 ms                 | ~9.29 ms           | ~8.77 ms             |
 
 `youpipe_async` matches `tokio_async_native` (the async ceiling) within ~3 % and stays well ahead of `youpipe_blocking`. `tokio_spawn_blocking` edges it via tokio's 512-thread blocking pool, aggressive OS-thread oversubscription that only pays off for pure-sleep (no CPU) work. The gap to the async ceiling shrank after two changes: eliminating the sync→async bridge thread for `stream(..).stage_async(..)` (the feeder pushes into a mixed-mode `SyncSender` + `AsyncReceiver` channel that the AsyncStage consumes directly, see the `StreamPipe` section of [core-types.md](../core-types.md)), and replacing the collector's per-item `recv().await` with a `try_recv` burst-drain that absorbs tokio's timer-tick completion bursts without per-item waker overhead.
 
@@ -26,12 +29,13 @@ Simulated IO uses `tokio::time::sleep` (90% × 1 ms, 10% × 8 ms tail), a wait t
 
 ### Mixed CPU (sync) + IO (`io_async_mixed`)
 
+Same anchor policy as `io_async_pure` (500 midpoint dropped 2026-11).
+
 | Size | youpipe_mixed_async | youpipe_mixed_blocking | tokio_mixed_blocking |
 | ---- | ------------------- | ---------------------- | -------------------- |
 | 200  | ~9.31 ms            | ~28.6 ms               | ~8.92 ms             |
-| 500  | ~9.55 ms            | ~63.2 ms               | ~10.08 ms            |
 
-`youpipe_mixed_async` stays well ahead of the all-blocking two-stage baseline, and at size 500 edges out `tokio_mixed_blocking` by ~150 µs: the async path overlaps the CPU and IO stages on separate pools, while the all-blocking path splits one compute pool between two blocking stages. At size 200 the fixed per-run setup cost (feeder, channel allocation, runtime entry) is a larger fraction of the ~9 ms total, so tokio's simpler spawn-per-item model still leads there.
+`youpipe_mixed_async` stays well ahead of the all-blocking two-stage baseline, and historically edged out `tokio_mixed_blocking` by ~150 µs already at the dropped 500 midpoint (a noise-level margin): the async path overlaps the CPU and IO stages on separate pools, while the all-blocking path splits one compute pool between two blocking stages. At size 200 the fixed per-run setup cost (feeder, channel allocation, runtime entry) is a larger fraction of the ~9 ms total, so tokio's simpler spawn-per-item model still leads there.
 
 ## Sharded terminal fan-in A/B (`sharded_term`, 2026-09-29)
 

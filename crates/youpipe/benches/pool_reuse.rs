@@ -4,7 +4,7 @@
 //! Every fused terminal with a non-default worker budget builds and tears
 //! down an `ExecPool::Owned` pool inside the timed region; this group makes
 //! that ~ms cost visible against the same run on a pre-created pool, across
-//! small/medium/large inputs (pool share shrinks as the batch grows).
+//! small/large inputs (pool share shrinks monotonically as the batch grows).
 //!
 //! Variants per size (all on the same cheap per-item op so the framework +
 //! pool lifecycle share dominates at small n):
@@ -39,7 +39,9 @@ fn cheap(x: u64) -> u64 {
 
 fn bench_pool_reuse(c: &mut Criterion) {
     let mut group = c.benchmark_group("pool_reuse");
-    for size in [1_000usize, 10_000, 100_000] {
+    // 1K / 100K anchors: pool lifecycle dominates at 1K, its share has
+    // vanished by 100K; the 10K midpoint interpolates monotonically.
+    for size in [1_000usize, 100_000] {
         group.throughput(Throughput::Elements(size as u64));
         let pool8 = ComputePool::new(8);
 
