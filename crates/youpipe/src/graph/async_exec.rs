@@ -120,6 +120,20 @@ impl<T: Send + Unpin + 'static> AsyncFanIn<T> {
             // ready future in poll order is the round's fair pick. The
             // per-input slots move out of `iter_mut` (disjoint borrows); the
             // rotation shuffles (ring, slot) pairs, not raw indices.
+            //
+            // `pairs`/`order`/`futs` are fresh per park episode, and both
+            // hoist levers of todo #32 were falsified on the
+            // `fanin_async_*` family (3-sided recompile A/B, 5 per-id
+            // isolated rounds, 2026-11-05): replacing the
+            // collected-and-rotated pairs Vec with a `split_at_mut(cursor)`
+            // walk measured sub-noise (every async id leaned faster,
+            // -0.5..-1.4 %, below the 2 % floor — neutral, reverted), and
+            // additionally hoisting `order` into an AsyncFanIn field
+            // REGRESSED the @1K ids +2.1..+2.4 % vs the rotation alone
+            // (0/25 round pairs) — the same hot-path-disturbance class as
+            // the sync FanIn order hoist (2026-10-25). `futs` cannot be
+            // hoisted at all: it borrows `slots`, so storing it would be
+            // self-referential.
             let closed = &self.closed;
             let rxs = &self.rxs;
             let mut pairs: Vec<_> = self.slots.iter_mut().enumerate().collect();

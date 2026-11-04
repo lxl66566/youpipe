@@ -16,6 +16,11 @@
 //!   all-pass-through diamond isolates the broadcast-clone + fair fan-in poll cost; two sources
 //!   into one node (2n items total) isolates the fan-in poll alone. Compare against
 //!   `chain_cheap_graph` for the added per-item cost of each shape.
+//! * `fanin_async_*_graph` — graph-only async twin of `fanin_cheap_graph`: two `source_async`
+//!   feeders into one `node_async` (default task fan-out), so the consumer population parks in
+//!   `AsyncFanIn::anchor`'s any-of-N combinator on every empty-input gap — the regime the
+//!   per-episode anchor allocation (todo #32) is visible in. `cpu` vs `cheap` pairs the
+//!   channel/park-dominated read with the amortized one.
 //!
 //! Same-binary engine selection via `YOUPIPE_GRAPH_VARIANT=graph|stream`
 //! (unset = both), mirroring `sync_fuse`'s knob so recompile layout noise
@@ -196,6 +201,53 @@ fn run_fanin_graph(v1: Vec<u64>, v2: Vec<u64>) -> u64 {
     total.load(Ordering::Relaxed)
 }
 
+/// One async source's item pull: the k-th call resolves the k-th item
+/// (`None` past the end). `Fn` (not `FnMut`) + repeated calls force the
+/// cursor through an `AtomicU64`; `ready` is the instant-return future
+/// (the same shape `sharded_term_async` uses), so producer pacing comes
+/// only from the ring's backpressure.
+#[cfg(feature = "tokio-runtime")]
+fn counter_source(
+    v: Vec<u64>,
+) -> impl Fn() -> std::future::Ready<Option<u64>> + Send + Sync + 'static {
+    let items = Arc::new(v);
+    let next = Arc::new(AtomicU64::new(0));
+    move || {
+        let k = usize::try_from(next.fetch_add(1, Ordering::Relaxed)).ok();
+        std::future::ready(k.and_then(|k| items.get(k).copied()))
+    }
+}
+
+/// Two async sources (n items each) fanned into one async node with the
+/// default task fan-out: the async twin of [`run_fanin_graph`]'s fair
+/// fan-in. The node's task population (128 by default) contends for two
+/// rings, so most woken tasks find both empty and re-park in
+/// `AsyncFanIn::anchor`'s any-of-N combinator — the park-heavy regime the
+/// per-episode anchor allocation (todo #32) lives in. Each `g.run()` also
+/// lazily builds the async runtime backend, a fixed cost the @1K rows
+/// carry on top of the per-item path.
+#[cfg(feature = "tokio-runtime")]
+fn run_fanin_async_graph(v1: Vec<u64>, v2: Vec<u64>, cheap: bool) -> u64 {
+    let total = Arc::new(AtomicU64::new(0));
+    let acc = Arc::clone(&total);
+    let mut g = graph();
+    let s1 = g.source_async("s1", counter_source(v1));
+    let s2 = g.source_async("s2", counter_source(v2));
+    let m = g.node_async("m", move |x: u64| async move {
+        if cheap {
+            bump(x)
+        } else {
+            bb(cpu_work(x))
+        }
+    });
+    let out = g.sink("out", move |x: u64| {
+        acc.fetch_add(x, Ordering::Relaxed);
+    });
+    g.edge(s1, m).edge(s2, m).edge(m, out);
+    g.run();
+    total.load(Ordering::Relaxed)
+}
+
 fn bench_graph_shapes(c: &mut Criterion) {
     // Never cancelled: `with_cancel` only forces the streaming topology on
     // the stream side, it must not change the work done.
@@ -269,6 +321,20 @@ fn bench_graph_shapes(c: &mut Criterion) {
                     );
                 },
             );
+            #[cfg(feature = "tokio-runtime")]
+            for (tag, cheap) in [("cpu", false), ("cheap", true)] {
+                group.bench_with_input(
+                    BenchmarkId::new(format!("fanin_async_{tag}_graph"), size),
+                    &data,
+                    |b, data| {
+                        b.iter_batched(
+                            || (warm_clone(data), warm_clone(data)),
+                            |(v1, v2)| bb(run_fanin_async_graph(v1, v2, cheap)),
+                            BatchSize::PerIteration,
+                        );
+                    },
+                );
+            }
         }
         if want(Side::Stream) {
             group.bench_with_input(
