@@ -692,16 +692,17 @@ fn anchor_claim<T: Send + 'static>(
 }
 
 /// Push a released fence batch into the downstream channel (`todo #4` fix,
-/// `YOUPIPE_FWD_BATCH`).
+/// `YOUPIPE_FWD_BATCH`, default on).
 ///
-/// `batched == false`: one blocking `send` per item (baseline).
+/// `batched == false`: one blocking `send` per item (the `"0"` escape).
 /// `batched == true`: [`SendItem::send_batch`] claims the longest sendable
 /// prefix with one tail CAS per run (falling back to per-item `try_send` on
 /// backings without a native batch op) and parks only on the unsent
 /// remainder — once per full ring, not per item. The fence-output channel
 /// is the serial-supplier→crowd interface where a per-item blocking send
 /// serializes a wake RTT into every item under a crowd of downstream
-/// workers.
+/// workers; the batched arm also merges the batch's consumer wakes into one
+/// `fire_n` registry acquisition (see `handoff::fwd_batch_enabled`).
 ///
 /// Arrival order within a batch was never a contract — unordered output
 /// interleaves workers anyway, ordered runs re-sequence by `seq` in the

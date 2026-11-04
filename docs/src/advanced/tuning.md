@@ -17,8 +17,8 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker SPSC shards (default on; `"0"` = shared ring) | streaming (sync/expand terminals) | leave on for multi-worker terminals; the shared ring only wins single-worker terminals, which never shard anyway |
 | `YOUPIPE_BATCH_RECV` | batched ring claims on the streaming data plane (default on, cap 64; `"0"` = per-item) | streaming | leave on; pairs with `YOUPIPE_SHARDED_TERM` — the two share the default |
 | `YOUPIPE_SHARDED_TERM_ASYNC` | async terminal channel = per-task-group async shards | streaming (async terminals) | async-only chain whose feeder saturates the single output ring (niche; a measured loss on sync-fed async terminals) |
-| `YOUPIPE_SPIN_ANCHOR` | adaptive pre-anchor `try_recv` spin window (µs) in sync worker recv loops | streaming | convoy collapse: serial supplier (feeder/fence) feeding ≥ ~10 workers, run times ~items × 2 µs (see [dev/streaming](../dev/streaming.md)) |
-| `YOUPIPE_FWD_BATCH` | fence forwarder pushes released batches via `try_send` | streaming | rarely useful alone; pairs with `YOUPIPE_SPIN_ANCHOR` on fence-heavy chains |
+| `YOUPIPE_SPIN_ANCHOR` | adaptive pre-anchor `try_recv` spin window (µs) in sync worker recv loops | streaming | convoy collapse on shapes the defaults exclude: `Barrier` fences, pinned buffers, or a residual slow-mode sighting (see [dev/streaming](../dev/streaming.md)) |
+| `YOUPIPE_FWD_BATCH` | fence forwarder flushes released chunks via `try_send_batch` (default on; `"0"` = per-item `send`) | streaming (fence forwarder) | leave on — it caps the fence convoy's tail at every size; `"0"` only to isolate the knob in a bench |
 | `YOUPIPE_CHAIN_FLOOR` | unpinned channel capacities of chains with an async stage or a `Chunked` fence floor at `min(n, 65536)` slots (default on; `"0"` = unfloored; a decimal = an explicit tier) | streaming | leave on — it removes the async and fence convoy slow modes; escape only to pin backpressure tightly (per-stage `buffer` pins are the better tool) or to lower the tier on zero-CPU latency-critical chains |
 | `YOUPIPE_GRAPH_TX_BATCH` | graph node/source outputs flushed per claim batch (`try_send_batch` per edge; default on; `"0"` = per-item `send`) | graph | leave on — the per-item loops cost 2–3× on light items; `"0"` only to isolate the knob in a bench |
 | `YOUPIPE_STREAM_TX_BATCH` | stream stage/expand workers flush the mapped claim batch (`try_send_batch` per free run; default on; `"0"` = per-item `send`) | streaming (pure-sync chains — async-tailed chains always keep per-item) | leave on — 1.6–3× on multi-stage light-item chains; `"0"` only to isolate the knob in a bench |
@@ -94,17 +94,19 @@ the convoy pathology (per-item futex park+wake at every
 serial-supplier→crowd channel: collapsed fence runs 180–254 ms → 27–57 ms
 @100K, parks 90–197K/run → 0.3–2.6K) at the cost of ~2–4× versus a lucky
 fast seed in shapes that were already fast, plus on-CPU spinning while a
-channel is live-but-sparse. Both convoy families now have a default
-capacity-side answer (the [`YOUPIPE_CHAIN_FLOOR`](#youpipe_chain_floor-chain-capacity-floor-streaming)
-lift): reach for the spin only when a fence chain still hits the residual
-slow mode at large `n` (the lift's rescue is coverage-graded, never fully
-zero) or on shapes the lift excludes — `Barrier`-mode fences and
-explicitly pinned buffers.
+channel is live-but-sparse. Both convoy families now have default answers
+(the [`YOUPIPE_CHAIN_FLOOR`](#youpipe_chain_floor-chain-capacity-floor-streaming)
+lift and the fence forwarder's batched flush, `YOUPIPE_FWD_BATCH`): reach
+for the spin only on the shapes those exclude — `Barrier`-mode fences with
+explicitly pinned buffers — or on a residual slow-mode sighting.
 
-`YOUPIPE_FWD_BATCH=1`: the fence forwarder drains a released chunk with
-back-to-back `try_send`, parking at most once per full ring. Measured no
-independent win while downstream workers still park per item on recv; keep
-for chains that already run `YOUPIPE_SPIN_ANCHOR`.
+`YOUPIPE_FWD_BATCH` (default on; `"0"` = per-item `send`): the fence
+forwarder flushes each released chunk through one `try_send_batch` per
+free run, parking at most once per full ring, and the chunk's consumer
+wakes go out under one registry acquisition instead of one contended lock
+per item. This is what caps the fence convoy's tail at every size (with
+the floor, @1K 890 → 145 µs; the slow-mode tail disappears outright up
+through 200K-scale runs); leave it on.
 
 `YOUPIPE_BATCH_RECV`: default on with cap 64 (unset or `"1"`); `"0"` =
 the per-item loops; `"N"` (2..=4096) = on with cap N. Batches the
@@ -181,12 +183,12 @@ backpressure-bound mode (async0_cheap/100K −30 %, tier A/B in
 [dev/benchmarks](../dev/benchmarks/attribution.md) "Floor-tier promotion").
 Fence: a `Chunked` fence chain collapses the same way at both
 serial-supplier→crowd interfaces (83 % of back-to-back runs @100K, median
-118 ms vs 9.6 ms fast); the floor drops that to ~1 % (mean −78 %), and the
-rescue holds at larger `n` coverage-graded (mean −70 % @200K, −87 % @1M)
-without ever reaching zero — `YOUPIPE_SPIN_ANCHOR` remains the complete
-opt-in fix for the residual. `Barrier`-mode fences never lift the chain
-(nothing overlaps a barrier; deep rings only add eager allocation), and
-pure-sync chains without a fence never lift either.
+118 ms vs 9.6 ms fast); the floor drops that to ~1 % (mean −78 %), with
+the large-`n` tail the forwarder's batched flush (`YOUPIPE_FWD_BATCH`,
+default on) then caps outright — on-side max 31.7 ms @200K vs the off
+side's 215 ms, no run above 60 ms. `Barrier`-mode fences never lift the
+chain (nothing overlaps a barrier; deep rings only add eager allocation),
+and pure-sync chains without a fence never lift either.
 
 Backpressure semantics are unchanged (bounded rings, blocking on `Full`
 past the floor), and explicit per-stage `buffer` pins win verbatim — to

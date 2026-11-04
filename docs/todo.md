@@ -13,11 +13,6 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 
 ---
 
-### 28. [P2] Fence-floor residual: slow-mode rate is coverage-graded at n ≫ 64K
-
-- Context: the chain floor's fence extension (2026-11-05) takes the collapsed-run rate from 67–87 % to ~1 % at n=100K, but the rescue is coverage-graded — 10–26 % slow at n=200K (tier 64K covers n/3), and `buffer = n` still reads ~10 % there, so a bigger tier is not a clean fix either (64K beats n on the fast mode at 100K). `YOUPIPE_SPIN_ANCHOR` remains the complete opt-in.
-- Candidate directions if revisited: an n-scaled fence tier under a byte budget (`min(n, 8 MiB / slot)`); a forwarder-side release-burst change (the fence-output interface's arrival rhythm, distinct from ring depth); per-ring decomposition of the lift (feeder vs fenced ring) to see which carries the rescue. All need the paired multi-process soak caliber — single-process cells are bistable (a screen read 0/12 slow where the soak read 4/104).
-
 ### 14. [P1] pipeline_integration intermittent hang, residual (stream side)
 
 - Context: the graph-engine occurrences are root-caused and fixed (2026-10-23, [benchmarks/graph.md](src/dev/benchmarks/graph.md)); the crossfire waker fire-steal — both faces (§12.5 cross-registry stale entry, §12.6 pop/wake waiter migration) — is fixed in the fork, records in [dev/crossfire-waker-designs.md](src/dev/crossfire-waker-designs.md). Attribution for the 09-28 stream-side occurrence remains circumstantial (no runtime evidence).

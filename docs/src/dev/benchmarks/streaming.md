@@ -152,7 +152,7 @@ Parallelism fix riding along, the share cap: promoting the pair exposed what the
 
 Criterion confirmation on the final binary (`bench_ab.sh -E`, old defaults `=0/=0` vs new default unset, 3 per-id isolated rounds; the flip changes only the readers' defaults, so this re-measures the four-combo on the promotion tree): every `sharded_term` id won 9/9, @100K single_unordered 29.9→11.9 ms, single_ordered 53.1→12.3 ms (old side bimodal, 75 % spread), workers2 4.46→1.14 ms, expand 47.3→21.7 ms, multi2 23.2→18.3 ms; @1K −21…−47 %; `sync_fuse/fence_infra/100000` 152.6→111.1 ms (old side in the documented collapsed mode); the fused control `mixed_load/youpipe_stream_cpu/1000` −0.5 % noise (the 100K control read +14.6 % with 19 % spread and 2/9 dominance; the same control measured ±0.5 % in the four-combo, and the knobs cannot touch the fused path, which has no channels, so treat it as draw wobble).
 
-Decision: the pair is the default. `YOUPIPE_SHARDED_TERM` and `YOUPIPE_BATCH_RECV` unset = on (cap 64); `"0"` on either recovers the shared-ring / per-item configuration. `YOUPIPE_SHARDED_TERM_ASYNC` stays off (falsified on sync-fed async terminals), and `YOUPIPE_SPIN_ANCHOR` / `YOUPIPE_FWD_BATCH` stay opt-in (their cost faces are load-shape-local: the spin's 2–4× lucky-fast-seed cost and idle burn). Note for deterministic-Ir baselines: the flip changes the streaming paths' instruction counts by design, so re-save gungraun baselines after this change.
+Decision: the pair is the default. `YOUPIPE_SHARDED_TERM` and `YOUPIPE_BATCH_RECV` unset = on (cap 64); `"0"` on either recovers the shared-ring / per-item configuration. `YOUPIPE_SHARDED_TERM_ASYNC` stays off (falsified on sync-fed async terminals), and `YOUPIPE_SPIN_ANCHOR` stays opt-in (its cost faces are load-shape-local: the spin's 2–4× lucky-fast-seed cost and idle burn); `YOUPIPE_FWD_BATCH` later flipped default-on with the chain floor live (2026-11-05, "Forwarder batch send promoted to default" below). Note for deterministic-Ir baselines: the flip changes the streaming paths' instruction counts by design, so re-save gungraun baselines after this change.
 
 ## Convoy fix A/B (`YOUPIPE_SPIN_ANCHOR` / `YOUPIPE_FWD_BATCH`, 2026-09-30)
 
@@ -167,7 +167,7 @@ Fix verdict for the convoy pathology (mechanism in [streaming.md](../streaming.m
 | soak 100K×10, 3 procs | mode wanders, 646 ms outlier | 26–107 ms, no ≥180 run |
 | yp-pool parks/run | 90–197 K (1–2/item) | 0.3–2.6 K |
 
-`async2/15-1` stays bimodal both ways (off 25–188, spin 29–309 ms): its slow mode parks on the collector (2.3/item) and the send side into the mixed async channel (1.2/item), not on the recv anchor, so it is outside the knob's reach (attribution in [streaming.md](../streaming.md)). Poll-ceiling sweep at spin=30: caps 1/8/16 regress or only partially heal the fence family (219/193/181 ms med) vs 64/128 (33–102 ms); tight polling bounces the ring stamps faster than items arrive. `FWD_BATCH` standalone gives no rescue (fence-auto med 205/165 ms) and combined with the spin is within noise. Both knobs stay default-off; per-shape guidance in [tuning](../../advanced/tuning.md).
+`async2/15-1` stays bimodal both ways (off 25–188, spin 29–309 ms): its slow mode parks on the collector (2.3/item) and the send side into the mixed async channel (1.2/item), not on the recv anchor, so it is outside the knob's reach (attribution in [streaming.md](../streaming.md)). Poll-ceiling sweep at spin=30: caps 1/8/16 regress or only partially heal the fence family (219/193/181 ms med) vs 64/128 (33–102 ms); tight polling bounces the ring stamps faster than items arrive. `FWD_BATCH` standalone gives no rescue at the then-default 256-slot ring (fence-auto med 205/165 ms) — a full ring never hands the batch a free prefix, so the arm never engaged; re-measured and promoted once the chain floor made it live ("Forwarder batch send promoted to default", below). The spin stays default-off; per-shape guidance in [tuning](../../advanced/tuning.md).
 
 Evidence-bench confirmation (`bench_ab.sh -E`, 5 per-id isolated interleaved rounds, same binary, median):
 
@@ -238,3 +238,23 @@ Same-binary knob A/B (`bench_ab.sh -E`, isolated per-id, 5 interleaved rounds, 3
 | async rows (post-gate), fused controls, mixed_load | ±1.5 % | noise |
 
 The async-tail gate: on `stage().stage().stage_async()` the batched delivery regressed **+4.9 % @100K (0/25)** with the mixed hop batched and still **+3.3 % @1K (0/25)** with only the mid-MPMC hop batched. Both hops of an async-tailed chain lose under send-side runs: the async terminal's task pacing does not benefit the way sync consumer loops do (convoy-probe async2: median +3–7 %, no slow mode on either side). The gate is `!ctx.has_async_stage`, the same predicate as the capacity floor, so async chains keep the per-item rhythm byte-for-byte and read ±1.5 % noise. The pre-gate 1K win (−14.4 %) was the mixed hop's, outweighed by its @100K cost; see [dead-ends.md](../dead-ends.md). Single-stage rows sit at noise: their only channel is the terminal shard ring, whose send-side CAS was already uncontended (sole producer); the win concentrates where sends contend (mid MPMC rings shared by k workers) or the claim share is small (workers2).
+
+## Forwarder batch send promoted to default (`YOUPIPE_FWD_BATCH`, 2026-11-05, todo #28)
+
+The fence forwarder's released chunks go out through `SendItem::send_batch` (one `try_send_batch` per free run + per-item blocking fallback) instead of one blocking `send` per item. The 2026-09-30 standalone A/B ("no independent rescue") measured the arm at the then-default 256-slot ring, where a full ring hands `try_send_batch` a zero-length free prefix every call — the batch never engaged. With the chain capacity floor live (default-on since 2026-11-05) the fenced ring holds slack and the arm engages; mechanism, paired soaks and the forensics decomposition in [streaming-forensics.md](../streaming-forensics.md) "Forwarder batch send promoted to default" (slow runs carry 0.5–0.85 yp-pool parks/item off; the batch merges the per-item `fire()` registry locks into one `fire_n` acquisition per chunk and hands the woken crowd whole chunks to `pop_batch`).
+
+Same-binary knob A/B (`bench_ab.sh -E off=YOUPIPE_FWD_BATCH=0 on=YOUPIPE_FWD_BATCH=1`, per-id isolated, 5 interleaved rounds, floor at its default on both sides):
+
+| id | off | on | Δ | verdict |
+| --- | --- | --- | --- | --- |
+| stream_pipeline/with_fence @1K | 1.022 ms | 145.6 µs | **−85.8 %** | 25/25 stable |
+| sync_fuse/fence_pair_cheap_merged @1K | 890.7 µs | 144.6 µs | **−83.8 %** | 25/25 stable |
+| sync_fuse/fence_pair_cpu_merged @1K | 879.3 µs | 144.6 µs | **−83.6 %** | 25/25 stable |
+| sync_fuse/fence_infra @1K | 864.7 µs | 144.9 µs | **−83.2 %** | 25/25 stable |
+| sync_fuse/fence_pair_{cheap,cpu}_split @1K | 373.3/345.8 µs | 114/112.5 µs | −69.5/−67.5 % | 25/25 stable |
+| stream_pipeline/with_fence @100K | 22.99 ms | 9.151 ms | **−60.2 %** | 25/25 dominant |
+| sync_fuse/fence_infra @100K | 24.07 ms | 9.397 ms | **−61.0 %** | 25/25 stable |
+| sync_fuse/fence_pair_{cpu,cheap}_merged @100K | 23.38/23.61 ms | 9.469/9.474 ms | −59.5/−59.9 % | 25/25 |
+| sync_fuse/fence_pair_{cpu,cheap}_split @100K | 7.857/7.731 ms | 7.254/7.253 ms | −7.7/−6.2 % | 25/25 / 24/25 |
+
+On-side spreads collapse to 0.8–4.2 % (off side 5–119 %) — the bistability the fence family carried at every size. The @1K rows are the quiet headline: the floor clamps to `min(n, 65536)` = n slots there, so small chains lived in the trickle regime the floor could not lift, and the batch arm removes it wholesale (890 → 145 µs). Paired fresh-process soaks (convoy-probe, 8–10 pairs × 12 runs): fence @200K off med 34.2 / max 215.1 / 12 runs >60 ms vs on med 21.7 / **max 31.7** / 0 runs >60 ms — the on side's maximum sits below the off side's median; @100K medians tie at ~12.4 with the off max 70 vs on max 16.7. Barrier mode benefits through the same arm (final-flush free-run claims; spot 45.0 → 31.7 ms mean @200K). The knob's only consumer is `forward_fenced`, so no-fence chains are structurally untouched. Default on; `"0"` recovers the per-item loop.

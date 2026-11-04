@@ -182,8 +182,8 @@ pub(crate) fn chain_floor_slots() -> Option<usize> {
 //
 // `YOUPIPE_SPIN_ANCHOR=<µs>` (unset/"0" = off): adaptive pre-anchor spin in
 // the sync worker recv loops (`spawn_stage` / `spawn_expand_stage` /
-// `forward_fenced`) — see `AnchorSpin`. `YOUPIPE_FWD_BATCH=1` (default
-// off): the fence forwarder pushes each released batch with `try_send`,
+// `forward_fenced`) — see `AnchorSpin`. `YOUPIPE_FWD_BATCH=0` (default
+// on): the fence forwarder pushes each released batch with `try_send_batch`,
 // parking at most once per full ring instead of paying a blocking send per
 // item. Runtime knobs rather than config fields so A/B benches compare the
 // same binary (recompiles swing tight benchmarks by tens of percent through
@@ -206,16 +206,29 @@ pub(crate) fn spin_anchor_us() -> u32 {
     })
 }
 
+// `YOUPIPE_FWD_BATCH`: the fence forwarder's released batches go out through
+// `SendItem::send_batch` (one `try_send_batch` per free run + per-item
+// blocking fallback) instead of one blocking `send` per item. Default ON;
+// "0" recovers the per-item loop. The 2026-09 standalone A/B read "no
+// independent rescue" because the default ring (256) sat full in steady
+// state — a full ring hands `try_send_batch` a zero-length free prefix every
+// time, so the batch arm never engaged. With the chain capacity floor
+// (default-on 2026-11) the fenced ring holds slack, the batch claims whole
+// chunks under one CAS, and `fire_n` merges the consumer wakes the per-item
+// sends paid one registry lock each; the convoy tail collapses with it
+// (readings in docs/src/dev/streaming-forensics.md "Forwarder batch send
+// promoted to default").
 static FWD_BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 pub(crate) fn fwd_batch_enabled() -> bool {
     *FWD_BATCH.get_or_init(|| match std::env::var("YOUPIPE_FWD_BATCH") {
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" || v.is_empty() => false,
+        Ok(v) if v == "1" || v.is_empty() => true,
+        Ok(v) if v == "0" => false,
         Ok(other) => {
             panic!("YOUPIPE_FWD_BATCH: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
         },
-        Err(_) => false,
+        // Unset = the default-on policy (see the knob comment above).
+        Err(_) => true,
     })
 }
 
