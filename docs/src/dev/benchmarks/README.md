@@ -71,6 +71,6 @@ Further traps are documented with the campaigns that exposed them: cross-commit 
 
 - [sync-fused.md](sync-fused.md): fused and sync-engine benches against rayon, from `sync_cpu_heavy` and pipeline fusion through input materialization, `try_collect`, the filter-chain collect variants, reduce terminals, on-pool nesting, expand-heavy, and adjacent-sync fusion.
 - [streaming.md](streaming.md): streaming benches, mixed load, async IO, sharded-terminal and batched-ring knob A/Bs with the default-policy soaks, the convoy fix, channel throughput, and stream worker tx batching.
-- [attribution.md](attribution.md): attribution and forensics, hotpath and data-plane probes, measurement traps (layout lottery, LLVM folding), NT-store and 2M/4M gap attribution, wake accounting, and the async-chain capacity floor.
+- [attribution.md](attribution.md): attribution and forensics, hotpath and data-plane probes, measurement traps (layout lottery, LLVM folding), NT-store and 2M/4M gap attribution, wake accounting, and the chain capacity floors.
 - [counters.md](counters.md): the horizontal cross-library comparison (charts, methodology, results) plus perf-event counters, deterministic instruction counts, and the lab bench crate layout.
 - [graph.md](graph.md): graph engine benches, the `graph_shapes` A/B and data-plane batching.

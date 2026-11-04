@@ -95,28 +95,41 @@ pub(crate) fn sharded_term_async_enabled() -> bool {
     })
 }
 
-// `YOUPIPE_ASYNC_CHAIN_FLOOR` lifts the unpinned stage-output channel
-// capacities (the feeder ring included) of async-tailed chains — any chain
-// containing an async stage: each such channel floors at
-// `min(n, ASYNC_CHAIN_FLOOR_SLOTS)` slots, byte-clamped per ring.
-// Mechanism (todo #4, "Async face re-attribution" in docs/src/dev/
-// streaming.md): the surviving async2 slow mode is a backpressure-driven
-// per-item wake chain; a capacity sweep showed every ring lifted to ~16K
-// slots removes it entirely (terminal-only decoupling to the full
-// in-flight bound `n` does NOT — the mid/mixed rings re-seed the chain —
-// and `buffer = n` measures slightly worse than 16K, paying the bigger
-// eager allocation's cache footprint). Pure-sync chains do not lift: sync2
-// shows no slow mode at the small default, so the floor binds only where
-// the runtime-task wake-RTT pacing exists. Explicit per-stage buffer pins
-// win verbatim (the caller opted into that exact backpressure). Runtime
-// knob so A/B benches compare the same binary.
+// `YOUPIPE_CHAIN_FLOOR` lifts the unpinned stage-output channel
+// capacities (the feeder ring included) of two chain families — any chain
+// containing an async stage, and any chain containing a `Chunked`-mode
+// fence: each such channel floors at `min(n, CHAIN_FLOOR_SLOTS)` slots,
+// byte-clamped per ring.
 //
-// Default ON (promoted with the A/B above: async2 soak 0/120 collapsed
+// Async-tailed chains (todo #4, "Async face re-attribution" in
+// docs/src/dev/streaming-forensics.md): the surviving async2 slow mode is
+// a backpressure-driven per-item wake chain; a capacity sweep showed every
+// ring lifted to ~16K slots removes it entirely (terminal-only decoupling
+// to the full in-flight bound `n` does NOT — the mid/mixed rings re-seed
+// the chain — and `buffer = n` measures slightly worse than 16K, paying
+// the bigger eager allocation's cache footprint).
+//
+// Chunked-fence chains: the fence convoy (per-item park+wake trickle at
+// every serial-supplier→crowd interface; "Convoy collapse forensics") —
+// the same capacity slack gives the feeder a `min(n, slots)` head start
+// and the forwarder's chunk releases a ring deep enough to never park,
+// so consumer bursts re-form (soak @100K: 67 % collapsed runs → ~1 %,
+// mean 99.6 → 17-23 ms; @200K 87 % → 10-20 %; the rescue is
+// coverage-graded and never fully zero — `YOUPIPE_SPIN_ANCHOR` remains
+// the complete opt-in fix). `Barrier`-mode fences are excluded: nothing
+// overlaps a barrier, so deep rings only add eager allocation (mean +28 %
+// on the barrier probe). Pure-sync chains without a fence do not lift:
+// sync2 shows no slow mode at the small default. Explicit per-stage
+// buffer pins win verbatim (the caller opted into that exact
+// backpressure). Runtime knob so A/B benches compare the same binary.
+//
+// Default ON (promoted with the A/Bs above: async2 soak 0/120 collapsed
 // runs vs 18-30/120 off, async0_cheap/100K −41.8 %, every async shape
-// 9/9 dominant, all sync families inert noise). "0" recovers the unfloored
-// sizing; a decimal slot count overrides the tier ("16384" reproduces the
-// 2026-10-22..25 default — kept for the zero-CPU latency corner where the
-// 1 MiB/ring L3 recycling costs ~2 % fast-mode median).
+// 9/9 dominant, all sync families inert noise; fence soak per the
+// paragraph above). "0" recovers the unfloored sizing; a decimal slot
+// count overrides the tier ("16384" reproduces the 2026-10-22..25 async
+// default — kept for the zero-CPU latency corner where the 1 MiB/ring L3
+// recycling costs ~2 % fast-mode median).
 
 /// Slot floor for the lifted channels. 2026-10-22 landed at 16K (the
 /// smallest sweep value with zero collapsed runs, 4 proc x 12 runs per
@@ -128,35 +141,39 @@ pub(crate) fn sharded_term_async_enabled() -> bool {
 /// chains inert. The one cost: +2% fast-mode median on the zero-CPU
 /// forensic probe only (1 MiB/ring recycles through L3 where 256 KiB
 /// stayed inside one core's L2) — invisible on every cpu-bearing shape.
-pub(crate) const ASYNC_CHAIN_FLOOR_SLOTS: usize = 65536;
+/// The fence tier shares this constant: @100K 64K beat `buffer = n` on the
+/// fast mode (p10 5.2 vs 12.6 ms, same eager-alloc mechanism as the async
+/// sweep); higher tiers only trade small-n quality for a residual that
+/// never reaches zero (n=200K: 64K 20 % collapsed vs n 10 %).
+pub(crate) const CHAIN_FLOOR_SLOTS: usize = 65536;
 
 /// Byte budget for the lift: bounded rings allocate every slot up front,
 /// so one lifted ring costs `cap x size_of::<SLOT>()` bytes. Beyond the
 /// budget the floored `buffer_size` stays — large payloads amortize the
 /// wake-RTT pathology anyway (per-item work dwarfs the ~1-2 µs RTT).
-pub(crate) const ASYNC_CHAIN_FLOOR_BYTES: usize = 8 << 20;
+pub(crate) const CHAIN_FLOOR_BYTES: usize = 8 << 20;
 
-static ASYNC_CHAIN_FLOOR: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+static CHAIN_FLOOR: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
 
 /// Resolved floor tier: `None` = the knob is off (unfloored sizing),
 /// `Some(slots)` = lift to `min(n, slots)` (byte-clamped per ring).
-/// Values: unset/`"1"` = on at the `ASYNC_CHAIN_FLOOR_SLOTS` tier, `"0"` =
+/// Values: unset/`"1"` = on at the `CHAIN_FLOOR_SLOTS` tier, `"0"` =
 /// off, a decimal `>= 2` = on at that explicit slot count (the tier A/B
 /// caliber; `1` stays boolean so the bool reading cannot silently become a
 /// one-slot floor).
-pub(crate) fn async_chain_floor_slots() -> Option<usize> {
-    *ASYNC_CHAIN_FLOOR.get_or_init(|| match std::env::var("YOUPIPE_ASYNC_CHAIN_FLOOR") {
-        Ok(v) if v == "1" || v.is_empty() => Some(ASYNC_CHAIN_FLOOR_SLOTS),
+pub(crate) fn chain_floor_slots() -> Option<usize> {
+    *CHAIN_FLOOR.get_or_init(|| match std::env::var("YOUPIPE_CHAIN_FLOOR") {
+        Ok(v) if v == "1" || v.is_empty() => Some(CHAIN_FLOOR_SLOTS),
         Ok(v) if v == "0" => None,
         Ok(other) => match other.parse::<usize>() {
             Ok(n) if n >= 2 => Some(n),
             _ => panic!(
-                "YOUPIPE_ASYNC_CHAIN_FLOOR: invalid value {other:?} (leave unset or use \"0\" \
-                 \"1\", or an explicit slot count >= 2)"
+                "YOUPIPE_CHAIN_FLOOR: invalid value {other:?} (leave unset or use \"0\" \"1\", or \
+                 an explicit slot count >= 2)"
             ),
         },
         // Unset = the default-on policy (see the knob comment above).
-        Err(_) => Some(ASYNC_CHAIN_FLOOR_SLOTS),
+        Err(_) => Some(CHAIN_FLOOR_SLOTS),
     })
 }
 

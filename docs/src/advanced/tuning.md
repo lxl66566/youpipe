@@ -19,7 +19,7 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `YOUPIPE_SHARDED_TERM_ASYNC` | async terminal channel = per-task-group async shards | streaming (async terminals) | async-only chain whose feeder saturates the single output ring (niche; a measured loss on sync-fed async terminals) |
 | `YOUPIPE_SPIN_ANCHOR` | adaptive pre-anchor `try_recv` spin window (µs) in sync worker recv loops | streaming | convoy collapse: serial supplier (feeder/fence) feeding ≥ ~10 workers, run times ~items × 2 µs (see [dev/streaming](../dev/streaming.md)) |
 | `YOUPIPE_FWD_BATCH` | fence forwarder pushes released batches via `try_send` | streaming | rarely useful alone; pairs with `YOUPIPE_SPIN_ANCHOR` on fence-heavy chains |
-| `YOUPIPE_ASYNC_CHAIN_FLOOR` | unpinned channel capacities of async-tailed chains floor at `min(n, 65536)` slots (default on; `"0"` = unfloored; a decimal = an explicit tier) | streaming (chains with an async stage) | leave on — it removes the async convoy slow mode; escape only to pin backpressure tightly (per-stage `buffer` pins are the better tool) or to lower the tier on zero-CPU latency-critical chains |
+| `YOUPIPE_CHAIN_FLOOR` | unpinned channel capacities of chains with an async stage or a `Chunked` fence floor at `min(n, 65536)` slots (default on; `"0"` = unfloored; a decimal = an explicit tier) | streaming | leave on — it removes the async and fence convoy slow modes; escape only to pin backpressure tightly (per-stage `buffer` pins are the better tool) or to lower the tier on zero-CPU latency-critical chains |
 | `YOUPIPE_GRAPH_TX_BATCH` | graph node/source outputs flushed per claim batch (`try_send_batch` per edge; default on; `"0"` = per-item `send`) | graph | leave on — the per-item loops cost 2–3× on light items; `"0"` only to isolate the knob in a bench |
 | `YOUPIPE_STREAM_TX_BATCH` | stream stage/expand workers flush the mapped claim batch (`try_send_batch` per free run; default on; `"0"` = per-item `send`) | streaming (pure-sync chains — async-tailed chains always keep per-item) | leave on — 1.6–3× on multi-stage light-item chains; `"0"` only to isolate the knob in a bench |
 
@@ -94,10 +94,12 @@ the convoy pathology (per-item futex park+wake at every
 serial-supplier→crowd channel: collapsed fence runs 180–254 ms → 27–57 ms
 @100K, parks 90–197K/run → 0.3–2.6K) at the cost of ~2–4× versus a lucky
 fast seed in shapes that were already fast, plus on-CPU spinning while a
-channel is live-but-sparse. Leave off unless the shape matches the
-pathology; it cannot help async-terminal chains (their slow mode parks on
-the send side and the collector, not the recv anchor) — those are covered
-by the default `YOUPIPE_ASYNC_CHAIN_FLOOR` lift instead.
+channel is live-but-sparse. Both convoy families now have a default
+capacity-side answer (the [`YOUPIPE_CHAIN_FLOOR`](#youpipe_chain_floor-chain-capacity-floor-streaming)
+lift): reach for the spin only when a fence chain still hits the residual
+slow mode at large `n` (the lift's rescue is coverage-graded, never fully
+zero) or on shapes the lift excludes — `Barrier`-mode fences and
+explicitly pinned buffers.
 
 `YOUPIPE_FWD_BATCH=1`: the fence forwarder drains a released chunk with
 back-to-back `try_send`, parking at most once per full ring. Measured no
@@ -162,22 +164,29 @@ Its sole measured winner is the async-only feeder-saturated chain at
 −57.5 % (readings: [dev/benchmarks](../dev/benchmarks/streaming.md)); reach for it
 only on that shape.
 
-## `YOUPIPE_ASYNC_CHAIN_FLOOR`: async-chain capacity floor (streaming)
+## `YOUPIPE_CHAIN_FLOOR`: chain capacity floor (streaming)
 
-Default (unset or `"1"`): when the chain contains an async stage, every
-unpinned channel it builds — each stage's output ring and the feeder ring —
-floors at `min(n, 65536)` slots, byte-clamped at 8 MiB per ring; `"0"`
-recovers the unfloored sizing, and an explicit decimal slot count overrides
-the tier (`"16384"` is the 2026-10-22 tier). The slack removes the async
-convoy slow mode: with the small default buffers a sync-prefix→`stage_async`
-chain collapses into a per-item park+wake chain paced by wake latency (~20 %
-of back-to-back runs at 100K items; 130–230 ms vs 18–21 ms fast), and the
-floor takes the collapsed runs to zero while tightening the fast mode; the
-64K tier additionally keeps the async-only chain out of its residual
+Default (unset or `"1"`): when the chain contains an async stage or a
+`Chunked`-mode fence, every unpinned channel it builds — each stage's
+output ring and the feeder ring — floors at `min(n, 65536)` slots,
+byte-clamped at 8 MiB per ring; `"0"` recovers the unfloored sizing, and an
+explicit decimal slot count overrides the tier (`"16384"` is the 2026-10-22
+async tier). The slack removes both convoy slow modes. Async: with the
+small default buffers a sync-prefix→`stage_async` chain collapses into a
+per-item park+wake chain paced by wake latency (~20 % of back-to-back runs
+at 100K items; 130–230 ms vs 18–21 ms fast), and the floor takes the
+collapsed runs to zero while tightening the fast mode; the 64K tier
+additionally keeps the async-only chain out of its residual
 backpressure-bound mode (async0_cheap/100K −30 %, tier A/B in
 [dev/benchmarks](../dev/benchmarks/attribution.md) "Floor-tier promotion").
-Pure-sync chains never lift — their convoy face is the fence family,
-addressed by `YOUPIPE_SPIN_ANCHOR`.
+Fence: a `Chunked` fence chain collapses the same way at both
+serial-supplier→crowd interfaces (83 % of back-to-back runs @100K, median
+118 ms vs 9.6 ms fast); the floor drops that to ~1 % (mean −78 %), and the
+rescue holds at larger `n` coverage-graded (mean −70 % @200K, −87 % @1M)
+without ever reaching zero — `YOUPIPE_SPIN_ANCHOR` remains the complete
+opt-in fix for the residual. `Barrier`-mode fences never lift the chain
+(nothing overlaps a barrier; deep rings only add eager allocation), and
+pure-sync chains without a fence never lift either.
 
 Backpressure semantics are unchanged (bounded rings, blocking on `Full`
 past the floor), and explicit per-stage `buffer` pins win verbatim — to
@@ -186,7 +195,7 @@ the floor chain-wide. The lift's eager allocation is bounded per ring
 (65536 slots ≤ 8 MiB; small runs lift only to `n`). The one measurable
 cost of the 64K tier is ~2 % median on zero-CPU latency-bound chains
 (the 1 MiB ring recycles through L3 where the 16K tier's 256 KiB stayed
-inside L2); set `YOUPIPE_ASYNC_CHAIN_FLOOR=16384` if that corner is your
+inside L2); set `YOUPIPE_CHAIN_FLOOR=16384` if that corner is your
 shape.
 
 ## Worker budget across stages (streaming)
@@ -254,9 +263,9 @@ Per-channel capacity between stages, default 256. The effective capacity is
 `max(buffer_size, workers * 4)`, where `workers` is the fan-out of the stage
 producing into that channel — a floor so each of those workers has a few free
 slots ahead; an explicit `SyncStageOptions::buffer(n)` replaces that logic
-for that stage's output channel. Chains containing an async stage
-additionally apply the
-[`YOUPIPE_ASYNC_CHAIN_FLOOR`](#youpipe_async_chain_floor-async-chain-capacity-floor-streaming)
+for that stage's output channel. Chains containing an async stage or a
+`Chunked`-mode fence additionally apply the
+[`YOUPIPE_CHAIN_FLOOR`](#youpipe_chain_floor-chain-capacity-floor-streaming)
 lift (`min(n, 65536)`, byte-clamped) to every unpinned channel. Small
 buffers tighten backpressure (less peak memory); large ones absorb bursts.
 

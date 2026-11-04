@@ -1708,6 +1708,18 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
         false
     }
 
+    /// Whether this chain contains at least one `Chunked`-mode fence.
+    ///
+    /// Gates the chain capacity floor's fence family ([`StreamCtx::
+    /// stage_buffer`]): a `Chunked` fence overlaps its neighbours, so its
+    /// serial forwarder feeds a worker crowd through rings the convoy
+    /// pathology can collapse (see `handoff/mod.rs`). A `Barrier`-mode
+    /// fence is transparent here — nothing overlaps a barrier, so deep
+    /// rings only add eager allocation.
+    fn has_chunked_fence(&self) -> bool {
+        false
+    }
+
     /// Attempt a **fused pass-through** execution: compose the whole chain
     /// into a single [`RangeOp`] and collect `items` on the fused index core
     /// (hybrid dispatch + zero-copy [`Slots`](super::slots::Slots)) —
@@ -2067,9 +2079,10 @@ pub(crate) struct TermPolicy {
     // Read only on the async terminal paths (tokio-runtime).
     #[cfg_attr(not(feature = "tokio-runtime"), allow(dead_code))]
     sharded_async: bool,
-    /// `YOUPIPE_ASYNC_CHAIN_FLOOR`: async-tailed chains lift their unpinned
-    /// stage-output channel capacities (see `stage_buffer`). `None` = the
-    /// knob is off; `Some(slots)` = the floor tier.
+    /// `YOUPIPE_CHAIN_FLOOR`: chains with an async stage or a `Chunked`
+    /// fence lift their unpinned stage-output channel capacities (see
+    /// `stage_buffer`). `None` = the knob is off; `Some(slots)` = the
+    /// floor tier.
     chain_floor: Option<usize>,
 }
 
@@ -2078,7 +2091,7 @@ impl TermPolicy {
         Self {
             sharded: crate::handoff::sharded_term_enabled(),
             sharded_async: crate::handoff::sharded_term_async_enabled(),
-            chain_floor: crate::handoff::async_chain_floor_slots(),
+            chain_floor: crate::handoff::chain_floor_slots(),
         }
     }
 }
@@ -2119,11 +2132,18 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// `thread::spawn` per worker.
     pub dedicated_threads: bool,
     /// Whether the chain contains any async stage (`StageSpawn::
-    /// has_async_stage`). Gates the async-chain capacity floor in
-    /// [`Self::stage_buffer`]: pure-sync chains show no slow mode at the
-    /// small default, so the lift binds only where runtime-task wake-RTT
-    /// pacing exists.
+    /// has_async_stage`). Gates the async family of the chain capacity
+    /// floor in [`Self::stage_buffer`] (and keeps async-tailed chains on
+    /// per-item sends, `spawn_stage_fanout`'s `tx_batch`): pure-sync chains
+    /// show no slow mode at the small default, so the lift binds only where
+    /// runtime-task wake-RTT pacing exists.
     pub(crate) has_async_stage: bool,
+    /// Whether the chain contains a `Chunked`-mode fence (`StageSpawn::
+    /// has_chunked_fence`). Gates the fence family of the chain capacity
+    /// floor in [`Self::stage_buffer`]: the fence convoy lives on rings a
+    /// `Chunked` forwarder feeds, while a `Barrier` fence overlaps nothing
+    /// and only pays the eager allocation.
+    pub(crate) has_chunked_fence: bool,
     /// Terminal channel-shape policy (runtime knobs; see [`TermPolicy`]).
     pub(crate) terminal_policy: TermPolicy,
     /// The pool-capacity lease backing pool mode (`dedicated_threads ==
@@ -2317,17 +2337,20 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
         }
     }
 
-    /// The async-chain floor applied to an already-floored unpinned capacity
-    /// (`YOUPIPE_ASYNC_CHAIN_FLOOR`; see [`Self::stage_buffer`]). Generic
-    /// over the channel's full slot type for the byte clamp.
-    fn async_chain_floor<SLOT>(&self, buffer: usize) -> usize {
+    /// The chain capacity floor applied to an already-floored unpinned
+    /// capacity (`YOUPIPE_CHAIN_FLOOR`; see [`Self::stage_buffer`]). Binds
+    /// on async-tailed chains and chains with a `Chunked`-mode fence —
+    /// the two families whose wake-chain/trickle slow modes the slack
+    /// removes. Generic over the channel's full slot type for the byte
+    /// clamp.
+    fn chain_floor<SLOT>(&self, buffer: usize) -> usize {
         let Some(floor) = self.terminal_policy.chain_floor else {
             return buffer;
         };
-        if !self.has_async_stage {
+        if !self.has_async_stage && !self.has_chunked_fence {
             return buffer;
         }
-        let budget_slots = crate::handoff::ASYNC_CHAIN_FLOOR_BYTES / size_of::<SLOT>().max(1);
+        let budget_slots = crate::handoff::CHAIN_FLOOR_BYTES / size_of::<SLOT>().max(1);
         buffer.max(self.n.min(floor).min(budget_slots.max(1)))
     }
 
@@ -2340,15 +2363,16 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     /// kind ([`SyncStageOptions`] / [`AsyncStageOptions`] /
     /// [`FenceOptions`]) carries it.
     ///
-    /// `YOUPIPE_ASYNC_CHAIN_FLOOR` (async-tailed chains only): the unpinned
-    /// capacity additionally floors at `min(n, ASYNC_CHAIN_FLOOR_SLOTS)`
-    /// slots, byte-clamped per ring — the capacity slack that removes the
-    /// chain's per-item wake-chain slow mode (see `handoff/mod.rs`).
-    /// Generic over the channel's full slot type for the byte clamp;
-    /// callers turbofish with their `(u64, M)` slot type.
+    /// `YOUPIPE_CHAIN_FLOOR` (async-tailed chains and chains with a
+    /// `Chunked`-mode fence): the unpinned capacity additionally floors at
+    /// `min(n, CHAIN_FLOOR_SLOTS)` slots, byte-clamped per ring — the
+    /// capacity slack that removes the chain's per-item wake-chain /
+    /// convoy slow modes (see `handoff/mod.rs`). Generic over the channel's
+    /// full slot type for the byte clamp; callers turbofish with their
+    /// `(u64, M)` slot type.
     pub fn stage_buffer<SLOT>(&self, buffer: Option<NonZeroUsize>, parallelism: usize) -> usize {
         let resolved = buffer.map_or_else(
-            || self.async_chain_floor::<SLOT>(self.buffer_size(parallelism)),
+            || self.chain_floor::<SLOT>(self.buffer_size(parallelism)),
             NonZeroUsize::get,
         );
         // In-flight estimate: one output channel of this capacity per call
@@ -2705,6 +2729,10 @@ where
         self.prev.has_async_stage()
     }
 
+    fn has_chunked_fence(&self) -> bool {
+        self.prev.has_chunked_fence()
+    }
+
     fn fuse_exec<OP>(
         &self,
         downstream: OP,
@@ -2897,6 +2925,10 @@ where
 
     fn has_async_stage(&self) -> bool {
         self.prev.has_async_stage()
+    }
+
+    fn has_chunked_fence(&self) -> bool {
+        self.prev.has_chunked_fence()
     }
 }
 
@@ -3190,6 +3222,10 @@ where
     fn has_async_stage(&self) -> bool {
         self.prev.has_async_stage()
     }
+
+    fn has_chunked_fence(&self) -> bool {
+        matches!(self.mode, FenceMode::Chunked(_)) || self.prev.has_chunked_fence()
+    }
 }
 
 /// Shared fence spawn core (todo #10, same factory shape as the sync
@@ -3306,6 +3342,10 @@ where
     fn has_async_stage(&self) -> bool {
         self.prev.has_async_stage()
     }
+
+    fn has_chunked_fence(&self) -> bool {
+        self.prev.has_chunked_fence()
+    }
 }
 
 impl<Prev, F, In, A, B> StageSpawn<In> for GroupedStage<Prev, F>
@@ -3390,6 +3430,10 @@ where
     fn has_async_stage(&self) -> bool {
         self.prev.has_async_stage()
     }
+
+    fn has_chunked_fence(&self) -> bool {
+        self.prev.has_chunked_fence()
+    }
 }
 
 impl<Prev, F, In, A, N> StageSpawn<In> for GroupedExpandStage<Prev, F, N>
@@ -3471,6 +3515,10 @@ where
 
     fn has_async_stage(&self) -> bool {
         self.prev.has_async_stage()
+    }
+
+    fn has_chunked_fence(&self) -> bool {
+        self.prev.has_chunked_fence()
     }
 }
 
@@ -3588,6 +3636,10 @@ where
         true
     }
 
+    fn has_chunked_fence(&self) -> bool {
+        self.prev.has_chunked_fence()
+    }
+
     fn spawn_async_feeder<R: AsyncRuntime>(
         self,
         rx: AsyncReceiver<(u64, In)>,
@@ -3681,6 +3733,10 @@ where
 
     fn has_async_stage(&self) -> bool {
         true
+    }
+
+    fn has_chunked_fence(&self) -> bool {
+        self.prev.has_chunked_fence()
     }
 
     fn spawn_async_feeder<R: AsyncRuntime>(
@@ -5995,6 +6051,7 @@ where
         stages_left,
     } = resolve_admission(&stages.stage_budget(), &config, compute_pool.as_ref(), n);
     let has_async_stage = stages.has_async_stage();
+    let has_chunked_fence = stages.has_chunked_fence();
     let ctx: StreamCtx<'_, R> = StreamCtx {
         config: &config,
         cancel,
@@ -6002,6 +6059,7 @@ where
         per_stage_parallelism,
         dedicated_threads,
         has_async_stage,
+        has_chunked_fence,
         terminal_policy: TermPolicy::from_env(),
         lease,
         worker_slots_left: Cell::new(worker_slots_left),
@@ -6991,14 +7049,14 @@ where
     I: Send + Unpin + 'static,
     R: AsyncRuntime,
 {
-    // The async-chain floor covers the feeder ring too (same wake-chain
+    // The chain capacity floor covers the feeder ring too (same wake-chain
     // face — the serial feeder pushing into a stage-1 crowd). The
     // lifted capacity only moves the feeder's inline/job threshold
     // upward, so the parking-lease prediction (`feeder_slot`, computed
     // from the unfloored `floored_channel_capacity` in
     // `resolve_admission`) can only over-reserve a slot — returned by
     // the lease's drop, never missed.
-    let buffer = ctx.async_chain_floor::<(u64, I)>(ctx.buffer_size(ctx.per_stage_parallelism));
+    let buffer = ctx.chain_floor::<(u64, I)>(ctx.buffer_size(ctx.per_stage_parallelism));
     // In-flight estimate, feeder side: the feeder channel's capacity,
     // the one item held in a blocked `send`, and the collector's batch
     // scratch (`batch_recv_cap()` items claimed but not yet inserted).
@@ -7387,6 +7445,7 @@ mod tests {
             per_stage_parallelism: 1,
             dedicated_threads: false,
             has_async_stage: false,
+            has_chunked_fence: false,
             terminal_policy: TermPolicy {
                 sharded: sync,
                 sharded_async: async_,
@@ -7412,76 +7471,136 @@ mod tests {
         assert_eq!(ctx(true, true).sharded_async_terminal(1), 0);
     }
 
-    /// `stage_buffer` applies the async-chain floor only where eligible:
-    /// the knob plus an async-tailed chain lifts the unpinned capacity to
-    /// `min(n, ASYNC_CHAIN_FLOOR_SLOTS)` (byte-clamped); pure-sync chains,
-    /// explicit pins, and rings beyond the byte budget keep the standard
-    /// rule.
+    /// `stage_buffer` applies the chain floor only where eligible: the knob
+    /// plus an async-tailed or chunked-fence chain lifts the unpinned
+    /// capacity to `min(n, CHAIN_FLOOR_SLOTS)` (byte-clamped); pure-sync
+    /// chains, explicit pins, and rings beyond the byte budget keep the
+    /// standard rule.
     #[cfg(all(test, feature = "tokio-runtime"))]
     #[test]
-    fn stage_buffer_async_chain_floor_gates() {
+    fn stage_buffer_chain_floor_gates() {
         use crate::runtime::TokioPool;
 
         let cfg = PipelineConfig::default(); // buffer_size 256
         let pool = TokioPool::build(1).expect("build test runtime");
-        let ctx = |n: usize, floor: Option<usize>, has_async: bool| StreamCtx::<TokioPool> {
-            config: &cfg,
-            cancel: None,
-            n,
-            per_stage_parallelism: 1,
-            dedicated_threads: false,
-            has_async_stage: has_async,
-            terminal_policy: TermPolicy {
-                sharded: false,
-                sharded_async: false,
-                chain_floor: floor,
-            },
-            lease: None,
-            worker_slots_left: Cell::new(0),
-            stages_left: Cell::new(0),
-            in_flight: Cell::new(0),
-            compute_pool: None,
-            async_pool: Some(pool.clone()),
-            cached_pool: OnceLock::new(),
-            async_panic: OnceLock::new(),
-            _marker: PhantomData,
-        };
-        // Knob off, or a pure-sync chain: the floored default.
+        let ctx =
+            |n: usize, floor: Option<usize>, has_async: bool, chunked_fence: bool| StreamCtx::<
+                TokioPool,
+            > {
+                config: &cfg,
+                cancel: None,
+                n,
+                per_stage_parallelism: 1,
+                dedicated_threads: false,
+                has_async_stage: has_async,
+                has_chunked_fence: chunked_fence,
+                terminal_policy: TermPolicy {
+                    sharded: false,
+                    sharded_async: false,
+                    chain_floor: floor,
+                },
+                lease: None,
+                worker_slots_left: Cell::new(0),
+                stages_left: Cell::new(0),
+                in_flight: Cell::new(0),
+                compute_pool: None,
+                async_pool: Some(pool.clone()),
+                cached_pool: OnceLock::new(),
+                async_panic: OnceLock::new(),
+                _marker: PhantomData,
+            };
+        // Knob off, or a pure-sync chain without a fence: the floored default.
         assert_eq!(
-            ctx(100_000, None, true).stage_buffer::<(u64, u64)>(None, 8),
+            ctx(100_000, None, true, false).stage_buffer::<(u64, u64)>(None, 8),
             256
         );
         assert_eq!(
-            ctx(100_000, Some(1024), false).stage_buffer::<(u64, u64)>(None, 8),
+            ctx(100_000, Some(1024), false, false).stage_buffer::<(u64, u64)>(None, 8),
             256
         );
-        // Knob on, async chain: lifted to the slot floor — the default tier
-        // and an explicit env tier take the same path.
+        // Knob on, async chain or chunked-fence chain: lifted to the slot
+        // floor — the default tier and an explicit env tier take the same
+        // path.
         assert_eq!(
-            ctx(100_000, Some(crate::handoff::ASYNC_CHAIN_FLOOR_SLOTS), true)
-                .stage_buffer::<(u64, u64)>(None, 8),
-            crate::handoff::ASYNC_CHAIN_FLOOR_SLOTS
+            ctx(
+                100_000,
+                Some(crate::handoff::CHAIN_FLOOR_SLOTS),
+                true,
+                false
+            )
+            .stage_buffer::<(u64, u64)>(None, 8),
+            crate::handoff::CHAIN_FLOOR_SLOTS
         );
         assert_eq!(
-            ctx(100_000, Some(65536), true).stage_buffer::<(u64, u64)>(None, 8),
+            ctx(100_000, Some(65536), false, true).stage_buffer::<(u64, u64)>(None, 8),
             65536
         );
         // Small run: the lift never exceeds `n`.
         assert_eq!(
-            ctx(1_000, Some(65536), true).stage_buffer::<(u64, u64)>(None, 8),
+            ctx(1_000, Some(65536), false, true).stage_buffer::<(u64, u64)>(None, 8),
             1_000
         );
         // Byte budget: 1 KiB payloads clamp the floor to
         // 8 MiB / 1032 B ≈ 8123 slots (still above the 256 default).
         assert_eq!(
-            ctx(100_000, Some(65536), true).stage_buffer::<(u64, [u8; 1024])>(None, 8),
-            crate::handoff::ASYNC_CHAIN_FLOOR_BYTES / size_of::<(u64, [u8; 1024])>()
+            ctx(100_000, Some(65536), false, true).stage_buffer::<(u64, [u8; 1024])>(None, 8),
+            crate::handoff::CHAIN_FLOOR_BYTES / size_of::<(u64, [u8; 1024])>()
         );
         // Explicit pin: the caller's exact backpressure request, verbatim.
         let pin = NonZeroUsize::new(16).unwrap();
         assert_eq!(
-            ctx(100_000, Some(65536), true).stage_buffer::<(u64, u64)>(Some(pin), 8),
+            ctx(100_000, Some(65536), false, true).stage_buffer::<(u64, u64)>(Some(pin), 8),
             16
+        );
+    }
+
+    /// `has_chunked_fence` recursion: a `Chunked` fence anywhere in the
+    /// chain flips it, a `Barrier`-only chain never does, and the stage
+    /// kinds around fences (sync/expand/async) pass it through.
+    #[cfg(all(test, feature = "tokio-runtime"))]
+    #[test]
+    fn has_chunked_fence_tracks_fence_modes() {
+        let chunked = FenceMode::Chunked(NonZeroUsize::new(16).unwrap());
+        assert!(
+            !stream(0..8u64)
+                .stage(|x: u64| x + 1)
+                .stages
+                .has_chunked_fence()
+        );
+        assert!(
+            stream(0..8u64)
+                .stage(|x: u64| x + 1)
+                .fence(chunked)
+                .stage(|x: u64| x + 1)
+                .stages
+                .has_chunked_fence()
+        );
+        assert!(
+            !stream(0..8u64)
+                .stage(|x: u64| x + 1)
+                .fence(FenceMode::Barrier)
+                .stage(|x: u64| x + 1)
+                .stages
+                .has_chunked_fence()
+        );
+        // Chunked behind a barrier: the chain still contains one.
+        assert!(
+            stream(0..8u64)
+                .stage(|x: u64| x + 1)
+                .fence(FenceMode::Barrier)
+                .stage(|x: u64| x + 1)
+                .fence(chunked)
+                .stages
+                .has_chunked_fence()
+        );
+        // Fence downstream of an async stage (mixed chain) still counts.
+        assert!(
+            stream(0..8u64)
+                .stage(|x: u64| x + 1)
+                .stage_async(|x: u64| async move { x + 1 })
+                .fence(chunked)
+                .stages
+                .has_chunked_fence()
         );
     }
 
@@ -7629,6 +7748,7 @@ mod tests {
             per_stage_parallelism: 1,
             dedicated_threads: false,
             has_async_stage: false,
+            has_chunked_fence: false,
             terminal_policy: TermPolicy {
                 sharded: false,
                 sharded_async: false,
@@ -7686,6 +7806,7 @@ mod tests {
             per_stage_parallelism: 1,
             dedicated_threads: false,
             has_async_stage: false,
+            has_chunked_fence: false,
             terminal_policy: TermPolicy {
                 sharded: false,
                 sharded_async: false,
@@ -7747,6 +7868,7 @@ mod tests {
             per_stage_parallelism: 1,
             dedicated_threads: false,
             has_async_stage: false,
+            has_chunked_fence: false,
             terminal_policy: TermPolicy {
                 sharded: false,
                 sharded_async: false,

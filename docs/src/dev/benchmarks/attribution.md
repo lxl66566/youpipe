@@ -218,6 +218,29 @@ The residual reproduces (10 vs 0, Fisher p ≈ 0.001) and 64K eliminates it — 
 
 **Verdict: promoted (`ASYNC_CHAIN_FLOOR_SLOTS = 65536`).** The promotion bar was "median cost within noise": by the criterion verdict caliber (median-of-rounds) every family is noise-or-better and one canonical family wins 30 %; the only median regression is the zero-CPU forensic probe's fast mode (+2.4 %), whose tail-adjusted aggregate still favors 64K and whose medians read flat (19.0 vs 19.1) in the 2026-10-22 sweep session — a corner effect, consistent with the 1 MiB ring recycling through L3 where the 16K tier's 256 KiB stayed inside one core's L2 (unmeasured directly; the cpu-bearing shapes hide it). Memory cost: 4× the eager ring allocation on async chains only (1 MiB vs 256 KiB per lifted ring for u64 slots), still byte-clamped at 8 MiB per ring — the clamp's payload threshold moves from ~512 B to ~128 B/slot, above which the lift declines exactly as before. The knob kept the explicit-tier escape (`=16384` reproduces the old default for the zero-CPU latency corner).
 
+## Fence-family floor extension (`YOUPIPE_CHAIN_FLOOR`, 2026-11-05)
+
+The chain floor's predicate broadened from async-tailed chains to chains containing a `Chunked`-mode fence (`StageSpawn::has_chunked_fence`; `Barrier`-mode fences never lift — nothing overlaps a barrier), and the knob renamed `YOUPIPE_ASYNC_CHAIN_FLOOR` → `YOUPIPE_CHAIN_FLOOR` (0.x, no compat). Motivation, boundary-matrix extension, tier scan and soaks: [streaming-forensics.md](../streaming-forensics.md) "Fence-family floor extension". Criterion A/B (`bench_ab.sh -E off=YOUPIPE_CHAIN_FLOOR=0 on=YOUPIPE_CHAIN_FLOOR=1`, same binary, 5 per-id isolated rounds, 32 cores; the off side sits in the documented collapsed mode under criterion's back-to-back cadence):
+
+| id | off | on | Δ | verdict |
+| --- | --- | --- | --- | --- |
+| stream_pipeline/with_fence/100000 | 112.6 ms | 24.5 ms | **−78.3 %** | 25/25 dominant |
+| sync_fuse/fence_pair_cpu_merged/100000 | 112.5 ms | 21.0 ms | **−81.3 %** | 25/25 stable |
+| sync_fuse/fence_pair_cheap_merged/100000 | 109.7 ms | 21.0 ms | **−80.8 %** | 25/25 stable |
+| sync_fuse/fence_pair_cpu_split/100000 | 29.7 ms | 7.7 ms | **−74.1 %** | 25/25 stable |
+| sync_fuse/fence_pair_cheap_split/100000 | 33.8 ms | 7.8 ms | **−76.9 %** | 25/25 stable |
+| sync_fuse/fence_infra/100000 (canary) | 115.2 ms | 39.1 ms | **−66.0 %** | 25/25 |
+| sync_fuse/fence_pair_cpu_merged/1000 | 1.249 ms | 867 µs | −30.5 % | 25/25 stable |
+| sync_fuse/fence_pair_cheap_merged/1000 | 1.244 ms | 903 µs | −27.4 % | 25/25 stable |
+| sync_fuse/fence_infra/1000 | 1.261 ms | 919 µs | −27.2 % | 25/25 stable |
+| sync_fuse/fence_pair_cpu_split/1000 | 429.7 µs | 326.8 µs | −23.9 % | 25/25 |
+| stream_pipeline/with_fence/1000 | 1.271 ms | 1.021 ms | −19.7 % | 25/25 stable |
+| sync_fuse/fence_pair_cheap_split/1000 | 435.6 µs | 353 µs | −19.0 % | 25/25 |
+| sync_fuse/cancel_pair_* (4 ids, no-fence control) | — | — | ±1.2 % | noise |
+| sharded_term/single_unordered_cpu (both sizes) | — | — | ±0.6 % | noise |
+
+Every fence id improves with full round dominance — including every @1K row, where the floor clamps to `min(n, 65536)` = 1000 slots and even that depth wins (the 1K fence chains run at a ~4×-deeper ring for ~0.5 MB of eager allocation). The no-fence controls confirm the knob does not leak outside the predicate. `fence_infra/100000`'s on-side mid-tail (21–46 ms across rounds) is the coverage-graded residual the soaks describe, not a regression: the off side is uniformly collapsed at 115 ms.
+
 ## v0.7.0 release regression check (2026-10-23)
 
 Full-suite interleaved A/B, `v0.6.1` (0ddc9c2) vs the 0.7.0 tip: 11 criterion targets × 3 rounds × 2 sides (graph_shapes has no v0.6.1 counterpart, the engine is new in 0.7.0), taskset 1-31. The 0.7.0 defaults — sharded+batch terminals, the async-chain capacity floor, stream tx batching — show up as real, family-wide improvements: `sync_fuse` cancel/pair families −30…−91 % (async_pair_cpu_split/100K −91.4 %), `sharded_term` −34…−88 % (workers2_cpu/100K −78.5 %), `sharded_term_async` async0/1@100K −23…−42 %, `expand_heavy` fanout rows −44…−51 %, `stream_pipeline/with_fence` −21…−40 %, `channel_throughput/youpipe_mpmc`/`std_mpsc_unbounded` dominant wins. Every flag resolved as artifact; no semantic regression remains:

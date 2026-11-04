@@ -71,7 +71,7 @@ The spin's cost side is real but bounded: in the rare lucky fast seed (fence 1/1
 
 `YOUPIPE_FWD_BATCH` standalone shows no independent rescue (fence auto med 205/165 with only the knob on): removing the forwarder's per-item send parks does not help while the downstream crowd still parks per item on recv. Combined with the spin it is within noise (occasionally slightly better: fence-auto min 15.6 vs 28.7 ms). Default stays off; the knob is retained since it is free when the ring is not full.
 
-Default policy: **both knobs stay off** (opt-in). The spin is a large win exactly when the convoy pathology is present (serial supplier → worker crowd ≥ ~10) and a measurable cost in the lucky fast regime; user guidance lives in `advanced/tuning.md`.
+Default policy: **both knobs stay off** (opt-in). The spin is a large win exactly when the convoy pathology is present (serial supplier → worker crowd ≥ ~10) and a measurable cost in the lucky fast regime; user guidance lives in `advanced/tuning.md`. The fence family later gained a default capacity-side answer — the chain floor's fence extension (2026-11-05, below); the spin is now the residual's opt-in, not the only fix.
 
 ## Async face re-attribution (2026-10-21)
 
@@ -91,6 +91,31 @@ The capacity direction landed, in a different shape than proposed: **terminal-on
 Verdicts (tables in [benchmarks/streaming.md](benchmarks/streaming.md)): async2 soak 18–30/120 collapsed runs off → **0/120 on** (release-gate binary: 21/96 → 2/96, residual ~1 %), async0_cheap/100K −41.8 %, async1 shapes −2…−15 %, sync_fuse async_pair rows −8…−61 %, every pure-sync family inert noise. `SPIN_ANCHOR` remains the fence-family opt-in; for async chains the floor is the default answer and the spin is not needed.
 
 **Tier promotion 16K → 64K (2026-10-25, todo #4 residual closed).** The ~1 % residual reproduced at the 16K default (10/2160 slow runs, 0.46 %, 95 % 0.22–0.85) and the 64K tier eliminated it outright (0/2160, mid-tail 50–100 ms 38 → 1 runs; pooled mean −6 % — the 16K fast-mode median is ~2 % better but its own tail costs more than that saves). The criterion A/B found the bigger prize: `async0_cheap/100K` −30.7 % stable — the async-only chain's single mixed ring stays backpressure-bound at 16K; a binary×env crossover ruled out the layout lottery. One corner cost: +2.4 % fast-mode median on the zero-CPU probe (1 MiB/ring recycles through L3 vs 256 KiB inside L2), invisible on cpu-bearing shapes and flat in the sweep session; `=16384` remains the explicit escape. The default moved to `ASYNC_CHAIN_FLOOR_SLOTS = 65536`; full tables in [attribution.md](benchmarks/attribution.md) "Floor-tier promotion".
+
+## Fence-family floor extension (`YOUPIPE_CHAIN_FLOOR`, 2026-11-05)
+
+The fence convoy had been left to the opt-in `YOUPIPE_SPIN_ANCHOR` (its cost faces are load-shape-local), so default `.fence(Chunked)` chains still collapsed: the pair-promotion-era soak measured fence @100K at 98–158 ms medians against a 25–36 ms fast mode. The async family's landed lever — chain-wide capacity slack — had one unmeasured cell for fences: the 2026-09 boundary matrix stopped at 16 384 ("partial: fast mode returns, unstable mixture") and `buffer = n` ("fully rescued", the feeder going inline); the 64K tier sat untested in between.
+
+**Boundary-matrix extension + tier scan** (convoy-probe `fence` @100K/200K, `--buffer` emulating a whole-chain floor, paired fresh-process soaks, 8–12 pairs × 12 runs, `taskset 1-31`, sides alternating with lead flipped, `--delay-ms` 0/300 mixed; "slow" = > 100 ms):
+
+| cell | slow runs | mean | note |
+| --- | --- | --- | --- |
+| @100K buffer 256 (default) | 70/104 (67 %) | 99.6 ms | med 112.6 |
+| @100K buffer 16384 | 2/12 (screen) | 10.8 ms | the old "partial" reading reproduces |
+| @100K buffer 65536 | 1–4/104–156 | 17.0–22.6 ms | med 12.0, p10 5.2 |
+| @100K buffer = n | 3/156 | 22.0 ms | med 15.9, p10 12.6 — **worse fast mode than 64K** |
+| @200K buffer 256 | 90/104 (87 %) | 198.7 ms | |
+| @200K buffer 65536 | 11–32/104–156 | 49.7–67.1 ms | coverage n/3, residual stays |
+| @200K buffer 131072 | 4–14/104 | 44–51 ms | |
+| @200K buffer = n | 4–16/104–156 | 37.5–48.0 ms | still 10 % slow — not clean either |
+| @1M buffer 256 | 0/5 > 2 s | 841 ms mean | partial collapse |
+| @1M buffer 65536 | 0/5 | 110 ms | rescue holds at 6.5 % coverage |
+
+The rescue is **coverage-graded** (64K ≈ clean at n=100K where it covers 65 % of the run, 10–26 % slow at n=200K, still a 7.6× mean win at n=1M) and `buffer = n` never fully cleans the 200K cell either — the residual is bistability the head start only mostly outruns. 64K beats `n` on the fast mode at 100K (p10 5.2 vs 12.6 ms; the same eager-allocation footprint effect the async sweep measured), so the tier stays the shared `CHAIN_FLOOR_SLOTS = 65536` rather than a fence-specific n-scaled floor; `YOUPIPE_SPIN_ANCHOR` remains the complete opt-in fix for the residual.
+
+**`Barrier` mode is excluded** (`StageSpawn::has_chunked_fence` is false for Barrier-only chains): nothing overlaps a barrier — stage 2 idles until EOF regardless — so deep rings only add eager allocation. Paired soak on `--chunk 0`: buffer 256 mean 23.3 ms vs 64K 29.9 ms (slow 1 vs 3/104), a mild real cost, gone entirely by the exclusion. A chain mixing Barrier and Chunked fences lifts throughout (the predicate is chain-wide, same coarseness as the async family) — rare shape, the mild barrier-segment cost is the documented price.
+
+**Landed verdict** (same-binary env A/B, `bench_ab.sh -E off=YOUPIPE_CHAIN_FLOOR=0 on=YOUPIPE_CHAIN_FLOOR=1`, 5 per-id isolated rounds): every fence id improves, 25/25 dominant or stable — `with_fence/100K` 112.6 → 24.5 ms (−78 %), `fence_pair_{cpu,cheap}_{split,merged}/100K` −74…−81 %, `fence_infra/100K` −66 % (the bistable canary, on-side mid-tail matches the soak residual), every @1K row −19…−31 % (the floor clamps to `min(n, 65536)` = 1000 slots and even that depth wins); the no-fence controls (`cancel_pair_*`, `sharded_term/single_unordered_cpu`) read ±1.2 % noise. Post-implementation soaks on the landed default: fence @100K 129/156 → 1/156 slow (mean 109.6 → 24.3 ms), @200K 118/130 → 34/130 (mean 214.7 → 65.2), cpu-cost @100K 87/104 → 6/104 (mean 111.6 → 37.4), Barrier @100K statistically identical both sides. Tables in [benchmarks/streaming.md](benchmarks/streaming.md); the async-side readings are unchanged by the predicate broadening (pure predicate extension, same code path).
 
 
 ## Stream-side hang stakeout: negative; async panic-swallow race caught (2026-10-25)
