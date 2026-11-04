@@ -67,6 +67,8 @@ Criterion filter arguments are regexes anchored loosely at both ends: the filter
 
 Further traps are documented with the campaigns that exposed them: cross-commit codegen layout drift and the whole-group 100 K fused collapse in [attribution.md](attribution.md), and the placement sensitivity of the 1P1C channel-throughput group in [streaming.md](streaming.md).
 
+A falsified knob's verdict is only as durable as its engagement preconditions: `YOUPIPE_FWD_BATCH` read "no independent rescue" at the 256-slot default ring (full ring ⇒ zero-length free prefix ⇒ the batch arm never ran) and flipped to the convoy's biggest default win the day the chain floor gave it slack ([streaming.md](streaming.md) "Forwarder batch send promoted to default"). When a new default changes a mechanism's precondition (ring depth, worker counts, admission mode), re-open the delivery-side knobs that were falsified under the old one before inventing new mechanisms.
+
 ## Topic index
 
 - [sync-fused.md](sync-fused.md): fused and sync-engine benches against rayon, from `sync_cpu_heavy` and pipeline fusion through input materialization, `try_collect`, the filter-chain collect variants, reduce terminals, on-pool nesting, expand-heavy, and adjacent-sync fusion.
