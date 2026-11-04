@@ -41,6 +41,7 @@ use std::{
 use crate::{
     builder::PipelineConfig,
     executor::compute::ComputePool,
+    handoff::{Broadcast, Unicast},
     runtime::{AsyncRuntime, DefaultRuntime},
     sync::{CancellationToken, RunOutcome},
 };
@@ -212,7 +213,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             plan::NodeKind::Source,
             plan::Fanout::Move,
             plan::NodeOpts::default(),
-            exec::source_spawn::<T, I, fanin::Unicast<T>>(iter),
+            exec::source_spawn::<T, I, Unicast<T>>(iter),
         );
         self.plan.handle(id)
     }
@@ -237,7 +238,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
             plan::NodeKind::Source,
             plan::Fanout::Broadcast,
             plan::NodeOpts::default(),
-            exec::source_spawn::<T, I, fanin::Broadcast<T>>(iter),
+            exec::source_spawn::<T, I, Broadcast<T>>(iter),
         );
         self.plan.handle(id)
     }
@@ -323,7 +324,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
                 buffer: opts.buffer,
                 io_concurrency: None,
             },
-            exec::node_spawn::<I, O, F, fanin::Unicast<O>>(name, f),
+            exec::node_spawn::<I, O, F, Unicast<O>>(name, f),
         );
         self.plan.handle(id)
     }
@@ -363,7 +364,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
                 buffer: opts.buffer,
                 io_concurrency: None,
             },
-            exec::node_spawn::<I, O, F, fanin::Broadcast<O>>(name, f),
+            exec::node_spawn::<I, O, F, Broadcast<O>>(name, f),
         );
         self.plan.handle(id)
     }
@@ -405,7 +406,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
                 buffer: opts.buffer,
                 io_concurrency: None,
             },
-            exec::expand_node_spawn::<I, O, F, fanin::Unicast<O>>(name, f),
+            exec::expand_node_spawn::<I, O, F, Unicast<O>>(name, f),
         );
         self.plan.handle(id)
     }
@@ -449,7 +450,7 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
                 buffer: opts.buffer,
                 io_concurrency: None,
             },
-            exec::expand_node_spawn::<I, O, F, fanin::Broadcast<O>>(name, f),
+            exec::expand_node_spawn::<I, O, F, Broadcast<O>>(name, f),
         );
         self.plan.handle(id)
     }

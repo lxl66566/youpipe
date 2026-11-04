@@ -622,9 +622,9 @@ One line each; real findings are todo #20–#22.
   (panic caught → recorded → cancel); async→sync bridge threads are
   uncounted but their EOF propagates channel-wise before downstream
   workers can finish, so `done.wait()` ordering holds.
-- `resolve_budget`: `need` is gated atomically by `try_reserve_parking`;
-  nested-run detection (`is_on_this_pool`) falls back to dedicated
-  threads (tested both ways).
+- `resolve_budget` (through the shared `admit`): `need` is gated atomically
+  by `try_reserve_parking`; nested-run detection (`is_on_this_pool`) falls
+  back to dedicated threads (tested both ways).
 - `Broadcast::send` / `AsyncBroadcast::send` swap_remove survivor loops
   are correct (the async side keeps `txs`/`slots` pairing).
 - `claim_poll`'s half-close contract survives the batch path (stragglers

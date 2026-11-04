@@ -1,14 +1,11 @@
-//! Sync-node fan-in and fan-out primitives: the fair round-robin aggregation
-//! over a node's input edges, the activity-gated pre-anchor backoff, and the
-//! [`Delivery`] strategies that hand one worker's outputs to the node's
-//! outgoing edges ([`Broadcast`] clones to every edge).
+//! Sync-node fan-in primitives: the fair round-robin aggregation over a
+//! node's input edges and the activity-gated pre-anchor backoff. The output
+//! side (the `Delivery` strategies) lives in `handoff::worker` with the
+//! shared worker loops.
 
-use std::{
-    mem::MaybeUninit,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
-use crate::handoff::{Claim, Receiver, SyncSender, claim_poll, stage_batch};
+use crate::handoff::{Claim, Receiver, claim_poll};
 
 // ── Graph data-plane batching knob ──
 //
@@ -16,9 +13,9 @@ use crate::handoff::{Claim, Receiver, SyncSender, claim_poll, stage_batch};
 // named for the light-item regime (docs benchmarks.md "Graph-engine DAG
 // shapes"): per-item channel ops on a node's output edges. On, the mapped
 // claim batch is staged and each open edge takes one `try_send_batch` per
-// free run (`Broadcast::send_batch`); off, every item is an individual
-// blocking `send`. Runtime knob rather than a config field so A/B benches
-// compare the same binary (recompiles swing tight benches by tens of
+// free run (`handoff::worker::Broadcast::send_batch`); off, every item is an
+// individual blocking `send`. Runtime knob rather than a config field so A/B
+// benches compare the same binary (recompiles swing tight benches by tens of
 // percent through pure code layout). The sibling lever from the same
 // verdict — fan-in claim sweeps (one round claiming from every open input)
 // — measured as pure noise on top of this knob and was removed; see
@@ -26,8 +23,8 @@ use crate::handoff::{Claim, Receiver, SyncSender, claim_poll, stage_batch};
 
 static GRAPH_TX_BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Batched broadcast sends (`Broadcast::send_batch`) on by default; "0"
-/// recovers the per-item `send` loops.
+/// Batched output delivery on by default; "0" recovers the per-item `send`
+/// loops.
 pub(crate) fn graph_tx_batch() -> bool {
     *GRAPH_TX_BATCH.get_or_init(|| match std::env::var("YOUPIPE_GRAPH_TX_BATCH") {
         Ok(v) if v == "1" || v.is_empty() => true,
@@ -314,273 +311,11 @@ impl RoundSpin {
     }
 }
 
-/// One producer's output-side delivery strategy, owned by ONE worker: the
-/// worker bodies are generic over it — one source, per-strategy
-/// monomorphization, no dynamic dispatch on the hot path.
-pub(crate) trait Delivery<T: Send + 'static>: Send + 'static {
-    /// Build one worker's handle from the node's output senders (each worker
-    /// receives its own clone of every sender).
-    fn new(txs: Vec<SyncSender<T>>) -> Self;
-    /// Deliver one item. Returns `false` when every edge has closed (the
-    /// caller's worker exits).
-    fn send(&mut self, item: T) -> bool;
-    /// Batched delivery (the tx-batch knob's path); same `false` contract.
-    fn send_batch(&mut self, batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) -> bool;
-}
-
-/// Single-edge delivery: the counterpart of [`Broadcast`] for producers
-/// registered without a `_broadcast` variant. Each item moves into the
-/// node's one outgoing edge — no clones, so the item type carries no
-/// `Clone` bound. The out-degree-1 invariant is validated at `run()`
-/// before any worker spawns; a mismatch inside `new` is an internal bug.
-pub(crate) struct Unicast<T: Send + 'static> {
-    tx: SyncSender<T>,
-}
-
-impl<T: Send + 'static> Delivery<T> for Unicast<T> {
-    fn new(txs: Vec<SyncSender<T>>) -> Self {
-        let [tx]: [SyncSender<T>; 1] = txs
-            .try_into()
-            .ok()
-            .expect("move producer has exactly one outgoing edge (validated)");
-        Self { tx }
-    }
-
-    fn send(&mut self, item: T) -> bool {
-        self.tx.send(item).is_ok()
-    }
-
-    fn send_batch(&mut self, batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) -> bool {
-        stage_batch(batch, staged);
-        flush_staged(&self.tx, staged)
-    }
-}
-
-/// Broadcast fan-out over one node's output edges, owned by ONE worker (each
-/// worker clones every edge sender). Every open edge receives a clone of the
-/// item; the last surviving edge gets the owned item — one clone saved per
-/// item. An edge that reports closed is dropped from the active set; the
-/// worker keeps serving the rest, and exits only when every edge closed
-/// (one dead downstream must not kill the node's other branches).
-pub(crate) struct Broadcast<T: Send + 'static> {
-    txs: Vec<SyncSender<T>>,
-}
-
-impl<T: Send + Clone + 'static> Delivery<T> for Broadcast<T> {
-    fn new(txs: Vec<SyncSender<T>>) -> Self {
-        Self { txs }
-    }
-
-    /// Deliver one item to every open edge. Returns `false` when every edge
-    /// has closed (the caller's worker exits).
-    fn send(&mut self, item: T) -> bool {
-        let mut i = 0;
-        while i + 1 < self.txs.len() {
-            if self.txs[i].send(item.clone()).is_err() {
-                // Closed edge: drop it without advancing (swap_remove brings
-                // the tail into the hole; order among edges is irrelevant).
-                self.txs.swap_remove(i);
-            } else {
-                i += 1;
-            }
-        }
-        // The final surviving edge takes the owned item.
-        if self.txs.is_empty() {
-            return false;
-        }
-        let last = self.txs.len() - 1;
-        if self.txs[last].send(item).is_err() {
-            self.txs.swap_remove(last);
-        }
-        !self.txs.is_empty()
-    }
-
-    /// Batched delivery of every item of `batch` to every open edge — the
-    /// stream engine's `try_send_batch` + per-item blocking fallback rhythm
-    /// (`push_items` / `fence_batch_send`), generalized to k edges: one
-    /// tail CAS per free-run prefix per edge instead of one channel op per
-    /// item. Every open edge but the last receives clones (the broadcast
-    /// contract); the last surviving edge takes the owned items — one clone
-    /// saved per item, as `send`. `staged` is caller-owned scratch,
-    /// `clear`-reused per edge.
-    ///
-    /// The last edge stages through [`stage_batch`] — the
-    /// `extend(drain(..).map(..))` shape emits a `Map<Drain<T>>` drop-glue
-    /// landing pad per item type, the single-CGU layout hazard 7d3cff3
-    /// eradicated from `SendItem::send_batch` (once cost horizontal
-    /// cpu_balanced +33-40 % through code this never executes). The
-    /// per-edge clone staging (`extend(iter().cloned())`) holds
-    /// trivially-droppable iterators and can stay.
-    ///
-    /// Cancellation is deliberately not consulted here
-    /// (`SendItem::send_batch` parity, todo #21): the acceptance point is
-    /// the caller's — workers check the token once per claim batch before
-    /// mapping — and an accepted batch is delivered in full. On a full ring
-    /// the per-item fallback parks until the consumer claims or every
-    /// receiver drops; under cancel that park always resolves (downstream
-    /// workers exit on their next token check and drop their receivers,
-    /// whose close wakes parked senders with `Closed`), so the emitted set
-    /// never depends on ring pressure. A closed edge still drops its unsent
-    /// remainder (`assume_init_drop` — a `Vec<MaybeUninit<_>>` drop would
-    /// skip the destructors).
-    fn send_batch(&mut self, batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) -> bool {
-        let mut i = 0;
-        while i + 1 < self.txs.len() {
-            staged.clear();
-            staged.extend(batch.iter().cloned().map(MaybeUninit::new));
-            if flush_staged(&self.txs[i], staged) {
-                i += 1;
-            } else {
-                self.txs.swap_remove(i);
-            }
-        }
-        if self.txs.is_empty() {
-            return false; // remaining batch items drop with the Vec
-        }
-        let last = self.txs.len() - 1;
-        stage_batch(batch, staged);
-        if !flush_staged(&self.txs[last], staged) {
-            self.txs.swap_remove(last);
-        }
-        !self.txs.is_empty()
-    }
-}
-
-/// Flush one fully-initialized `staged` batch through one edge: the free
-/// prefix goes out with one `try_send_batch`, the remainder per item
-/// (parking at most once per full ring, cancellation-blind — see
-/// [`Broadcast::send_batch`]). Returns whether the edge survived.
-fn flush_staged<T: Send + 'static>(tx: &SyncSender<T>, staged: &mut [MaybeUninit<T>]) -> bool {
-    // SAFETY: every staged slot is initialized (the callers stage fully
-    // initialized batches); the sent prefix is skipped below.
-    let sent = unsafe { tx.try_send_batch(staged) };
-    let mut j = sent;
-    while j < staged.len() {
-        // SAFETY: only [..j) was moved out; slot `j` is still initialized.
-        let item = unsafe { staged[j].assume_init_read() };
-        j += 1;
-        if tx.send(item).is_err() {
-            drop_staged(&mut staged[j..]);
-            return false;
-        }
-    }
-    true
-}
-
-/// Run the destructors of every still-initialized slot — the explicit-drop
-/// half of the `MaybeUninit` staging contract (see `send_batch`).
-fn drop_staged<T>(slots: &mut [MaybeUninit<T>]) {
-    for slot in slots {
-        // SAFETY: callers only pass never-sent (still initialized) slots.
-        unsafe { slot.assume_init_drop() };
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::handoff::channel;
 
-    fn drain_n<T: Send + 'static>(rx: &Receiver<T>, n: usize) -> Vec<T> {
-        (0..n).map(|_| rx.recv().expect("item buffered")).collect()
-    }
-
-    /// Every open edge receives the whole batch in order; the delivery
-    /// keeps serving the surviving edges after one closes mid-batch.
-    #[test]
-    fn send_batch_delivers_to_every_open_edge() {
-        let (tx1, rx1) = channel::<u32>(16);
-        let (tx2, rx2) = channel::<u32>(16);
-        let (tx3, rx3) = channel::<u32>(16);
-        let mut b = Broadcast::new(vec![tx1, tx2, tx3]);
-        let mut batch = vec![1, 2, 3];
-        let mut staged = Vec::new();
-        assert!(b.send_batch(&mut batch, &mut staged));
-        assert_eq!(drain_n(&rx1, 3), vec![1, 2, 3]);
-        assert_eq!(drain_n(&rx2, 3), vec![1, 2, 3]);
-        assert_eq!(drain_n(&rx3, 3), vec![1, 2, 3]);
-        drop(rx2); // one edge closed
-        let mut batch = vec![4, 5];
-        assert!(b.send_batch(&mut batch, &mut staged));
-        assert_eq!(drain_n(&rx1, 2), vec![4, 5]);
-        assert_eq!(drain_n(&rx3, 2), vec![4, 5]);
-    }
-
-    /// A batch larger than the ring capacity parks per item on the
-    /// remainder (the blocking fallback) and still delivers everything;
-    /// the consumer drains concurrently, as in a live pipeline.
-    #[test]
-    fn send_batch_flushes_remainder_per_item() {
-        let (tx, rx) = channel::<u32>(2);
-        let drainer = std::thread::spawn(move || drain_n(&rx, 5));
-        let mut b = Broadcast::new(vec![tx]);
-        let mut batch = vec![1, 2, 3, 4, 5];
-        let mut staged = Vec::new();
-        assert!(b.send_batch(&mut batch, &mut staged));
-        assert_eq!(drainer.join().unwrap(), vec![1, 2, 3, 4, 5]);
-    }
-
-    /// Delivery is cancellation-blind (todo #21): a fired token must not
-    /// change the emitted set — the whole batch is delivered even when the
-    /// ring is full (the per-item fallback parks for the drainer), so no
-    /// output depends on ring pressure. Sweep the capacity: the emitted set
-    /// is identical at every pressure level.
-    #[test]
-    fn send_batch_cancelled_token_still_delivers_full_batch() {
-        for cap in [1, 2, 7] {
-            let (tx, rx) = channel::<u32>(cap);
-            let drainer = std::thread::spawn(move || drain_n(&rx, 5));
-            let cancel = crate::sync::CancellationToken::new();
-            cancel.cancel();
-            let mut b = Broadcast::new(vec![tx]);
-            let mut batch = vec![1, 2, 3, 4, 5];
-            let mut staged = Vec::new();
-            assert!(b.send_batch(&mut batch, &mut staged), "cap {cap}");
-            assert!(batch.is_empty(), "cap {cap}: batch must be drained");
-            assert_eq!(drainer.join().unwrap(), vec![1, 2, 3, 4, 5], "cap {cap}");
-        }
-    }
-
-    /// Same emitted set across the knob-equivalent paths and ring pressures
-    /// (todo #21): the per-item `send` loop (tx-batch knob off) and
-    /// `send_batch` (knob on) deliver identical item sets under a fired
-    /// token — acceptance granularity may differ per path, delivery never
-    /// does.
-    #[test]
-    fn send_and_send_batch_emit_identical_sets_under_cancel() {
-        for cap in [1, 2, 7] {
-            let items: Vec<u32> = (0..8).collect();
-            let cancel = crate::sync::CancellationToken::new();
-            cancel.cancel();
-            let (tx1, rx1) = channel::<u32>(cap);
-            let d1 = std::thread::spawn(move || drain_n(&rx1, 8));
-            let mut per_item = Broadcast::new(vec![tx1]);
-            for it in items.iter().copied() {
-                assert!(per_item.send(it), "cap {cap}");
-            }
-            let (tx2, rx2) = channel::<u32>(cap);
-            let d2 = std::thread::spawn(move || drain_n(&rx2, 8));
-            let mut batched = Broadcast::new(vec![tx2]);
-            let mut owned = items.clone();
-            let mut staged = Vec::new();
-            assert!(batched.send_batch(&mut owned, &mut staged), "cap {cap}");
-            assert_eq!(d1.join().unwrap(), items, "cap {cap}");
-            assert_eq!(d2.join().unwrap(), items, "cap {cap}");
-        }
-    }
-
-    /// Every edge closed: `false`, the worker-exit signal.
-    #[test]
-    fn send_batch_all_edges_closed_returns_false() {
-        let (tx1, rx1) = channel::<u32>(4);
-        let (tx2, rx2) = channel::<u32>(4);
-        drop(rx1);
-        drop(rx2);
-        let mut b = Broadcast::new(vec![tx1, tx2]);
-        let mut batch = vec![1, 2];
-        let mut staged = Vec::new();
-        assert!(!b.send_batch(&mut batch, &mut staged));
-    }
     /// Liveness regression (the graph-side shape of todo #14's intermittent
     /// hang): a fan-in worker anchored while one input is empty must still
     /// claim from the OTHER input. In a DAG the anchored input's producer

@@ -19,9 +19,10 @@ use super::{
     plan::SpawnStep,
 };
 use crate::{
-    builder::{PanicSlot, cancel_active, record_panic},
+    builder::{PanicSlot, record_panic},
     handoff::{
-        AsyncReceiver, AsyncSender, Receiver as SyncReceiver, TryRecvError, WakerSlot, channel,
+        AsyncReceiver, AsyncSender, Receiver as SyncReceiver, TryRecvError, WakerSlot,
+        cancel_active, channel,
     },
     sync::CancellationToken,
 };
@@ -196,7 +197,7 @@ impl<F: Future + Unpin> Future for FirstReady<F> {
 }
 
 /// One async producer task's output-side delivery strategy — the async twin
-/// of [`Delivery`](super::fanin::Delivery). Task bodies are generic over it;
+/// of the sync `Delivery` trait (see `handoff::worker`). Task bodies are generic over it;
 /// the RPITIT `+ Send` bound carries through the spawned task futures.
 pub(crate) trait AsyncDelivery<T: Send + Unpin + 'static>: Send + 'static {
     /// Build one task's handle from the node's output senders (each task

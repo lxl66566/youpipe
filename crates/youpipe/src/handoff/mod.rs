@@ -4,6 +4,9 @@ pub mod channel;
 // `sharded_mpsc_channel(0, ..)` constructed fine, then panicked at `% 0` on
 // the first drain pass).
 pub(crate) mod sharded;
+// Crate-internal: the shared worker loop and delivery strategies serve the
+// stream and graph engines' spawn cores.
+pub(crate) mod worker;
 
 // ── Batched data-plane knob (todo #1 residual (d)) ──
 //
@@ -266,3 +269,7 @@ pub(crate) use channel::{Claim, claim_poll, stage_batch};
 #[cfg(feature = "tokio-runtime")]
 pub(crate) use sharded::{ShardedAsyncReceiver, sharded_mpsc_async_channel};
 pub(crate) use sharded::{ShardedReceiver, sharded_mpsc_channel};
+pub(crate) use worker::{
+    Broadcast, CancelCheck, Delivery, Unicast, cancel_active, claim_expand_deliver,
+    claim_map_deliver, per_worker_claim_cap,
+};

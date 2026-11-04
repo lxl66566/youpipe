@@ -128,6 +128,9 @@ crates/youpipe/src/
 ├── builder/          # Strongly-typed data-first API + compile-time fusion + StreamPipe
 │   ├── mod.rs        # Public re-exports
 │   ├── config.rs     # PipelineConfig, Workload enum
+│   ├── admission.rs  # ParkingLease + admit(): the pool parking-lease admission
+│   │                 #   shared by the stream (resolve_admission) and graph
+│   │                 #   (resolve_budget) runner cores
 │   └── typed/        # Pipe / TryPipe / StreamPipe builder core
 │       ├── mod.rs    # Re-exports
 │       ├── fused.rs  # pipe(), Pipe<S,I,O>, TryPipe<S,I,O,E>, par_index_* core,
@@ -144,6 +147,11 @@ crates/youpipe/src/
 ├── graph/            # Runtime DAG engine (graph()): builder, validation, per-node executors
 ├── handoff/          # Data transfer layer
 │   ├── channel.rs    # MPMC channels (crossfire wrapper: sync + async)
+│   ├── worker.rs     # The engine-agnostic claim → map/expand → deliver worker
+│   │                 #   loops (claim_map_deliver / claim_expand_deliver,
+│   │                 #   CancelCheck) + the Delivery output strategies
+│   │                 #   (Unicast / Broadcast, blanket over SendItem) shared
+│   │                 #   by the stream and graph worker bodies
 │   └── mod.rs
 ├── runtime/          # Pluggable async-runtime backend for streaming .stage_async
 │   ├── mod.rs        # AsyncRuntime trait, NoRuntime, DefaultRuntime alias

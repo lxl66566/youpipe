@@ -35,14 +35,17 @@ use crate::state::{
     drain_ordered_async, drain_ordered_async_sharded, drain_unordered_async_sharded,
 };
 use crate::{
-    builder::config::{PipelineConfig, Workload},
+    builder::{
+        admission::{ParkingLease, admit},
+        config::{PipelineConfig, Workload},
+    },
     executor::compute::ComputePool,
     handoff::{
-        Claim, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem, ShardedReceiver, SyncSender,
-        channel::channel, claim_poll, mpsc_channel, sharded::MIN_SHARD_BUFFER,
-        sharded_mpsc_channel,
+        CancelCheck, Claim, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem,
+        ShardedReceiver, SyncSender, cancel_active, channel::channel, claim_expand_deliver,
+        claim_map_deliver, claim_poll, mpsc_channel, per_worker_claim_cap,
+        sharded::MIN_SHARD_BUFFER, sharded_mpsc_channel,
     },
-    pool::Registry,
     runtime::{AsyncRuntime, DefaultRuntime},
     state::{
         FenceBarrier, FenceMode, OrderedAccounting, OrderedWindow, drain_ordered,
@@ -68,13 +71,6 @@ use crate::{
 // Stages may be sync (run on `ComputePool`), async (run on an `AsyncRuntime`
 // backend via runtime tasks), or a fence (a forwarder parking on its input
 // channel between adjacent stages — a leased pool job in pool mode).
-
-/// True iff `cancel` is set and the pipeline should stop feeding new work.
-/// `pub(crate)`: shared by the graph engine's worker/feeder loops.
-#[inline]
-pub(crate) fn cancel_active(cancel: Option<&CancellationToken>) -> bool {
-    cancel.is_some_and(CancellationToken::is_cancelled)
-}
 
 /// Bridge an [`AsyncReceiver`] to a sync [`Receiver`] via a dedicated OS
 /// thread that runs `block_on` and forwards items. Used when a sync stage
@@ -230,80 +226,6 @@ pub(crate) struct AsyncTaskPanics {
     /// `Arc` so each task's wrapper can share it without cloning the
     /// whole bookkeeping.
     pub(crate) settle: Arc<TaskSettleGate>,
-}
-
-/// Pool-capacity lease covering one streaming run's channel-parking jobs
-/// (non-inline feeder + sync/expand stage workers).
-///
-/// A job that parks inside a crossfire send/recv holds its worker until the
-/// run's channels drain, so per-run budgeting alone ("my jobs ≤ my pool") is
-/// only sound while a single run uses the pool: two concurrent full-budget
-/// runs oversubscribe it, every worker parks on a full/empty channel, and
-/// the still-queued jobs — stage workers of either run, fused chunks behind
-/// them in the injector FIFO — can never be popped (reproduced with 4
-/// concurrent 2-stage runs on the global pool; every worker parked on
-/// `send`, all stage-2 jobs queued). The lease closes that hole at *pool*
-/// scope: a run either atomically reserves capacity for its whole upper
-/// bound of parking jobs (≤ remaining worker count) or falls back to
-/// dedicated threads, restoring the invariant "some worker is free of
-/// parking jobs whenever a parking job is still queued".
-///
-/// Release is per job (each wrapped job returns its slot on completion, via
-/// drop so unwinds are covered) plus the never-spawned remainder here.
-pub(crate) struct ParkingLease {
-    registry: Arc<Registry>,
-    /// Reserved upper bound: `feeder_slot + fences + explicit_workers +
-    /// unpinned_stages * min(per_stage, n)`.
-    reserved: usize,
-    /// Jobs wrapped so far; never exceeds `reserved`.
-    spawned: Cell<usize>,
-}
-
-impl ParkingLease {
-    /// Lease `reserved` parking slots on `registry` (graph engine entry;
-    /// the stream engine computes its own `need` in `resolve_admission`
-    /// and builds its lease inline).
-    pub(crate) fn new(registry: Arc<Registry>, reserved: usize) -> Self {
-        Self {
-            registry,
-            reserved,
-            spawned: Cell::new(0),
-        }
-    }
-
-    /// Wrap `job` so its completion — return or unwind — returns one leased
-    /// slot. The release must not precede the job's last channel access,
-    /// hence drop-guard (a plain tail call would be skipped on unwind).
-    ///
-    /// `pub(crate)`: shared by the graph engine's job dispatch.
-    pub(crate) fn wrap_job<F>(&self, job: F) -> impl FnOnce() + Send + 'static
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.spawned.set(self.spawned.get() + 1);
-        let registry = Arc::clone(&self.registry);
-        move || {
-            struct ReleaseSlot(Arc<Registry>);
-            impl Drop for ReleaseSlot {
-                fn drop(&mut self) {
-                    self.0.release_parking(1);
-                }
-            }
-            let _release = ReleaseSlot(registry);
-            job();
-        }
-    }
-}
-
-impl Drop for ParkingLease {
-    fn drop(&mut self) {
-        // Return only the never-spawned remainder: spawned jobs return their
-        // own slot, possibly still in flight while this drop runs (the
-        // collector's return only orders the channel close, not each
-        // worker's exit from the job).
-        self.registry
-            .release_parking(self.reserved - self.spawned.get());
-    }
 }
 
 /// Handle returned by [`feed_items`]: either an inline push (already done,
@@ -771,20 +693,9 @@ fn spawn_stage_fanout<I, O, Tx, R>(
 {
     let stage = Arc::new(stage);
     // Multi-consumer ring: the workers below share `rx`, so each claim is
-    // capped at a per-worker share of the batch cap — one head CAS must not
-    // monopolize a whole ready burst that the stage's other workers should
-    // split. Sole-consumer sites (collector, feeder, fence forwarder) keep
-    // the full cap; there a big claim starves nobody. Found when the pair
-    // became the default: a 40-item burst with 2 workers and 5 ms items
-    // serialized onto one worker (max concurrency 1,
-    // `test_stage_options_workers_pins_parallelism`).
-    let workers = txs.len().max(1);
-    let batch_cap = crate::handoff::batch_recv_cap();
-    let claim_cap = if batch_cap == 0 {
-        0
-    } else {
-        (batch_cap / workers).max(1)
-    };
+    // capped at a per-worker share of the batch cap
+    // (`per_worker_claim_cap`).
+    let claim_cap = per_worker_claim_cap(txs.len().max(1));
     // Batched output delivery (YOUPIPE_STREAM_TX_BATCH): stage the mapped
     // claim batch, flush with one `try_send_batch` per free run + per-item
     // blocking fallback. Zero-cap claims keep the per-item send (staging
@@ -803,78 +714,35 @@ fn spawn_stage_fanout<I, O, Tx, R>(
     // dominates.
     let jobs: Vec<_> = txs
         .into_iter()
-        .map(|tx| {
+        .map(|mut tx| {
             let stage = stage.clone();
             let rx = rx.clone();
             let worker_cancel = ctx.cancel.clone();
             move || {
-                // Adaptive pre-anchor spin state (todo #4); plain locals.
+                // The claim → map → deliver loop is the shared
+                // `claim_map_deliver` driver. Claim side: adaptive pre-anchor
+                // spin (todo #4) + anchor + burst-drain via `anchor_claim` —
+                // absorb already-queued items while the channel's cache lines
+                // are hot, without re-entering the blocking-recv preamble per
+                // item. With several workers contending on the same MPMC
+                // ring, the workers that lag behind park on the anchor while
+                // the burst winners drain the backlog — the contending
+                // population thins itself instead of every worker hammering
+                // the ring per item. Cancel is observed per item
+                // (`CancelCheck::PerItem`: the tx-batch knob must not change
+                // which items are accepted).
                 let mut spin = AnchorSpin::new(crate::handoff::spin_anchor_us());
-                // Batch claim scratch (YOUPIPE_BATCH_RECV, todo #1 residual
-                // (d)); cap 0 keeps the per-item anchor + burst rhythm. The
-                // claim cap is the per-worker share (see `claim_cap` above).
-                let mut scratch: Vec<(u64, I)> = Vec::with_capacity(claim_cap.max(1));
-                // Output staging for the batched arm (see `tx_batch`); zero
-                // capacity when inert (`with_capacity(0)` allocates nothing).
-                let stage_cap = if tx_batch {
-                    claim_cap
-                } else {
-                    0
-                };
-                let mut mapped: Vec<(u64, O)> = Vec::with_capacity(stage_cap);
-                let mut staged: Vec<std::mem::MaybeUninit<(u64, O)>> =
-                    Vec::with_capacity(stage_cap);
-                'outer: loop {
-                    // Anchor + burst-drain via `anchor_claim`: absorb
-                    // already-queued items while the channel's cache lines are
-                    // hot, without re-entering the blocking-recv preamble per
-                    // item. With several workers contending on the same MPMC
-                    // ring, the workers that lag behind park on the anchor
-                    // while the burst winners drain the backlog — the
-                    // contending population thins itself
-                    // instead of every worker hammering the ring per item.
-                    // With batching on, the burst claims ready runs (≤ the
-                    // per-worker share) with one head CAS per run; with the
-                    // spin knob on, the anchor rides out empty micro-gaps
-                    // before parking.
-                    let claimed = anchor_claim(&mut spin, &rx, &mut scratch, claim_cap);
-                    if claimed == 0 {
-                        break;
-                    }
-                    if tx_batch {
-                        // Stage the mapped outputs, cancel checked before
-                        // every stage call — exactly the per-item loop's
-                        // observation point.
-                        let mut cancelled = false;
-                        mapped.clear();
-                        for (seq, item) in scratch.drain(..) {
-                            if cancel_active(worker_cancel.as_ref()) {
-                                cancelled = true;
-                                break;
-                            }
-                            mapped.push((seq, stage(item)));
-                        }
-                        // Deliver even on cancel: every mapped output's stage
-                        // call completed before the token was observed — the
-                        // same item set the per-item loop sends.
-                        if !tx.send_batch(&mut mapped, &mut staged) {
-                            break 'outer;
-                        }
-                        if cancelled {
-                            break 'outer;
-                        }
-                    } else {
-                        for (seq, item) in scratch.drain(..) {
-                            if cancel_active(worker_cancel.as_ref()) {
-                                break 'outer;
-                            }
-                            let output = stage(item);
-                            if tx.send((seq, output)).is_err() {
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
+                claim_map_deliver(
+                    &mut |scratch: &mut Vec<(u64, I)>| {
+                        anchor_claim(&mut spin, &rx, scratch, claim_cap)
+                    },
+                    |(seq, item): (u64, I)| (seq, stage(item)),
+                    &mut tx,
+                    worker_cancel.as_ref(),
+                    tx_batch,
+                    claim_cap,
+                    CancelCheck::PerItem,
+                );
             }
         })
         .collect();
@@ -912,108 +780,48 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
     // Per-worker claim share — see `spawn_stage_fanout` (an expand worker
     // turns one input into many outputs, so a monopolized burst costs even
     // more wall time than on a plain stage).
-    let workers = txs.len().max(1);
-    let batch_cap = crate::handoff::batch_recv_cap();
-    let claim_cap = if batch_cap == 0 {
-        0
-    } else {
-        (batch_cap / workers).max(1)
-    };
+    let claim_cap = per_worker_claim_cap(txs.len().max(1));
     // Batched output delivery (see `spawn_stage_fanout` for the knob and
     // the async-tail gate). The staging flush cap sits at the batch cap so
     // an expansion fan-out cannot grow the staging buffer with a whole
     // claim batch's outputs.
     let tx_batch = crate::handoff::stream_tx_batch() && claim_cap > 0 && !ctx.has_async_stage;
-    let flush_cap = batch_cap.max(claim_cap).max(1);
+    let flush_cap = crate::handoff::batch_recv_cap().max(claim_cap).max(1);
     let jobs: Vec<_> = txs
         .into_iter()
-        .map(|tx| {
+        .map(|mut tx| {
             let expand = expand.clone();
             let rx = rx.clone();
             let worker_cancel = ctx.cancel.clone();
             move || {
-                // Per-worker scratch buffer, reused across items (cleared
-                // per item): expand-heavy loads pay zero steady-state
-                // allocation instead of one `Vec` per input.
-                let mut buf: Vec<N> = Vec::new();
-                // Adaptive pre-anchor spin state (todo #4); see
-                // `spawn_stage_fanout`.
+                // The claim → expand → deliver loop is the shared
+                // `claim_expand_deliver` driver (claim side and cancel policy
+                // as in `spawn_stage_fanout`). The raw expansion scratch
+                // below is reused across items (cleared per item):
+                // expand-heavy loads pay zero steady-state allocation instead
+                // of one `Vec` per input. Outputs of one input inherit its
+                // `seq` (the collector groups them); a downstream close
+                // mid-group drops the unforwarded outputs (the worker is on
+                // its abort path anyway).
                 let mut spin = AnchorSpin::new(crate::handoff::spin_anchor_us());
-                // Batch claim scratch (see `spawn_stage`); the claim cap is
-                // the per-worker share (see `claim_cap` above).
-                let mut scratch: Vec<(u64, I)> = Vec::with_capacity(claim_cap.max(1));
-                // Output staging for the batched arm (see `tx_batch`); zero
-                // capacity when inert (`with_capacity(0)` allocates nothing).
-                let stage_cap = if tx_batch {
-                    claim_cap
-                } else {
-                    0
+                let mut raw: Vec<N> = Vec::new();
+                let tag_outputs = move |(seq, item): (u64, I), out: &mut Vec<(u64, N)>| {
+                    raw.clear();
+                    expand(item, &mut raw);
+                    out.extend(raw.drain(..).map(|n| (seq, n)));
                 };
-                let mut mapped: Vec<(u64, N)> = Vec::with_capacity(stage_cap);
-                let mut staged: Vec<std::mem::MaybeUninit<(u64, N)>> =
-                    Vec::with_capacity(stage_cap);
-                'outer: loop {
-                    // Anchor + burst-drain, same shape as `spawn_stage`
-                    // (batched + spin-gated via `anchor_claim` there too).
-                    let claimed = anchor_claim(&mut spin, &rx, &mut scratch, claim_cap);
-                    if claimed == 0 {
-                        break;
-                    }
-                    if tx_batch {
-                        // Stage the `(seq, output)` pairs, cancel checked
-                        // before every expand call — exactly the per-item
-                        // loop's observation point. Outputs of one input
-                        // inherit its `seq` (the collector groups them).
-                        let mut cancelled = false;
-                        mapped.clear();
-                        for (seq, item) in scratch.drain(..) {
-                            if cancel_active(worker_cancel.as_ref()) {
-                                cancelled = true;
-                                break;
-                            }
-                            buf.clear();
-                            expand(item, &mut buf);
-                            mapped.extend(buf.drain(..).map(|n| (seq, n)));
-                            if mapped.len() >= flush_cap && !tx.send_batch(&mut mapped, &mut staged)
-                            {
-                                break 'outer;
-                            }
-                        }
-                        // Deliver the tail (and, on cancel, the outputs whose
-                        // expand calls completed before the token was
-                        // observed — the same item set the per-item loop
-                        // sends).
-                        if !tx.send_batch(&mut mapped, &mut staged) {
-                            break 'outer;
-                        }
-                        if cancelled {
-                            break 'outer;
-                        }
-                    } else {
-                        for (seq, item) in scratch.drain(..) {
-                            if cancel_active(worker_cancel.as_ref()) {
-                                break 'outer;
-                            }
-                            // Expand `item` into the scratch buffer and
-                            // forward the outputs; false = downstream closed
-                            // mid-group (unforwarded outputs are dropped by
-                            // the next `clear` — the worker is on its abort
-                            // path anyway).
-                            buf.clear();
-                            expand(item, &mut buf);
-                            let mut open = true;
-                            for n in buf.drain(..) {
-                                if tx.send((seq, n)).is_err() {
-                                    open = false;
-                                    break;
-                                }
-                            }
-                            if !open {
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
+                claim_expand_deliver(
+                    &mut |scratch: &mut Vec<(u64, I)>| {
+                        anchor_claim(&mut spin, &rx, scratch, claim_cap)
+                    },
+                    tag_outputs,
+                    &mut tx,
+                    worker_cancel.as_ref(),
+                    tx_batch,
+                    claim_cap,
+                    flush_cap,
+                    CancelCheck::PerItem,
+                );
             }
         })
         .collect();
@@ -6907,30 +6715,13 @@ struct Admission {
 /// Resolve the run's pool admission: the default per-stage compute-pool
 /// parallelism and the dispatch mode (pool jobs vs dedicated OS threads).
 ///
-/// Liveness invariant (pool mode): every blocking job the run parks
-/// on a pool thread must be simultaneously schedulable — that is
-/// `feeder(≤1) + Σ stage workers + Σ fence forwarders ≤ pool_threads`. A worker parked
-/// inside a crossfire send/recv never returns to the pool's find_work
-/// loop, so a job left queued while every thread is parked deadlocks
-/// the run (reproduced pre-fix: 4 stages on a 4-thread pool with
-/// n > k × buffer hung forever — the feeder job was uncounted and the
-/// per-stage floor of 1 pushed the total past the pool).
-///
-/// That budget must hold at *pool* scope, not per run: concurrent
-/// full-budget runs on a shared pool (global pool + parallel callers)
-/// each individually fit yet jointly oversubscribe it, parking every
-/// worker with stage-2 jobs still queued (see [`ParkingLease`]). The
-/// run therefore leases its whole upper bound of parking jobs from
-/// the pool atomically, or falls back to dedicated threads.
-///
-/// When the remaining lease capacity cannot host the run (busy pool,
-/// or more sync stages than slots), or when `run()` itself executes
-/// on a worker of the same pool (nested pipelines: the collector
-/// parks that worker for the whole run, so pool admission of *any*
-/// further blocking job — feeder included — depends on other
-/// tenants' courtesy), stage workers and the feeder fall back to
-/// dedicated OS threads, which the OS schedules independently of
-/// pool occupancy.
+/// The liveness invariant, the pool-scope lease rationale and the
+/// snapshot/CAS discipline live once on the shared [`admit`]; here only the
+/// stream-specific terms: the feeder-slot prediction and the fence
+/// forwarders as fixed lease jobs. When admission falls back to dedicated
+/// threads (busy pool, more sync stages than slots, or a nested `run()` on
+/// a worker of the same pool), stage workers and the feeder run on OS
+/// threads, which the OS schedules independently of pool occupancy.
 fn resolve_admission(
     budget: &StageBudget,
     config: &PipelineConfig,
@@ -6938,15 +6729,6 @@ fn resolve_admission(
     n: usize,
 ) -> Admission {
     let pool = compute_pool.map_or_else(|| ComputePool::global().clone(), Clone::clone);
-    let pool_threads = pool.num_workers();
-    // Budget resolution: an explicitly pinned `with_compute_workers` wins
-    // (clamped to the pool below); unpinned follows the pool's thread
-    // count so a big blocking-IO pool actually gets its workers.
-    let workers_budget = if config.compute_workers_pinned {
-        config.compute_workers
-    } else {
-        config.compute_workers.max(pool_threads)
-    };
     // Feeder-slot prediction must cover (never miss) the pool-job case.
     // The feeder is a job iff `n > buffer_actual = max(buffer_size,
     // per_stage_actual * 4)`; `per_stage_actual ≥ 1`, so predicting with
@@ -6955,74 +6737,43 @@ fn resolve_admission(
     // converse (reserved but inline) merely over-reserves by one slot,
     // returned by the lease's drop. Interlock: `floored_channel_capacity`.
     let feeder_slot = usize::from(n > floored_channel_capacity(config.buffer_size, 1));
-    let (lease, dedicated_threads, per_stage_parallelism, worker_budget) = if pool.is_on_this_pool()
-    {
-        (None, true, budget.default_workers(workers_budget), 0)
-    } else {
-        // Snapshot the pool's lease load, size this run against it, and
-        // CAS the whole grant in one piece — `try_reserve_parking`
-        // revalidates against the live counter, so a stale snapshot can
-        // only under-promise (per_stage too small), never over-admit.
-        // Each fence forwarder is one channel-parking pool job for
-        // the whole run: it takes a lease slot (never returned until
-        // the run drains) and is deducted from the stage-worker
-        // division up front, exactly like the feeder slot. Skipping
-        // this term re-opens the shared-pool deadlock for chains
-        // with fences (regression-tested in
-        // `test_fence_forwarder_counts_in_parking_lease_no_deadlock`).
-        let fences = budget.fences;
-        let used = pool.registry().parking_used();
-        let live_slots = pool_threads.saturating_sub(used + feeder_slot + fences);
-        let per_stage = budget.default_workers(workers_budget.min(live_slots));
+    // Each fence forwarder is one channel-parking pool job for the whole
+    // run: it takes a lease slot (never returned until the run drains) and
+    // is deducted from the stage-worker division up front, exactly like
+    // the feeder slot. Skipping this term re-opens the shared-pool
+    // deadlock for chains with fences (regression-tested in
+    // `test_fence_forwarder_counts_in_parking_lease_no_deadlock`).
+    let fixed_jobs = feeder_slot + budget.fences;
+    let d = admit(&pool, config, fixed_jobs, |worker_budget| {
+        let per_stage = budget.default_workers(worker_budget);
         // Upper bound of granted workers: pins are additionally clamped
         // to `n` by `stage_workers`, so this never under-reserves.
+        // `per_stage >= 1` (`default_workers` floors the division) and
+        // `n >= 1` (the zero-item early return), so the unpinned term
+        // alone covers every unpinned stage's >= 1 grant — admission's
+        // promise of a resident worker per sync stage.
         let unpinned = budget.stages.saturating_sub(budget.explicit_stages);
-        // `per_stage >= 1` (`default_workers` floors the division)
-        // and `n >= 1` (the zero-item early return), so the unpinned
-        // term alone covers every unpinned stage's >= 1 grant —
-        // admission's promise of a resident worker per sync stage.
-        let need = feeder_slot + fences + budget.explicit_workers + unpinned * per_stage.min(n);
-        if need <= pool_threads && pool.registry().try_reserve_parking(need) {
-            let lease = ParkingLease {
-                registry: Arc::clone(pool.registry()),
-                reserved: need,
-                spawned: Cell::new(0),
-            };
-            // The stage-grant budget comes from the RESERVATION, not the
-            // pre-CAS snapshot: `live_slots` can be stale-high (other
-            // runs' jobs release slots between the snapshot and the CAS —
-            // worker jobs outlive the collector's return), so a lease can
-            // be admitted against just-freed capacity while `live_slots`
-            // still reads 0 — `stage_workers`'s >= 1 grant floor then
-            // underflowed `worker_slots_left` (`0 - 1`; debug panics,
-            // release wraps). Reproduced as a miri flake (2026-10-20,
-            // stream_reduce `empty_and_single`: a 1-item run racing the
-            // previous run's unreturned lease). The reservation's own
-            // arithmetic covers every grant: `explicit_workers >=
-            // explicit_stages` (pins are NonZero) and the unpinned term
-            // >= one per unpinned stage.
-            let worker_budget = need - feeder_slot - fences;
-            (Some(lease), false, per_stage, worker_budget)
-        } else {
-            (None, true, budget.default_workers(workers_budget), 0)
-        }
-    };
-    // Per-run worker budget in pool mode: the lease's stage-worker
-    // portion (see the `worker_budget` comment above), which the
-    // reservation guarantees covers every stage's grant — including the
-    // stale-snapshot case where the pre-CAS `live_slots` read is lower
-    // than what the CAS actually admitted. Unspent remainder returns via
+        (
+            per_stage,
+            budget.explicit_workers + unpinned * per_stage.min(n),
+        )
+    });
+    // Per-run worker budget in pool mode: the lease's stage-worker portion
+    // (`worker_need`), which the reservation guarantees covers every
+    // stage's grant — including the stale-snapshot case where the pre-CAS
+    // `live` read is lower than what the CAS actually admitted (see the
+    // snapshot-discipline note on `admit`). Unspent remainder returns via
     // the lease's drop.
-    let (worker_slots_left, stages_left) = if dedicated_threads {
+    let (worker_slots_left, stages_left) = if d.dedicated {
         (0, 0)
     } else {
-        (worker_budget, budget.stages)
+        (d.worker_need, budget.stages)
     };
     Admission {
         pool,
-        lease,
-        dedicated_threads,
-        per_stage_parallelism,
+        lease: d.lease,
+        dedicated_threads: d.dedicated,
+        per_stage_parallelism: d.share,
         worker_slots_left,
         stages_left,
     }

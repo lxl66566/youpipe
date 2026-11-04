@@ -10,16 +10,19 @@ use std::{
 
 use super::{
     GraphBuilder,
-    fanin::{Delivery, FanIn, RoundSpin},
+    fanin::{FanIn, RoundSpin},
     plan::{EdgeConnector, Erased, GraphPlan, NodeKind, NodeOpts, SpawnStep},
 };
 use crate::{
     builder::{
-        PanicSlot, ParkingLease, PipelineConfig, cancel_active, floored_channel_capacity,
-        record_panic, resume_stored_panic,
+        PanicSlot, ParkingLease, PipelineConfig, admit, floored_channel_capacity, record_panic,
+        resume_stored_panic,
     },
     executor::compute::ComputePool,
-    handoff::{Receiver as SyncReceiver, SyncSender},
+    handoff::{
+        CancelCheck, Delivery, Receiver as SyncReceiver, SyncSender, cancel_active,
+        claim_expand_deliver, claim_map_deliver, per_worker_claim_cap,
+    },
     runtime::AsyncRuntime,
     sync::CancellationToken,
 };
@@ -182,19 +185,6 @@ impl GraphCore {
             done.dec();
         }));
     }
-
-    /// Per-worker batch-claim share: the global batch cap divided across the
-    /// node's workers — one head CAS must not monopolize a ready burst that
-    /// the node's other workers should split (same policy as the streaming
-    /// `spawn_stage_fanout`'s `claim_cap`).
-    fn claim_cap(workers: usize) -> usize {
-        let batch_cap = crate::handoff::batch_recv_cap();
-        if batch_cap == 0 {
-            0
-        } else {
-            (batch_cap / workers.max(1)).max(1)
-        }
-    }
 }
 
 // ── Worker bodies ──
@@ -253,18 +243,15 @@ where
 }
 
 /// One sync node worker: fair fan-in claim, map, deliver through the node's
-/// [`Delivery`] strategy. Exits on EOF (every input closed), cancel, or
-/// every output edge closed. With the tx-batch knob on the mapped claim
-/// batch is staged and flushed per edge with one `try_send_batch` per free
-/// run (single-item claims — `claim_cap == 0` — keep the per-item send:
-/// staging a 1-item batch only adds moves).
-///
-/// Cancel acceptance is per claim batch in the batched arm (the token check
-/// precedes the batch's mapping, so up to `claim_cap` items can be accepted
-/// after the fire) and per item in the per-item arm; either way an accepted
-/// item is always delivered — the sends never consult the token — so the
-/// emitted set is independent of ring pressure (todo #21, the stream
-/// engine's contract).
+/// [`Delivery`] strategy — the shared `claim_map_deliver` driver with
+/// `PerClaim` cancel acceptance (the token check precedes the batch's
+/// mapping, so up to `claim_cap` items can be accepted after the fire;
+/// either way an accepted item is always delivered, so the emitted set is
+/// independent of ring pressure — todo #21). With the tx-batch knob on the
+/// mapped claim batch is staged and flushed per edge with one
+/// `try_send_batch` per free run (single-item claims — `claim_cap == 0` —
+/// keep the per-item send: staging a 1-item batch only adds moves). Exits
+/// on EOF (every input closed), cancel, or every output edge closed.
 fn node_worker<I, O, F, D>(
     f: &F,
     mut fanin: FanIn<I>,
@@ -279,42 +266,23 @@ fn node_worker<I, O, F, D>(
 {
     let tx_batch = super::fanin::graph_tx_batch() && claim_cap > 0;
     let mut spin = RoundSpin::new(crate::handoff::spin_anchor_us());
-    let mut scratch: Vec<I> = Vec::with_capacity(claim_cap.max(1));
-    let mut mapped: Vec<O> = Vec::new();
-    let mut staged: Vec<std::mem::MaybeUninit<O>> = Vec::new();
-    loop {
-        let claimed = fanin.claim(&mut scratch, claim_cap, &mut spin);
-        if claimed == 0 {
-            return; // EOF
-        }
-        if tx_batch {
-            if cancel_active(cancel) {
-                return;
-            }
-            mapped.clear();
-            mapped.extend(scratch.drain(..).map(f));
-            if !out.send_batch(&mut mapped, &mut staged) {
-                return; // every output edge closed
-            }
-        } else {
-            for item in scratch.drain(..) {
-                if cancel_active(cancel) {
-                    return;
-                }
-                if !out.send(f(item)) {
-                    return; // every output edge closed
-                }
-            }
-        }
-    }
+    claim_map_deliver(
+        &mut |scratch| fanin.claim(scratch, claim_cap, &mut spin),
+        f,
+        &mut out,
+        cancel,
+        tx_batch,
+        claim_cap,
+        CancelCheck::PerClaim,
+    );
 }
 
 /// One expansion node worker: like [`node_worker`] but each input expands
-/// into zero or more outputs pushed into a reused per-worker scratch `Vec`
-/// (zero steady-state allocation), each delivered downstream through the
-/// node's [`Delivery`] strategy. The batched arm flushes the staged outputs
-/// whenever they reach the batch cap — an expansion's fan-out must not
-/// force the staging buffer to grow with the whole claim batch's expansion.
+/// into zero or more outputs through the shared `claim_expand_deliver`
+/// driver (push-style expand into a reused per-worker scratch `Vec`, zero
+/// steady-state allocation; the batched arm flushes the staged outputs at
+/// the batch cap so an expansion's fan-out cannot grow the staging buffer
+/// with the whole claim batch's expansion).
 fn expand_worker<I, O, F, D>(
     f: &F,
     mut fanin: FanIn<I>,
@@ -330,49 +298,16 @@ fn expand_worker<I, O, F, D>(
     let tx_batch = super::fanin::graph_tx_batch() && claim_cap > 0;
     let flush_cap = crate::handoff::batch_recv_cap().max(claim_cap).max(1);
     let mut spin = RoundSpin::new(crate::handoff::spin_anchor_us());
-    let mut scratch: Vec<I> = Vec::with_capacity(claim_cap.max(1));
-    let mut buf: Vec<O> = Vec::new();
-    let mut mapped: Vec<O> = Vec::new();
-    let mut staged: Vec<std::mem::MaybeUninit<O>> = Vec::new();
-    loop {
-        let claimed = fanin.claim(&mut scratch, claim_cap, &mut spin);
-        if claimed == 0 {
-            return;
-        }
-        if tx_batch {
-            if cancel_active(cancel) {
-                return;
-            }
-            mapped.clear();
-            for item in scratch.drain(..) {
-                buf.clear();
-                f(item, &mut buf);
-                mapped.append(&mut buf);
-                if mapped.len() >= flush_cap {
-                    if !out.send_batch(&mut mapped, &mut staged) {
-                        return;
-                    }
-                    mapped.clear();
-                }
-            }
-            if !mapped.is_empty() && !out.send_batch(&mut mapped, &mut staged) {
-                return;
-            }
-        } else {
-            for item in scratch.drain(..) {
-                if cancel_active(cancel) {
-                    return;
-                }
-                buf.clear();
-                f(item, &mut buf);
-                for expanded in buf.drain(..) {
-                    if !out.send(expanded) {
-                        return;
-                    }
-                }
-            }
-        }
-    }
+    claim_expand_deliver(
+        &mut |scratch| fanin.claim(scratch, claim_cap, &mut spin),
+        f,
+        &mut out,
+        cancel,
+        tx_batch,
+        claim_cap,
+        flush_cap,
+        CancelCheck::PerClaim,
+    );
 }
 
 /// The single sink worker: fair fan-in claim, side-effect consume, no output.
@@ -466,7 +401,7 @@ where
     // The feeder job runs on a pool worker / dedicated thread; the iterator
     // crosses the thread boundary once.
     I::IntoIter: Send + 'static,
-    D: Delivery<T>,
+    D: Delivery<T> + From<Vec<SyncSender<T>>>,
 {
     // Convert up front so the Send bound is carried by the iterator itself.
     let iter = iter.into_iter();
@@ -475,7 +410,7 @@ where
             let txs = downcast_endpoints::<SyncSender<T>>(outputs, "outputs", "source");
             let cancel = core.cancel.clone();
             core.dispatch_job(move || {
-                source_feeder_worker(iter, D::new(txs), Some(&cancel));
+                source_feeder_worker(iter, D::from(txs), Some(&cancel));
             });
         },
     )
@@ -488,18 +423,18 @@ where
     I: Send + 'static,
     O: Send + 'static,
     F: Fn(I) -> O + Send + Sync + 'static,
-    D: Delivery<O>,
+    D: Delivery<O> + From<Vec<SyncSender<O>>>,
 {
     Box::new(
         move |core: &GraphCore, workers: usize, inputs: Vec<Erased>, outputs: Vec<Erased>| {
             let rxs = downcast_endpoints::<SyncReceiver<I>>(inputs, "inputs", &name);
             let txs = downcast_endpoints::<SyncSender<O>>(outputs, "outputs", &name);
-            let claim_cap = GraphCore::claim_cap(workers);
+            let claim_cap = per_worker_claim_cap(workers);
             let f = Arc::new(f);
             core.dispatch_jobs((0..workers).map(|_| {
                 let f = Arc::clone(&f);
                 let fanin = FanIn::new(rxs.clone());
-                let out = D::new(txs.clone());
+                let out = D::from(txs.clone());
                 let cancel = core.cancel.clone();
                 move || node_worker(&*f, fanin, out, Some(&cancel), claim_cap)
             }));
@@ -514,18 +449,18 @@ where
     I: Send + 'static,
     O: Send + 'static,
     F: Fn(I, &mut Vec<O>) + Send + Sync + 'static,
-    D: Delivery<O>,
+    D: Delivery<O> + From<Vec<SyncSender<O>>>,
 {
     Box::new(
         move |core: &GraphCore, workers: usize, inputs: Vec<Erased>, outputs: Vec<Erased>| {
             let rxs = downcast_endpoints::<SyncReceiver<I>>(inputs, "inputs", &name);
             let txs = downcast_endpoints::<SyncSender<O>>(outputs, "outputs", &name);
-            let claim_cap = GraphCore::claim_cap(workers);
+            let claim_cap = per_worker_claim_cap(workers);
             let f = Arc::new(f);
             core.dispatch_jobs((0..workers).map(|_| {
                 let f = Arc::clone(&f);
                 let fanin = FanIn::new(rxs.clone());
-                let out = D::new(txs.clone());
+                let out = D::from(txs.clone());
                 let cancel = core.cancel.clone();
                 move || expand_worker(&*f, fanin, out, Some(&cancel), claim_cap)
             }));
@@ -543,7 +478,7 @@ where
     Box::new(
         move |core: &GraphCore, _workers: usize, inputs: Vec<Erased>, _outputs: Vec<Erased>| {
             let rxs = downcast_endpoints::<SyncReceiver<I>>(inputs, "inputs", &name);
-            let claim_cap = GraphCore::claim_cap(1);
+            let claim_cap = per_worker_claim_cap(1);
             let f = Arc::new(f);
             let fanin = FanIn::new(rxs);
             let cancel = core.cancel.clone();
@@ -562,7 +497,7 @@ where
     Box::new(
         move |core: &GraphCore, _workers: usize, inputs: Vec<Erased>, _outputs: Vec<Erased>| {
             let rxs = downcast_endpoints::<SyncReceiver<T>>(inputs, "inputs", "collect sink");
-            let claim_cap = GraphCore::claim_cap(1);
+            let claim_cap = per_worker_claim_cap(1);
             let cancel = core.cancel.clone();
             core.dispatch_job(move || {
                 collect_worker(&buf, FanIn::new(rxs), Some(&cancel), claim_cap);
@@ -584,24 +519,12 @@ struct OutEdge {
 /// Resolve every node's worker count (async nodes: task fan-out) and the
 /// dispatch mode (pool jobs under a parking lease vs dedicated threads).
 ///
-/// Liveness invariant (pool mode, same as the stream engine's `resolve_admission`):
-/// every blocking job the run parks on a pool thread must be simultaneously
-/// schedulable — `source feeders + Σ sync node workers ≤ pool threads` —
-/// reserved atomically through [`ParkingLease`]. Async nodes run on the
-/// async runtime and consume no pool slot; bridge threads are always
-/// dedicated. When the remaining lease capacity cannot host the whole bound,
-/// or `run()` itself executes on a worker of the same pool (nested runs),
-/// every sync worker / feeder falls back to dedicated OS threads.
+/// The admission skeleton (liveness invariant, pool-scope lease, snapshot /
+/// CAS discipline) lives once on the shared [`admit`]; graph specifics: the
+/// source feeders and sinks are the fixed lease jobs, sync/expand nodes the
+/// divided units. Async nodes run on the async runtime and consume no pool
+/// slot; bridge threads are always dedicated.
 fn resolve_budget(plan: &GraphPlan, config: &PipelineConfig, pool: &ComputePool) -> RunPlan {
-    let pool_threads = pool.num_workers();
-    // A pinned budget wins (clamped by `set_compute_workers`); unpinned
-    // follows the pool so a big blocking-IO pool actually gets its workers.
-    let workers_budget = if config.compute_workers_pinned {
-        config.compute_workers
-    } else {
-        config.compute_workers.max(pool_threads)
-    };
-
     let feeders = plan
         .nodes
         .iter()
@@ -634,22 +557,10 @@ fn resolve_budget(plan: &GraphPlan, config: &PipelineConfig, pool: &ComputePool)
         (budget.saturating_sub(pinned_workers) / unpinned_divided).max(1)
     };
 
-    let (lease, dedicated, share) = if pool.is_on_this_pool() {
-        (None, true, share_of(workers_budget))
-    } else {
-        let used = pool.registry().parking_used();
-        // Sinks and feeders take their fixed slots off the pool before the
-        // division (each is one channel-parking job for the whole run).
-        let live = pool_threads.saturating_sub(used + feeders + sinks);
-        let share = share_of(workers_budget.min(live));
-        let need = feeders + sinks + pinned_workers + unpinned_divided * share;
-        if need <= pool_threads && pool.registry().try_reserve_parking(need) {
-            let lease = ParkingLease::new(Arc::clone(pool.registry()), need);
-            (Some(lease), false, share)
-        } else {
-            (None, true, share_of(workers_budget))
-        }
-    };
+    let d = admit(pool, config, feeders + sinks, |worker_budget| {
+        let share = share_of(worker_budget);
+        (share, pinned_workers + unpinned_divided * share)
+    });
 
     // Per-node worker/task counts. Async nodes resolve their task fan-out
     // here too (io_concurrency pin or the config default; async sources and
@@ -659,9 +570,10 @@ fn resolve_budget(plan: &GraphPlan, config: &PipelineConfig, pool: &ComputePool)
         .iter()
         .map(|node| match node.kind {
             NodeKind::Source | NodeKind::SourceAsync | NodeKind::Sink => 1,
-            NodeKind::Sync | NodeKind::Expand => {
-                node.opts.workers.map_or(share, std::num::NonZeroUsize::get)
-            },
+            NodeKind::Sync | NodeKind::Expand => node
+                .opts
+                .workers
+                .map_or(d.share, std::num::NonZeroUsize::get),
             NodeKind::Async => node
                 .opts
                 .io_concurrency
@@ -670,8 +582,8 @@ fn resolve_budget(plan: &GraphPlan, config: &PipelineConfig, pool: &ComputePool)
         .collect();
 
     RunPlan {
-        dedicated,
-        lease,
+        dedicated: d.dedicated,
+        lease: d.lease,
         workers,
     }
 }
