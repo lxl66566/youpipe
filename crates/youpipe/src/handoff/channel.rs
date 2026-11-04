@@ -672,17 +672,18 @@ pub trait SendItem<T>: Clone + Send + 'static {
         n
     }
 
-    /// Deliver every item of `batch`: one `try_send_batch` for the free
-    /// prefix, then per-item blocking [`Self::send`] for the remainder —
-    /// backpressure granularity (park per item, only when full) and item
-    /// order are identical to the per-item loop this replaces; what
-    /// changes is one tail CAS per free run instead of one per item on
-    /// backings with a native batch op. `batch` is drained on return;
-    /// `staged` is caller-owned scratch, `clear`-reused per call (one
-    /// allocation per caller, not per batch). Returns `false` as soon as a
-    /// send reports the channel closed; the unsent remainder is dropped
-    /// with its destructors run (a `Vec<MaybeUninit<_>>` drop would skip
-    /// them).
+    /// Deliver every item of `batch`: stage it ([`stage_batch`]), then
+    /// flush with [`Self::flush_staged`] — one `try_send_batch` for the
+    /// free prefix, then per-item blocking [`Self::send`] for the
+    /// remainder. Backpressure granularity (park per item, only when
+    /// full) and item order are identical to the per-item loop this
+    /// replaces; what changes is one tail CAS per free run instead of one
+    /// per item on backings with a native batch op. `batch` is drained on
+    /// return; `staged` is caller-owned scratch, `clear`-reused per call
+    /// (one allocation per caller, not per batch). Returns `false` as soon
+    /// as a send reports the channel closed; the unsent remainder is
+    /// dropped with its destructors run (a `Vec<MaybeUninit<_>>` drop
+    /// would skip them).
     ///
     /// No cancellation hook by design: the per-item worker loops this
     /// serves observe cancel between item productions, never between
@@ -694,7 +695,30 @@ pub trait SendItem<T>: Clone + Send + 'static {
             return true;
         }
         stage_batch(batch, staged);
-        // SAFETY: `stage_batch` initialized every staged slot.
+        self.flush_staged(staged)
+    }
+
+    /// Flush one fully-initialized `staged` batch through this sender: the
+    /// free prefix goes out with one [`Self::try_send_batch`], the remainder
+    /// per item with the blocking [`Self::send`] (parking at most once per
+    /// full ring — the backpressure granularity of the per-item loop).
+    /// Returns whether the channel survived; a closed send drops the unsent
+    /// remainder with its destructors run (a `Vec<MaybeUninit<_>>` drop
+    /// would skip them). Cancellation-blind, like [`Self::send_batch`].
+    ///
+    /// This is the one home of the `MaybeUninit` move-out bookkeeping
+    /// (todo #30): every batched-delivery site — `send_batch`, the
+    /// `Delivery` strategies in `worker.rs`, any future fan-out — stages
+    /// into `MaybeUninit` slots and flushes through here, so the
+    /// sent-prefix/remainder split exists exactly once.
+    ///
+    /// Contract: every slot of `staged` must be initialized on entry
+    /// ([`stage_batch`] or an equivalent clone-staging loop established
+    /// that).
+    fn flush_staged(&self, staged: &mut [MaybeUninit<T>]) -> bool {
+        // SAFETY: the caller upholds the initialization contract; the sent
+        // prefix (the returned count's worth of slots) is moved out and
+        // skipped below.
         let sent = unsafe { self.try_send_batch(staged) };
         let mut j = sent;
         while j < staged.len() {

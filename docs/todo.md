@@ -19,10 +19,3 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 - Pending: the async face audit (async_rx/async_tx waker state machine) — the fix covers the shared `reg_waker`/`set_seq` steal surface async re-arms use.
 - Standing: run `perf/verify/hang-stakeout.sh` (forensics-before-kill) on the next sighting before touching the process.
 
-### 30. [P2] Engine duplication, second tier: bridge loops, staged-flush unsafe
-
-- Same review, lower-stakes duplicates (the worker loop and admission landed with todo #29 and the spin state machines with todo #30, 2026-11-05: `handoff/worker.rs` + `builder/admission.rs`, `SpinBudget` over a `poll_once` closure):
-  - Six copies of the cancel-parity forward loop across the bridge threads/tasks (three sync `recv→send` bodies, three async `recv_cached→send_cached` twins) — one `forward_sync`/`forward_async` pair in `handoff` covers them.
-  - The unsafe staged-flush contract (`handoff/worker.rs::flush_staged`, moved there from the graph engine with todo #29, vs `SendItem::send_batch`'s tail): two hand-written MaybeUninit move-out bookkeeping paths; express the flush through a `SendItem` method so the unsafe surface exists once.
-  - The `drain_async_sharded` trait requirement (no default impl, six collector impls) for the default-off falsified `YOUPIPE_SHARDED_TERM_ASYNC` flavour is pure tax on every new collector type; default it (unreachable body when the knob is off) or feature-gate the flavour.
-

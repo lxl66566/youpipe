@@ -147,6 +147,8 @@ crates/youpipe/src/
 ├── graph/            # Runtime DAG engine (graph()): builder, validation, per-node executors
 ├── handoff/          # Data transfer layer
 │   ├── channel.rs    # MPMC channels (crossfire wrapper: sync + async)
+│   ├── forward.rs    # The bridge forward loops (forward_sync / forward_async /
+│   │                 #   forward_async_to_sync) shared by both engines' bridges
 │   ├── worker.rs     # The engine-agnostic claim → map/expand → deliver worker
 │   │                 #   loops (claim_map_deliver / claim_expand_deliver,
 │   │                 #   CancelCheck) + the Delivery output strategies

@@ -18,6 +18,8 @@ use super::{
     exec::{GraphCore, downcast_endpoints},
     plan::SpawnStep,
 };
+// The async-to-sync bridge forward loop (the graph bridge body).
+use crate::handoff::forward_async_to_sync;
 use crate::{
     builder::{PanicSlot, record_panic},
     handoff::{
@@ -350,8 +352,8 @@ where
 }
 
 /// Forward an async upstream edge into the sync channel a sync downstream
-/// consumes: a dedicated OS thread runs `block_on` over the async receiver
-/// and pushes through a blocking `SyncSender` (the same shape as the stream
+/// consumes: a dedicated OS thread runs `block_on` over
+/// [`forward_async_to_sync`] (the shared loop also driven by the stream
 /// engine's `bridge_async_to_sync` — a blocking send must never run inside a
 /// runtime task).
 ///
@@ -367,18 +369,8 @@ where
         .spawner
         .as_ref()
         .expect("async-to-sync bridge requires the async spawner");
-    let cancel = core.cancel.clone();
-    let forward: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
-        let mut rx_slot = WakerSlot::new();
-        while let Ok(item) = a_rx.recv_cached(&mut rx_slot).await {
-            if cancel_active(Some(&cancel)) {
-                return;
-            }
-            if s_tx.send(item).is_err() {
-                return;
-            }
-        }
-    });
+    let forward: Pin<Box<dyn Future<Output = ()> + Send>> =
+        Box::pin(forward_async_to_sync(a_rx, s_tx, Some(core.cancel.clone())));
     let driver = Arc::clone(spawner);
     std::thread::spawn(move || driver.block_on(forward));
     s_rx

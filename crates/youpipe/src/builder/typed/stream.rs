@@ -4,13 +4,9 @@
 use std::sync::OnceLock;
 #[cfg(feature = "tokio-runtime")]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{
-    cell::Cell,
-    marker::PhantomData,
-    num::NonZeroUsize,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+#[cfg(feature = "tokio-runtime")]
+use std::time::Duration;
+use std::{cell::Cell, marker::PhantomData, num::NonZeroUsize, sync::Arc, time::Instant};
 #[cfg(feature = "tokio-runtime")]
 use std::{
     future::Future,
@@ -27,8 +23,8 @@ use super::{
 #[cfg(feature = "tokio-runtime")]
 use crate::handoff::{
     AsyncReceiver, AsyncRecvItem, AsyncSendItem, AsyncSender, MpscAsyncReceiver, MpscAsyncSender,
-    ShardedAsyncReceiver, WakerSlot, async_channel, mpsc_async_channel, sharded_mpsc_async_channel,
-    sync_async_channel,
+    ShardedAsyncReceiver, WakerSlot, async_channel, forward_async, forward_async_to_sync,
+    mpsc_async_channel, sharded_mpsc_async_channel, sync_async_channel,
 };
 #[cfg(feature = "tokio-runtime")]
 use crate::state::{
@@ -43,8 +39,8 @@ use crate::{
     handoff::{
         CancelCheck, Claim, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem,
         ShardedReceiver, SpinBudget, SpinPoll, SyncSender, cancel_active, channel::channel,
-        claim_expand_deliver, claim_map_deliver, claim_poll, mpsc_channel, per_worker_claim_cap,
-        sharded::MIN_SHARD_BUFFER, sharded_mpsc_channel,
+        claim_expand_deliver, claim_map_deliver, claim_poll, forward_sync, mpsc_channel,
+        per_worker_claim_cap, sharded::MIN_SHARD_BUFFER, sharded_mpsc_channel,
     },
     runtime::{AsyncRuntime, DefaultRuntime},
     state::{
@@ -88,17 +84,7 @@ fn bridge_async_to_sync<T: Send + Unpin + 'static, R: AsyncRuntime>(
     let cancel = ctx.cancel.clone();
     let pool = ctx.acquire_async().expect("failed to build async runtime");
     std::thread::spawn(move || {
-        pool.block_on(async move {
-            let mut rx_slot = WakerSlot::new();
-            while let Ok(item) = rx.recv_cached(&mut rx_slot).await {
-                if cancel_active(cancel.as_ref()) {
-                    return;
-                }
-                if s_tx.send(item).is_err() {
-                    return;
-                }
-            }
-        });
+        pool.block_on(forward_async_to_sync(rx, s_tx, cancel));
     });
     s_rx
 }
@@ -2228,14 +2214,7 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
         let (tx, out_rx) = mpsc_channel::<(u64, I)>(buffer);
         let cancel = ctx.cancel.clone();
         std::thread::spawn(move || {
-            while let Ok(item) = rx.recv() {
-                if cancel_active(cancel.as_ref()) {
-                    return;
-                }
-                if tx.send(item).is_err() {
-                    return;
-                }
-            }
+            forward_sync(&rx, &tx, cancel.as_ref());
         });
         FinalRx::SyncSingle(out_rx)
     }
@@ -2319,14 +2298,7 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
         let (tx, a_rx) = sync_async_channel::<(u64, I)>(buffer);
         let cancel = ctx.cancel.clone();
         std::thread::spawn(move || {
-            while let Ok(item) = rx.recv() {
-                if cancel_active(cancel.as_ref()) {
-                    return;
-                }
-                if tx.send(item).is_err() {
-                    return;
-                }
-            }
+            forward_sync(&rx, &tx, cancel.as_ref());
         });
         a_rx
     }
@@ -2348,18 +2320,7 @@ impl<I: Send + Unpin + 'static> StageSpawn<I> for StreamStart {
         let (tx, out_rx) = mpsc_async_channel::<(u64, I)>(buffer);
         let cancel = ctx.cancel.clone();
         let pool = ctx.acquire_async().expect("failed to build async runtime");
-        pool.spawn(async move {
-            let mut rx_slot = WakerSlot::new();
-            let mut tx_slot = WakerSlot::new();
-            while let Ok(item) = rx.recv_cached(&mut rx_slot).await {
-                if cancel_active(cancel.as_ref()) {
-                    return;
-                }
-                if tx.send_cached(item, &mut tx_slot).await.is_err() {
-                    return;
-                }
-            }
-        });
+        pool.spawn(forward_async(rx, tx, cancel));
         FinalRx::AsyncSingle(out_rx)
     }
 }
@@ -3871,14 +3832,7 @@ where
             // (first-stage-async chains where a later sync stage feeds us).
             let (a_in_tx, a_in_rx) = sync_async_channel::<(u64, T)>(buffer);
             std::thread::spawn(move || {
-                while let Ok(item) = mid_rx.recv() {
-                    if cancel_active(bridge_cancel.as_ref()) {
-                        return;
-                    }
-                    if a_in_tx.send(item).is_err() {
-                        return;
-                    }
-                }
+                forward_sync(&mid_rx, &a_in_tx, bridge_cancel.as_ref());
             });
             a_in_rx
         },
@@ -3909,18 +3863,7 @@ where
             // upstream into a single-waker source. Keep it.
             let (a_in_tx, a_in_rx) = async_channel::<(u64, T)>(buffer);
             let pool = ctx.acquire_async().expect("failed to build async runtime");
-            pool.spawn(async move {
-                let mut rx_slot = WakerSlot::new();
-                let mut tx_slot = WakerSlot::new();
-                while let Ok(item) = prev_async_rx.recv_cached(&mut rx_slot).await {
-                    if cancel_active(bridge_cancel.as_ref()) {
-                        return;
-                    }
-                    if a_in_tx.send_cached(item, &mut tx_slot).await.is_err() {
-                        return;
-                    }
-                }
-            });
+            pool.spawn(forward_async(prev_async_rx, a_in_tx, bridge_cancel));
             a_in_rx
         },
         FinalRx::AsyncSingle(_) => {
@@ -5008,15 +4951,32 @@ trait Terminal<T: Send + Unpin + 'static>: Sized {
     /// Async sharded-terminal counterpart of [`Self::drain_async`] — the
     /// collector aggregates the async terminal's shard rings (the
     /// `YOUPIPE_SHARDED_TERM_ASYNC=1` async path).
+    ///
+    /// Defaulted (todo #30, 2026-11-05): the flavour is default-off and
+    /// falsified on its target shapes (+42…+51 %, dev/benchmarks/
+    /// streaming.md "Async sharded-terminal A/B"), so requiring every new
+    /// collector to implement it was pure tax. The default body is
+    /// unreachable with the knob off; only a collector that did not opt
+    /// into the niche flavour can ever see it, and then panics loudly
+    /// instead of silently draining wrong.
     #[cfg(feature = "tokio-runtime")]
     fn drain_async_sharded(
         self,
-        rx: ShardedAsyncReceiver<(u64, T)>,
-        ordered: bool,
-        window: OrderedWindow,
-        n: usize,
-        cancel: Option<&CancellationToken>,
-    ) -> impl Future<Output = Self::Out>;
+        _rx: ShardedAsyncReceiver<(u64, T)>,
+        _ordered: bool,
+        _window: OrderedWindow,
+        _n: usize,
+        _cancel: Option<&CancellationToken>,
+    ) -> impl Future<Output = Self::Out> {
+        async move {
+            unreachable!(
+                "drain_async_sharded: terminal {} did not implement the                  \
+                 YOUPIPE_SHARDED_TERM_ASYNC flavour (default-off; measured as a                  \
+                 regression on sync-fed async terminals)",
+                std::any::type_name::<Self>()
+            )
+        }
+    }
 }
 
 /// `Vec`-materialising terminal — the behaviour of `.run()`.

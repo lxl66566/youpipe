@@ -270,7 +270,7 @@ impl<T: Send + 'static> Delivery<T> for Unicast<T> {
 
     fn send_batch(&mut self, batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) -> bool {
         stage_batch(batch, staged);
-        flush_staged(&self.tx, staged)
+        SendItem::flush_staged(&self.tx, staged)
     }
 }
 
@@ -339,14 +339,14 @@ impl<T: Send + Clone + 'static> Delivery<T> for Broadcast<T> {
     /// workers exit on their next token check and drop their receivers,
     /// whose close wakes parked senders with `Closed`), so the emitted set
     /// never depends on ring pressure. A closed edge still drops its unsent
-    /// remainder (`assume_init_drop` — a `Vec<MaybeUninit<_>>` drop would
-    /// skip the destructors).
+    /// remainder (`SendItem::flush_staged`'s `assume_init_drop` — a
+    /// `Vec<MaybeUninit<_>>` drop would skip the destructors).
     fn send_batch(&mut self, batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>>) -> bool {
         let mut i = 0;
         while i + 1 < self.txs.len() {
             staged.clear();
             staged.extend(batch.iter().cloned().map(MaybeUninit::new));
-            if flush_staged(&self.txs[i], staged) {
+            if SendItem::flush_staged(&self.txs[i], staged) {
                 i += 1;
             } else {
                 self.txs.swap_remove(i);
@@ -357,41 +357,10 @@ impl<T: Send + Clone + 'static> Delivery<T> for Broadcast<T> {
         }
         let last = self.txs.len() - 1;
         stage_batch(batch, staged);
-        if !flush_staged(&self.txs[last], staged) {
+        if !SendItem::flush_staged(&self.txs[last], staged) {
             self.txs.swap_remove(last);
         }
         !self.txs.is_empty()
-    }
-}
-
-/// Flush one fully-initialized `staged` batch through one edge: the free
-/// prefix goes out with one `try_send_batch`, the remainder per item (parking
-/// at most once per full ring, cancellation-blind — see
-/// [`Broadcast::send_batch`]). Returns whether the edge survived.
-fn flush_staged<T: Send + 'static>(tx: &SyncSender<T>, staged: &mut [MaybeUninit<T>]) -> bool {
-    // SAFETY: every staged slot is initialized (the callers stage fully
-    // initialized batches); the sent prefix is skipped below.
-    let sent = unsafe { tx.try_send_batch(staged) };
-    let mut j = sent;
-    while j < staged.len() {
-        // SAFETY: only [..j) was moved out; slot `j` is still initialized.
-        let item = unsafe { staged[j].assume_init_read() };
-        j += 1;
-        if tx.send(item).is_err() {
-            drop_staged(&mut staged[j..]);
-            return false;
-        }
-    }
-    true
-}
-
-/// Run the destructors of every still-initialized slot — the explicit-drop
-/// half of the `MaybeUninit` staging contract (see
-/// [`Broadcast::send_batch`]).
-fn drop_staged<T>(slots: &mut [MaybeUninit<T>]) {
-    for slot in slots {
-        // SAFETY: callers only pass never-sent (still initialized) slots.
-        unsafe { slot.assume_init_drop() };
     }
 }
 

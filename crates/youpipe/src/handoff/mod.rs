@@ -1,4 +1,7 @@
 pub mod channel;
+// Crate-internal: the bridge forward loops (recv -> cancel-check -> send)
+// shared by both engines' cross-mode bridges.
+pub(crate) mod forward;
 // Crate-internal: every receiver method here is `pub(crate)`, so a public
 // module would only expose vestigial constructors (review R-5: an external
 // `sharded_mpsc_channel(0, ..)` constructed fine, then panicked at `% 0` on
@@ -266,6 +269,11 @@ pub use channel::{
     mpsc_async_channel, mpsc_channel, sync_async_channel,
 };
 pub(crate) use channel::{Claim, claim_poll, stage_batch};
+#[cfg(feature = "tokio-runtime")]
+pub(crate) use forward::forward_async;
+// `forward_async_to_sync` is re-exported ungated: the graph engine's bridge
+// compiles (dead) without the tokio backend too.
+pub(crate) use forward::{forward_async_to_sync, forward_sync};
 #[cfg(feature = "tokio-runtime")]
 pub(crate) use sharded::{ShardedAsyncReceiver, sharded_mpsc_async_channel};
 pub(crate) use sharded::{ShardedReceiver, sharded_mpsc_channel};
