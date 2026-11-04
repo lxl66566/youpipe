@@ -255,6 +255,13 @@ impl<T: Send + Unpin + 'static> AsyncDelivery<T> for AsyncUnicast<T> {
 /// Every open edge receives a clone; the last surviving edge gets the owned
 /// item. A closed edge (send resolves `Err`) drops out of the active set —
 /// one dead downstream must not kill the node's other branches.
+///
+/// Ordering scope: "every edge sees the same sequence" holds per task, not
+/// per node — with `io_concurrency > 1` the tasks interleave their per-item
+/// sends, so two edges can take the same items in different orders (each
+/// edge stays a FIFO). Cross-edge order-sensitive consumers need a
+/// single-task node; mid-edge holes are never produced (an accepted item
+/// reaches every open edge).
 pub(crate) struct AsyncBroadcast<T: Send + Unpin + 'static> {
     txs: Vec<AsyncSender<T>>,
     /// Per-edge waker-node slots (see [`AsyncFanIn`]).

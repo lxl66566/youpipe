@@ -382,6 +382,60 @@ still trip the gate. gungraun's Ir benches and
 youpipe-bench's one-shot bins stay opt-in manual runs (valgrind / perf
 counters / disk paths).
 
+## Gate record: 2026-11-05 (main @ dcea959, Linux 32-core agent worktree)
+
+- miri RED, all other stages green (native 97 s / 524 tests + doctests +
+  both clippy lines; loom 318 s, 4/4 blocks; bench-full 872 s with all 12
+  youpipe binaries, 3 fork suites, horizontal and gungraun ok — this host
+  has valgrind + gungraun-runner installed, so the Windows census's
+  horizontal/gungraun "skip" expectations do not apply here).
+- Deterministic miri lib failure (3/3 runs byte-identical, tree-borrows):
+  `graph::tests::async_broadcast_panic_multi_sink_conserves_partial` —
+  sink prefixes `[0..32, 36]` vs `[0..32, 34]`: a hole (x=17 missing from
+  one sink while x=18 was delivered), which a per-edge FIFO cannot
+  produce; the test's "shorter observed multiset is a prefix of the
+  longer" acceptance contract is falsified under this interleaving.
+  bisect (single-test miri, good=e443ded, bad=dcea959): first bad =
+  86260ee "unify the bridge forward loops" — code motion with
+  byte-identical cancel parity, so the likely trigger is the code-layout
+  shift moving miri's deterministic preemption points and exposing a
+  latent ordering/cancel interaction in the graph sink drain (one
+  `sink_worker` per sink + cancel check per item inside the claim batch;
+  exact mechanism still open for the graph owner). Native passes
+  (timing-dependent), and the Windows miri host never reaches this
+  assertion (the test dies in mio's CreateIoCompletionPort shim first),
+  so Linux miri is the only gate that sees it. Repro:
+  `MIRI_TARGETS=lib perf/verify/miri.sh async_broadcast_panic_multi_sink`.
+- RESOLVED 2026-11-05 (P0, agent/c): no item was lost — the "hole" is a
+  cross-edge order divergence read through the sorted cross-sink
+  comparison. Instrumented miri trace (kept at
+  `/root/youpipe-p0-logs/evidence-trace-passing-run.log`): at the node's
+  default `io_concurrency(128)` two boom tasks' per-item broadcasts
+  interleaved differently per edge (ring-entry `[0,2,4,..]` vs `[0,4,2,..]`
+  — transpositions 2↔4, 18↔20), while every per-edge FIFO stayed intact
+  (bridge recv = prefix of ring entry; sink = prefix of bridge forwards).
+  The gate's sinks each held a prefix of their own edge's sequence; the
+  cancel cut landed inside a transposed (34, 36) pair, so sorted(A)
+  = `[..., 32, 36]` vs sorted(B) = `[..., 32, 34]` — two prefixes of two
+  different valid interleavings, not a mid-edge loss. The test's premise
+  ("both sinks push prefixes of the SAME sequence") is a single-task
+  broadcast property; guide/graph.md "No reordering" already documents the
+  multi-task divergence. Fix: pin `io_concurrency(1)` in the test (prefix
+  contract kept verbatim) + the ordering-scope note on `AsyncBroadcast`.
+  Verdict: latent test bug — 86260ee moved the bridge loop verbatim
+  (diff-verified, no semantic change on this path); its layout shift only
+  relocated the preemption points. Empirically confirmed: e443ded (the
+  bisect good commit) fails the same assertion under 24-burner co-load
+  (1/3 runs; sinks [..,18,22,24] vs [..,18,20,22] — the same transposed
+  straddle), so the bisect's good verdict was layout luck, not absence of
+  the mechanism. Nothing to backport.
+- Trap: /tmp gate logs were deleted mid-run by something on this host
+  (stage logs vanished while their writers still ran; rescued the miri
+  tail via `/proc/<pid>/fd/1`). Keep gate logs under `/root`, not `/tmp`.
+- miri walls under heavy sibling co-load (loadavg ~26): heavy group 181 s
+  vs the 58 s census, `sharded_terminal_async` 307 s — walls only, zero
+  failures; schedule the miri stage around sibling bench load.
+
 ## Native (default members, debug)
 
 | step                                               | wall                      |

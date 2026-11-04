@@ -929,6 +929,17 @@ fn async_node_panic_propagates_to_run_caller() {
 /// past the common prefix are ring leftovers each sink legitimately drops
 /// at the cancel. Side-effect sinks observe the partials: a panicking run
 /// re-raises before `run_collect` could return its buffers.
+///
+/// The prefix contract compares the two sinks' sequences, so it needs the
+/// node pinned to ONE task: with several tasks the per-edge ring-entry
+/// orders can differ (each task's per-item broadcast lands in the edges in
+/// its own interleaving; each edge stays a FIFO — the "No reordering"
+/// semantics, guide/graph.md, allow this). The 2026-11-05 miri gate caught
+/// the unpinned shape (first-bad 86260ee only shifted code layout): sinks
+/// observed `[..., 32, 36]` vs `[..., 32, 34]` — a transposed (34, 36)
+/// pair straddling the cancel cut, i.e. two prefixes of two different
+/// valid interleavings, NOT a lost item. Per-edge FIFOs stayed intact
+/// (trace in testing.md's gate record).
 #[cfg(feature = "tokio-runtime")]
 // miri (windows): building the tokio runtime registers an IOCP handle,
 // which the interpreter cannot execute; Linux miri (epoll) stays covered.
@@ -972,23 +983,32 @@ fn async_broadcast_panic_multi_sink_conserves_partial() {
             // non-doomed item clones into both sinks; the deadline only
             // guards against a wedged run).
             let want = boom_at.min(8);
-            let boom = g.node_async_broadcast("boom", move |x: u64| {
-                let (a, b) = (Arc::clone(&boom_cnt_a), Arc::clone(&boom_cnt_b));
-                async move {
-                    if x >= boom_at {
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(2);
-                        while a.load(Ordering::Relaxed) < want || b.load(Ordering::Relaxed) < want {
-                            if std::time::Instant::now() > deadline {
-                                break;
+            // One task: with io_concurrency > 1 the two edges' entry
+            // orders can diverge (see the test doc), voiding the prefix
+            // contract below while every per-edge FIFO stays intact.
+            let boom = g.node_async_broadcast_with(
+                "boom",
+                AsyncNodeOptions::new().io_concurrency(1),
+                move |x: u64| {
+                    let (a, b) = (Arc::clone(&boom_cnt_a), Arc::clone(&boom_cnt_b));
+                    async move {
+                        if x >= boom_at {
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(2);
+                            while a.load(Ordering::Relaxed) < want
+                                || b.load(Ordering::Relaxed) < want
+                            {
+                                if std::time::Instant::now() > deadline {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                         }
+                        assert!(x < boom_at, "async broadcast boom at {x}");
+                        x.wrapping_mul(2)
                     }
-                    assert!(x < boom_at, "async broadcast boom at {x}");
-                    x.wrapping_mul(2)
-                }
-            });
+                },
+            );
             let out_a = g.sink("out-a", move |x: u64| {
                 acc_a.lock().unwrap().push(x);
                 sink_cnt_a.fetch_add(1, Ordering::Relaxed);
