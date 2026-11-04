@@ -3,9 +3,44 @@
 //! the output side (the `Delivery` strategies) live in `handoff::worker`
 //! with the shared worker loops.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use crate::handoff::{Claim, Receiver, SpinBudget, SpinPoll, claim_poll};
+
+/// Per-worker closed-input set. n <= 64 (every realistic node) is a u64
+/// bitmask — one `vec![false; n]` per worker was a measured share of the
+/// graph engine's fixed per-run assembly cost at µs-scale workloads; wider
+/// fan-ins keep the Vec.
+enum ClosedSet {
+    Bits(u64),
+    Wide(Vec<bool>),
+}
+
+impl ClosedSet {
+    fn new(n: usize) -> Self {
+        if n <= 64 {
+            Self::Bits(0)
+        } else {
+            Self::Wide(vec![false; n])
+        }
+    }
+
+    #[inline]
+    fn is_closed(&self, i: usize) -> bool {
+        match self {
+            Self::Bits(mask) => *mask & (1 << i) != 0,
+            Self::Wide(v) => v[i],
+        }
+    }
+
+    #[inline]
+    fn close(&mut self, i: usize) {
+        match self {
+            Self::Bits(mask) => *mask |= 1 << i,
+            Self::Wide(v) => v[i] = true,
+        }
+    }
+}
 
 // ── Graph data-plane batching knob ──
 //
@@ -37,8 +72,8 @@ pub(crate) fn graph_tx_batch() -> bool {
 }
 
 /// Fair fan-in over the shared receivers of one node's input edges, owned by
-/// ONE worker (each worker clones every input receiver — MPMC competition
-/// plus fair polling across the round).
+/// ONE worker (every worker of the node shares one receiver set — see
+/// [`FanIn::new`]; MPMC competition plus fair polling across the round).
 ///
 /// The claim rhythm mirrors the streaming workers' anchor + burst-drain
 /// shape, generalized from one ring to a round of rings (same shape as the
@@ -48,10 +83,15 @@ pub(crate) fn graph_tx_batch() -> bool {
 /// closes its sender clones and the input here reports `Closed` while the
 /// others keep flowing.
 pub(crate) struct FanIn<T: Send + 'static> {
-    rxs: Vec<Receiver<T>>,
+    /// Shared by every worker of the node: a crossfire receiver is a pure
+    /// view of the channel's shared context (clones carry no per-consumer
+    /// state, only a drop refcount), so one handle set serves all workers —
+    /// the last worker's drop closes the input at the same instant the last
+    /// per-worker clone would.
+    rxs: Arc<[Receiver<T>]>,
     /// Closed inputs are never polled again (a `try_recv`/`recv` on a closed
     /// crossfire channel re-reads its disconnect state every call).
-    closed: Vec<bool>,
+    closed: ClosedSet,
     /// Round-robin start index; rotated by every round and anchor so no
     /// input systematically waits behind another.
     cursor: usize,
@@ -60,10 +100,10 @@ pub(crate) struct FanIn<T: Send + 'static> {
 }
 
 impl<T: Send + 'static> FanIn<T> {
-    pub(crate) fn new(rxs: Vec<Receiver<T>>) -> Self {
+    pub(crate) fn new(rxs: Arc<[Receiver<T>]>) -> Self {
         let open = rxs.len();
         Self {
-            closed: vec![false; open],
+            closed: ClosedSet::new(open),
             rxs,
             cursor: 0,
             open,
@@ -79,7 +119,7 @@ impl<T: Send + 'static> FanIn<T> {
         let n = self.rxs.len();
         for k in 0..n {
             let i = (self.cursor + k) % n;
-            if self.closed[i] {
+            if self.closed.is_closed(i) {
                 continue;
             }
             match claim_poll(&self.rxs[i], scratch, claim_cap) {
@@ -88,7 +128,7 @@ impl<T: Send + 'static> FanIn<T> {
                     return Some(m);
                 },
                 Claim::Closed => {
-                    self.closed[i] = true;
+                    self.closed.close(i);
                     self.open -= 1;
                 },
                 Claim::Empty => {},
@@ -178,7 +218,7 @@ impl<T: Send + 'static> FanIn<T> {
             let mut sel = crossfire::select::Select::new();
             for k in 0..n {
                 let i = (self.cursor + k) % n;
-                if !self.closed[i] {
+                if !self.closed.is_closed(i) {
                     sel.add(self.rxs[i].crossfire_rx());
                     order.push(i);
                 }
@@ -199,7 +239,7 @@ impl<T: Send + 'static> FanIn<T> {
             // Close event: drop the input from the round and re-anchor
             // over the survivors (items always win over the close token,
             // so the drain-before-Closed contract holds).
-            self.closed[ring] = true;
+            self.closed.close(ring);
             self.open -= 1;
         }
     }
@@ -215,7 +255,7 @@ impl<T: Send + 'static> FanIn<T> {
         let n = self.rxs.len();
         for k in 0..n {
             let i = (self.cursor + k) % n;
-            if self.closed[i] {
+            if self.closed.is_closed(i) {
                 continue;
             }
             if let Ok(item) = self.rxs[i].recv() {
@@ -223,7 +263,7 @@ impl<T: Send + 'static> FanIn<T> {
                 scratch.push(item);
                 return 1;
             }
-            self.closed[i] = true;
+            self.closed.close(i);
             self.open -= 1;
         }
         0
@@ -254,7 +294,7 @@ mod tests {
 
         let (tx_a, rx_a) = channel::<u32>(4);
         let (tx_b, rx_b) = channel::<u32>(4);
-        let mut fan = FanIn::new(vec![rx_a, rx_b]);
+        let mut fan = FanIn::new(Arc::from(vec![rx_a, rx_b]));
         let mut spin = SpinBudget::new(0);
         let claimed = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&claimed);

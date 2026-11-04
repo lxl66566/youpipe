@@ -258,3 +258,24 @@ Same-binary knob A/B (`bench_ab.sh -E off=YOUPIPE_FWD_BATCH=0 on=YOUPIPE_FWD_BAT
 | sync_fuse/fence_pair_{cpu,cheap}_split @100K | 7.857/7.731 ms | 7.254/7.253 ms | −7.7/−6.2 % | 25/25 / 24/25 |
 
 On-side spreads collapse to 0.8–4.2 % (off side 5–119 %) — the bistability the fence family carried at every size. The @1K rows are the quiet headline: the floor clamps to `min(n, 65536)` = n slots there, so small chains lived in the trickle regime the floor could not lift, and the batch arm removes it wholesale (890 → 145 µs). Paired fresh-process soaks (convoy-probe, 8–10 pairs × 12 runs): fence @200K off med 34.2 / max 215.1 / 12 runs >60 ms vs on med 21.7 / **max 31.7** / 0 runs >60 ms — the on side's maximum sits below the off side's median; @100K medians tie at ~12.4 with the off max 70 vs on max 16.7. Barrier mode benefits through the same arm (final-flush free-run claims; spot 45.0 → 31.7 ms mean @200K). The knob's only consumer is `forward_fenced`, so no-fence chains are structurally untouched. Default on; `"0"` recovers the per-item loop.
+
+## Stream-side per-run assembly attribution (2026-11-05, todo #33)
+
+The graph engine's shared-sender attempt (the todo #33 sender bullet; falsified, verdict in [graph.md](graph.md)) was preceded by the same Instant-probe discipline on the streaming engine, over the `stream_pipeline` shapes it gates — temporary env-gated probes through `exec_stream`/the `OutChannel` factories/`drain_terminal`, fully reverted. Medians of 400 runs:
+
+| phase (per run) | single_stage @1K | with_fence @1K |
+| --- | --- | --- |
+| fused pass-through | 10.5 µs (the whole run) | 0.02 µs (the fence declines) |
+| admission | — | 0.17 µs |
+| feeder ring + feed setup | — | 3.5 + 2.2 µs |
+| spawn walk total | — | 42.1 µs |
+| — mid/fence MPMC rings ×2 | — | 6.6 µs |
+| — sharded terminal (32 SPSC rings) | — | 17.1 µs |
+| — per-worker sender fan-out, 2×31 clones | — | 0.34 µs |
+| — worker closure builds ×2 | — | 0.38 µs |
+| — pool job submits (2 batches + forwarder) | — | 15.9 µs |
+| collector setup | — | 0.03 µs |
+| drain (execution + teardown) | — | 111.5 µs |
+| **TOTAL** | **10.5 µs** | **164 µs** |
+
+Two structural facts fall out. First, `single_stage_*` (and `multi_stage_2`, `mixed_load/youpipe_stream_cpu`) are the type-level fused pass-through — no channels, no spawn walk, no senders — so no delivery-side change can reach them at all. Second, on the one gated shape that does run the streaming topology, the per-worker sender-clone slice (the stream-side twin of the graph's `From<Vec<SyncSender>>` builds) is ≈ 0.7 µs of a 164 µs run — half a percent, an order of magnitude below the family's ±10 % drift. The assembly budget is actually dominated by ring allocations (~27 µs, of which the default-on sharded terminal's 32 SPSC rings alone cost 17 µs) and pool job submission (~16 µs) — the todo #33 channel-creation and pool-submission bullets. Sharing the stream fan-out was therefore not attempted; the graph side, where the spawn walk pays the per-worker Vec build 32×, then measured the lever as noise as well (tcache-cheap builds — [graph.md](graph.md) "Shared sender sets: falsified").

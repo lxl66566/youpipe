@@ -427,13 +427,15 @@ where
 {
     Box::new(
         move |core: &GraphCore, workers: usize, inputs: Vec<Erased>, outputs: Vec<Erased>| {
-            let rxs = downcast_endpoints::<SyncReceiver<I>>(inputs, "inputs", &name);
+            let rxs: Arc<[SyncReceiver<I>]> = Arc::from(downcast_endpoints::<SyncReceiver<I>>(
+                inputs, "inputs", &name,
+            ));
             let txs = downcast_endpoints::<SyncSender<O>>(outputs, "outputs", &name);
             let claim_cap = per_worker_claim_cap(workers);
             let f = Arc::new(f);
             core.dispatch_jobs((0..workers).map(|_| {
                 let f = Arc::clone(&f);
-                let fanin = FanIn::new(rxs.clone());
+                let fanin = FanIn::new(Arc::clone(&rxs));
                 let out = D::from(txs.clone());
                 let cancel = core.cancel.clone();
                 move || node_worker(&*f, fanin, out, Some(&cancel), claim_cap)
@@ -453,13 +455,15 @@ where
 {
     Box::new(
         move |core: &GraphCore, workers: usize, inputs: Vec<Erased>, outputs: Vec<Erased>| {
-            let rxs = downcast_endpoints::<SyncReceiver<I>>(inputs, "inputs", &name);
+            let rxs: Arc<[SyncReceiver<I>]> = Arc::from(downcast_endpoints::<SyncReceiver<I>>(
+                inputs, "inputs", &name,
+            ));
             let txs = downcast_endpoints::<SyncSender<O>>(outputs, "outputs", &name);
             let claim_cap = per_worker_claim_cap(workers);
             let f = Arc::new(f);
             core.dispatch_jobs((0..workers).map(|_| {
                 let f = Arc::clone(&f);
-                let fanin = FanIn::new(rxs.clone());
+                let fanin = FanIn::new(Arc::clone(&rxs));
                 let out = D::from(txs.clone());
                 let cancel = core.cancel.clone();
                 move || expand_worker(&*f, fanin, out, Some(&cancel), claim_cap)
@@ -477,7 +481,9 @@ where
 {
     Box::new(
         move |core: &GraphCore, _workers: usize, inputs: Vec<Erased>, _outputs: Vec<Erased>| {
-            let rxs = downcast_endpoints::<SyncReceiver<I>>(inputs, "inputs", &name);
+            let rxs: Arc<[SyncReceiver<I>]> = Arc::from(downcast_endpoints::<SyncReceiver<I>>(
+                inputs, "inputs", &name,
+            ));
             let claim_cap = per_worker_claim_cap(1);
             let f = Arc::new(f);
             let fanin = FanIn::new(rxs);
@@ -496,7 +502,11 @@ where
 {
     Box::new(
         move |core: &GraphCore, _workers: usize, inputs: Vec<Erased>, _outputs: Vec<Erased>| {
-            let rxs = downcast_endpoints::<SyncReceiver<T>>(inputs, "inputs", "collect sink");
+            let rxs: Arc<[SyncReceiver<T>]> = Arc::from(downcast_endpoints::<SyncReceiver<T>>(
+                inputs,
+                "inputs",
+                "collect sink",
+            ));
             let claim_cap = per_worker_claim_cap(1);
             let cancel = core.cancel.clone();
             core.dispatch_job(move || {

@@ -19,3 +19,11 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 - Closed (2026-11-05): the async face audit found no race — every youpipe async re-arm site is clean by argument plus model check (3 loom arbiters pinning the async re-arm shapes: retire-keep, `_reg_waker_async` Reuse's stamp-preserving reset, future-Drop abandon; 4 exactly-once cancel-storm tests). Records in crossfire-waker-designs.md §16 (local doc, gitignored) and the test commit.
 - Standing: run `perf/verify/hang-stakeout.sh` (forensics-before-kill) on the next sighting before touching the process.
 
+
+### 33. [P1] graph engine residual per-run assembly cost (@1K)
+
+- Context: the ~23 µs @1K graph−stream chain delta was attributed phase-by-phase and cut to ~3–9 µs by sharing each node's receiver set across its workers (2026-11-05, [benchmarks/graph.md](src/dev/benchmarks/graph.md) "per-run assembly attribution"). The residue sits outside `graph/`:
+  - Per-worker sender clones: falsified and closed (2026-11-05) — the shared-sender `Delivery` reshape (one `Arc<[SyncSender]>` per node, closed edges as a per-worker `ClosedSet` mask instead of `swap_remove`) measured noise on every gated id (graph @1K −1.4…+0.8 %, below the 2 % floor; the stream gate rows carry no per-worker sender builds at all — the fused pass-through ids have no senders, and `with_fence`'s whole clone slice is ≈ 0.7 µs of a 164 µs run): the builds are tcache-cheap, unlike their receiver-side twins. Records in [benchmarks/graph.md](src/dev/benchmarks/graph.md) and the stream-side attribution in [benchmarks/streaming.md](src/dev/benchmarks/streaming.md).
+  - Per-job pool submission ≈ 0.3 µs/job (HeapJob boxing, injector segment push, wake scan) — pool-side, shared with every engine; staging jobs into one batch was falsified (execution no longer overlaps late assembly).
+  - Per-edge channel creation ≈ 1.4 µs (crossfire ring allocation) — symmetric with the stream engine, cancels in the engine delta but bounds both.
+  - The async twin still clones per task (`AsyncFanIn::new(rxs.clone())` in `graph/async_exec.rs`); a default 128-task fan-out pays it 128× — fold into the same shared-set shape when the async face is touched next.

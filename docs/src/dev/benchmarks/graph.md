@@ -71,3 +71,54 @@ A/B verdict (`bench_ab.sh -a base=15699b5 -b wt -B graph_shapes --per-id -r 5`, 
 @100K the per-item cost drops ≈715 → ≈630 ns/item (200K items); the @1K rows carry the fixed lazy-runtime-build cost and do not resolve. The async-vs-sync gap narrows from ~3.6× to ~3.2× — the rest is the wake/registration protocol itself, not allocation. No-regression controls on the streaming engine: `io_async_pure`/`io_async_mixed` @200/@2000 all noise (|Δ| ≤ 0.6 %, spreads ≤ 1.2 %) and `sharded_term_async` `async1_{cheap,cpu}` @1K/@100K all noise (|Δ| ≤ 1.4 %, dominance ≤ 13/25) — expected, those paths never cancel parked cached futures (P-4 already floored them; the sharded anchor parks one shard at a time through the Single registry, whose node stays registered on cancel).
 
 
+## Per-run assembly attribution, shared fan-in receivers (2026-11-05)
+
+The fixed @1K assembly delta above was attributed phase-by-phase before any change: a temporary `Instant` probe of `run_graph` (env-gated, removed after the study) over the chain shape @1K — 4 nodes / 3 edges / 32 pool jobs — plus an interleaved graph-vs-stream driver for the end-to-end delta.
+
+| run-graph phase | per run | note |
+| --------------- | ------- | ---- |
+| `validate_and_order` + collector walk | 0.45 µs | the pre-study suspects — name→index re-walks, build-then-validate passes — are noise at real node counts; Kahn and its HashSets are not the cost |
+| `resolve_budget` + pool admission | 0.5 µs | |
+| out-edge bundling + topo reorder | 0.3 µs | |
+| edge-channel creation | 4.2 µs | 3 crossfire 256-slot rings ≈ 1.4 µs each; symmetric with the stream engine's stage channels |
+| spawn walk | 19–22 µs | the body of the delta: type-erased endpoint downcasts 0.2 µs (erasure is free), per-worker closure builds 8.8–9.6 µs, `submit_batch` rounds 10–11 µs |
+
+Two experiments came out of that table:
+
+- **Falsified: staging the walk's jobs into one `inject_batch`.** The spawn side dropped to 9.2 µs but end-to-end @1K regressed (+6 µs cheap / +1 µs cpu): with every job held back until the walk ends, execution no longer overlaps late assembly — the source feeder's early Kahn-order submission is worth more than the saved submission rounds. The same run proved `submit_batch`'s cost is per-job, not per-round: one 32-job flush costs the same ~11 µs as the four batches (1+15+15+1) — HeapJob boxing, injector segment push and the wake scan scale with job count.
+- **Landed: one receiver set per node, shared by its workers.** A crossfire receiver is a pure view of the channel's shared context — a clone carries no per-consumer state, only the drop refcount — so `FanIn` now holds `Arc<[Receiver]>` and a worker's `FanIn::new` is one `Arc` clone instead of a `Vec` clone (an allocation plus one `add_rx` bump per input edge per worker). The per-worker `closed` `Vec<bool>` became a `u64` bitmask (≤ 64 inputs; a `Wide` Vec fallback keeps larger fan-ins). Semantics unchanged: the last worker's drop closes the input exactly when the last per-worker clone would, and contention patterns are identical because the consumer state was always in the shared context. Probe caliber: build phase 9.6 → 2.8–3.2 µs, chain @1K driver totals −11 µs, graph−stream delta ~16 → ~3–9 µs.
+
+Official verdict (`bench_ab.sh -a base=main -b wt`, `graph_shapes`, 5 per-id interleaved rounds; the `*_stream` rows are drift controls):
+
+| id | base @med | wt @med | Δ | dominance |
+| --- | --------- | ------- | --- | --------- |
+| fanin_cheap_graph @1K | 464.9 µs | 416.8 µs | **−10.3 %** | 24/25 |
+| chain_cpu_graph @1K | 145.1 µs | 133.3 µs | **−8.1 %** | 23/25 |
+| diamond_cheap_graph @1K | 151.3 µs | 141.0 µs | **−6.8 %** | 25/25 |
+| chain_cheap_graph @1K | 145.4 µs | 136.2 µs | **−6.3 %** | 25/25 |
+| diamond_cpu_graph @1K | 150.1 µs | 141.3 µs | **−5.9 %** | 25/25 |
+| @100K graph rows (5) | — | — | −0.5…+1.2 %, mixed signs | ≤15/25 (noise) |
+| stream controls @1K (2) | — | — | −0.8 / +0.2 % | noise |
+| stream control chain_cpu @100K | — | — | −2.0 % | layout-band drift (no stream path was touched) |
+
+Residual (todo #33): the remaining @1K delta (~3–9 µs) is per-worker sender `Vec` clones in the spawn steps (delivery construction goes through `From<Vec<SyncSender>>`; sharing needs the `Delivery` strategies to serve from `&`-access — `Broadcast` mutates its edge Vec), per-job pool submission (~0.3 µs/job), and the per-edge ring allocation — all outside `graph/`.
+
+## Shared sender sets: falsified (2026-11-05, todo #33)
+
+The symmetric shape of the shared-receiver landing was implemented and gated: `Unicast`/`Broadcast` served from one `Arc<[SyncSender]>` per node (per worker an `Arc` clone instead of a `Vec` alloc plus a sender clone per edge; `Broadcast` closed edges via a per-worker `ClosedSet` bitmask — `swap_remove` compaction replaced by masking, semantics documented identical) and the graph spawn steps built the set once (`From<Arc<[SyncSender]>>`). A/B (`bench_ab.sh -a base=main -b wt`, 5 per-id interleaved rounds, same caliber as the receiver-side table):
+
+| id | base @med | wt @med | Δ | dominance |
+| --- | --------- | ------- | --- | --------- |
+| chain_cheap_graph @1K | 128.6 µs | 126.8 µs | −1.4 % | 22/25 |
+| chain_cpu_graph @1K | 127.7 µs | 126.0 µs | −1.3 % | 17/25 |
+| diamond_cpu_graph @1K | 137.7 µs | 136.2 µs | −1.1 % | 15/25 |
+| diamond_cheap_graph @1K | 137.2 µs | 136.9 µs | −0.2 % | 15/25 |
+| fanin_cheap_graph @1K | 424.6 µs | 427.9 µs | +0.8 % | 16/25 |
+| graph @100K rows (5) | — | — | −1.2…+4.6 %, mixed signs | ≤16/25 (noise; fanin +4.6 % on its known bimodal mode, 7/25) |
+| `*_stream` controls (4) | — | — | −0.1…+4.8 % | noise (drift band) |
+| mixed_load/youpipe_stream_cpu @1K | 9.19 µs | 9.17 µs | −0.2 % | 15/25 |
+| mixed_load @100K (youpipe + 2 controls) | — | — | −8.9 % (19.6 % spread) / −1.2 % / −0.2 % | 15–21/25 (noise) |
+
+Every id verdicts noise: the medians lean toward the change on 4 of 5 @1K graph rows by −1.1…−1.4 %, but that is under the 2 % floor with dominance at most 22/25 and side spreads of 4.6–5 %. The stream-side gate rows are structurally out of reach — `stream_pipeline/single_stage_*` and `mixed_load/youpipe_stream_cpu` are the type-level fused pass-through (no channels, no spawn walk, no senders; measured −0.6/+0.3 % @1K, pure noise), and `with_fence` @1K carries a sender-clone slice of ≈ 0.7 µs of a 164 µs run (see [streaming.md](streaming.md) "Stream-side per-run assembly attribution") — its A/B read −18 % median on 20–27 % spreads, the fence family's bimodality, verdict noise, and @100K +1.2 % noise. `mixed_load` completed the gate (youpipe @1K −0.2 % on 1.7 % spreads, dead flat, as the attribution predicts for the fused path; the rayon/tokio controls ±1.2 % rule out session drift), and the async fan-in ids — untouched `AsyncDelivery` twins — read +1.3/+2.4 % @1K, noise.
+
+Falsified premise: the per-worker sender `Vec` builds are tcache-cheap — one node's 32 single-edge builds (alloc + `add_tx` + `Arc` bump ≈ 2 atomic RMWs each) cost ~1–2 µs, an order below the family's per-round spread, unlike the receiver-side builds they mirror (those carried a second per-worker allocation — the closed-input `Vec<bool>` — and measured −5.9…−10.3 %). The change was reverted; the `From<Vec<SyncSender>>` per-worker build stays, and the @1K assembly residue is now fully attributed: per-job pool submission (~0.3 µs/job) and the per-edge ring allocation (~1.4 µs) are the only members left with real mass.
