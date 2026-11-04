@@ -77,7 +77,8 @@ narrowing them measured as global regressions there (history in `sleep.rs`)
 tuning levers with known upside.
 
 The fused `.collect()` output-store policy defaults to **auto**:
-eligible 8-byte outputs of at least 8 MiB (1 M items) per whole batch are
+eligible 8-byte outputs of at least 8 MB (a 1 M-item batch of 8-byte
+outputs, decimal) per whole batch are
 written with non-temporal (streaming) stores that bypass the cache
 hierarchy — at those sizes removing read-for-ownership traffic and L3
 pollution dominates everything else. Runtime-overridable tri-state via
@@ -135,7 +136,7 @@ over the output immediately after collect +12–15 % at 1–4 M
 (`cpu_balanced_readback`) — the parallel phase's RFO elimination
 outweighs the consumer's prefetched sequential re-read. Below the
 threshold gains shrink toward ±2 % (output fits cache), which is why
-auto starts at 8 MiB; known write-once workloads below it can force the
+auto starts at 8 MB; known write-once workloads below it can force the
 knob on (100 K items measured +9–11 %). Data in the developer guide's
 benchmarks notes ("NT-store attribution").
 ## `YOUPIPE_SHARDED_TERM`: terminal fan-in sharding (streaming)

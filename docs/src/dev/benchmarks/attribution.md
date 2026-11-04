@@ -294,6 +294,29 @@ Raw JSON under `target/horizontal/nt_readback_ab/` (not committed). Mechanism: t
 
 Default-tier decision (closed 2026-09): NT wins both consumer shapes, so the knob graduated from opt-in to an auto tier. `nt_store_enabled` resolves per whole-batch output size (a leaf only sees its chunk), ≥ 8 MiB → NT, threaded down as a leaf `bool`. Env became a tri-state: unset = auto, `"0"` = force off, `"1"` = force on, any other value panics (the `=off` trap above is now a loud failure). 8 MiB rather than 800 KB: the sub-threshold gains (+9–11 % at 100K) shrink toward the ±2 % noise floor where the balance gets machine-dependent, and known write-once shapes below the threshold can force it on. The remaining occupancy deficit (~1–4 pt) remains open.
 
+## NT auto-tier boundary: the @1M cell sat below the gate (2026-11-05): closed
+
+Established fact (two independent reruns, 2026-09 and 2026-10-28, [counters.md](counters.md)): horizontal `cpu_balanced` @1M is the only regime where rayon led (+6 %, 0.494 vs 0.465 ms median in the last rerun) while youpipe holds 1K–100K (−57…−79 %) and 2M/4M (−2…−6 %). Cause found by reading the gate, then proven causally: `NT_AUTO_MIN_BYTES` was 8 MiB (8,388,608 B), but the horizontal batch is decimal 1M × 8 B = 8,000,000 B — 4.6 % under the gate — so @1M alone ran plain RFO output stores while 2M/4M took NT. The docs even stated the gate as "8 MiB (1 M items)": intent and implementation disagreed by the decimal/binary gap. Chunking ruled out by code reading first: 1M and 2M both take the large-batch hybrid path (`Workload::Balanced` → oversplit 4, `num_chunks = num_threads`, `chunk_splits > 0`; only the per-chunk tree gains one level), no 1M-specific geometry exists.
+
+Session note: this session's machine state was slow (rayon @1M 0.63 ms vs the October rerun's 0.465), and in it youpipe led @1M even with NT off (write-once 0.502 vs 0.618 ms, 5 interleaved rounds) — exactly the documented drift shape (the fixed µs-scale deficit looms when compute is fast), so the October fast state is where the missing NT tier bit. The causal knob verdict below is state-robust either way.
+
+Same-binary env A/B (`YOUPIPE_NT_STORE` unset=auto vs `"1"`, horizontal `cpu_balanced` isolated per n, alternating two-process pairs, leading side flipped on even pairs, `--rounds 2`, `taskset -c 1-31`, rayon column = drift control):
+
+| shape @n | auto | nt-on | Δ | dominant | rayon control |
+| --- | --- | --- | --- | --- | --- |
+| cpu_balanced @1M | 0.4753 ms | 0.4143 ms | **−12.85 %** | 7/8 | +0.15 % |
+| cpu_balanced_readback @1M | 0.6587 ms | 0.5732 ms | **−12.98 %** | 7/8 | −0.12 % |
+| cpu_balanced @2M (control) | 0.8053 ms | 0.8035 ms | −0.23 % | 4/4 (noise) | −0.27 % |
+| cpu_balanced_readback @2M | 1.1132 ms | 1.1073 ms | −0.53 % | 4/4 (noise) | −0.23 % |
+| cpu_balanced @100K (info) | 0.0521 ms | 0.0474 ms | −8.99 % | 4/4 | +1.99 % |
+| cpu_balanced_readback @100K | 0.0795 ms | 0.0743 ms | −6.55 % | 4/4 | +0.78 % |
+
+@2M the knob is inert (auto already selects NT) and reads noise — the sanity anchor. The −12.9 % causal delta covers the October +6 % deficit with margin in either machine state.
+
+Occupancy re-check @1M (same protocol, `YOUPIPE_SPIN_ROUNDS=2048 YOUPIPE_YIELD_ROUNDS=2048`, NT left at default): write-once −11.6 % (5/6 dominant) but `cpu_balanced_readback` **+14.5 %** — the keep-warm window makes the 31 workers spin through the consumer's serial post-collect fold, so window-widening stays a non-landing trade (matches the 2026-09 causal check and the `ROUNDS_SPIN` history); the structural answer remains opt-in pinning (`ComputePool::new_pinned`).
+
+Landed: `NT_AUTO_MIN_BYTES` 8 MiB → 8 MB decimal (`8_000_000`), so the decimal-1M-item u64 batch crosses the gate exactly as the docs always stated. Cells that change behavior: whole-batch outputs in [8,000,000, 8,388,608) B — nothing else; 100K (0.8 MB) stays below the gate on a bit-identical path, protecting the strongest cell (its sub-gate NT win, −9 % this session / +9–11 % in 2026-09, stays available via `YOUPIPE_NT_STORE=1`). Post-landing cross-binary confirm (old-gate binary vs new-gate binary, both env-clean, 6 pairs @1M): write-once **−11.14 % (6/6)**, readback **−9.40 % (5/6)**, rayon controls +1.5 %/±0.0 %; the @2M/@100K unchanged-path controls swung −1…−6 % on both libraries (draw/drift, dominance ≤ 2/3), i.e. no cell regression beyond the documented band.
+
 ## Attributing the 2M/4M fused-collect gap (2026-09-25)
 
 Single-shape single-library runs of the horizontal binary itself (`--libs X --batches N`, taskset 1-31, A-B-A-B interleaved; iteration counts from the JSON `iters` field normalize whole-process `perf stat`). Machine: 16 physical / 32 SMT threads, 32 MB shared L3 + 32 × 1 MB L2.

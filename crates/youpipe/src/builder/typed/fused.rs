@@ -433,9 +433,17 @@ enum NtStorePolicy {
 /// non-temporal stores are a measured win in *both* consumer shapes
 /// (write-only drop and immediate read-back). Fixed, not probed from cache
 /// geometry: the win is per-line RFO elimination, and below the threshold
-/// (100 K items = 0.8 MB: +9–11 %) gains shrink toward the ±2 % noise floor
+/// (100 K items = 0.8 MB: +7–11 %) gains shrink toward the ±2 % noise floor
 /// where the balance gets machine-dependent.
-const NT_AUTO_MIN_BYTES: usize = 8 << 20;
+///
+/// 8 MB decimal, NOT 8 MiB: the first gate (8 MiB = 8,388,608 B) missed the
+/// decimal-1M-item batch (1,000,000 × 8 = 8,000,000 B) by 4.6 %, leaving
+/// horizontal `cpu_balanced` @1M — the one size rayon led (+6 %, 2026-09 and
+/// 2026-10-28 reruns) — on plain RFO stores while 2M/4M enjoyed NT.
+/// Same-binary A/B @1M (2026-11-05): NT-on −12.9 % in both consumer shapes,
+/// 7/8 pair-dominant, rayon control ±0.2 % (attribution.md "NT auto-tier
+/// boundary").
+const NT_AUTO_MIN_BYTES: usize = 8_000_000;
 
 fn nt_store_policy() -> NtStorePolicy {
     static POLICY: OnceLock<NtStorePolicy> = OnceLock::new();
@@ -469,7 +477,7 @@ fn nt_store_policy() -> NtStorePolicy {
 /// default. Write-once shape: +9/+12/+14/+18 % at 100 K/1 M/2 M/4 M
 /// (NT-on also beats rayon at 2 M and 4 M, reversing the former
 /// −12…−14 % deficit); 1 K/10 K ±2 % (output fits cache — nothing to
-/// bypass), which is what the 8 MiB auto threshold leaves off.
+/// bypass), which is what the 8 MB auto threshold leaves off.
 ///
 /// Decision inputs: the process policy (env, cached) and the
 /// *whole-batch* output size — resolved once per collect call in
