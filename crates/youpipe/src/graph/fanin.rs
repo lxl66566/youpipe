@@ -1,11 +1,11 @@
 //! Sync-node fan-in primitives: the fair round-robin aggregation over a
-//! node's input edges and the activity-gated pre-anchor backoff. The output
-//! side (the `Delivery` strategies) lives in `handoff::worker` with the
-//! shared worker loops.
+//! node's input edges. The pre-anchor spin state machine (`SpinBudget`) and
+//! the output side (the `Delivery` strategies) live in `handoff::worker`
+//! with the shared worker loops.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::handoff::{Claim, Receiver, claim_poll};
+use crate::handoff::{Claim, Receiver, SpinBudget, SpinPoll, claim_poll};
 
 // ── Graph data-plane batching knob ──
 //
@@ -98,26 +98,33 @@ impl<T: Send + 'static> FanIn<T> {
     }
 
     /// Claim the next batch of items into `scratch`; `0` means EOF (every
-    /// input disconnected). Burst round first, knob-gated spin second
-    /// (see [`RoundSpin`]), blocking anchor last — the anchor parks
-    /// registered on every open input, and its park latency folds back into
-    /// the spin budget.
+    /// input disconnected). Burst round first, knob-gated spin second (the
+    /// shared [`SpinBudget`] polling whole rounds; a closed input is marked
+    /// and rotated past inside [`FanIn::round`], never a spin verdict),
+    /// blocking anchor last — the anchor parks registered on every open
+    /// input, and its park latency folds back into the spin budget.
     pub(crate) fn claim(
         &mut self,
         scratch: &mut Vec<T>,
         claim_cap: usize,
-        spin: &mut RoundSpin,
+        spin: &mut SpinBudget,
     ) -> usize {
         if let Some(m) = self.round(scratch, claim_cap) {
             return m;
         }
-        if let Some(m) = spin.spin_rounds(self, scratch, claim_cap) {
-            return m;
+        match spin.spin_poll(|| {
+            self.round(scratch, claim_cap)
+                .map_or(SpinPoll::Empty, SpinPoll::Ready)
+        }) {
+            SpinPoll::Ready(m) => return m,
+            // A single-ring `Closed` cannot come out of a round; the empty
+            // budget arm falls through to the anchor.
+            SpinPoll::Closed | SpinPoll::Empty => {},
         }
         if self.open == 0 {
             return 0;
         }
-        let timed = spin.max_us > 0;
+        let timed = spin.armed();
         let start = Instant::now();
         let got = self.anchor(scratch);
         if timed && got > 0 {
@@ -222,95 +229,6 @@ impl<T: Send + 'static> FanIn<T> {
         0
     }
 }
-
-// ── Activity-gated pre-anchor backoff ──
-
-/// Calibration and backoff ceiling copied from the stream engine's
-/// `AnchorSpin` (one `pause` + one empty poll ≈ 15 ns on the reference
-/// machine; 64 pauses ≈ 1 µs between polls at the tail) so the fan-in
-/// round rides out empty micro-gaps with the same rhythm the single-ring
-/// workers use.
-const SPIN_ROUNDS_PER_US: u32 = 64;
-const MAX_POLL_PAUSES: u32 = 64;
-
-/// Adaptive pre-anchor spin budget for one fan-in worker's claim loop —
-/// `AnchorSpin` generalized from "spin one ring" to "spin the round of
-/// rings". Activity-gated exactly like the original: the budget only stays
-/// above zero while items keep arriving within the knob's window after a
-/// failed spin (measured as the anchor's park latency right after the spin
-/// gave up); inert with the `YOUPIPE_SPIN_ANCHOR` knob off.
-pub(crate) struct RoundSpin {
-    /// Current spin window in µs; 0 = park immediately.
-    budget_us: u32,
-    /// Knob value: the largest window worth spinning through.
-    max_us: u32,
-}
-
-impl RoundSpin {
-    pub(crate) fn new(max_us: u32) -> Self {
-        Self {
-            budget_us: 0,
-            max_us,
-        }
-    }
-
-    /// First growth step: max/16 clamped to ≥ 1 µs (geometric doubling then
-    /// reaches a covering window in ~4 anchors).
-    fn initial(max_us: u32) -> u32 {
-        (max_us / 16).max(1)
-    }
-
-    /// Spin-poll rounds for up to the current budget, with the same pause
-    /// doubling as `AnchorSpin::spin_claim` (a crowd of workers on the same
-    /// rings must not poll at full rate). `Some(n)` when a round caught data
-    /// mid-spin — the park is avoided.
-    fn spin_rounds<T: Send + 'static>(
-        &mut self,
-        fan: &mut FanIn<T>,
-        scratch: &mut Vec<T>,
-        claim_cap: usize,
-    ) -> Option<usize> {
-        if self.budget_us == 0 {
-            return None;
-        }
-        let mut pauses = 1u32;
-        let mut polls = 0u64;
-        let max_polls = u64::from(self.budget_us) * u64::from(SPIN_ROUNDS_PER_US);
-        let window = Duration::from_micros(u64::from(self.budget_us));
-        let start = Instant::now();
-        loop {
-            if let Some(m) = fan.round(scratch, claim_cap) {
-                return Some(m);
-            }
-            if polls >= max_polls || (polls & 7 == 7 && start.elapsed() >= window) {
-                return None;
-            }
-            for _ in 0..pauses {
-                std::hint::spin_loop();
-            }
-            pauses = pauses.saturating_mul(2).min(MAX_POLL_PAUSES);
-            polls += 1;
-        }
-    }
-
-    /// Fold the blocking anchor's latency into the budget (same policy as
-    /// `AnchorSpin::note_park`): an item within 4x the knob's window means
-    /// the fan-in is live — double the budget; longer means quiet relative
-    /// to what this worker is prepared to spin — quarter it.
-    fn note_park(&mut self, parked: Duration) {
-        let live_below = Duration::from_micros(u64::from(self.max_us) * 4);
-        if parked <= live_below {
-            self.budget_us = self
-                .budget_us
-                .saturating_mul(2)
-                .max(Self::initial(self.max_us))
-                .min(self.max_us);
-        } else {
-            self.budget_us /= 4;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,7 +255,7 @@ mod tests {
         let (tx_a, rx_a) = channel::<u32>(4);
         let (tx_b, rx_b) = channel::<u32>(4);
         let mut fan = FanIn::new(vec![rx_a, rx_b]);
-        let mut spin = RoundSpin::new(0);
+        let mut spin = SpinBudget::new(0);
         let claimed = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&claimed);
         let worker = std::thread::spawn(move || {

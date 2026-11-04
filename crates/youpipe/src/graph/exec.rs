@@ -10,7 +10,7 @@ use std::{
 
 use super::{
     GraphBuilder,
-    fanin::{FanIn, RoundSpin},
+    fanin::FanIn,
     plan::{EdgeConnector, Erased, GraphPlan, NodeKind, NodeOpts, SpawnStep},
 };
 use crate::{
@@ -20,7 +20,7 @@ use crate::{
     },
     executor::compute::ComputePool,
     handoff::{
-        CancelCheck, Delivery, Receiver as SyncReceiver, SyncSender, cancel_active,
+        CancelCheck, Delivery, Receiver as SyncReceiver, SpinBudget, SyncSender, cancel_active,
         claim_expand_deliver, claim_map_deliver, per_worker_claim_cap,
     },
     runtime::AsyncRuntime,
@@ -265,7 +265,7 @@ fn node_worker<I, O, F, D>(
     D: Delivery<O>,
 {
     let tx_batch = super::fanin::graph_tx_batch() && claim_cap > 0;
-    let mut spin = RoundSpin::new(crate::handoff::spin_anchor_us());
+    let mut spin = SpinBudget::new(crate::handoff::spin_anchor_us());
     claim_map_deliver(
         &mut |scratch| fanin.claim(scratch, claim_cap, &mut spin),
         f,
@@ -297,7 +297,7 @@ fn expand_worker<I, O, F, D>(
 {
     let tx_batch = super::fanin::graph_tx_batch() && claim_cap > 0;
     let flush_cap = crate::handoff::batch_recv_cap().max(claim_cap).max(1);
-    let mut spin = RoundSpin::new(crate::handoff::spin_anchor_us());
+    let mut spin = SpinBudget::new(crate::handoff::spin_anchor_us());
     claim_expand_deliver(
         &mut |scratch| fanin.claim(scratch, claim_cap, &mut spin),
         f,
@@ -320,7 +320,7 @@ fn sink_worker<I, F>(
     I: Send + 'static,
     F: Fn(I) + Send + Sync,
 {
-    let mut spin = RoundSpin::new(crate::handoff::spin_anchor_us());
+    let mut spin = SpinBudget::new(crate::handoff::spin_anchor_us());
     let mut scratch: Vec<I> = Vec::with_capacity(claim_cap.max(1));
     loop {
         let claimed = fanin.claim(&mut scratch, claim_cap, &mut spin);
@@ -349,7 +349,7 @@ fn collect_worker<T>(
 ) where
     T: Send + 'static,
 {
-    let mut spin = RoundSpin::new(crate::handoff::spin_anchor_us());
+    let mut spin = SpinBudget::new(crate::handoff::spin_anchor_us());
     let mut scratch: Vec<T> = Vec::with_capacity(claim_cap.max(1));
     loop {
         let claimed = fanin.claim(&mut scratch, claim_cap, &mut spin);

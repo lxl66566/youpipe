@@ -270,6 +270,6 @@ pub(crate) use channel::{Claim, claim_poll, stage_batch};
 pub(crate) use sharded::{ShardedAsyncReceiver, sharded_mpsc_async_channel};
 pub(crate) use sharded::{ShardedReceiver, sharded_mpsc_channel};
 pub(crate) use worker::{
-    Broadcast, CancelCheck, Delivery, Unicast, cancel_active, claim_expand_deliver,
-    claim_map_deliver, per_worker_claim_cap,
+    Broadcast, CancelCheck, Delivery, SpinBudget, SpinPoll, Unicast, cancel_active,
+    claim_expand_deliver, claim_map_deliver, per_worker_claim_cap,
 };

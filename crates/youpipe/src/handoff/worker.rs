@@ -6,9 +6,12 @@
 //! arms, cancel-observed-before-map and deliver-even-on-cancel semantics —
 //! lives once here.
 
-use std::mem::MaybeUninit;
+use std::{
+    mem::MaybeUninit,
+    time::{Duration, Instant},
+};
 
-use super::{SendItem, SyncSender, stage_batch};
+use super::{Claim, SendItem, SyncSender, stage_batch};
 use crate::sync::CancellationToken;
 
 /// True iff `cancel` is set and the pipeline should stop feeding new work.
@@ -392,10 +395,162 @@ fn drop_staged<T>(slots: &mut [MaybeUninit<T>]) {
     }
 }
 
+// ── Activity-gated pre-anchor spin (todo #4 fix, `YOUPIPE_SPIN_ANCHOR`) ──
+
+/// Calibration: one `pause` + one empty `try_recv` ≈ 15 ns on the reference
+/// machine, so 1 µs of window ≈ 64 polls. Doubles as the miri backstop (the
+/// wall-clock deadline may never fire there — time can freeze in a busy
+/// loop); on real hardware the clock check dominates.
+const SPIN_ROUNDS_PER_US: u32 = 64;
+
+/// Backoff ceiling inside the pre-anchor spin: 64 pauses ≈ 1 µs between
+/// polls at the tail of a long window (see [`SpinBudget::spin_poll`]).
+const MAX_POLL_PAUSES: u32 = 64;
+
+/// Outcome of one non-blocking poll inside a [`SpinBudget`] window —
+/// [`Claim`] lifted to the poll-closure contract (single-ring claim sites
+/// convert via `From`; fan-in rounds map their `Option` themselves, a
+/// closed input is internal state there, never a verdict).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SpinPoll {
+    /// `n` items were caught mid-spin — the park is avoided.
+    Ready(usize),
+    /// Nothing ready right now; keep spinning while the budget lasts.
+    Empty,
+    /// Terminal verdict (channel disconnected mid-spin): stop the spin and
+    /// propagate. Trusted like the burst phase's `Closed` (the crossfire pin
+    /// at 3.1.20 or newer carries the spurious-`Closed` race fix), never
+    /// second-guessed: the blocking anchor would only repeat it.
+    Closed,
+}
+
+impl From<Claim> for SpinPoll {
+    fn from(c: Claim) -> Self {
+        match c {
+            Claim::Ready(n) => SpinPoll::Ready(n),
+            Claim::Empty => SpinPoll::Empty,
+            Claim::Closed => SpinPoll::Closed,
+        }
+    }
+}
+
+/// Adaptive pre-anchor spin budget for one worker's claim loop — the shared
+/// state machine behind both engines' claim sources (the stream engine's
+/// single-ring `anchor_claim`, the graph engine's `FanIn` round).
+///
+/// The convoy pathology (streaming.md "Convoy collapse forensics") lives at
+/// channels whose supply side is a single rate-limited entity (feeder job /
+/// fence forwarder) and whose demand side is a crowd: the channel hovers
+/// empty, every arrival pays a futex wake RTT (~1–2 µs), and the pipeline
+/// clocks at items × RTT. Spinning non-blocking polls before parking lets
+/// consumers ride out those micro-gaps — bursts re-form and the wake RTT
+/// leaves the critical path.
+///
+/// The budget must be **activity-gated** (constant spin-window widening is
+/// falsified, dead-ends.md): it only stays above zero while items keep
+/// arriving within the knob's window after a failed spin, measured as the
+/// blocking anchor's latency right after the spin gave up. All state is
+/// per-worker locals touched once per anchor — no atomics, no clock reads
+/// while the channel has a backlog.
+pub(crate) struct SpinBudget {
+    /// Current spin window in µs; 0 = park immediately (baseline behavior).
+    budget_us: u32,
+    /// Knob value: the largest window worth spinning through.
+    max_us: u32,
+}
+
+impl SpinBudget {
+    pub(crate) fn new(max_us: u32) -> Self {
+        Self {
+            budget_us: 0,
+            max_us,
+        }
+    }
+
+    /// Whether the knob arms the spin at all (max window > 0); the anchor
+    /// skips its park-latency bookkeeping when not.
+    pub(crate) fn armed(&self) -> bool {
+        self.max_us > 0
+    }
+
+    /// First growth step (first "live" park): max/16 clamped to ≥1 µs, so
+    /// geometric doubling reaches a covering window in ~4 anchors without
+    /// ever spinning near the full knob on the first try.
+    fn initial(max_us: u32) -> u32 {
+        (max_us / 16).max(1)
+    }
+
+    /// Spin `poll` for up to the current budget.
+    /// `Ready(n)`: a run was caught mid-spin — the park is avoided.
+    /// `Empty`: budget exhausted — run the blocking anchor, then fold its
+    /// latency back via [`SpinBudget::note_park`].
+    /// `Closed`: terminal verdict, propagate.
+    ///
+    /// Backoff polling: the first polls are tight (fast suppliers are caught
+    /// almost immediately), then the pause count doubles up to
+    /// `MAX_POLL_PAUSES` — a crowd of spinning workers on one shared ring
+    /// must not poll at full rate or the ring's stamp cache lines bounce
+    /// between cores faster than items arrive (measured: tight spinning at
+    /// 14 workers REGRESSES the collapsed cell 3x vs parking, 2026-09 convoy
+    /// matrix; ~1 poll/µs/worker at the backoff tail rides out micro-gaps
+    /// without the futex round-trip).
+    pub(crate) fn spin_poll(&mut self, mut poll: impl FnMut() -> SpinPoll) -> SpinPoll {
+        if self.budget_us == 0 {
+            return SpinPoll::Empty;
+        }
+        let mut pauses = 1u32;
+        let mut polls = 0u64;
+        let max_polls = u64::from(self.budget_us) * u64::from(SPIN_ROUNDS_PER_US);
+        let window = Duration::from_micros(u64::from(self.budget_us));
+        let start = Instant::now();
+        loop {
+            match poll() {
+                SpinPoll::Ready(n) => return SpinPoll::Ready(n),
+                SpinPoll::Closed => return SpinPoll::Closed,
+                SpinPoll::Empty => {},
+            }
+            // Wall-clock deadline (checked every 8 polls) keeps the window
+            // honest under contention; the poll backstop bounds the loop when
+            // the clock does not advance (miri).
+            if polls >= max_polls || (polls & 7 == 7 && start.elapsed() >= window) {
+                return SpinPoll::Empty;
+            }
+            for _ in 0..pauses {
+                std::hint::spin_loop();
+            }
+            pauses = pauses.saturating_mul(2).min(MAX_POLL_PAUSES);
+            polls += 1;
+        }
+    }
+
+    /// Fold the blocking anchor's latency into the budget:
+    /// - item arrived within `4x` the knob's window: the channel is live — a longer spin might have
+    ///   caught an earlier item, double the budget. The 4x slack is load-bearing: with a crowd of
+    ///   `k` parked consumers and wake-one delivery, a given worker wins an item only every ~k
+    ///   gaps, so a strict `parked <= window` rule decays every loser to a pure park (measured:
+    ///   parks stayed at ~190 K/run — the spin never engaged at all; with the slack the crowd ramps
+    ///   collectively);
+    /// - item took longer than 4x the window: quiet relative to what this worker is prepared to
+    ///   spin — quarter it (an idle stage decays to pure parking within log₄(window) anchors, ≤
+    ///   ~1.33x the window of wasted spin per idle episode).
+    pub(crate) fn note_park(&mut self, parked: Duration) {
+        let live_below = Duration::from_micros(u64::from(self.max_us) * 4);
+        if parked <= live_below {
+            self.budget_us = self
+                .budget_us
+                .saturating_mul(2)
+                .max(Self::initial(self.max_us))
+                .min(self.max_us);
+        } else {
+            self.budget_us /= 4;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handoff::channel::{SyncReceiver, channel};
+    use crate::handoff::channel::{SyncReceiver, channel, claim_poll};
 
     fn drain_n<T: Send + 'static>(rx: &SyncReceiver<T>, n: usize) -> Vec<T> {
         (0..n).map(|_| rx.recv().expect("item buffered")).collect()
@@ -543,6 +698,54 @@ mod tests {
         }
         assert_eq!(run(CancelCheck::PerClaim), (0..8).collect::<Vec<_>>());
         assert_eq!(run(CancelCheck::PerItem), (0..4).collect::<Vec<_>>());
+    }
+
+    /// `note_park` growth/decay: live parks double the budget up to the
+    /// knob, quiet parks quarter it to zero, a zero knob is inert.
+    #[test]
+    fn spin_budget_adapts() {
+        let mut s = SpinBudget::new(10);
+        assert_eq!(s.budget_us, 0);
+        // First live park: initial window (10/16 -> 1).
+        s.note_park(Duration::from_micros(2));
+        assert_eq!(s.budget_us, 1);
+        // Doubling, capped at the knob.
+        for expected in [2, 4, 8, 10, 10] {
+            s.note_park(Duration::from_nanos(500));
+            assert_eq!(s.budget_us, expected);
+        }
+        // Quiet channel: quarters down to pure parking.
+        for _ in 0..4 {
+            s.note_park(Duration::from_millis(1));
+        }
+        assert_eq!(s.budget_us, 0);
+        // Knob off: stays inert regardless of park latency.
+        let mut off = SpinBudget::new(0);
+        off.note_park(Duration::from_nanos(1));
+        assert_eq!(off.budget_us, 0);
+    }
+
+    /// `spin_poll`: a zero budget never spins; with a budget it catches a
+    /// queued run without parking, exhausts to `Empty` on an empty source
+    /// (bounded rounds — miri-safe, no wall clock), and propagates
+    /// `Closed`.
+    #[test]
+    fn spin_poll_phases() {
+        let (tx, rx) = channel::<u32>(4);
+        let mut s = SpinBudget::new(100);
+        let mut scratch: Vec<u32> = Vec::with_capacity(2);
+        let poll = |scratch: &mut Vec<u32>| claim_poll(&rx, scratch, 0).into();
+        assert_eq!(s.spin_poll(|| poll(&mut scratch)), SpinPoll::Empty); // budget 0: no spin
+        tx.send(7).unwrap();
+        s.budget_us = 100;
+        assert_eq!(s.spin_poll(|| poll(&mut scratch)), SpinPoll::Ready(1));
+        assert_eq!(scratch, vec![7]);
+        scratch.clear();
+        s.budget_us = 1; // 64-poll backstop: exhausts immediately on empty
+        assert_eq!(s.spin_poll(|| poll(&mut scratch)), SpinPoll::Empty);
+        drop(tx);
+        s.budget_us = 100;
+        assert_eq!(s.spin_poll(|| poll(&mut scratch)), SpinPoll::Closed);
     }
 
     /// The expand driver's batched arm flushes at `flush_cap` and delivers

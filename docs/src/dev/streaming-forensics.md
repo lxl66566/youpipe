@@ -47,7 +47,7 @@ Same-root notes: todo #1 (terminal fan-in) is the collector-side face of the sam
 
 ## Fix (a)+(b) landed: adaptive pre-anchor spin, fence batch send (2026-09-30)
 
-Both fix candidates above are implemented as **default-off runtime knobs** (readers in `handoff/mod.rs` with the other data-plane knobs; `AnchorSpin` / `fence_batch_send` live in `builder/typed/stream.rs`):
+Both fix candidates above are implemented as **default-off runtime knobs** (readers in `handoff/mod.rs` with the other data-plane knobs; the shared spin state machine lives in `handoff/worker.rs` as `SpinBudget` since 2026-11-05, `fence_batch_send` in `builder/typed/stream.rs`):
 
 - `YOUPIPE_SPIN_ANCHOR=<µs>` — per-worker spin budget in the three sync recv loops (`spawn_stage` / `spawn_expand_stage` / `forward_fenced`). Before the blocking anchor, spin `try_recv` for the current budget with **backoff polling** (pause count doubles per poll up to 64 ≈ 1 µs between polls at the tail); the budget is gated on the measured anchor latency — a park that returned within 4× the knob window doubles the budget (the 4× slack is load-bearing: with wake-one delivery a worker wins an item only every ~k gaps, so a strict `parked ≤ window` rule decays the whole crowd back to parking), a quiet park quarters it to zero. Constant spin windows stay falsified ([dead-ends.md](dead-ends.md)): the gate is per-worker state, and an idle stage reaches pure parking within log₄(window) anchors.
 - `YOUPIPE_FWD_BATCH=1` — the fence forwarder pushes a released batch with `try_send` back-to-back, parking at most once per full ring instead of per item (needs `MpscSender::try_send`, also added).
