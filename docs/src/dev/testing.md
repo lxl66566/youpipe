@@ -1,20 +1,24 @@
 # Miri & Loom Compatibility
 
 
-Canonical runners (they reap stale miri processes, apply per-binary
+Canonical runners (they reap stale miri processes, apply per-group
 timeouts and the required flag combinations):
 
 ```sh
 perf/verify/miri.sh            # lib + integration binaries + vendored crossfire lib
+                              # (default path: `cargo miri nextest run`, -j 8;
+                              #  MIRI_SERIAL=1 restores the one-binary-at-a-time loop)
 perf/verify/loom.sh            # youpipe + vendored queue + crossfire + st3 models
+                              # (four independent blocks run concurrently;
+                              #  LOOM_SERIAL=1 restores sequential execution)
 perf/verify/linkcheck.sh       # mdbook intra-book link targets (docs/src)
 ```
 
 Of these, `linkcheck.sh` runs in CI verbatim (first step of the Test
-workflow's PR gate and before the Docs workflow's `mdbook build`); the CI
-miri/loom jobs run reduced target lists of `miri.sh`/`loom.sh` (see
-`.github/workflows/test.yml`), so the local scripts remain the
-authoritative full runs.
+workflow's PR gate and before the Docs workflow's `mdbook build`), and
+the CI miri/loom jobs invoke `miri.sh`/`loom.sh` with their full default
+target lists (see `.github/workflows/test.yml`), so target-list changes
+land in the scripts and both environments pick them up together.
 
 The `youpipe-sys` crate (workspace member `crates/youpipe-sys`) provides a
 unified `Mutex`/`Condvar`/atomics API via
@@ -142,6 +146,68 @@ release and silently skips wakes. A `debug_assert` now catches it.
 under loom to keep the model's state space small; the budget's only
 synchronization role (the final mutex acquire) is exercised either way.
 `CachePadded` drops its alignment under loom (no cache lines in the model).
+
+### Miri runner: nextest parallelism (2026-11-04)
+
+`miri.sh`'s default path is `cargo +nightly miri nextest run`
+(cargo-miri forwards nextest's flags verbatim): the default target list
+runs as six groups — light (9 binaries) / medium (5) / heavy
+(async_waker_alloc + compute_pool) / async (sharded_terminal_async) /
+lib / pipeline_integration — each group one nextest invocation at
+`-j ${MIRI_JOBS:-8}` (`--no-fail-fast`, `--no-tests warn`), the doctests
+stay on `cargo miri test --doc` (nextest does not run doctests), and the
+vendored crossfire lib stays its own `-p youpipe-crossfire --lib` block.
+A caller-supplied `MIRI_TARGETS` list runs as a single nextest
+invocation. Timeout semantics mapping: the serial loop gave every
+*binary* its own `timeout $MIRI_TIMEOUT_SECS`; nextest 0.9.92 has no
+per-test hard timeout (profile `timeout`/`timeouts.*` keys are silently
+ignored — verified empirically), so each *group* carries the deadline
+instead. Single-binary groups (lib, pipeline_integration) are exactly
+serial-equivalent; bundled groups' full serial sum sits far below one
+budget (census below), so no legitimate run truncates. In exchange every
+test is its own process: a wedged or aborting test no longer takes its
+binary down — on Windows this turned two instant whole-binary aborts
+(stream_reduce, pipeline_integration) into single-test failures with
+87/100 resp. 3/4 sibling tests still executing. The price is ~1 s
+interpreter startup per test, amortized by the parallelism. `MIRI_SERIAL=1`
+restores the pre-nextest loop (for toolchains without `cargo miri
+nextest` or bisecting a reporting difference).
+
+Windows-host census (2026-11-04, 32-core, nightly miri 0.1.0, warm
+builds, flag combo unchanged; serial numbers measured with the
+MIRI_SERIAL path immediately before the switch):
+
+| group (serial Σ of its binaries) | serial | nextest -j8 |
+| -------------------------------- | ------ | ----------- |
+| light (9 binaries, 195 s Σ)      | 195 s  | 31 s        |
+| medium (5 binaries, 343 s Σ)     | 343 s  | 78 s        |
+| heavy + async (67 s Σ)           | 67 s   | 58 s        |
+| lib (aborted mid-run at 414 s)   | ≥414 s | 212 s       |
+| pipeline_integration (aborted at 2 s) | ~0 s coverage | 49 s |
+| doc + crossfire lib              | 26+35 s| 25+14 s     |
+
+Full default pass ≈ 470 s wall vs ≈ 1080 s serial — and the serial pass
+aborted two binaries early (coverage below the parallel pass, see the
+host quirks paragraph). On the Linux census host (Σ ≈ 32 min serial) the
+same -j8 grouping projects to ~5–8 min (not re-measured there yet).
+
+Host-specific miri findings on this Windows machine (2026-11-04,
+pre-existing — identical failures with the old serial script; all pass
+on Linux):
+
+- Every tokio-runtime test dies with `unsupported operation: can't call
+  foreign function CreateIoCompletionPort` — mio's Windows backend has
+  no miri shim (Linux's epoll does). Affected: pipeline_integration's 13
+  async-shaped tests, 5 lib tests, 1 each in stream_reduce /
+  async_waker_alloc / sharded_terminal_async, 2 doctests. Not a youpipe
+  bug; the async paths stay covered on Linux and by loom.
+- The GlobalAlloc-shim binaries (submit_batch_alloc, pipe_range_alloc,
+  expand_alloc) hit `Undefined Behavior: deallocation through (root of
+  the allocation) is forbidden` in **libtest's own** mpmc completion
+  channel teardown (std::sys::alloc::windows HeapFree through the test's
+  counting allocator), after the test body itself passed — both borrow
+  models flag it. std/Windows-path issue, tracked informally; the tests
+  print `ok` before the harness abort.
 
 ### Miri workload scaling (`cfg!(miri)`)
 
@@ -382,6 +448,18 @@ concurrent-queue 3, crossfire waker-registry 6. Documented per-model range
 min. Not re-timed this round (no loom-relevant changes in the audited
 range).
 
+Since 2026-11-04 the four blocks (youpipe models / concurrent-queue /
+st3 / crossfire) run CONCURRENTLY as background jobs: each keeps its own
+per-block timeout (youpipe unbounded, queue 600 s, st3 1800 s,
+crossfire 600 s — unchanged), output is captured per block and printed
+in the original order after all finish (no interleaving), and the exit
+code aggregates all four. Windows 32-core (2026-11-04): 262–269 s vs
+~427 s serial — the win is host-shape-dependent because st3's
+exploration (~260 s) dominates here; on the Linux census host all four
+blocks are multi-minute and the overlap saves the three shorter blocks
+entirely. `LOOM_SERIAL=1` restores one-at-a-time execution for
+bisecting.
+
 ## Benches
 
 `cargo bench --no-run` (default members): 64 s release build at jobs=8.
@@ -483,9 +561,11 @@ drift anchors only (~187 of 246 kept).
 
 ## Where the time goes
 
-native + clippy ≈ 1 min · miri ≈ 32 min (lib ~9 · pipeline_integration
-6 · sharded_terminal_async ~4.7 · the other 18 targets ~12) ·
-loom ≈ 10–30 min · benches ≥ 30 min for full sweeps (~3 min saved by
+native + clippy ≈ 1 min · miri ≈ 32 min serial (lib ~9 ·
+pipeline_integration 6 · sharded_terminal_async ~4.7 · the other 18
+targets ~12), ~5–8 min projected at the 2026-11-04 nextest-parallel
+default (470 s measured on the Windows host) · loom ≈ 10–30 min ·
+benches ≥ 30 min for full sweeps (~3 min saved by
 `--sweep`). The levers and their
 protection costs: todo #19 (landed 2026-10-25, see "After r9 trims"
 above); the miri.sh coverage gap discovered by the census (4 of 20

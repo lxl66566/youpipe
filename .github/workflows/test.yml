@@ -29,11 +29,15 @@ jobs:
       - run: cargo clippy --all-features --all-targets -- -D warnings
 
   miri:
-    name: cargo miri test
+    name: miri (perf/verify/miri.sh)
     runs-on: ubuntu-latest
+    timeout-minutes: 100
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
+      # Parallel test jobs inside miri.sh's nextest groups (4 = the runner's
+      # core count; the script's local default is 8).
+      MIRI_JOBS: "4"
     steps:
       - uses: actions/checkout@v6
       - name: Setup sccache-cache
@@ -41,16 +45,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      # Miri is slow (~minutes per test); the integration tests scale their
-      # heavy workloads down via `cfg!(miri)` (same code paths, fewer
-      # repetitions), so lib + all integration binaries stay within budget.
-      # The `.cargo/config.toml` MIRIFLAGS (-Zmiri-ignore-leaks) is applied
-      # automatically for the global pool's intentionally-leaked threads.
-      - run: cargo miri test --lib --test compute_pool --test pipeline_integration --test filter_collect_panic --test scope_integration
+      # Canonical runner, full default target list: lib + doctests + every
+      # miri-meaningful integration binary + the vendored crossfire lib. The
+      # strict MIRIFLAGS combo (tree-borrows + ignore-leaks), per-target
+      # timeout and the deliberately-excluded binaries are the script's
+      # (per-target durations: docs/src/dev/testing.md "Suite duration
+      # census"; workloads scale down via `cfg!(miri)`).
+      - run: perf/verify/miri.sh
+        timeout-minutes: 90
 
   loom:
-    name: loom model tests
+    name: loom model tests (perf/verify/loom.sh)
     runs-on: ubuntu-latest
+    timeout-minutes: 55
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
@@ -58,13 +65,13 @@ jobs:
       - uses: actions/checkout@v6
       - name: Setup sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: dtolnay/rust-toolchain@stable
-      # Loom is switched on by the `--cfg loom` rustflag, not a cargo feature
-      # (see Cargo.toml). Regular unit tests cannot run on loom's simulated
-      # primitives, so filter to the `loom_tests` modules.
-      - run: RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
-      # The vendored queue's models need upstream's preemption bound to
-      # finish in seconds instead of hours (LOOM_MAX_PREEMPTIONS=2).
-      - run: RUSTFLAGS="--cfg loom" cargo test -p youpipe-concurrent-queue --test loom
-        env:
-          LOOM_MAX_PREEMPTIONS: "2"
+      # Nightly, not stable: loom.sh's youpipe-st3 block passes
+      # `-Z unstable-options --report-time` to the test harness, which a
+      # stable-built harness rejects.
+      - uses: dtolnay/rust-toolchain@nightly
+      # Canonical runner: youpipe lib models plus the vendored
+      # youpipe-concurrent-queue, youpipe-st3 and youpipe-crossfire waker
+      # blocks. Per-block timeouts and LOOM_MAX_PREEMPTIONS are the
+      # script's; full pass ≈ 10–30 min on the 32-core dev host.
+      - run: perf/verify/loom.sh
+        timeout-minutes: 45
