@@ -104,11 +104,12 @@ impl<T: Send + Unpin + 'static> AsyncFanIn<T> {
     /// whose shards all hang off one producer population in a linear
     /// chain.
     ///
-    /// Cost: one select cycle drops the k−1 futures that did not win, and
-    /// each dropped pending future abandons (unregisters) its waker node —
-    /// the next anchor re-allocates those nodes. That per-park churn is
-    /// the price of the any-of-N registration; the winner's slot stays
-    /// cached for reuse (P-4).
+    /// Cost: one select cycle drops the k−1 futures that did not win. Each
+    /// dropped pending future abandons its episode and RETIRES the waker
+    /// node into its slot (crossfire's cancel-path reuse, the P-4
+    /// extension), so the next anchor re-arms the same nodes in place —
+    /// steady state is one node per input endpoint, no per-park
+    /// allocation.
     async fn anchor(&mut self) -> Option<T> {
         if self.open == 1 {
             return self.anchor_single().await;

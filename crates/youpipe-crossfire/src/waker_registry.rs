@@ -79,6 +79,18 @@ pub trait Registry: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Retire a node its owner just abandoned (`abandon_waker` returned
+    /// `Ok`), keeping it re-armable by the next registration — the
+    /// cancel-path half of cross-episode node reuse (youpipe P-4): a
+    /// slot-borrowing future dropped while parked must not cost one node
+    /// allocation per cancelled episode. Returns `false` when the registry
+    /// does not support it (RegistrySingle keeps the node registered in
+    /// its cell; the owner drops the node instead).
+    #[inline(always)]
+    fn retire_abandoned_waker(&self, _waker: &Self::Waker) -> bool {
+        false
+    }
+
     #[inline(always)]
     fn fire(&self) -> WakeResult {
         WakeResult::Next
@@ -783,6 +795,21 @@ impl Registry for RegistryMulti {
             }
             Err(state) => Err(state),
         }
+    }
+
+    #[inline(always)]
+    fn retire_abandoned_waker(&self, waker: &ArcWaker) -> bool {
+        // abandon() just CASed the registered episode to Closed and
+        // abandon_waker cleared its queue entry, so no other writer can
+        // touch the word: the unconditional Closed->Reuse store is safe.
+        // Reuse is inert to wake() (skipped before the stamp gate) and the
+        // next registration re-arms the same node in place — the stamp is
+        // preserved, so a stale entry held by a racing fire keeps failing
+        // the stamp gate (or meets the event-free Init branch in the
+        // reset_init->set_seq window), the same shapes as the cancel_waker
+        // retire path.
+        waker.retire();
+        true
     }
 
     /// cancel one outdated waker, make sure it does not accumulate
@@ -2055,6 +2082,289 @@ mod loom_tests {
             // it to Woken either way.
             let _ = reg2.fire();
             assert_eq!(node.get_state(), WakerState::Woken as u8);
+        });
+    }
+
+    // ── Async face arbiters (todo #14 pending audit, 2026-11-05) ──
+    // The sync-side steal arbiters above drive blocking-shaped re-arms
+    // (reg_waker_blocking / reset). The async faces reach the same
+    // registries through different re-arm shapes: cancel_waker's
+    // retire-keep (the lucky-retry window), _reg_waker_async's Reuse
+    // branch (reset_init PRESERVES the stamp, so the packed word
+    // re-visits (Init, s) before reg_waker mints the next stamp), and the
+    // future-Drop abandon (Waiting→Closed CAS). These arbiters pin the
+    // async analogues of both fixed race classes.
+
+    // Async twin of `loom_stale_rearm_cannot_steal_committed_fire_unordered`:
+    // T1's async episode on reg1 ends through the P-4 retire path and
+    // re-arms on reg2 through _reg_waker_async's Reuse branch; both
+    // settled before the fire. One fire on reg1 must spend its event on
+    // the fresh reg1 waiter — never on T1's reg2 episode (the cross-
+    // registry stale-entry steal), whose node must still be Waiting after
+    // it. reset_init's stamp-preservation is the new interleaving surface:
+    // the stale reg1 entry's stamp equals the word's stamp again in the
+    // reset_init→set_seq window, and only the Init branch (event-free) can
+    // match there.
+    #[test]
+    fn loom_async_retire_rearm_cannot_steal_committed_fire() {
+        loom::model(|| {
+            let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let reg2 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let settled1 = Arc::new(AtomicUsize::new(0));
+            let settled3 = Arc::new(AtomicUsize::new(0));
+
+            let t1 = {
+                let reg1 = reg1.clone();
+                let reg2 = reg2.clone();
+                let settled1 = settled1.clone();
+                loom::thread::spawn(move || {
+                    let mut cx = Context::from_waker(std::task::Waker::noop());
+                    let mut o_waker: Option<ArcWaker> = None;
+                    <RegistryMulti as RegistryRecv>::reg_waker_async(&reg1, &mut cx, &mut o_waker);
+                    reg1.commit_waiting(&o_waker);
+                    // Episode end, P-4 shape: an item arrived after
+                    // registration (lucky retry) — cancel retires the
+                    // still-registered node and keeps it in the slot.
+                    <RegistryMulti as Registry>::cancel_waker(&reg1, &mut o_waker);
+                    // Re-arm on the foreign registry through the Reuse
+                    // branch: reset_init (stamp preserved) + reg_waker
+                    // (fresh stamp), then commit.
+                    <RegistryMulti as RegistryRecv>::reg_waker_async(&reg2, &mut cx, &mut o_waker);
+                    reg2.commit_waiting(&o_waker);
+                    settled1.store(1, Ordering::SeqCst);
+                    o_waker
+                })
+            };
+
+            let t3 = {
+                let reg1 = reg1.clone();
+                let settled3 = settled3.clone();
+                loom::thread::spawn(move || {
+                    let mut cx = Context::from_waker(std::task::Waker::noop());
+                    let mut o_waker: Option<ArcWaker> = None;
+                    <RegistryMulti as RegistryRecv>::reg_waker_async(&reg1, &mut cx, &mut o_waker);
+                    reg1.commit_waiting(&o_waker);
+                    settled3.store(1, Ordering::SeqCst);
+                    o_waker
+                })
+            };
+
+            wait_committed(&settled1);
+            wait_committed(&settled3);
+            assert_eq!(reg1.fire(), WakeResult::Woken);
+            let t1_waker = t1.join().unwrap();
+            let other = t3.join().unwrap();
+            assert_eq!(
+                other.as_ref().unwrap().get_state(),
+                WakerState::Woken as u8,
+                "the event must land on the fresh waiter, not the stale entry"
+            );
+            // The reg2 episode was not touched by reg1's event.
+            assert_eq!(t1_waker.as_ref().unwrap().get_state(), WakerState::Waiting as u8);
+            // Its own event still delivers; nothing ever ends Closed.
+            assert_eq!(reg2.fire(), WakeResult::Woken);
+            assert_eq!(t1_waker.as_ref().unwrap().get_state(), WakerState::Woken as u8);
+        });
+    }
+
+    // Async twin of `loom_wake_after_waiter_migration_redirects_to_fresh_waiter`:
+    // the abandonment is a future Drop (abandon: Waiting→Closed CAS, the
+    // airtight outcome marker) and the re-arm is a fresh async node on the
+    // foreign registry. The fire races the abandon + re-arm span; whenever
+    // the abandon wins, the event must be redirected to the fresh waiter,
+    // never spent on the re-armed reg2 episode.
+    #[test]
+    fn loom_async_cancel_migration_between_pop_and_wake() {
+        loom::model(|| {
+            let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let reg2 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let committed3 = Arc::new(AtomicUsize::new(0));
+            // T1 episode outcome: 1 = abandoned while still registered (the
+            // fire had not delivered), 2 = a wake landed first (legitimate).
+            let abandoned = Arc::new(AtomicUsize::new(0));
+
+            let t1 = {
+                let reg1 = reg1.clone();
+                let reg2 = reg2.clone();
+                let abandoned = abandoned.clone();
+                loom::thread::spawn(move || {
+                    let mut cx = Context::from_waker(std::task::Waker::noop());
+                    let mut o_waker: Option<ArcWaker> = None;
+                    <RegistryMulti as RegistryRecv>::reg_waker_async(&reg1, &mut cx, &mut o_waker);
+                    reg1.commit_waiting(&o_waker);
+                    // Cancellation Drop shape: abandon stamps Closed; a
+                    // racing fire's wake can no longer deliver here.
+                    let ok = reg1.abandon_waker(o_waker.as_ref().unwrap()).is_ok();
+                    abandoned.store(if ok { 1 } else { 2 }, Ordering::SeqCst);
+                    // The dropped future releases the node; the next episode
+                    // allocates a fresh one on the foreign registry.
+                    o_waker = None;
+                    <RegistryMulti as RegistryRecv>::reg_waker_async(&reg2, &mut cx, &mut o_waker);
+                    reg2.commit_waiting(&o_waker);
+                    o_waker
+                })
+            };
+
+            let t3 = {
+                let reg1 = reg1.clone();
+                let committed3 = committed3.clone();
+                loom::thread::spawn(move || {
+                    let mut cx = Context::from_waker(std::task::Waker::noop());
+                    let mut o_waker: Option<ArcWaker> = None;
+                    <RegistryMulti as RegistryRecv>::reg_waker_async(&reg1, &mut cx, &mut o_waker);
+                    reg1.commit_waiting(&o_waker);
+                    committed3.store(1, Ordering::SeqCst);
+                    o_waker
+                })
+            };
+
+            wait_committed(&committed3);
+            let _ = reg1.fire();
+            let t1_waker = t1.join().unwrap();
+            let other = t3.join().unwrap();
+            if abandoned.load(Ordering::SeqCst) == 1 {
+                assert_eq!(
+                    other.as_ref().unwrap().get_state(),
+                    WakerState::Woken as u8,
+                    "event spent on the re-armed foreign episode, fresh waiter stranded"
+                );
+            }
+            // The reg2 episode still receives its own event; no Closed leak.
+            let _ = reg2.fire();
+            assert_eq!(t1_waker.as_ref().unwrap().get_state(), WakerState::Woken as u8);
+            assert_ne!(other.as_ref().unwrap().get_state(), WakerState::Closed as u8);
+        });
+    }
+
+    // RegistrySingle's async face (mpsc recv, WeakCell): the async mpsc
+    // waiter parks in Init (commit_waiting is the no-op default), cancel
+    // retires the node while leaving the cell entry stale, and the next
+    // registration re-arms the SAME node in place (reset_init + replace).
+    // A fire racing that retire→re-arm window must never wedge the
+    // registry: the stale entry wakes as Skip (Reuse) or a self-healing
+    // Init wake, and a later fire still delivers to the live registration.
+    #[test]
+    fn loom_async_single_retire_stale_cell_fire_stays_live() {
+        loom::model(|| {
+            let reg = Arc::new(<RegistrySingle as RegistryRecv>::new());
+
+            let t1 = {
+                let reg = reg.clone();
+                loom::thread::spawn(move || {
+                    let mut cx = Context::from_waker(std::task::Waker::noop());
+                    let mut o_waker: Option<SingleWaker> = None;
+                    <RegistrySingle as RegistryRecv>::reg_waker_async(&reg, &mut cx, &mut o_waker);
+                    // Lucky-retry episode end: retire (cell entry goes stale).
+                    <RegistrySingle as Registry>::cancel_waker(&reg, &mut o_waker);
+                    // Re-arm in place: Reuse + will_wake → reset_init + replace.
+                    <RegistrySingle as RegistryRecv>::reg_waker_async(&reg, &mut cx, &mut o_waker);
+                    o_waker
+                })
+            };
+
+            // Races the retire→re-arm window: pops the stale or fresh entry.
+            let _ = reg.fire();
+            let o_waker = t1.join().unwrap();
+            let node = o_waker.as_ref().expect("slot keeps the node");
+
+            // Liveness: with the re-arm settled, one fire delivers to the
+            // live registration (Init → Woken wake), whatever the racing
+            // fire did to the stale entry.
+            reg.fire();
+            let state = node.get_state();
+            assert_eq!(state, WakerState::Woken as u8, "live registration must stay wakeable");
+        });
+    }
+
+    // Cancel-path reuse arbiter (youpipe P-4 extension, 2026-11-05): the
+    // Drop of a slot-borrowing future cancelled while parked abandons the
+    // episode (Waiting→Closed CAS + entry clear) and RETIRES the node
+    // (Closed→Reuse) instead of freeing it; the next registration re-arms
+    // the SAME node through _reg_waker_async's Reuse branch on the SAME
+    // registry. A fire racing that abandon→retire→re-arm span must spend
+    // its event only on a live episode: the stale entry wakes as Skip
+    // (Closed/Reuse), the re-armed word's fresh stamp fails the entry's
+    // stamp gate, and only the event-free Init branch (the
+    // reset_init→set_seq window) can match in between — a self-healing
+    // spurious poll. Liveness: both live waiters wake within a bounded
+    // event count; nothing ever ends Closed.
+    #[test]
+    fn loom_async_cancel_retire_rearm_racing_fire_keeps_liveness() {
+        loom::model(|| {
+            let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let committed3 = Arc::new(AtomicUsize::new(0));
+            // T1 episode outcome: 1 = abandoned while still registered
+            // (retired for reuse), 2 = a wake landed first (node Woken,
+            // kept and re-armed through the Woken branch).
+            let abandoned = Arc::new(AtomicUsize::new(0));
+
+            let t1 = {
+                let reg1 = reg1.clone();
+                let abandoned = abandoned.clone();
+                loom::thread::spawn(move || {
+                    let mut cx = Context::from_waker(std::task::Waker::noop());
+                    let mut o_waker: Option<ArcWaker> = None;
+                    <RegistryMulti as RegistryRecv>::reg_waker_async(&reg1, &mut cx, &mut o_waker);
+                    reg1.commit_waiting(&o_waker);
+                    // Cancel-Drop keep shape: abandon, then retire the node
+                    // in place for the next registration (a wake that won
+                    // leaves it Woken — the outcome marker records which).
+                    let retired = match reg1.abandon_waker(o_waker.as_ref().unwrap()) {
+                        Ok(()) => reg1.retire_abandoned_waker(o_waker.as_ref().unwrap()),
+                        Err(_) => false,
+                    };
+                    abandoned.store(usize::from(retired) + 1, Ordering::SeqCst);
+                    // Next episode: re-arm the SAME node in place (the
+                    // Reuse or Woken branch of _reg_waker_async), commit.
+                    <RegistryMulti as RegistryRecv>::reg_waker_async(&reg1, &mut cx, &mut o_waker);
+                    reg1.commit_waiting(&o_waker);
+                    o_waker
+                })
+            };
+
+            let t3 = {
+                let reg1 = reg1.clone();
+                let committed3 = committed3.clone();
+                loom::thread::spawn(move || {
+                    let mut cx = Context::from_waker(std::task::Waker::noop());
+                    let mut o_waker: Option<ArcWaker> = None;
+                    <RegistryMulti as RegistryRecv>::reg_waker_async(&reg1, &mut cx, &mut o_waker);
+                    reg1.commit_waiting(&o_waker);
+                    committed3.store(1, Ordering::SeqCst);
+                    o_waker
+                })
+            };
+
+            wait_committed(&committed3);
+            // Races the abandon→retire→re-arm span.
+            let _ = reg1.fire();
+            let t1_waker = t1.join().unwrap();
+            let other = t3.join().unwrap();
+
+            // Liveness: each event wakes one committed waiter; two live
+            // waiters are both Woken within two more events, whatever the
+            // racing fire did (deliver, Skip-collect, or Init-wake T1's
+            // re-arm — the last leaves T1 already Woken).
+            for _ in 0..2 {
+                if t1_waker.as_ref().unwrap().get_state() == WakerState::Woken as u8
+                    && other.as_ref().unwrap().get_state() == WakerState::Woken as u8
+                {
+                    break;
+                }
+                let _ = reg1.fire();
+            }
+            assert_eq!(
+                t1_waker.as_ref().unwrap().get_state(),
+                WakerState::Woken as u8,
+                "the re-armed episode must stay wakeable"
+            );
+            assert_eq!(
+                other.as_ref().unwrap().get_state(),
+                WakerState::Woken as u8,
+                "the fresh waiter must receive a wake within a bounded event count"
+            );
+            // No episode died Closed outside a channel close (none here).
+            assert_ne!(abandoned.load(Ordering::SeqCst), 0);
         });
     }
 }

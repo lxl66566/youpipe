@@ -22,10 +22,13 @@
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
-use youpipe::{AsyncStageOptions, stream};
+use youpipe::{AsyncNodeOptions, AsyncStageOptions, graph, stream};
 
 static WAKER_CLASS: AtomicU64 = AtomicU64::new(0);
 
@@ -136,3 +139,56 @@ fn async_stage_waker_alloc_wiring() {
          park, so the pipeline bound above proves nothing"
     );
 }
+
+/// Graph-side twin: the async fan-in anchor (`AsyncFanIn`, two sources into
+/// one `node_async`) parks its any-of-N combinator on every empty-input
+/// gap, and the select cycle drops the losing futures — with cancel-path
+/// slot reuse those drops retire into the slots, so the whole run stays at
+/// the per-endpoint floor (node tasks x 2 input slots + the bridge), not
+/// one node per park episode. Loose bound: the 48-byte bucket also
+/// catches the anchor's per-episode `futs` Vec and debug-build runtime
+/// noise; a wiring regression to per-episode nodes adds hundreds.
+#[test]
+fn graph_async_anchor_waker_alloc_wiring() {
+    let n = 256_u64;
+    let total = Arc::new(AtomicU64::new(0));
+    let acc = Arc::clone(&total);
+    let before = waker_class();
+    let mut g = graph();
+    let items: Vec<u64> = (0..n).collect();
+    let all_items = Arc::new(items);
+    let items = Arc::clone(&all_items);
+    let source = move || {
+        let k = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::future::ready((k < n).then(|| items[usize::try_from(k).expect("k < n fits usize")]))
+    };
+    let s1 = g.source_async("s1", source);
+    let items2 = Arc::clone(&all_items);
+    let source2 = move || {
+        let k = NEXT2.fetch_add(1, Ordering::Relaxed);
+        std::future::ready((k < n).then(|| items2[usize::try_from(k).expect("k < n fits usize")]))
+    };
+    let s2 = g.source_async("s2", source2);
+    let m = g.node_async_with(
+        "m",
+        AsyncNodeOptions::new().io_concurrency(4).buffer(16),
+        |x: u64| async move { x + 1 },
+    );
+    let out = g.sink("out", move |x: u64| {
+        acc.fetch_add(x, Ordering::Relaxed);
+    });
+    g.edge(s1, m).edge(s2, m).edge(m, out);
+    g.run();
+    let allocs = waker_class() - before;
+    // 2 sources x (sum(0..n) + n items' +1 from the node) = n * (n + 1).
+    assert_eq!(total.load(Ordering::SeqCst), n * (n + 1));
+    println!("graph anchor (2x{n} items, 4 tasks): waker-class allocs = {allocs}");
+    assert!(
+        allocs <= 512,
+        "waker-class allocations {allocs} exceed the anchor wiring bound; the          any-of-N \
+         anchor probably regressed to per-episode node allocation"
+    );
+}
+
+static NEXT: AtomicU64 = AtomicU64::new(0);
+static NEXT2: AtomicU64 = AtomicU64::new(0);

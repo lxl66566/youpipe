@@ -10,7 +10,10 @@
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
+    future::Future,
+    pin::Pin,
     sync::atomic::{AtomicU64, Ordering},
+    task::{Context, Waker},
 };
 
 use crossfire::{mpmc, AsyncWakerSlot};
@@ -107,4 +110,54 @@ async fn recv_cached_allocates_per_endpoint_not_per_episode() {
         "recv_cached() allocated {cached} waker nodes for one endpoint; \
          cross-episode slot reuse regressed"
     );
+}
+
+/// Cancel-path node reuse (youpipe P-4 extension, 2026-11-05): a cached
+/// future dropped while parked (a select cancellation — the any-of-N
+/// anchor's losing futures, tokio::select! cancels) retires its node into
+/// the slot instead of freeing it, so a cancel-per-episode loop allocates
+/// a fixed handful, not one node per cancelled episode. The slot-less
+/// per-call twin pays one per episode (floor proof).
+#[test]
+fn cancelled_recv_cached_allocates_per_endpoint_not_per_episode() {
+    const EPISODES: u64 = 64;
+    let (tx, rx) = mpmc::bounded_async::<u64>(1);
+
+    // ── slot-less baseline: RecvFuture owns its node, freed on drop ──
+    let mut cx = Context::from_waker(Waker::noop());
+    let before = WAKER_CLASS.load(Ordering::SeqCst);
+    for _ in 0..EPISODES {
+        let mut fut = rx.recv();
+        assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+        drop(fut); // cancelled while parked
+    }
+    let plain = WAKER_CLASS.load(Ordering::SeqCst) - before;
+    println!("cancelled recv():          waker-class allocs = {plain}");
+    assert!(
+        plain >= EPISODES / 2,
+        "cancelled per-call recv() allocated only {plain} nodes for          {EPISODES} parked cancels; the workload does not park, the cached          bound below would prove nothing"
+    );
+
+    // ── slot loop: the cancelled episode retires into the slot ──
+    let mut slot = AsyncWakerSlot::new();
+    let before = WAKER_CLASS.load(Ordering::SeqCst);
+    for _ in 0..EPISODES {
+        let mut fut = rx.recv_cached(&mut slot);
+        assert!(Pin::new(&mut fut).poll(&mut cx).is_pending());
+        drop(fut); // cancelled while parked: abandon + retire-keep
+    }
+    let cached = WAKER_CLASS.load(Ordering::SeqCst) - before;
+    println!("cancelled recv_cached():   waker-class allocs = {cached}");
+    assert!(
+        cached <= 2,
+        "cancelled recv_cached() allocated {cached} waker nodes for one          endpoint; cancel-path slot reuse regressed"
+    );
+
+    // The kept node still delivers: the channel re-arms it in place.
+    tx.try_send(7).unwrap();
+    let mut fut = rx.recv_cached(&mut slot);
+    match Pin::new(&mut fut).poll(&mut cx) {
+        std::task::Poll::Ready(Ok(v)) => assert_eq!(v, 7),
+        _ => panic!("the kept node failed to re-arm and deliver"),
+    }
 }

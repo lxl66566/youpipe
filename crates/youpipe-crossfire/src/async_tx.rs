@@ -328,7 +328,22 @@ impl<F: Flavor> AsyncTx<F> {
             } else if state > WakerState::Woken as u8 {
                 if state == WakerState::Done as u8 {
                     trace_log!("tx{:?}: send {:?} done", o_waker, tokio_task_id!());
-                    let _ = o_waker.take();
+                    // The item was direct-copied to a parked receiver. A
+                    // still-registered node was retired (Reuse) by
+                    // cancel_reuse_waker — keep it in the slot for the next
+                    // registration's in-place re-arm (cancel-path node
+                    // reuse, youpipe P-4). Per-call callers take the field
+                    // on Ready anyway, so this only affects slot borrowers;
+                    // only a wake-raced (Woken) node is dropped here, whose
+                    // abandon would fire the on_recv token pass.
+                    let retired = o_waker.is_some()
+                        && shared
+                            .senders
+                            .get_waker_state(o_waker, std::sync::atomic::Ordering::Relaxed)
+                            == WakerState::Reuse as u8;
+                    if !retired {
+                        let _ = o_waker.take();
+                    }
                     return Poll::Ready(Ok(()));
                 } else {
                     debug_assert_eq!(state, WakerState::Closed as u8);
@@ -371,11 +386,11 @@ impl<F: Flavor> Drop for SendFuture<'_, F> {
         // is dropped iff the future still owns it (see `consumed`).
         let mut owned = !self.consumed;
         if let Some(waker) = self.waker.as_ref() {
-            // abandon_send_waker() returns false only for WakerState::Done:
-            // the item was direct-copied into the channel, ownership left
-            // with it. (Defensive: the Done-stamping paths in `poll` already
-            // set `consumed = true` before returning Ready.)
-            if !self.tx.shared.abandon_send_waker(waker) {
+            // Consumed is returned only for WakerState::Done: the item was
+            // direct-copied into the channel, ownership left with it.
+            // (Defensive: the Done-stamping paths in `poll` already set
+            // `consumed = true` before returning Ready.)
+            if matches!(self.tx.shared.abandon_send_waker(waker), AbandonOutcome::Consumed) {
                 owned = false;
             }
         }
@@ -443,8 +458,11 @@ impl<F: Flavor> Drop for CachedSendFuture<'_, F> {
         let mut owned = !self.consumed;
         if !self.done {
             if let Some(waker) = self.slot.node.take() {
-                if !self.tx.shared.abandon_send_waker(&waker) {
-                    owned = false;
+                // Cancel-path node reuse, see CachedRecvFuture::drop.
+                match self.tx.shared.abandon_send_waker(&waker) {
+                    AbandonOutcome::Reusable => self.slot.node = Some(waker),
+                    AbandonOutcome::Consumed => owned = false,
+                    AbandonOutcome::Dead => {}
                 }
             }
         }
@@ -515,8 +533,8 @@ where
         // is dropped iff the future still owns it (see `consumed`).
         let mut owned = !self.consumed;
         if let Some(waker) = self.waker.as_ref() {
-            // See SendFuture::drop: false == Done == direct-copied away.
-            if !self.tx.shared.abandon_send_waker(waker) {
+            // See SendFuture::drop: Consumed == Done == direct-copied away.
+            if matches!(self.tx.shared.abandon_send_waker(waker), AbandonOutcome::Consumed) {
                 owned = false;
             }
         }
@@ -561,7 +579,10 @@ where
             Poll::Pending => {
                 let sleep = unsafe { Pin::new_unchecked(&mut _self.sleep) };
                 if sleep.poll(ctx).is_ready() {
-                    if _self.tx.shared.abandon_send_waker(&_self.waker.take().unwrap()) {
+                    if !matches!(
+                        _self.tx.shared.abandon_send_waker(&_self.waker.take().unwrap()),
+                        AbandonOutcome::Consumed
+                    ) {
                         // Ownership moves into the Timeout error below.
                         _self.consumed = true;
                         return Poll::Ready(Err(SendTimeoutError::Timeout(unsafe {

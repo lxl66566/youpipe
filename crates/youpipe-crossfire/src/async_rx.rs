@@ -342,9 +342,12 @@ impl<F: Flavor> AsyncRx<F> {
 /// slot to [`AsyncRx::recv_cached`] / [`AsyncTx::send_cached`] lets the node
 /// survive across calls: the registry re-arms a consumed (`Woken`) node in
 /// place when `will_wake` still holds and rebuilds only when the executor's
-/// waker identity changed (issue #14 pattern). The `ThinWaker` handle is
-/// written once at node creation and never rewritten, so — unlike the
-/// blocking-side cache designs — no `UnsafeCell` write is involved in reuse.
+/// waker identity changed (issue #14 pattern). A future dropped while
+/// parked (select cancellation) retires its still-registered node into the
+/// slot instead of freeing it, so cancelled episodes reuse it too. The
+/// `ThinWaker` handle is written once at node creation and never rewritten,
+/// so — unlike the blocking-side cache designs — no `UnsafeCell` write is
+/// involved in reuse.
 ///
 /// Use one slot per endpoint (one for a receiver loop, one per sender), not
 /// shared between different channels; a slot moved to a different task
@@ -442,7 +445,14 @@ impl<F: Flavor> Drop for CachedRecvFuture<'_, F> {
     fn drop(&mut self) {
         if !self.done {
             if let Some(waker) = self.slot.node.take() {
-                self.rx.shared.abandon_recv_waker(&waker);
+                // Cancel-path node reuse (youpipe P-4): a node the abandon
+                // retired in place (or a racing wake already consumed) goes
+                // back into the slot for the next registration to re-arm —
+                // a select dropping this future every episode must not cost
+                // one node allocation per episode.
+                if matches!(self.rx.shared.abandon_recv_waker(&waker), AbandonOutcome::Reusable) {
+                    self.slot.node = Some(waker);
+                }
             }
         }
     }

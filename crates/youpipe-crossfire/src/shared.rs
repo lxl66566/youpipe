@@ -9,6 +9,22 @@ use std::sync::atomic::{compiler_fence, fence, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// What a cancellation-abandon (`abandon_send_waker`/`abandon_recv_waker`)
+/// leaves in the caller's slot: whether the Drop may keep the node for the
+/// next registration to re-arm in place, and — send side — whether item
+/// ownership already left the future.
+pub(crate) enum AbandonOutcome {
+    /// Unregistered and retired in place: keep the node in the slot
+    /// (cancel-path node reuse, youpipe P-4).
+    Reusable,
+    /// Dead episode (close_wake'd Closed / Done) or a registry without
+    /// cancel-path reuse (the node stays registered): drop the node.
+    Dead,
+    /// Direct-copy consumed the item; ownership already left the future
+    /// (send side only; the node is dead too).
+    Consumed,
+}
+
 pub struct ChannelShared<F: Flavor> {
     pub(crate) inner: F,
     tx_count: AtomicUsize,
@@ -282,46 +298,73 @@ impl<F: Flavor> ChannelShared<F> {
         //        }
     }
 
-    /// Call on cancellation, return true to indicate drop temporary message
-    /// return false to indicate already Done.
+    /// Call on cancellation. The outcome tells a slot-borrowing (cached)
+    /// future's Drop what may happen to the node (youpipe P-4 cancel-path
+    /// reuse): `Reusable` — no longer registered and retired in place, keep
+    /// it in the slot for the next registration to re-arm in place;
+    /// `Dead` — close_wake'd, Done, or a registry without cancel-path
+    /// reuse, drop it; `Consumed` — direct-copy already moved the item
+    /// (send side only), ownership left the future.
     #[inline(always)]
-    pub(crate) fn abandon_send_waker(&self, waker: &<F::Send as Registry>::Waker) -> bool {
+    pub(crate) fn abandon_send_waker(
+        &self, waker: &<F::Send as Registry>::Waker,
+    ) -> AbandonOutcome {
         match self.senders.abandon_waker(waker) {
-            Ok(_) => true,
+            Ok(_) => {
+                if self.senders.retire_abandoned_waker(waker) {
+                    AbandonOutcome::Reusable
+                } else {
+                    AbandonOutcome::Dead
+                }
+            }
             Err(state) => {
                 trace_log!("tx: abandon err  {:?} {}", waker, state);
                 if state == WakerState::Woken as u8 {
                     // We are awake, but give up sending, should notify another sender for safety
                     self.on_recv();
+                    AbandonOutcome::Reusable
                 } else if state == WakerState::Closed as u8 {
+                    AbandonOutcome::Dead
                 } else if state == WakerState::Reuse as u8 {
                     // Retired node (not registered): nothing to pass on.
+                    AbandonOutcome::Reusable
                 } else {
                     debug_assert_eq!(state, WakerState::Done as u8);
                     // Unused code for direct_copy
-                    return false;
+                    AbandonOutcome::Consumed
                 }
-                true
             }
         }
     }
 
-    /// Call on cancellation, return true to indicate drop temporary message
+    /// Call on cancellation; the outcome semantics are those of
+    /// [`Self::abandon_send_waker`] (`Consumed` cannot occur on the recv
+    /// side).
     #[inline(always)]
-    pub(crate) fn abandon_recv_waker(&self, waker: &<F::Recv as Registry>::Waker) {
+    pub(crate) fn abandon_recv_waker(
+        &self, waker: &<F::Recv as Registry>::Waker,
+    ) -> AbandonOutcome {
         if let Err(state) = self.recvs.abandon_waker(waker) {
             trace_log!("rx: abandon err {:?} {}", waker, state);
             if state == WakerState::Woken as u8 {
                 // We are awake, but give up receiving, should notify another receiver for safety
                 self.on_send();
+                AbandonOutcome::Reusable
             } else if state == WakerState::Closed as u8 {
                 // Closed
+                AbandonOutcome::Dead
             } else if state == WakerState::Reuse as u8 {
                 // Retired node (not registered): nothing to pass on.
+                AbandonOutcome::Reusable
             } else {
                 debug_assert_eq!(state, WakerState::Done as u8);
                 // Unused code for direct_copy
+                AbandonOutcome::Dead
             }
+        } else if self.recvs.retire_abandoned_waker(waker) {
+            AbandonOutcome::Reusable
+        } else {
+            AbandonOutcome::Dead
         }
     }
 
