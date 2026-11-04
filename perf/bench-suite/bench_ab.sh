@@ -363,6 +363,18 @@ run_one() { # label bin round filter
 first_round=$(( $(ls -1d "$OUTDIR"/round-* 2>/dev/null \
     | sed 's/.*round-//' | sort -n | tail -1 || echo 0) + 1 ))
 
+# The timed rounds hold /tmp/youpipe-locks/bench.lock (co-workers protocol,
+# same file as bench-full.sh timed segments): a concurrent bench process
+# poisons every number through CPU contention — found 2026-11-05 when a
+# co-running bench_ab round shifted the rayon anchors +30-42%. fd-scoped so
+# the whole rounds phase is one lock episode; script exit releases.
+mkdir -p /tmp/youpipe-locks
+exec 9>/tmp/youpipe-locks/bench.lock
+if ! flock -w 7200 9; then
+    echo "REFUSING TO START: timed out waiting 2h for /tmp/youpipe-locks/bench.lock" >&2
+    exit 1
+fi
+
 echo "==> running $ROUNDS interleaved rounds, sides: ${LABELS[*]}"
 fail=0
 for (( r=0; r<ROUNDS; r++ )); do
