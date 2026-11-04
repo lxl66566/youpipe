@@ -1083,7 +1083,64 @@ impl StageBudget {
 /// collector runs — the batched-vs-per-item choice changes channel slot
 /// types, so it cannot stay a runtime flag. Sealed: the modes are only ever
 /// produced by the builder methods.
-pub trait StreamMode: sealed::Sealed {}
+///
+/// Beyond the marker, the trait is the terminal family's pass-core
+/// selector (todo #31): [`Payload`](Self::Payload) ties a chain to its mode
+/// (`S: StageSpawn<I, Out = M::Payload<O>>`) and the three `*_pass` methods
+/// pick the per-mode pass core (fused attempt, collector flavour, drain
+/// flag) behind the mode-generic terminal impl — sealed plumbing; call the
+/// [`StreamPipe`] terminals, not these.
+pub trait StreamMode: sealed::Sealed {
+    /// The payload one final-channel slot carries for element type `O`:
+    /// `O` itself on the per-item modes, one expansion group `Vec<O>` on
+    /// [`Grouped`]. A mode can only run chains whose [`StageSpawn::Out`]
+    /// equals its payload — the compile-time check that keeps the Grouped
+    /// group-payload split typestate-clean.
+    type Payload<O>;
+
+    /// Pass core of the collecting terminals
+    /// ([`run`](StreamPipe::run) / [`collect`](StreamPipe::collect) /
+    /// [`try_run`](StreamPipe::try_run)): the mode's fused-pass-through
+    /// attempt (per-item modes only) plus its collector and drain flag.
+    fn run_pass<S, I, O, R: AsyncRuntime>(
+        pipe: StreamPipe<S, I, O, R, Self>,
+    ) -> std::io::Result<Vec<O>>
+    where
+        S: StageSpawn<I, Out = Self::Payload<O>>,
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        Self: Sized;
+
+    /// Pass core of [`StreamPipe::for_each`] (never fuses — its drain runs
+    /// on the calling thread).
+    fn for_each_pass<S, I, O, F, R: AsyncRuntime>(pipe: StreamPipe<S, I, O, R, Self>, f: F)
+    where
+        S: StageSpawn<I, Out = Self::Payload<O>>,
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        F: FnMut(O),
+        Self: Sized;
+
+    /// Pass core of the aggregation terminals
+    /// ([`reduce`](StreamPipe::reduce) / [`fold`](StreamPipe::fold) /
+    /// [`sum`](StreamPipe::sum) / [`count`](StreamPipe::count)): the mode's
+    /// fused-reduce attempt (per-item modes only) plus its reducer
+    /// collector. `make_reducer` runs at most twice (fused attempt, then
+    /// streaming terminal) — exactly once on [`Grouped`], which never
+    /// fuses.
+    fn reduce_pass<S, I, O, Red, Mk, R: AsyncRuntime>(
+        pipe: StreamPipe<S, I, O, R, Self>,
+        make_reducer: Mk,
+    ) -> std::io::Result<Red::Acc>
+    where
+        S: StageSpawn<I, Out = Self::Payload<O>>,
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        Red: Reducer<O>,
+        Red::Acc: 'static,
+        Mk: Fn() -> Red,
+        Self: Sized;
+}
 
 mod sealed {
     pub trait Sealed {}
@@ -1113,10 +1170,6 @@ pub struct Ordered;
 /// payloads elementwise, keeping each group atomic; nested expands flatten
 /// naturally into the same output group (`(seq, sub₁, sub₂)` order).
 pub struct Grouped;
-
-impl StreamMode for Unordered {}
-impl StreamMode for Ordered {}
-impl StreamMode for Grouped {}
 
 /// Compile-time "this chain contains no per-item [`ExpandStage`]" — the
 /// bound that makes `.ordered()` *after* `.expand()` a compile error (todo
@@ -5934,16 +5987,156 @@ where
     )
 }
 
-// ── Unordered run family ──
+// ── Per-mode pass-core selection (todo #31) ──
+//
+// The whole mode-specific surface the terminal family needs: the payload
+// GAT (the chain bound `S: StageSpawn<I, Out = M::Payload<O>>`) plus the
+// three pass-core selectors. Unordered and Ordered differ only in the drain
+// flag (they share the per-item pass cores above, fused attempts included);
+// Grouped takes the flattening collectors with no fused attempt (its chains
+// contain an expansion by construction).
 
-impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R, Unordered>
+impl StreamMode for Unordered {
+    type Payload<O> = O;
+
+    fn run_pass<S, I, O, R: AsyncRuntime>(
+        pipe: StreamPipe<S, I, O, R, Self>,
+    ) -> std::io::Result<Vec<O>>
+    where
+        S: StageSpawn<I, Out = Self::Payload<O>>,
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+    {
+        run_stream_pass(pipe, false)
+    }
+
+    fn for_each_pass<S, I, O, F, R: AsyncRuntime>(pipe: StreamPipe<S, I, O, R, Self>, f: F)
+    where
+        S: StageSpawn<I, Out = Self::Payload<O>>,
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        F: FnMut(O),
+    {
+        for_each_stream_pass(pipe, f, false);
+    }
+
+    fn reduce_pass<S, I, O, Red, Mk, R: AsyncRuntime>(
+        pipe: StreamPipe<S, I, O, R, Self>,
+        make_reducer: Mk,
+    ) -> std::io::Result<Red::Acc>
+    where
+        S: StageSpawn<I, Out = Self::Payload<O>>,
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        Red: Reducer<O>,
+        Red::Acc: 'static,
+        Mk: Fn() -> Red,
+    {
+        reduce_stream_pass(pipe, false, make_reducer)
+    }
+}
+
+impl StreamMode for Ordered {
+    type Payload<O> = O;
+
+    fn run_pass<S, I, O, R: AsyncRuntime>(
+        pipe: StreamPipe<S, I, O, R, Self>,
+    ) -> std::io::Result<Vec<O>>
+    where
+        S: StageSpawn<I, Out = Self::Payload<O>>,
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+    {
+        run_stream_pass(pipe, true)
+    }
+
+    fn for_each_pass<S, I, O, F, R: AsyncRuntime>(pipe: StreamPipe<S, I, O, R, Self>, f: F)
+    where
+        S: StageSpawn<I, Out = Self::Payload<O>>,
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        F: FnMut(O),
+    {
+        for_each_stream_pass(pipe, f, true);
+    }
+
+    fn reduce_pass<S, I, O, Red, Mk, R: AsyncRuntime>(
+        pipe: StreamPipe<S, I, O, R, Self>,
+        make_reducer: Mk,
+    ) -> std::io::Result<Red::Acc>
+    where
+        S: StageSpawn<I, Out = Self::Payload<O>>,
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        Red: Reducer<O>,
+        Red::Acc: 'static,
+        Mk: Fn() -> Red,
+    {
+        reduce_stream_pass(pipe, true, make_reducer)
+    }
+}
+
+impl StreamMode for Grouped {
+    type Payload<O> = Vec<O>;
+
+    fn run_pass<S, I, O, R: AsyncRuntime>(
+        pipe: StreamPipe<S, I, O, R, Self>,
+    ) -> std::io::Result<Vec<O>>
+    where
+        S: StageSpawn<I, Out = Self::Payload<O>>,
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+    {
+        run_grouped_pass(pipe)
+    }
+
+    fn for_each_pass<S, I, O, F, R: AsyncRuntime>(pipe: StreamPipe<S, I, O, R, Self>, f: F)
+    where
+        S: StageSpawn<I, Out = Self::Payload<O>>,
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        F: FnMut(O),
+    {
+        for_each_grouped_pass(pipe, f);
+    }
+
+    fn reduce_pass<S, I, O, Red, Mk, R: AsyncRuntime>(
+        pipe: StreamPipe<S, I, O, R, Self>,
+        make_reducer: Mk,
+    ) -> std::io::Result<Red::Acc>
+    where
+        S: StageSpawn<I, Out = Self::Payload<O>>,
+        I: Send + Unpin + 'static,
+        O: Send + Unpin + 'static,
+        Red: Reducer<O>,
+        Red::Acc: 'static,
+        Mk: Fn() -> Red,
+    {
+        // No fused attempt on grouped chains (an expansion is in the chain
+        // by construction), so the reducer is built exactly once.
+        reduce_grouped_pass(pipe, make_reducer())
+    }
+}
+
+// ── Terminal run family (todo #31: one impl for every `StreamMode`) ──
+//
+// The 12 terminals delegate to the [`StreamMode`] selectors above; the
+// hand-copied per-mode impl blocks this replaces were exactly how
+// `Grouped::max` went missing (filled 2026-11-05) — the next terminal lands
+// here once and every mode gets it.
+
+impl<S, I, O, R: AsyncRuntime, M: StreamMode> StreamPipe<S, I, O, R, M>
 where
-    S: StageSpawn<I, Out = O>,
+    S: StageSpawn<I, Out = M::Payload<O>>,
     I: Send + Unpin + 'static,
     O: Send + Unpin + 'static,
 {
-    /// Execute the streaming pipeline and collect results into a `Vec<O>`
-    /// in completion order (see [`StreamPipe::ordered`] for input order).
+    /// Execute the streaming pipeline and collect results into a `Vec<O>` —
+    /// completion order on the default mode, input order on
+    /// [`.ordered()`](StreamPipe::ordered) chains, and flattened input order
+    /// on ordered-[`expand`](StreamPipe::expand) chains (groups in seq
+    /// order, elements in expansion order within each group; empty groups
+    /// contribute nothing but still advance the reorder position).
     ///
     /// # Fused pass-through
     ///
@@ -5954,8 +6147,9 @@ where
     /// [`buffer`](SyncStageOptions::buffer)
     /// pin — `run()` composes the stages into one `g ∘ f` pass and executes
     /// it on the fused index core (hybrid dispatch, zero-copy slots), the
-    /// same core `pipe(..).map().collect()` uses. Behavioural differences vs
-    /// the streaming topology:
+    /// same core `pipe(..).map().collect()` uses. Grouped chains never
+    /// qualify — an ordered `expand()` is in the chain by construction.
+    /// Behavioural differences vs the streaming topology:
     ///
     /// - **No backpressure**: peak memory is the input + output `Vec`s, not bounded by
     ///   `buffer_size`.
@@ -6045,7 +6239,8 @@ where
     ///
     /// Without `.ordered()`, `f` sees items in completion order. With
     /// `.ordered()`, items are re-sequenced through a [`ReorderBuffer`] in
-    /// input order first.
+    /// input order first; on ordered-`expand()` chains `f` sees the groups
+    /// flattened, elementwise, in input order.
     ///
     /// `f` runs on the calling thread, so it needs no `Send`/`'static`
     /// bounds — accumulate into local state directly, no atomics required.
@@ -6070,7 +6265,7 @@ where
     where
         F: FnMut(O),
     {
-        for_each_stream_pass(self, f, false);
+        M::for_each_pass(self, f);
     }
 
     /// Execute the streaming pipeline and reduce the outputs into a single
@@ -6094,7 +6289,7 @@ where
     where
         F: Fn(O, O) -> O + Send + Sync + 'static,
     {
-        reduce_stream_pass(self, false, || OptionReducer(&op))
+        M::reduce_pass(self, || OptionReducer(&op))
             .expect("StreamPipe::reduce: failed to build async runtime (see run/try_run)")
     }
 
@@ -6113,7 +6308,7 @@ where
         F: Fn(A, O) -> A + Send + Sync + 'static,
         C: Fn(A, A) -> A + Send + Sync + 'static,
     {
-        reduce_stream_pass(self, false, || FoldReducer {
+        M::reduce_pass(self, || FoldReducer {
             init: init.clone(),
             f: &f,
             combine: &combine,
@@ -6132,7 +6327,7 @@ where
     where
         O: std::iter::Sum,
     {
-        reduce_stream_pass(self, false, || SumReducer::<O>(PhantomData))
+        M::reduce_pass(self, || SumReducer::<O>(PhantomData))
             .expect("StreamPipe::sum: failed to build async runtime (see run/try_run)")
     }
 
@@ -6143,7 +6338,7 @@ where
     ///
     /// Same contract as [`run`](Self::run).
     pub fn count(self) -> usize {
-        reduce_stream_pass(self, false, || CountReducer)
+        M::reduce_pass(self, || CountReducer)
             .expect("StreamPipe::count: failed to build async runtime (see run/try_run)")
     }
 
@@ -6198,7 +6393,7 @@ where
     /// transport described there — except that async-runtime construction
     /// failure is returned as `Err` instead of panicking.
     pub fn try_run(self) -> std::io::Result<Vec<O>> {
-        run_stream_pass(self, false)
+        M::run_pass(self)
     }
 
     /// Execute the pipeline and report whether it completed or was
@@ -6251,314 +6446,6 @@ where
         // `emitted == out.len()` exactly: the drain collects every item that
         // crossed the final channel before the workers stopped, and the
         // token read happens after the drain (see `RunOutcome::classify`).
-        let emitted = out.len();
-        Ok(RunOutcome::classify(out, emitted, token.as_ref()))
-    }
-}
-
-// ── Ordered run family ──
-
-impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R, Ordered>
-where
-    S: StageSpawn<I, Out = O>,
-    I: Send + Unpin + 'static,
-    O: Send + Unpin + 'static,
-{
-    /// [`StreamPipe::run`] with the ordered drain: the collector
-    /// re-sequences outputs into input order through a [`ReorderBuffer`].
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::run`].
-    pub fn run(self) -> Vec<O> {
-        self.try_run().expect(
-            "StreamPipe::run: failed to build async runtime (OS resource limit? pass a custom \
-             backend via with_async_pool, or use try_run to handle the failure)",
-        )
-    }
-
-    /// Alias for [`run`](Self::run) — see [`StreamPipe::collect`].
-    pub fn collect(self) -> Vec<O> {
-        self.run()
-    }
-
-    /// [`StreamPipe::for_each`] in input order.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::for_each`].
-    pub fn for_each<F>(self, f: F)
-    where
-        F: FnMut(O),
-    {
-        for_each_stream_pass(self, f, true);
-    }
-
-    /// [`StreamPipe::reduce`] over the input-ordered drain.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::reduce`].
-    pub fn reduce<F>(self, op: F) -> Option<O>
-    where
-        F: Fn(O, O) -> O + Send + Sync + 'static,
-    {
-        reduce_stream_pass(self, true, || OptionReducer(&op))
-            .expect("StreamPipe::reduce: failed to build async runtime (see run/try_run)")
-    }
-
-    /// [`StreamPipe::fold`] over the input-ordered drain.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::fold`].
-    pub fn fold<A, F, C>(self, init: A, f: F, combine: C) -> A
-    where
-        A: Clone + Send + Sync + 'static,
-        F: Fn(A, O) -> A + Send + Sync + 'static,
-        C: Fn(A, A) -> A + Send + Sync + 'static,
-    {
-        reduce_stream_pass(self, true, || FoldReducer {
-            init: init.clone(),
-            f: &f,
-            combine: &combine,
-        })
-        .expect("StreamPipe::fold: failed to build async runtime (see run/try_run)")
-    }
-
-    /// [`StreamPipe::sum`] over the input-ordered drain.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::sum`].
-    pub fn sum(self) -> O
-    where
-        O: std::iter::Sum,
-    {
-        reduce_stream_pass(self, true, || SumReducer::<O>(PhantomData))
-            .expect("StreamPipe::sum: failed to build async runtime (see run/try_run)")
-    }
-
-    /// [`StreamPipe::count`] over the input-ordered drain.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::count`].
-    pub fn count(self) -> usize {
-        reduce_stream_pass(self, true, || CountReducer)
-            .expect("StreamPipe::count: failed to build async runtime (see run/try_run)")
-    }
-
-    /// [`StreamPipe::min`] over the input-ordered drain.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::min`].
-    pub fn min(self) -> Option<O>
-    where
-        O: Ord,
-    {
-        self.reduce(Ord::min)
-    }
-
-    /// [`StreamPipe::max`] over the input-ordered drain.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::max`].
-    pub fn max(self) -> Option<O>
-    where
-        O: Ord,
-    {
-        self.reduce(Ord::max)
-    }
-
-    /// [`StreamPipe::try_run`] with the ordered drain (the fused
-    /// pass-through, when eligible, is already input-ordered).
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::try_run`].
-    pub fn try_run(self) -> std::io::Result<Vec<O>> {
-        run_stream_pass(self, true)
-    }
-
-    /// [`StreamPipe::run_checked`] with the ordered drain.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::run_checked`].
-    pub fn run_checked(self) -> RunOutcome<Vec<O>> {
-        self.try_run_checked()
-            .expect("StreamPipe::run_checked: failed to build async runtime (see run/try_run)")
-    }
-
-    /// [`StreamPipe::try_run_checked`] with the ordered drain.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::try_run_checked`].
-    pub fn try_run_checked(self) -> std::io::Result<RunOutcome<Vec<O>>> {
-        let token = self.cancel.clone();
-        let out = self.try_run()?;
-        let emitted = out.len();
-        Ok(RunOutcome::classify(out, emitted, token.as_ref()))
-    }
-}
-
-// ── Grouped run family ──
-
-impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R, Grouped>
-where
-    S: StageSpawn<I, Out = Vec<O>>,
-    I: Send + Unpin + 'static,
-    O: Send + Unpin + 'static,
-{
-    /// Execute the ordered expansion chain and collect the flattened
-    /// outputs into a `Vec<O>` in input order — groups in seq order,
-    /// elements in expansion order within each group. Empty groups
-    /// contribute nothing but still advance the reorder position.
-    ///
-    /// No fused pass-through exists on this path: the chain contains an
-    /// expansion by construction (see [`StreamPipe::ordered`]).
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::run`] (the streaming tier applies —
-    /// a panicking expand/stage closure aborts the process; a panicking
-    /// `stage_async` closure re-raises on the caller).
-    pub fn run(self) -> Vec<O> {
-        self.try_run().expect(
-            "StreamPipe::run: failed to build async runtime (OS resource limit? pass a custom \
-             backend via with_async_pool, or use try_run to handle the failure)",
-        )
-    }
-
-    /// Alias for [`run`](Self::run) — see [`StreamPipe::collect`].
-    pub fn collect(self) -> Vec<O> {
-        self.run()
-    }
-
-    /// [`StreamPipe::for_each`] over the flattened, input-ordered outputs.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::for_each`].
-    pub fn for_each<F>(self, f: F)
-    where
-        F: FnMut(O),
-    {
-        for_each_grouped_pass(self, f);
-    }
-
-    /// [`StreamPipe::reduce`] over the flattened, input-ordered outputs.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::reduce`].
-    pub fn reduce<F>(self, op: F) -> Option<O>
-    where
-        F: Fn(O, O) -> O + Send + Sync + 'static,
-    {
-        reduce_grouped_pass(self, OptionReducer(&op))
-            .expect("StreamPipe::reduce: failed to build async runtime (see run/try_run)")
-    }
-
-    /// [`StreamPipe::fold`] over the flattened, input-ordered outputs.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::fold`].
-    pub fn fold<A, F, C>(self, init: A, f: F, combine: C) -> A
-    where
-        A: Clone + Send + Sync + 'static,
-        F: Fn(A, O) -> A + Send + Sync + 'static,
-        C: Fn(A, A) -> A + Send + Sync + 'static,
-    {
-        reduce_grouped_pass(self, FoldReducer {
-            init,
-            f: &f,
-            combine: &combine,
-        })
-        .expect("StreamPipe::fold: failed to build async runtime (see run/try_run)")
-    }
-
-    /// [`StreamPipe::sum`] over the flattened, input-ordered outputs.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::sum`].
-    pub fn sum(self) -> O
-    where
-        O: std::iter::Sum,
-    {
-        reduce_grouped_pass(self, SumReducer::<O>(PhantomData))
-            .expect("StreamPipe::sum: failed to build async runtime (see run/try_run)")
-    }
-
-    /// [`StreamPipe::count`] over the flattened, input-ordered outputs.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::count`].
-    pub fn count(self) -> usize {
-        reduce_grouped_pass(self, CountReducer)
-            .expect("StreamPipe::count: failed to build async runtime (see run/try_run)")
-    }
-
-    /// [`StreamPipe::min`] over the flattened, input-ordered outputs.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::min`].
-    pub fn min(self) -> Option<O>
-    where
-        O: Ord,
-    {
-        self.reduce(Ord::min)
-    }
-
-    /// [`StreamPipe::max`] over the flattened, input-ordered outputs.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::max`].
-    pub fn max(self) -> Option<O>
-    where
-        O: Ord,
-    {
-        self.reduce(Ord::max)
-    }
-
-    /// [`StreamPipe::try_run`] on the ordered expansion chain (no fused
-    /// pass-through — see [`run`](Self::run)).
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::try_run`].
-    pub fn try_run(self) -> std::io::Result<Vec<O>> {
-        run_grouped_pass(self)
-    }
-
-    /// [`StreamPipe::run_checked`] on the ordered expansion chain —
-    /// `emitted` counts flattened items exactly.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::run_checked`].
-    pub fn run_checked(self) -> RunOutcome<Vec<O>> {
-        self.try_run_checked()
-            .expect("StreamPipe::run_checked: failed to build async runtime (see run/try_run)")
-    }
-
-    /// [`StreamPipe::try_run_checked`] on the ordered expansion chain.
-    ///
-    /// # Panics
-    ///
-    /// Same contract as [`StreamPipe::try_run_checked`].
-    pub fn try_run_checked(self) -> std::io::Result<RunOutcome<Vec<O>>> {
-        let token = self.cancel.clone();
-        let out = self.try_run()?;
         let emitted = out.len();
         Ok(RunOutcome::classify(out, emitted, token.as_ref()))
     }

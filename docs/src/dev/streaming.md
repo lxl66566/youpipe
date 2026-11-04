@@ -228,6 +228,20 @@ the pre-2026-10 runtime rejection (`has_expand`) is now a compile error;
 the fused pass-through stays eligible for `Ordered` pure-`stage` chains.
 Design record: core-types.md "Ordered expansion — group payloads".
 
+Terminal family (todo #31, 2026-11-05): the 12-method run family
+(`run`/`collect`/`for_each`/`reduce`/`fold`/`sum`/`count`/`min`/`max`/
+`try_run`/`run_checked`/`try_run_checked`) lives on one
+`impl<.., M: StreamMode>` block — the per-mode hand copies were how
+`Grouped::max` went missing (filled 2026-11-05 before the dedup).
+`StreamMode` is the pass-core selector: `type Payload<O>` (`O` per-item,
+`Vec<O>` grouped) carries the chain bound `S: StageSpawn<I, Out =
+M::Payload<O>>`, keeping the Grouped `Out = Vec<O>` split typestate-clean,
+and `run_pass`/`for_each_pass`/`reduce_pass` pick the pass core (fused
+attempt, collector flavour, drain flag; Grouped never fuses, so its reducer
+factory runs once). Semantics delta: grouped `fold` clones `init` once per
+run (the shared lazy-reducer shape) instead of moving it — one `Clone`
+per run, not per item. Parity audit at the dedup: no further mode holes.
+
 
 ## Fences (`FenceMode`)
 

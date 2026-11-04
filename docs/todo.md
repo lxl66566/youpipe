@@ -26,10 +26,6 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
   - The unsafe staged-flush contract (`handoff/worker.rs::flush_staged`, moved there from the graph engine with todo #29, vs `SendItem::send_batch`'s tail): two hand-written MaybeUninit move-out bookkeeping paths; express the flush through a `SendItem` method so the unsafe surface exists once.
   - The `drain_async_sharded` trait requirement (no default impl, six collector impls) for the default-off falsified `YOUPIPE_SHARDED_TERM_ASYNC` flavour is pure tax on every new collector type; default it (unreachable body when the knob is off) or feature-gate the flavour.
 
-### 31. [P2] Terminal run-family triplication on `StreamMode`
-
-- The 11-12-method terminal family (run/collect/for_each/reduce/fold/sum/count/min/max/try_run/…) is hand-copied across the Unordered/Ordered/Grouped impl blocks; the copies already produced one real API hole (`Grouped::max` was missing until 2026-11-05). Move the family onto one `impl<.., M: StreamMode>` block with the mode trait supplying the pass-core selector (Grouped needs its `Out = Vec<O>` payload split kept typestate-clean); ~300 lines of copy-paste go away and the next terminal lands once.
-
 ### 32. [P2] `AsyncFanIn::anchor` allocates three `Vec`s per park episode
 
 - `graph/async_exec.rs`: fresh `pairs`/`order`/`futs` `Vec::with_capacity` on every any-of-N park cycle (every empty-input gap of every async-node task). `futs` borrows `self.slots` and stays, but `pairs`/`order` are plain index buffers that could be `AsyncFanIn` fields (or a cursor rotation without collecting). Per park, not per item — worth an A/B before landing; the sync-side hoist in `fanin.rs` once measured a layout regression, so gate on measurement, not intuition.
