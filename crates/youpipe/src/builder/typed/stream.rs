@@ -6835,6 +6835,18 @@ where
         self.reduce(Ord::min)
     }
 
+    /// [`StreamPipe::max`] over the flattened, input-ordered outputs.
+    ///
+    /// # Panics
+    ///
+    /// Same contract as [`StreamPipe::max`].
+    pub fn max(self) -> Option<O>
+    where
+        O: Ord,
+    {
+        self.reduce(Ord::max)
+    }
+
     /// [`StreamPipe::try_run`] on the ordered expansion chain (no fused
     /// pass-through — see [`run`](Self::run)).
     ///

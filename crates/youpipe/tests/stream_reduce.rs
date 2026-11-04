@@ -141,3 +141,22 @@ fn streaming_aggregations_async_stage() {
         .count();
     assert_eq!(c, n as usize);
 }
+
+/// Grouped chains (`.ordered()` + `.expand()`): the aggregation terminals
+/// fold the flattened, input-ordered outputs — `min`/`max` parity with the
+/// sequential fold of the same expansion.
+#[test]
+#[allow(clippy::cast_possible_truncation)] // test sizes fit usize everywhere
+fn streaming_aggregations_grouped_min_max() {
+    let group = |x: u64| std::iter::repeat_n(bump(x), (x % 3 + 1) as usize).collect::<Vec<_>>();
+    let expected: Vec<u64> = (0..100_u64).flat_map(&group).collect();
+    let chained = || {
+        stream((0..100_u64).collect::<Vec<_>>())
+            .ordered()
+            .expand(group)
+            .stage(|o: u64| o)
+    };
+    assert_eq!(chained().count(), expected.len());
+    assert_eq!(chained().min(), expected.iter().copied().min());
+    assert_eq!(chained().max(), expected.iter().copied().max());
+}
