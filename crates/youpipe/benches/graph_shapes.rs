@@ -223,8 +223,8 @@ fn counter_source(
 /// (`min(io_concurrency, runtime workers)` by default — `io_concurrency`
 /// per-slot tasks only under `YOUPIPE_ASYNC_MUX=0`) contend for two
 /// rings, so woken drivers mostly find both empty and re-park in
-/// `AsyncFanIn::anchor`'s any-of-N combinator — the park-heavy regime the
-/// per-episode anchor allocation (todo #32) lives in. Each `g.run()` also
+/// `AsyncFanIn::poll_claim`'s any-of-N poll — the park-heavy regime the
+/// waker registration cost (todo #32) lives in. Each `g.run()` also
 /// lazily builds the async runtime backend, a fixed cost the @1K rows
 /// carry on top of the per-item path.
 #[cfg(feature = "tokio-runtime")]

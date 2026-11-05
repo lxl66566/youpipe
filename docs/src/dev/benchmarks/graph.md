@@ -139,3 +139,26 @@ The entry's last lever — the async twin's per-driver receiver builds (`AsyncFa
 | mixed_load/youpipe_stream_cpu @1K/@100K | — | — | +0.5 / −5.6 % | ≤14/25 |
 
 Every id verdicts noise. Falsified structurally, not only by the floor: the lever's whole mass is ~62 tcache `Vec` builds + ~62 receiver refcount clones ≈ 1–2 µs per node per run, but the async family has no assembly-sensitive row to resolve it on — each `g.run()` lazily builds the async runtime backend, so the @1K ids sit on that ~1 ms fixed cost (side spreads 15–33 %; the −7…−8 % median lean is the family's load-bimodal pacing — the side's fast rounds read 0.986/0.993 ms against a base minimum of 1.183 ms, and dominance caps at 19/25), and @100K amortizes per-run assembly to ~0.004 %. The sync twin's −5.9…−10.3 % lived on 130–460 µs rows carrying the same per-worker mass; no async row exists in that regime. The change was reverted; the per-driver `Vec` clone stays. This closes todo #33: the @1K assembly cost is fully attributed on both sides — per-job pool submission (~0.3 µs/job) and the per-edge ring allocation (~1.4 µs) on the sync side, plus the async-only lazy runtime build, are the only members with real mass.
+
+## Async broadcast fan-out ids (2026-11-06)
+
+`graph_shapes` gained `fanout_async_{cheap,cpu}_graph` (@1K/100K): one `source_async` feeder into a `node_async_broadcast` feeding two sinks — the fan-out mirror of the `fanin_async_*` family; until now every async graph id was a unicast 2-in-1-out shape. Purpose: isolate `AsyncBroadcast::deliver`'s unbatched per-item outlet cost — k−1 clones + k awaited `send_cached`s per item (k=2: one clone, two per-edge sends) — the target shape of a future batched-delivery lever. Items stay `u64` per family convention so the ids compare against the diamond/fanin anchors. Instrumentation-only addition, sanity-checked standalone (5 verdict-caliber passes, spreads 0.9–2.5 %, monotone @1K→@100K); no A/B recorded.
+
+## Poll-based async intake: landed (2026-11-06, C1 stage 1)
+
+`mux::drive` used to restart its select loop per completion: every `Event::Done` re-ran `try_claim` (an O(n) round walk), re-constructed the claim future — whose first poll ran the round AGAIN — and, on empty rings, entered `AsyncFanIn::anchor`: three fresh Vecs (`pairs`/`order`/`futs`) plus per-input waker re-registration per park episode, torn down again on the next `Done` (each teardown abandoning every node: one registry-mutex pass, then another on the re-arm). The landing replaces `AsyncIntake::claim() -> impl Future` with `poll_claim(&mut Context) -> Poll<Option<T>>`: the anchor folds into a cursor-ordered by-index poll of every open input (close marks handled in the same scan), `anchor`/`anchor_single`/`FirstReady` and their Vecs are deleted, and `drive`'s select polls the intake inline. The load-bearing constraint the conversion surfaced: a transient `recv_cached` future per poll LOSES the wake (its Drop abandons the node), so the fork gained `AsyncRx::poll_recv_cached` — `poll_item` over the caller's slot with no episode future; on `Pending` the slot-owned waker node stays registered across polls (any-input liveness, todo #14, now pinned by `fanin_poll_claim_marks_closes_and_claims_any_input`), and a steady-state re-poll re-validates in place with one state check per input, no registry mutex. Cancel-safety became structural (no episode exists); the per-impl cancel contract was deleted with the trait method.
+
+A/B (`bench_ab.sh -a base=af704fe -b side=8e539c1 -r 5 --per-id`, the same caliber as the tables above):
+
+| id | base @med | side @med | Δ | dominance |
+| --- | --------- | --------- | --- | --------- |
+| fanin_async_cheap_graph @100K | 57.16 ms | 55.25 ms | **−3.3 %** | 25/25 |
+| fanin_async_cpu_graph @100K | 57.06 ms | 55.29 ms | **−3.1 %** | 25/25 |
+| fanin_async_cpu_graph @1K | 1.403 ms | 1.372 ms | **−2.2 %** | 25/25 |
+| fanin_async_cheap_graph @1K | 1.389 ms | 1.365 ms | −1.7 % | 25/25 (inside the side's 11.6 % spread — one load-bimodal fast round) |
+| sharded_term_async/async1_* @1K/@100K (6) | — | — | −0.7…+0.3 % | ≤20/25 (noise) |
+| sync_fuse/async_pair_cpu_* @1K/@100K (4) | — | — | −0.3…+0.9 % | ≤14/25 (noise) |
+| io_async youpipe rows (4) | — | — | −0.1…+0.2 % | noise (dead flat) |
+| mixed_load rows (youpipe_stream_cpu + rayon/tokio controls, 6) | — | — | −0.8…+3.8 % | ≤17/25 (noise; the @100K fused row sits in its documented 26–33 % bimodal band with its rayon control at +1.5 %) |
+
+Both @100K primaries clear the 2 % floor at full 25/25 dominance — consistent with deleting, per completion, the future build+drop cycle (n abandon + n re-arm registry-mutex passes) and, per park episode, three mallocs; what remains per `Done` is the refill round + the poll's round walk plus one state check per input. The instant-future residue family (`sharded_term_async/async1_*`, the documented +2.8…+3.7 % knob rows) did NOT move: the single-ring `RxIntake` was already registration-cheap per completion, so the churn this removed was specific to the multi-input fan-in. Stage 2 (per-input tagged wakers over a ready bitmask, killing the O(n) walk per completion wake) remains open if a `hotpath-profile` attribution shows the walk is still a visible share.

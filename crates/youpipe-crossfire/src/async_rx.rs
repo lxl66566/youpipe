@@ -148,6 +148,32 @@ impl<F: Flavor> AsyncRx<F> {
         CachedRecvFuture { rx: self, slot, done: false }
     }
 
+    /// Poll-based counterpart of [`Self::recv_cached`] for callers that own
+    /// the slot across polls and hold NO future between them (an M:N
+    /// multiplexing driver's intake poll): on `Pending` the registered
+    /// waker node stays live in the registry — owned by the slot, not by a
+    /// future — so a later channel event wakes the task with nothing held;
+    /// dropping a future's pending episode (`CachedRecvFuture`'s cancel
+    /// path) would instead abandon and retire the node. The next poll
+    /// re-validates through the slot's node (the registration/reuse
+    /// machinery of `poll_item` applies unchanged; a still-registered
+    /// matching-waker node re-arms without touching the registry mutex).
+    /// `Ready` leaves the node consumed or dead in the slot exactly like
+    /// the future variant's completion.
+    #[inline(always)]
+    pub fn poll_recv_cached(
+        &self, ctx: &mut Context<'_>, slot: &mut AsyncWakerSlot<<F::Recv as Registry>::Waker>,
+    ) -> Poll<Result<F::Item, RecvError>> {
+        match self.poll_item::<false>(ctx, &mut slot.node) {
+            Ok(item) => Poll::Ready(Ok(item)),
+            Err(TryRecvError::Disconnected) => {
+                let _ = slot.node.take();
+                Poll::Ready(Err(RecvError {}))
+            }
+            Err(TryRecvError::Empty) => Poll::Pending,
+        }
+    }
+
     // NOTE: we cannot use async fn recv_timeout signature because &self is not Send
     /// Receives a message from the channel with a timeout.
     /// Will await when channel is empty.

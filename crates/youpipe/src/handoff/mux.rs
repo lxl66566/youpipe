@@ -20,7 +20,7 @@
 use std::{
     future::{Future, poll_fn},
     pin::pin,
-    task::Poll,
+    task::{Context, Poll},
 };
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -111,10 +111,12 @@ pub(crate) enum TryClaim<T> {
 pub(crate) trait AsyncIntake<T>: Send {
     /// Claim one item without parking.
     fn try_claim(&mut self) -> TryClaim<T>;
-    /// Park until an item arrives (`Some`) or every input is exhausted
-    /// (`None`). Must be cancel-safe: the driver drops a pending claim
-    /// whenever one of its in-flight items completes first.
-    fn claim(&mut self) -> impl Future<Output = Option<T>> + Send;
+    /// Poll for one item: `Ready(Some)` = claimed, `Ready(None)` = every
+    /// input closed and drained (EOF), `Pending` = `cx.waker()` is
+    /// registered on every open input. Cancel-safety is structural — a poll
+    /// that loses (a completion wins the select first) leaves nothing
+    /// behind but the armed waker nodes in the intake's own slots.
+    fn poll_claim(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>>;
 }
 
 /// One driver's output side.
@@ -152,8 +154,17 @@ impl<T: Send + Unpin + 'static> AsyncIntake<T> for RxIntake<T> {
         }
     }
 
-    async fn claim(&mut self) -> Option<T> {
-        self.rx.recv_cached(&mut self.slot).await.ok()
+    /// Registration-free fast path first (`try_recv`), then one poll of the
+    /// cached recv — on `Pending` the slot's waker node stays registered
+    /// with the ring (slot-owned, no future held between polls), so an
+    /// arrival wakes the parked driver; the next poll re-validates in place.
+    fn poll_claim(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        match self.rx.try_recv() {
+            Ok(item) => return Poll::Ready(Some(item)),
+            Err(TryRecvError::Closed) => return Poll::Ready(None),
+            Err(TryRecvError::Empty) => {},
+        }
+        self.rx.poll_recv_cached(cx, &mut self.slot).map(Result::ok)
     }
 }
 
@@ -204,7 +215,7 @@ pub(crate) async fn drive<T, O, Fut>(
     Fut: Future<Output = O>,
 {
     if cap <= 1 {
-        while let Some(item) = intake.claim().await {
+        while let Some(item) = poll_fn(|cx| intake.poll_claim(cx)).await {
             if cancel_active(cancel) || !out.deliver(map(item).await).await {
                 return;
             }
@@ -268,13 +279,15 @@ pub(crate) async fn drive<T, O, Fut>(
             if !open {
                 return;
             }
-            Event::Claimed(intake.claim().await)
+            Event::Claimed(poll_fn(|cx| intake.poll_claim(cx)).await)
         } else {
             // The first completion, or an arrival while there is room. The
             // in-flight futures are polled first: completions free slots and
-            // keep downstream fed; a losing claim is dropped (cancel-safe).
+            // keep downstream fed; the intake is polled inline only while
+            // there is room — a Pending pass registers on every open input
+            // alongside the in-flight set, and a losing poll leaves only
+            // armed waker nodes behind (no claim future to drop).
             let room = open && in_flight < cap;
-            let mut claim = pin!(room.then(|| intake.claim()));
             poll_fn(|cx| {
                 if let Some(Poll::Ready(output)) = head.as_mut().as_pin_mut().map(|f| f.poll(cx)) {
                     head.set(None);
@@ -283,10 +296,13 @@ pub(crate) async fn drive<T, O, Fut>(
                 if let Poll::Ready(Some(output)) = overflow.poll_next_unpin(cx) {
                     return Poll::Ready(Event::Done(output));
                 }
-                match claim.as_mut().as_pin_mut().map(|c| c.poll(cx)) {
-                    Some(Poll::Ready(item)) => Poll::Ready(Event::Claimed(item)),
-                    _ => Poll::Pending,
+                if room {
+                    match intake.poll_claim(cx) {
+                        Poll::Ready(item) => return Poll::Ready(Event::Claimed(item)),
+                        Poll::Pending => {},
+                    }
                 }
+                Poll::Pending
             })
             .await
         };
@@ -307,7 +323,13 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         collections::HashMap,
+        pin::Pin,
         rc::Rc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Wake, Waker},
     };
 
     use futures::{channel::oneshot, executor::LocalPool, task::LocalSpawnExt};
@@ -337,9 +359,7 @@ mod tests {
             })
         }
 
-        fn map(
-            self: &Rc<Self>,
-        ) -> impl Fn(u32) -> std::pin::Pin<Box<dyn Future<Output = u32>>> + use<> {
+        fn map(self: &Rc<Self>) -> impl Fn(u32) -> Pin<Box<dyn Future<Output = u32>>> + use<> {
             let g = Rc::clone(self);
             move |x| {
                 g.started.borrow_mut().push(x);
@@ -523,6 +543,52 @@ mod tests {
         assert!(
             g.keys.borrow()[&1].is_canceled(),
             "in-flight item dropped with the driver"
+        );
+    }
+
+    /// `poll_claim`'s ready path resolves on the first poll without arming a
+    /// waker (the counting waker never fires); the empty path parks armed
+    /// (the next send wakes it); the closed path is EOF.
+    #[test]
+    fn rx_intake_poll_claim_ready_path_is_registration_free() {
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (tx, rx) = async_channel::<u32>(4);
+        let mut intake = RxIntake::new(rx);
+        let wake_calls = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake_calls));
+        let mut cx = Context::from_waker(&waker);
+
+        tx.try_send(7).unwrap();
+        assert_eq!(intake.poll_claim(&mut cx), Poll::Ready(Some(7)));
+        assert_eq!(
+            wake_calls.0.load(Ordering::SeqCst),
+            0,
+            "ready path arms no waker"
+        );
+
+        assert_eq!(intake.poll_claim(&mut cx), Poll::Pending);
+        assert_eq!(wake_calls.0.load(Ordering::SeqCst), 0, "parked, not woken");
+
+        futures::executor::block_on(tx.send(8)).unwrap();
+        assert_eq!(
+            wake_calls.0.load(Ordering::SeqCst),
+            1,
+            "the armed node woke on arrival"
+        );
+        assert_eq!(intake.poll_claim(&mut cx), Poll::Ready(Some(8)));
+
+        drop(tx);
+        assert_eq!(intake.poll_claim(&mut cx), Poll::Ready(None));
+        assert_eq!(
+            wake_calls.0.load(Ordering::SeqCst),
+            1,
+            "close re-wakes nothing by itself"
         );
     }
 

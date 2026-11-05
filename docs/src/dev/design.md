@@ -69,8 +69,9 @@ plane is the same crossfire MPMC channels (fan-out = one channel per outbound
 edge, move or clone per registration; fan-in = fair round-robin over the
 inbound edges, with the
 blocking anchor parked on every open input at once — sync workers via crossfire
-`Select` (reservation tokens), async tasks via a poll-all `FirstReady`
-combinator; a fan-in worker parked on a single input deadlocks DAGs, see
+`Select` (reservation tokens), async drivers via a poll-all claim
+(`AsyncFanIn::poll_claim`, slot-owned waker registration); a fan-in worker
+parked on a single input deadlocks DAGs, see
 `FanIn::anchor`), and the
 scheduling faces are the same `ComputePool` (sync nodes) and `AsyncRuntime`
 (async nodes, pull-based async sources). Output delivery is batched

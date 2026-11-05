@@ -1,4 +1,4 @@
-use std::{future::Future, mem::MaybeUninit, ptr};
+use std::{future::Future, mem::MaybeUninit, ptr, task::Poll};
 
 use crossfire::{mpmc, mpsc};
 
@@ -242,17 +242,17 @@ impl<T: Send + Unpin + 'static> Clone for AsyncSender<T> {
 }
 
 impl<T: Send + Unpin + 'static> AsyncReceiver<T> {
-    /// The concrete `recv_cached` future (`CachedRecvFuture`, an `Unpin`
-    /// struct) for callers that collect per-input futures into a
-    /// multi-input select (the graph async fan-in anchor); `Err` is
-    /// crossfire's `RecvError` (senders dropped + ring drained). The
-    /// plain `recv_cached` resolves through the async trait method, whose
-    /// opaque return type hides `Unpin`.
-    pub(crate) fn recv_cached_unpin<'a>(
-        &'a self,
-        slot: &'a mut WakerSlot,
-    ) -> impl Future<Output = Result<T, crossfire::RecvError>> + Unpin + 'a {
-        crossfire::AsyncRx::recv_cached(&self.rx, slot)
+    /// Poll-based cached recv (the fork's `AsyncRx::poll_recv_cached`) for
+    /// poll-based claim loops (the async intakes' `poll_claim`): `Pending`
+    /// leaves the waker node registered with the ring, owned by the slot —
+    /// no future held between polls; `Err` is crossfire's `RecvError`
+    /// (senders dropped + ring drained).
+    pub(crate) fn poll_recv_cached(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        slot: &mut WakerSlot,
+    ) -> Poll<Result<T, crossfire::RecvError>> {
+        crossfire::AsyncRx::poll_recv_cached(&self.rx, cx, slot)
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncReceiver"))]
