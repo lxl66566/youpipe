@@ -21,8 +21,9 @@ The fused engine compiles the whole `.map()/.filter()` chain into one
 monomorphized closure and runs it over a fork-join work-stealing tree,
 writing results into a pre-allocated buffer in input order. The streaming
 engine gives every stage its own workers connected by bounded channels: sync
-stages share the compute pool, async stages multiplex `io_concurrency` tasks
-over a tokio runtime, and results reach the collector in completion order.
+stages share the compute pool, async stages multiplex up to `io_concurrency`
+in-flight futures over a tokio runtime, and results reach the collector in
+completion order.
 Fused wins on per-item overhead; streaming wins whenever stages must be
 separate units (async IO, backpressure, fences, cancellation). The two are
 not mutually exclusive: a `stream()` chain of only plain `.stage()`s (no

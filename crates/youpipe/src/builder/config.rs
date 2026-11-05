@@ -134,7 +134,7 @@ pub struct PipelineConfig {
     pub(crate) compute_workers_pinned: bool,
     /// Number of OS threads backing the async I/O runtime (worker threads of
     /// the active [`AsyncRuntime`](crate::AsyncRuntime) backend). Async stages
-    /// multiplex many more tasks than this via the runtime's scheduler — see
+    /// multiplex many more in-flight items than this — see
     /// [`Self::io_concurrency`]. Streaming-only.
     pub(crate) async_workers: usize,
     /// Per-channel buffer capacity (items) between stages. Streaming-only.
@@ -148,12 +148,13 @@ pub struct PipelineConfig {
     /// replaces
     /// this logic for that stage's output channel.
     pub(crate) buffer_size: usize,
-    /// Number of concurrently in-flight async I/O tasks per async stage.
+    /// Number of concurrently in-flight async I/O items per async stage.
     ///
-    /// This is the concurrency multiplier: async I/O tasks (e.g. a timer,
+    /// This is the concurrency multiplier: async I/O futures (e.g. a timer,
     /// real network/disk IO) yield the OS thread back to the runtime while
     /// waiting, so `io_concurrency` can be far larger than `async_workers`
-    /// (the thread count). Defaults to 128 — high enough to saturate the
+    /// (the thread count). The items are multiplexed over at most one driver
+    /// task per runtime worker thread. Defaults to 128 — high enough to saturate the
     /// runtime with yielded waits, bounded to cap memory.
     ///
     /// Streaming-only, and applies to *every* async stage in the chain; use

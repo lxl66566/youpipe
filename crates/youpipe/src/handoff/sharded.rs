@@ -78,15 +78,16 @@ pub(crate) fn sharded_mpsc_channel<T: Send + 'static>(
 
 /// Create `shards` independent bounded async MPSC channels presenting one
 /// logical fan-in — the async-terminal flavour of [`sharded_mpsc_channel`].
-/// The producers are runtime tasks (`io_concurrency` of them) sending via
+/// The producers are the async stage's driver tasks sending via
 /// [`MpscAsyncSender::send`](super::channel::MpscAsyncSender::send).await.
 ///
 /// Unlike the sync constructor, senders here MAY be shared by several tasks:
 /// the caller caps `shards` at the runtime's worker-thread count (only that
-/// many tasks can send concurrently), so a large-`io_concurrency` stage has
-/// each shard shared by `io_concurrency / shards` tasks — per-ring
-/// contention drops from `io_concurrency`-way to that quotient while the
-/// collector's pass cost stays bounded by `shards`.
+/// many tasks can send concurrently), so a stage with more producer tasks
+/// than shards (`YOUPIPE_ASYNC_MUX=0`: one task per in-flight slot) shares
+/// each shard among `tasks / shards` producers — per-ring contention drops
+/// to that quotient while the collector's pass cost stays bounded by
+/// `shards`.
 #[cfg(feature = "tokio-runtime")]
 #[must_use]
 pub(crate) fn sharded_mpsc_async_channel<T: Send + Unpin + 'static>(

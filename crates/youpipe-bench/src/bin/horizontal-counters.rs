@@ -13,15 +13,19 @@
 //!   alignment / capacity and the containing VMA's `AnonHugePages` from `/proc/self/smaps`
 //!   (allocator / THP comparison).
 //!
-//! Usage (both forms run the same runner; the bench alias exists because
-//! "probe" muscle memory reaches for `cargo bench`, and a bench target
-//! without `harness = false` would silently compile this file as a libtest
-//! harness that rejects every flag below):
+//! Usage:
 //!   cargo run --release -p youpipe-bench --bin horizontal-counters -- \
 //!       --n 2000000,4000000 --reps 5 --duration-ms 700
-//!   cargo bench -p youpipe-bench --bench horizontal-counters -- \
-//!       --n 2000000,4000000 --reps 5 --duration-ms 700
 //!   ... --mode addr --n 4000000
+//!
+//! (A `[[bench]]` alias over this same file served `cargo bench --bench
+//! horizontal-counters` until 2026-11-06; dropped because cargo warns on
+//! one file claimed by two build targets. If it returns: `harness = false`
+//! is load-bearing — without it cargo compiles the file with `--test` and
+//! every flag dies on the libtest getopts parser ("Unrecognized option:
+//! 'n'", the r15 forensics trap) while the build itself still succeeds.
+//! `cargo bench --bin` is no substitute — it likewise builds the bin as
+//! unittests.)
 
 use std::{
     fmt::Write as _,

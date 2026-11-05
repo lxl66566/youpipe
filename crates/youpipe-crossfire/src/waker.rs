@@ -449,7 +449,8 @@ impl WakerInner {
                 if stamp != NO_STAMP && seq_of(w) != stamp {
                     return WakeResult::Skip;
                 }
-                if self.word
+                if self
+                    .word
                     .compare_exchange(
                         w,
                         pack(WakerState::Woken as u8, seq_of(w)),

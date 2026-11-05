@@ -23,8 +23,9 @@ use super::{
 #[cfg(feature = "tokio-runtime")]
 use crate::handoff::{
     AsyncReceiver, AsyncRecvItem, AsyncSendItem, AsyncSender, MpscAsyncReceiver, MpscAsyncSender,
-    ShardedAsyncReceiver, WakerSlot, async_channel, forward_async, forward_async_to_sync,
-    mpsc_async_channel, sharded_mpsc_async_channel, sync_async_channel,
+    ShardedAsyncReceiver, async_channel, forward_async, forward_async_to_sync, mpsc_async_channel,
+    mux::{self, MuxPlan, RxIntake, TxOutlet},
+    sharded_mpsc_async_channel, sync_async_channel,
 };
 #[cfg(feature = "tokio-runtime")]
 use crate::state::{
@@ -948,8 +949,8 @@ impl SyncStageOptions {
 /// [`StreamPipe::stage_async_with`]. Unset fields fall back to the
 /// pipeline-level [`PipelineConfig`]. There is no `workers` knob here: an
 /// async stage has no compute-pool workers, its fan-out is
-/// [`AsyncStageOptions::io_concurrency`] (the runtime multiplexes those
-/// tasks over `async_workers` OS threads).
+/// [`AsyncStageOptions::io_concurrency`] in-flight items (multiplexed over at
+/// most one driver task per async runtime worker thread).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AsyncStageOptions {
     pub(crate) io_concurrency: Option<NonZeroUsize>,
@@ -964,7 +965,7 @@ impl AsyncStageOptions {
         Self::default()
     }
 
-    /// Pin this async stage's concurrent-task fan-out, bypassing the global
+    /// Pin this async stage's in-flight item bound, bypassing the global
     /// `io_concurrency`. The right knob when one async stage talks to a
     /// high-latency network (wants 512 in flight) while another hits a local
     /// disk (wants 16).
@@ -1328,9 +1329,9 @@ pub struct GroupedAsyncStage<Prev, F> {
     pub(super) opts: AsyncStageOptions,
 }
 
-/// Async stage: `Fn(O) -> Future<Output = N>`, runs as `io_concurrency` tasks
-/// on the [`AsyncRuntime`](crate::AsyncRuntime) backend. Gated behind the
-/// `tokio-runtime` feature.
+/// Async stage: `Fn(O) -> Future<Output = N>`, up to `io_concurrency` items
+/// in flight on the [`AsyncRuntime`](crate::AsyncRuntime) backend
+/// (`handoff::mux`). Gated behind the `tokio-runtime` feature.
 #[cfg(feature = "tokio-runtime")]
 #[derive(Clone)]
 pub struct AsyncStage<Prev, F> {
@@ -3372,7 +3373,7 @@ where
 }
 
 // AsyncStage<Prev, F>: recurse into prev (likely sync), bridge sync→async,
-// then spawn `io_concurrency` async tasks on the runtime.
+// then spawn the driver tasks multiplexing `io_concurrency` in-flight items.
 #[cfg(feature = "tokio-runtime")]
 impl<Prev, F, In, M, Fut> StageSpawn<In> for AsyncStage<Prev, F>
 where
@@ -3658,33 +3659,26 @@ impl<M: Send + Unpin + 'static> AsyncOutChannel<M> for AsyncSharded {
     }
 }
 
-/// Spawn `io_concurrency` async consumer tasks that read `a_in_rx`, apply
-/// `f`, and forward into the factory's output channel.
+/// Spawn an async stage's consumer fan-out: the stage's `io_concurrency`
+/// in-flight slots split over at most the runtime's worker count of driver
+/// tasks ([`MuxPlan`]), each reading `a_in_rx`, applying `f`, and
+/// forwarding into the factory's output channel (one sender per driver).
 ///
-/// NOTE(perf): do NOT reshape the per-item `rx.recv().await` loop inside
-/// [`spawn_async_terminal_tasks`] into the sync workers' anchor +
-/// burst-drain shape (`try_recv` burst between awaited recvs). Attempted
-/// (2026-09, 32-core, `bench_ab.sh` 5 interleaved rounds, `io_async_pure/
-/// youpipe_async` and `io_async_mixed/youpipe_mixed_async` at 200/500 and a
-/// 2000-item steady-state row): every cell within ±0.5 %, spreads <1 % — a
-/// pure wash, while the sync port of the same shape measured −5…−14 %.
-/// Mechanism: crossfire's `MAsyncRx::recv` polls `try_recv` FIRST and only
-/// registers a waker (after a bounded spin) when the queue is empty — so an
-/// awaited `recv()` on a non-empty queue never pays the waker round-trip
-/// the burst loop was meant to amortize. What remains is only the
-/// future-poll envelope per item (tens of ns), invisible under ms-scale IO
-/// latencies. The async terminal collectors (`drain_*_async`) keep their
-/// burst loops — they are sole consumers of an MPSC ring where the shape
-/// measured real wins.
+/// NOTE(perf): the per-slot task loop (one runtime task per in-flight item,
+/// the pre-mux shape) never benefited from an anchor + `try_recv` burst
+/// drain (2026-09, 32-core, `bench_ab.sh` 5 interleaved rounds,
+/// `io_async_pure/youpipe_async` and `io_async_mixed/youpipe_mixed_async`
+/// at 200/500/2000: every cell within ±0.5 %): crossfire's `MAsyncRx::recv`
+/// polls `try_recv` FIRST and registers a waker only on an empty queue, so
+/// an awaited recv on a non-empty queue pays no waker round-trip. The
+/// driver's refill burst is not that lever — its win is the task count
+/// (remote spawns and per-item cross-thread wakes, see `handoff::mux`).
 ///
 /// This is the consumer fan-out half of an async stage, shared by both
 /// entry flavours: the `spawn` path (`a_in_rx` arrives directly from
 /// `prev.spawn_for_async`) and the `spawn_async_feeder` path (`a_in_rx` is
 /// bridged from a `FinalRx` first).
 #[cfg(feature = "tokio-runtime")]
-#[allow(clippy::needless_pass_by_value)] // ownership transfer is intentional:
-// `f` is moved into the `Arc` shared across consumer tasks; taking it by value
-// expresses "this is the last stop for the closure".
 fn spawn_async_consumers_into<Ch, R, In, M, Fut, F>(
     f: F,
     a_in_rx: AsyncReceiver<(u64, In)>,
@@ -3701,9 +3695,11 @@ where
 {
     let concurrency = ctx.stage_io_concurrency(opts);
     let buffer = ctx.stage_buffer::<(u64, M)>(opts.buffer, concurrency);
-    ctx.note_in_flight(concurrency); // one in-flight item per consumer task
-    let (senders, out_rx) = Ch::make(ctx, buffer, concurrency);
-    spawn_async_terminal_tasks(f, a_in_rx, ctx, senders);
+    ctx.note_in_flight(concurrency); // one in-flight item per slot
+    let pool = ctx.acquire_async().expect("failed to build async runtime");
+    let plan = MuxPlan::new(concurrency, pool.parallelism());
+    let (senders, out_rx) = Ch::make(ctx, buffer, plan.drivers());
+    spawn_async_drivers(f, a_in_rx, ctx, &pool, senders, plan);
     Ch::wrap(out_rx)
 }
 
@@ -3732,22 +3728,25 @@ where
     }
 }
 
-/// Spawn one async consumer task per provided output sender: the task loop
-/// is shared verbatim across the async channel shapes — the mid-stage MPMC
-/// channel ([`AsyncMpmc`], one `AsyncSender` clone per task), the single
-/// MPSC terminal ring, and its sharded variant (one `MpscAsyncSender` per
-/// task or task group) — only the sender set differs. The sender side
-/// stays async (`send().await`): the producers are runtime tasks, not OS
-/// threads — a blocking send would stall the runtime worker.
+/// Spawn one driver task per provided output sender, driver `i` admitting
+/// `plan.cap(i)` in-flight items. The driver loop ([`mux::drive`]) is shared
+/// verbatim across the async channel shapes — the mid-stage MPMC channel
+/// ([`AsyncMpmc`], one `AsyncSender` clone per driver), the single MPSC
+/// terminal ring, and its sharded variant (one `MpscAsyncSender` per driver
+/// or driver group) — only the sender set differs. The sender side stays
+/// async (`send().await`): the producers are runtime tasks, not OS threads —
+/// a blocking send would stall the runtime worker.
 #[cfg(feature = "tokio-runtime")]
 #[allow(clippy::needless_pass_by_value)] // `f` is moved into the `Arc` shared
-// across consumer tasks; taking it by value expresses "this is the last stop
-// for the closure" (same rationale as `spawn_async_consumers_body`).
-fn spawn_async_terminal_tasks<F, In, M, Fut, R, I>(
+// across drivers; taking it by value expresses "this is the last stop for the
+// closure".
+fn spawn_async_drivers<F, In, M, Fut, R, I>(
     f: F,
     a_in_rx: AsyncReceiver<(u64, In)>,
     ctx: &StreamCtx<'_, R>,
+    pool: &R,
     senders: I,
+    plan: MuxPlan,
 ) where
     F: Fn(In) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = M> + Send + 'static,
@@ -3757,13 +3756,13 @@ fn spawn_async_terminal_tasks<F, In, M, Fut, R, I>(
     I: IntoIterator,
     I::Item: AsyncSendItem<(u64, M)>,
 {
-    let pool = ctx.acquire_async().expect("failed to build async runtime");
     let f = Arc::new(f);
     let cancel = ctx.cancel.clone();
     let panics = ctx.async_task_panics();
-    for tx in senders {
-        let f = f.clone();
-        let rx = a_in_rx.clone();
+    for (i, tx) in senders.into_iter().enumerate() {
+        let f = Arc::clone(&f);
+        let intake = RxIntake::new(a_in_rx.clone());
+        let cap = plan.cap(i);
         let c = cancel.clone();
         let slot = Arc::clone(&panics.slot);
         let settle = Arc::clone(&panics.settle);
@@ -3773,23 +3772,11 @@ fn spawn_async_terminal_tasks<F, In, M, Fut, R, I>(
         // `enter` would have no RAII guard anyway).
         pool.spawn(CatchTaskPanic {
             fut: async move {
-                // Cross-episode waker-node slots (P-4): per task, not per
-                // item — a parked recv/send reuses its node instead of
-                // allocating a fresh one per park episode.
-                let mut rx_slot = WakerSlot::new();
-                let mut tx_slot = WakerSlot::new();
-                loop {
-                    let Ok((seq, item)) = rx.recv_cached(&mut rx_slot).await else {
-                        break;
-                    };
-                    if cancel_active(c.as_ref()) {
-                        break;
-                    }
-                    let out = f(item).await;
-                    if tx.send_cached((seq, out), &mut tx_slot).await.is_err() {
-                        break;
-                    }
-                }
+                let map = |(seq, item): (u64, In)| {
+                    let fut = f(item);
+                    async move { (seq, fut.await) }
+                };
+                mux::drive(intake, map, TxOutlet::new(tx), cap, c.as_ref()).await;
             },
             slot,
             settle,
@@ -4052,7 +4039,8 @@ impl<S, I, O, R: AsyncRuntime, M: StreamMode> StreamPipe<S, I, O, R, M> {
     }
 
     /// Set the async runtime's OS-thread count (streaming-only; async stages
-    /// multiplex [`PipelineConfig::io_concurrency`] tasks over these threads).
+    /// multiplex [`PipelineConfig::io_concurrency`] in-flight items over these
+    /// threads).
     ///
     /// # Panics
     ///
@@ -4510,10 +4498,10 @@ impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R, Unordered> {
         push_fence(self, opts, mode)
     }
 
-    /// Append an async IO stage: `Fn(O) -> Future<Output = N>`. Runs as
-    /// `io_concurrency` tasks on the [`AsyncRuntime`] backend — the runtime's
-    /// scheduler multiplexes those tasks over `async_workers` OS threads, so
-    /// concurrency is bounded by `io_concurrency` (not by the thread count).
+    /// Append an async IO stage: `Fn(O) -> Future<Output = N>`. Up to
+    /// `io_concurrency` items are in flight at once, multiplexed over at most
+    /// one driver task per [`AsyncRuntime`] worker thread, so concurrency is
+    /// bounded by `io_concurrency` (not by the thread count).
     ///
     /// For work that *blocks* the OS thread (e.g. `std::thread::sleep`), prefer
     /// [`Self::stage`]: a blocking call inside an async task stalls a runtime
@@ -4876,7 +4864,7 @@ where
     }
 
     /// Append an async IO stage mapping each group **elementwise**: each
-    /// consumer task takes one whole `(seq, Vec<O>)` group, awaits the
+    /// in-flight slot takes one whole `(seq, Vec<O>)` group, awaits the
     /// closure per element, and emits one `(seq, Vec<N>)` group — groups
     /// stay atomic, concurrency is across groups (bounded by
     /// `io_concurrency`).

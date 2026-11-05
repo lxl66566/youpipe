@@ -18,7 +18,7 @@ let r: Vec<u64> = (0..1000).stream()
 | Method | Runs on | Use for |
 | --- | --- | --- |
 | `.stage(f)` | work-stealing compute pool | sync CPU work |
-| `.stage_async(f)` | tokio runtime, `io_concurrency` tasks | IO whose waits `.await` (yield the thread) |
+| `.stage_async(f)` | tokio runtime, up to `io_concurrency` items in flight | IO whose waits `.await` (yield the thread) |
 
 Do not put thread-blocking work (`std::thread::sleep`, blocking file IO)
 inside `.stage_async` — it stalls a runtime worker. Use `.stage()` with an

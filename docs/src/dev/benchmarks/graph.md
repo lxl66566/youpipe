@@ -122,3 +122,20 @@ The symmetric shape of the shared-receiver landing was implemented and gated: `U
 Every id verdicts noise: the medians lean toward the change on 4 of 5 @1K graph rows by −1.1…−1.4 %, but that is under the 2 % floor with dominance at most 22/25 and side spreads of 4.6–5 %. The stream-side gate rows are structurally out of reach — `stream_pipeline/single_stage_*` and `mixed_load/youpipe_stream_cpu` are the type-level fused pass-through (no channels, no spawn walk, no senders; measured −0.6/+0.3 % @1K, pure noise), and `with_fence` @1K carries a sender-clone slice of ≈ 0.7 µs of a 164 µs run (see [streaming.md](streaming.md) "Stream-side per-run assembly attribution") — its A/B read −18 % median on 20–27 % spreads, the fence family's bimodality, verdict noise, and @100K +1.2 % noise. `mixed_load` completed the gate (youpipe @1K −0.2 % on 1.7 % spreads, dead flat, as the attribution predicts for the fused path; the rayon/tokio controls ±1.2 % rule out session drift), and the async fan-in ids — untouched `AsyncDelivery` twins — read +1.3/+2.4 % @1K, noise.
 
 Falsified premise: the per-worker sender `Vec` builds are tcache-cheap — one node's 32 single-edge builds (alloc + `add_tx` + `Arc` bump ≈ 2 atomic RMWs each) cost ~1–2 µs, an order below the family's per-round spread, unlike the receiver-side builds they mirror (those carried a second per-worker allocation — the closed-input `Vec<bool>` — and measured −5.9…−10.3 %). The change was reverted; the `From<Vec<SyncSender>>` per-worker build stays, and the @1K assembly residue is now fully attributed: per-job pool submission (~0.3 µs/job) and the per-edge ring allocation (~1.4 µs) are the only members left with real mass.
+
+## Shared async driver receiver sets: falsified (2026-11-06, todo #33)
+
+The entry's last lever — the async twin's per-driver receiver builds (`AsyncFanIn::new(rxs.clone())`, one receiver `Vec` clone plus a `closed` `Vec<bool>` per driver, `min(io_concurrency, workers)` = 31 per node per run under the bench taskset since the M:N drivers) — was implemented as the exact mirror of the sync landing: one `Arc<[AsyncReceiver]>` per node, one `Arc` clone per driver, the per-driver `closed` `Vec` folded into the shared `ClosedSet` mask (waker slots and cursor/open episode state stay per-driver). A/B (`bench_ab.sh -a base=e7d25e0 -b side=10c7f3b -r 5 --per-id`, anchored per-id filters, the same caliber as the tables above):
+
+| id | base @med | side @med | Δ | dominance |
+| --- | --------- | --------- | --- | --------- |
+| fanin_async_cheap_graph @1K | 1.367 ms | 1.252 ms | −8.4 % | 19/25 |
+| fanin_async_cpu_graph @1K | 1.369 ms | 1.268 ms | −7.3 % | 18/25 |
+| fanin_async_cheap_graph @100K | 57.60 ms | 56.98 ms | −1.1 % | 20/25 |
+| fanin_async_cpu_graph @100K | 57.61 ms | 57.32 ms | −0.5 % | 19/25 |
+| chain_cpu_graph @1K (sync control) | 131.8 µs | 133.5 µs | +1.2 % | 8/25 |
+| sharded_term_async/async1_* @1K/@100K (4) | — | — | +0.4…+2.4 % | ≤11/25 |
+| io_async youpipe rows (4) | — | — | −0.8…−0.1 % | ≤20/25 |
+| mixed_load/youpipe_stream_cpu @1K/@100K | — | — | +0.5 / −5.6 % | ≤14/25 |
+
+Every id verdicts noise. Falsified structurally, not only by the floor: the lever's whole mass is ~62 tcache `Vec` builds + ~62 receiver refcount clones ≈ 1–2 µs per node per run, but the async family has no assembly-sensitive row to resolve it on — each `g.run()` lazily builds the async runtime backend, so the @1K ids sit on that ~1 ms fixed cost (side spreads 15–33 %; the −7…−8 % median lean is the family's load-bimodal pacing — the side's fast rounds read 0.986/0.993 ms against a base minimum of 1.183 ms, and dominance caps at 19/25), and @100K amortizes per-run assembly to ~0.004 %. The sync twin's −5.9…−10.3 % lived on 130–460 µs rows carrying the same per-worker mass; no async row exists in that regime. The change was reverted; the per-driver `Vec` clone stays. This closes todo #33: the @1K assembly cost is fully attributed on both sides — per-job pool submission (~0.3 µs/job) and the per-edge ring allocation (~1.4 µs) on the sync side, plus the async-only lazy runtime build, are the only members with real mass.

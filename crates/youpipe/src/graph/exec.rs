@@ -21,7 +21,7 @@ use crate::{
     executor::compute::ComputePool,
     handoff::{
         CancelCheck, Delivery, Receiver as SyncReceiver, SpinBudget, SyncSender, cancel_active,
-        claim_expand_deliver, claim_map_deliver, per_worker_claim_cap,
+        claim_expand_deliver, claim_map_deliver, mux::MuxPlan, per_worker_claim_cap,
     },
     runtime::AsyncRuntime,
     sync::CancellationToken,
@@ -38,9 +38,15 @@ pub(crate) trait AsyncSpawner: Send + Sync {
     fn spawn(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>);
     /// Drive `fut` to completion on the calling thread (bridge threads).
     fn block_on(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>);
+    /// The backend's worker-thread count ([`AsyncRuntime::parallelism`]).
+    fn parallelism(&self) -> usize;
 }
 
 impl<R: AsyncRuntime> AsyncSpawner for R {
+    fn parallelism(&self) -> usize {
+        AsyncRuntime::parallelism(self)
+    }
+
     fn spawn(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>) {
         AsyncRuntime::spawn(self, fut);
     }
@@ -51,7 +57,7 @@ impl<R: AsyncRuntime> AsyncSpawner for R {
 }
 
 /// Worker-completion counter: pre-set to the run's total worker count
-/// (source feeders + sync node workers + async node tasks + async sources),
+/// (source feeders + sync node workers + async node drivers + async sources),
 /// decremented by every dispatched job / spawned task on completion —
 /// normal or caught-panic — and awaited by the run's main thread. No
 /// `JoinHandle` exists to join (pool jobs cannot be joined), so this is the
@@ -114,9 +120,18 @@ pub(crate) struct GraphCore {
     /// failure surfaces as `try_run`'s `Err` instead of a half-spawned
     /// pipeline.
     pub(crate) spawner: Option<Arc<dyn AsyncSpawner>>,
+    /// The spawner's worker-thread count (1 without a spawner): sizes the
+    /// async nodes' driver fan-out.
+    pub(crate) async_parallelism: usize,
 }
 
 impl GraphCore {
+    /// Driver fan-out of an async node admitting `concurrency` in-flight
+    /// items. `run_graph` sizes the completion counter with the same plan.
+    pub(crate) fn mux_plan(&self, concurrency: usize) -> MuxPlan {
+        MuxPlan::new(concurrency, self.async_parallelism)
+    }
+
     /// Dispatch one sync worker / feeder body: a lease-wrapped pool job in
     /// pool mode, a dedicated OS thread otherwise. The wrapper catches every
     /// panic (a pool job's uncaught panic aborts the process via the pool's
@@ -572,9 +587,10 @@ fn resolve_budget(plan: &GraphPlan, config: &PipelineConfig, pool: &ComputePool)
         (share, pinned_workers + unpinned_divided * share)
     });
 
-    // Per-node worker/task counts. Async nodes resolve their task fan-out
-    // here too (io_concurrency pin or the config default; async sources and
-    // sinks are single-worker by construction).
+    // Per-node worker counts. Async nodes resolve their in-flight slot
+    // count here (io_concurrency pin or the config default; the driver
+    // fan-out over those slots is `GraphCore::mux_plan`); async sources and
+    // sinks are single-worker by construction.
     let workers: Vec<usize> = plan
         .nodes
         .iter()
@@ -601,7 +617,7 @@ fn resolve_budget(plan: &GraphPlan, config: &PipelineConfig, pool: &ComputePool)
 struct RunPlan {
     dedicated: bool,
     lease: Option<ParkingLease>,
-    /// Per-node worker count (async nodes: concurrent task count).
+    /// Per-node worker count (async nodes: in-flight slot count).
     workers: Vec<usize>,
 }
 
@@ -663,7 +679,18 @@ pub(crate) fn run_graph<R: AsyncRuntime>(builder: GraphBuilder<R>) -> std::io::R
         None
     };
 
-    let total_workers: usize = run.workers.iter().sum();
+    let async_parallelism = spawner.as_ref().map_or(1, |s| s.parallelism());
+    // Async nodes spawn their `MuxPlan` driver count — the plan
+    // `GraphCore::mux_plan` hands their spawn steps.
+    let total_workers: usize = plan
+        .nodes
+        .iter()
+        .zip(&run.workers)
+        .map(|(node, &workers)| match node.kind {
+            NodeKind::Async => MuxPlan::new(workers, async_parallelism).drivers(),
+            _ => workers,
+        })
+        .sum();
     let core = GraphCore {
         pool,
         dedicated: run.dedicated,
@@ -672,6 +699,7 @@ pub(crate) fn run_graph<R: AsyncRuntime>(builder: GraphBuilder<R>) -> std::io::R
         panic: Arc::new(Mutex::new(None)),
         done: DoneCounter::new(total_workers),
         spawner,
+        async_parallelism,
     };
 
     // Snapshot the per-node buffer pins before the nodes are consumed by the

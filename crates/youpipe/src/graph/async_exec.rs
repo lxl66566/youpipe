@@ -25,15 +25,18 @@ use crate::{
     handoff::{
         AsyncReceiver, AsyncSender, Receiver as SyncReceiver, TryRecvError, WakerSlot,
         cancel_active, channel,
+        mux::{self, AsyncIntake, AsyncOutlet, TryClaim},
     },
     sync::CancellationToken,
 };
 
 /// Fair fan-in over the shared async receivers of one node's input edges,
-/// owned by ONE task of an async node (each task clones every input — the
-/// same MPMC-competition shape as the sync [`FanIn`](super::fanin::FanIn),
-/// with an any-of-N awaited anchor instead of a blocking one). EOF is
-/// every input disconnected.
+/// owned by ONE driver task of an async node (each driver clones every
+/// input — the same MPMC-competition shape as the sync
+/// [`FanIn`](super::fanin::FanIn), with an any-of-N awaited anchor instead
+/// of a blocking one). EOF is every input disconnected. The driver's intake
+/// ([`AsyncIntake`]): a claim dropped mid-anchor leaves the cursor and the
+/// closed marks untouched (they change only after a ready input resolves).
 pub(crate) struct AsyncFanIn<T: Send + Unpin + 'static> {
     rxs: Vec<AsyncReceiver<T>>,
     /// Closed inputs are never polled again.
@@ -60,10 +63,9 @@ impl<T: Send + Unpin + 'static> AsyncFanIn<T> {
         }
     }
 
-    /// Fair claim: one non-blocking round over every open input, then an
-    /// awaited anchor parked on every open input at once (see
-    /// [`AsyncFanIn::anchor`]). `None` means EOF.
-    pub(crate) async fn claim(&mut self) -> Option<T> {
+    /// One non-blocking round over every open input, starting at the
+    /// round-robin cursor.
+    fn round(&mut self) -> TryClaim<T> {
         let n = self.rxs.len();
         for k in 0..n {
             let i = (self.cursor + k) % n;
@@ -73,7 +75,7 @@ impl<T: Send + Unpin + 'static> AsyncFanIn<T> {
             match self.rxs[i].try_recv() {
                 Ok(item) => {
                     self.cursor = (i + 1) % n;
-                    return Some(item);
+                    return TryClaim::Item(item);
                 },
                 Err(TryRecvError::Closed) => {
                     self.closed[i] = true;
@@ -83,9 +85,10 @@ impl<T: Send + Unpin + 'static> AsyncFanIn<T> {
             }
         }
         if self.open == 0 {
-            return None;
+            TryClaim::Closed
+        } else {
+            TryClaim::Empty
         }
-        self.anchor().await
     }
 
     /// Awaited anchor: park the task registered on every open input at
@@ -189,12 +192,29 @@ impl<T: Send + Unpin + 'static> AsyncFanIn<T> {
     }
 }
 
+impl<T: Send + Unpin + 'static> AsyncIntake<T> for AsyncFanIn<T> {
+    fn try_claim(&mut self) -> TryClaim<T> {
+        self.round()
+    }
+
+    /// Fair claim: one non-blocking round over every open input, then an
+    /// awaited anchor parked on every open input at once (see
+    /// [`AsyncFanIn::anchor`]). `None` means EOF.
+    async fn claim(&mut self) -> Option<T> {
+        match self.round() {
+            TryClaim::Item(item) => Some(item),
+            TryClaim::Closed => None,
+            TryClaim::Empty => self.anchor().await,
+        }
+    }
+}
+
 /// Poll a set of futures in order and resolve with the first `Ready`
 /// (output + index); the losing futures are dropped. On `Pending` every
 /// future has been polled, so each one's waker registration is in place —
 /// the any-of-N wait [`AsyncFanIn::anchor`] parks on. A private stand-in
-/// for `futures::future::select_all`: the `futures` crate is a
-/// dev-dependency by design and this needs none of its machinery.
+/// for `futures::future::select_all` that drops the losing futures instead
+/// of handing them back.
 struct FirstReady<F> {
     futs: Vec<F>,
 }
@@ -214,15 +234,14 @@ impl<F: Future + Unpin> Future for FirstReady<F> {
 }
 
 /// One async producer task's output-side delivery strategy — the async twin
-/// of the sync `Delivery` trait (see `handoff::worker`). Task bodies are generic over it;
-/// the RPITIT `+ Send` bound carries through the spawned task futures.
-pub(crate) trait AsyncDelivery<T: Send + Unpin + 'static>: Send + 'static {
+/// of the sync `Delivery` trait (see `handoff::worker`): the driver's
+/// [`AsyncOutlet`] plus its per-task constructor. Task bodies are generic
+/// over it; the RPITIT `+ Send` bound carries through the spawned task
+/// futures.
+pub(crate) trait AsyncDelivery<T: Send + Unpin + 'static>: AsyncOutlet<T> + 'static {
     /// Build one task's handle from the node's output senders (each task
     /// receives its own clone of every sender).
     fn new(txs: Vec<AsyncSender<T>>) -> Self;
-    /// Deliver one item. Returns `false` when every edge has closed (the
-    /// caller's task exits).
-    fn send(&mut self, item: T) -> impl Future<Output = bool> + Send;
 }
 
 /// Single-edge delivery: the async counterpart of [`AsyncBroadcast`] for
@@ -245,8 +264,10 @@ impl<T: Send + Unpin + 'static> AsyncDelivery<T> for AsyncUnicast<T> {
             slot: WakerSlot::new(),
         }
     }
+}
 
-    async fn send(&mut self, item: T) -> bool {
+impl<T: Send + Unpin + 'static> AsyncOutlet<T> for AsyncUnicast<T> {
+    async fn deliver(&mut self, item: T) -> bool {
         self.tx.send_cached(item, &mut self.slot).await.is_ok()
     }
 }
@@ -256,12 +277,12 @@ impl<T: Send + Unpin + 'static> AsyncDelivery<T> for AsyncUnicast<T> {
 /// item. A closed edge (send resolves `Err`) drops out of the active set —
 /// one dead downstream must not kill the node's other branches.
 ///
-/// Ordering scope: "every edge sees the same sequence" holds per task, not
-/// per node — with `io_concurrency > 1` the tasks interleave their per-item
-/// sends, so two edges can take the same items in different orders (each
-/// edge stays a FIFO). Cross-edge order-sensitive consumers need a
-/// single-task node; mid-edge holes are never produced (an accepted item
-/// reaches every open edge).
+/// Ordering scope: "every edge sees the same sequence" holds per driver
+/// task, not per node — with `io_concurrency > 1` the drivers interleave
+/// their per-item sends, so two edges can take the same items in different
+/// orders (each edge stays a FIFO). Cross-edge order-sensitive consumers
+/// need `io_concurrency(1)` (one driver, one item in flight); mid-edge holes
+/// are never produced (an accepted item reaches every open edge).
 pub(crate) struct AsyncBroadcast<T: Send + Unpin + 'static> {
     txs: Vec<AsyncSender<T>>,
     /// Per-edge waker-node slots (see [`AsyncFanIn`]).
@@ -273,10 +294,12 @@ impl<T: Send + Clone + Unpin + 'static> AsyncDelivery<T> for AsyncBroadcast<T> {
         let slots = (0..txs.len()).map(|_| WakerSlot::new()).collect();
         Self { txs, slots }
     }
+}
 
+impl<T: Send + Clone + Unpin + 'static> AsyncOutlet<T> for AsyncBroadcast<T> {
     /// Deliver one item to every open edge. Returns `false` when every edge
     /// has closed (the caller's task exits).
-    async fn send(&mut self, item: T) -> bool {
+    async fn deliver(&mut self, item: T) -> bool {
         let mut i = 0;
         while i + 1 < self.txs.len() {
             if self.txs[i]
@@ -306,35 +329,6 @@ impl<T: Send + Clone + Unpin + 'static> AsyncDelivery<T> for AsyncBroadcast<T> {
     }
 }
 
-/// One async node task: fair fan-in claim, run the future, deliver the
-/// output through the node's [`AsyncDelivery`] strategy. The tasks of one
-/// node share the closure behind one `Arc` (call syntax auto-derefs it).
-async fn async_node_task<I, O, F, Fut, D>(
-    f: Arc<F>,
-    mut fanin: AsyncFanIn<I>,
-    mut out: D,
-    cancel: CancellationToken,
-) where
-    I: Send + Unpin + 'static,
-    O: Send + Unpin + 'static,
-    F: Fn(I) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = O>,
-    D: AsyncDelivery<O>,
-{
-    loop {
-        let Some(item) = fanin.claim().await else {
-            return; // EOF: every input disconnected
-        };
-        if cancel_active(Some(&cancel)) {
-            return;
-        }
-        let output = f(item).await;
-        if !out.send(output).await {
-            return; // every output edge closed
-        }
-    }
-}
-
 /// The async source task: call `f` until `None` (EOF), delivering each item
 /// through the source's [`AsyncDelivery`] strategy.
 async fn async_source_task<T, F, Fut, D>(f: F, mut out: D, cancel: CancellationToken)
@@ -350,7 +344,7 @@ where
         }
         match f().await {
             Some(item) => {
-                if !out.send(item).await {
+                if !out.deliver(item).await {
                     return;
                 }
             },
@@ -404,8 +398,9 @@ where
 }
 
 /// Type-erased spawn step for one async IO node (see `GraphBuilder::node_async`):
-/// `tasks` runtime tasks sharing the input receivers and output senders,
-/// delivering through `D`.
+/// the node's `concurrency` in-flight slots multiplexed over the driver
+/// tasks of [`GraphCore::mux_plan`] (`handoff::mux`), every driver sharing
+/// the input receivers and output senders and delivering through `D`.
 // Called only from `node_async`, which requires the `tokio-runtime` feature.
 #[cfg_attr(not(feature = "tokio-runtime"), allow(dead_code))]
 pub(crate) fn node_async_spawn<I, O, F, Fut, D>(name: Arc<str>, f: F) -> SpawnStep
@@ -416,20 +411,24 @@ where
     Fut: Future<Output = O> + Send,
     D: AsyncDelivery<O>,
 {
-    Box::new(move |core: &GraphCore, tasks: usize, inputs, outputs| {
-        let rxs = downcast_endpoints::<AsyncReceiver<I>>(inputs, "inputs", &name);
-        let txs = downcast_endpoints::<AsyncSender<O>>(outputs, "outputs", &name);
-        let f = Arc::new(f);
-        for _ in 0..tasks {
-            let f = Arc::clone(&f);
-            let fanin = AsyncFanIn::new(rxs.clone());
-            let out = D::new(txs.clone());
-            let cancel = core.cancel.clone();
-            core.spawn_task(async move {
-                async_node_task(f, fanin, out, cancel).await;
-            });
-        }
-    })
+    Box::new(
+        move |core: &GraphCore, concurrency: usize, inputs, outputs| {
+            let rxs = downcast_endpoints::<AsyncReceiver<I>>(inputs, "inputs", &name);
+            let txs = downcast_endpoints::<AsyncSender<O>>(outputs, "outputs", &name);
+            let plan = core.mux_plan(concurrency);
+            let f = Arc::new(f);
+            for i in 0..plan.drivers() {
+                let f = Arc::clone(&f);
+                let fanin = AsyncFanIn::new(rxs.clone());
+                let out = D::new(txs.clone());
+                let cancel = core.cancel.clone();
+                let cap = plan.cap(i);
+                core.spawn_task(async move {
+                    mux::drive(fanin, |item| f(item), out, cap, Some(&cancel)).await;
+                });
+            }
+        },
+    )
 }
 
 /// Wrap one async task body so a panic inside any of its polls is recorded

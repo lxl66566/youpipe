@@ -1,8 +1,9 @@
 //! Async sharded terminal fan-in A/B (evidence bench for todo #1 residual
-//! (c)): the async terminal's `io_concurrency` consumer tasks → one output
+//! (c)): the async terminal's driver tasks (`io_concurrency` in-flight items
+//! multiplexed over at most one driver per runtime worker) → one output
 //! channel → the sole async collector. `YOUPIPE_SHARDED_TERM_ASYNC=0/1`
 //! selects the channel shape (one shared MPSC async ring vs one async shard
-//! ring per task group, shards capped at the runtime's worker threads)
+//! ring per driver group, shards capped at the runtime's worker threads)
 //! inside the SAME binary — drive verdicts with the runtime-knob A/B so
 //! recompile layout noise cannot leak in:
 //!
@@ -26,8 +27,8 @@
 //! terminal signal. The immune references are used instead:
 //!
 //! * `async1_*` — ONE sync prefix (cheap or cpu) into `stage_async` with an instant-return future:
-//!   the terminal is the async stage's output ring with 128 hot producer tasks — the direct todo #1
-//!   (c) shape;
+//!   the terminal is the async stage's output ring with one hot producer per driver task — the
+//!   direct todo #1 (c) shape;
 //! * `async1_ordered_*` — ordered variant (ReorderBuffer downstream of the shards);
 //! * `async0_*` — async-only chain (mixed-mode feeder channel consumed directly):
 //!   feeder-throughput-limited reference, expected knob-insensitive (control for leakage into

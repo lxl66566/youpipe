@@ -145,7 +145,7 @@ fn reports_all_violations_at_once() {
 // ── Sync end-to-end ──
 
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -752,6 +752,48 @@ fn async_mixed_chain_conserves() {
     );
 }
 
+/// An async node whose `io_concurrency` exceeds the runtime's worker count
+/// multiplexes several in-flight items per driver task and still fills
+/// every slot, never exceeding the bound.
+#[cfg(feature = "tokio-runtime")]
+#[cfg_attr(miri, ignore)] // timer-sleep concurrency observation
+#[test]
+fn async_node_fills_io_concurrency_over_narrow_runtime() {
+    use std::sync::atomic::AtomicUsize;
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let (a, m) = (Arc::clone(&active), Arc::clone(&max_active));
+    let total = Arc::new(AtomicU64::new(0));
+    let acc = Arc::clone(&total);
+    let mut g = graph().with_async_pool(crate::TokioPool::build(2).unwrap());
+    let src = g.source("src", 0..64u64);
+    let io = g.node_async_with(
+        "io",
+        AsyncNodeOptions::new().io_concurrency(16),
+        move |x: u64| {
+            let (a, m) = (Arc::clone(&a), Arc::clone(&m));
+            async move {
+                let cur = a.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                a.fetch_sub(1, Ordering::SeqCst);
+                x
+            }
+        },
+    );
+    let out = g.sink("out", move |x: u64| {
+        acc.fetch_add(x, Ordering::Relaxed);
+    });
+    g.edge(src, io).edge(io, out);
+    g.run();
+    assert_eq!(total.load(Ordering::Relaxed), (0..64u64).sum::<u64>());
+    let max = max_active.load(Ordering::SeqCst);
+    assert!(
+        (16..=17).contains(&max), // +1: increment visible before the paired decrement
+        "16 in-flight slots over 2 runtime workers: peak {max}"
+    );
+}
+
 /// The async move path drops the `Clone` bound too: a non-`Clone` payload
 /// through `source` -> `node_async` -> `sink_collect` compiles and conserves.
 #[cfg(feature = "tokio-runtime")]
@@ -983,9 +1025,10 @@ fn async_broadcast_panic_multi_sink_conserves_partial() {
             // non-doomed item clones into both sinks; the deadline only
             // guards against a wedged run).
             let want = boom_at.min(8);
-            // One task: with io_concurrency > 1 the two edges' entry
-            // orders can diverge (see the test doc), voiding the prefix
-            // contract below while every per-edge FIFO stays intact.
+            // One driver, one item in flight: with io_concurrency > 1 the
+            // two edges' entry orders can diverge (see the test doc),
+            // voiding the prefix contract below while every per-edge FIFO
+            // stays intact.
             let boom = g.node_async_broadcast_with(
                 "boom",
                 AsyncNodeOptions::new().io_concurrency(1),

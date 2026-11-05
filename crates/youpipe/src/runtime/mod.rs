@@ -8,8 +8,9 @@
 //!
 //! youpipe originally called tokio APIs directly. The narrow trait describes
 //! only what the streaming code needs (spawn a fire-and-forget task; block on
-//! the collector future) and keeps the concrete executor out of the streaming
-//! machinery. The runtime is touched only at per-run stage-assembly time and
+//! the collector future; report the worker count that sizes the async
+//! stages' driver fan-out) and keeps the concrete executor out of the
+//! streaming machinery. The runtime is touched only at per-run stage-assembly time and
 //! once at collection (`block_on`), never in the per-item hot path, so the
 //! abstraction is cost-free in steady state — and opens the door to a future
 //! non-tokio backend (e.g. thread-per-core, monoio) without touching
@@ -51,6 +52,10 @@ pub trait AsyncRuntime: Clone + Send + Sync + 'static {
     /// Returns `io::Error` if the runtime cannot be constructed (e.g. OS thread
     /// / resource limits).
     fn build_default(workers: usize) -> std::io::Result<Self>;
+
+    /// Number of worker threads polling spawned tasks. An async stage
+    /// multiplexes its in-flight items over at most this many driver tasks.
+    fn parallelism(&self) -> usize;
 
     /// Spawn a fire-and-forget future onto the runtime.
     ///
@@ -111,6 +116,10 @@ impl AsyncRuntime for NoRuntime {
             "NoRuntime::build_default: no async runtime backend is enabled. Enable the \
              `tokio-runtime` feature on youpipe."
         );
+    }
+
+    fn parallelism(&self) -> usize {
+        panic!("NoRuntime::parallelism: no async runtime backend is enabled");
     }
 
     fn spawn<F>(&self, _fut: F)

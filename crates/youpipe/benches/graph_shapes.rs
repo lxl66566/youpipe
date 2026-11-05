@@ -218,10 +218,11 @@ fn counter_source(
     }
 }
 
-/// Two async sources (n items each) fanned into one async node with the
-/// default task fan-out: the async twin of [`run_fanin_graph`]'s fair
-/// fan-in. The node's task population (128 by default) contends for two
-/// rings, so most woken tasks find both empty and re-park in
+/// Two async sources (n items each) fanned into one async node: the async
+/// twin of [`run_fanin_graph`]'s fair fan-in. The node's driver tasks
+/// (`min(io_concurrency, runtime workers)` by default — `io_concurrency`
+/// per-slot tasks only under `YOUPIPE_ASYNC_MUX=0`) contend for two
+/// rings, so woken drivers mostly find both empty and re-park in
 /// `AsyncFanIn::anchor`'s any-of-N combinator — the park-heavy regime the
 /// per-episode anchor allocation (todo #32) lives in. Each `g.run()` also
 /// lazily builds the async runtime backend, a fixed cost the @1K rows

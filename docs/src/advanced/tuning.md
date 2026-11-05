@@ -9,14 +9,15 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `with_workload(Workload)` | fork/join split granularity | fused + `stream()`'s fused cores | item costs are skewed |
 | `with_filter_collect(FilterCollectMode)` | implementation of by-ref filter collects (default `Auto`: merge tree < 100K items, write-then-compact ≥ 100K) | fused by-ref `.collect()` with a filter stage | the Auto gate mismatches your shape (all identical output; see [dev/benchmarks](../dev/benchmarks/sync-fused.md) "Filter-chain collect") |
 | `with_buffer_size(n)` | channel capacity between stages | streaming | bursty producers, memory bounds |
-| `with_io_concurrency(n)` | in-flight async tasks per async stage | streaming | IO waits are cheap and plentiful |
+| `with_io_concurrency(n)` | in-flight async items per async stage | streaming + graph | IO waits are cheap and plentiful |
 | `.ordered()` | reorder pass restoring input order | streaming | output must match input order |
 | `.fence(mode)` / `.fence_with(FenceOptions, mode)` | isolation at one stage boundary (`buffer` pin) | streaming | downstream must not see partial upstream |
 | `SyncStageOptions` / `AsyncStageOptions` | per-stage workers (sync) / io_concurrency (async) / buffer (both) | streaming | stages have unequal costs |
 | `ComputePool::new_pinned(n)` | workers pinned 1:1 to allowed CPUs | pools | tight loops of large saturated fused batches (**not** streaming — see [pools](pools.md)) |
 | `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker SPSC shards (default on; `"0"` = shared ring) | streaming (sync/expand terminals) | leave on for multi-worker terminals; the shared ring only wins single-worker terminals, which never shard anyway |
 | `YOUPIPE_BATCH_RECV` | batched ring claims on the streaming data plane (default on, cap 64; `"0"` = per-item) | streaming | leave on; pairs with `YOUPIPE_SHARDED_TERM` — the two share the default |
-| `YOUPIPE_SHARDED_TERM_ASYNC` | async terminal channel = per-task-group async shards | streaming (async terminals) | async-only chain whose feeder saturates the single output ring (niche; a measured loss on sync-fed async terminals) |
+| `YOUPIPE_SHARDED_TERM_ASYNC` | async terminal channel = per-driver-group async shards | streaming (async terminals) | async-only chain whose feeder saturates the single output ring (niche; a measured loss on sync-fed async terminals) |
+| `YOUPIPE_ASYNC_MUX` | async stage/node driver tasks: `min(io_concurrency, runtime workers)`, each multiplexing its share of the in-flight items (default on; `"0"` = one task per in-flight slot; `"N"` = at most N drivers) | streaming + graph (async stages/nodes) | leave on — it removes `io_concurrency` task spawns and per-item cross-thread wakes from the run; `"0"` only to isolate the knob in a bench |
 | `YOUPIPE_SPIN_ANCHOR` | adaptive pre-anchor `try_recv` spin window (µs) in sync worker recv loops | streaming | convoy collapse on shapes the defaults exclude: `Barrier` fences, pinned buffers, or a residual slow-mode sighting (see [dev/streaming](../dev/streaming.md)) |
 | `YOUPIPE_FWD_BATCH` | fence forwarder flushes released chunks via `try_send_batch` (default on; `"0"` = per-item `send`) | streaming (fence forwarder) | leave on — it caps the fence convoy's tail at every size; `"0"` only to isolate the knob in a bench |
 | `YOUPIPE_CHAIN_FLOOR` | unpinned channel capacities of chains with an async stage or a `Chunked` fence floor at `min(n, 65536)` slots (default on; `"0"` = unfloored; a decimal = an explicit tier) | streaming | leave on — it removes the async and fence convoy slow modes; escape only to pin backpressure tightly (per-stage `buffer` pins are the better tool) or to lower the tier on zero-CPU latency-critical chains |
@@ -250,11 +251,14 @@ as dedicated OS threads — deadlock-free by construction, at the cost of one
 
 ## `io_concurrency`: M:N async fan-out (streaming)
 
-Async IO tasks yield the OS thread while waiting, so the in-flight task cap
+Async IO futures yield the OS thread while waiting, so the in-flight cap
 (`io_concurrency`, default 128) can far exceed `async_workers` (the thread
-count, default = available_parallelism). Raise it to keep the runtime
-saturated with cheap waits; it doubles as the memory bound — each in-flight
-task holds its item and buffers.
+count). Raise it to keep the runtime saturated with cheap waits; it doubles
+as the memory bound — each in-flight item holds its input and buffers.
+
+The items run on at most one driver task per runtime worker thread, each
+multiplexing its share of the cap, so a large `io_concurrency` costs no
+extra tasks: raising it from 128 to 4096 adds no per-run spawn cost.
 
 Override per stage when stages differ: a network stage wants ~512, a local
 disk stage ~16 — via

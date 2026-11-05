@@ -43,7 +43,7 @@ fn main() {
     // Sync branch: CPU hash on the work-stealing compute pool.
     let hashed = g.node("hash", |x: u64| hash(x));
 
-    // Async branch: simulated IO wait on the tokio runtime (M:N tasks).
+    // Async branch: simulated IO wait on the tokio runtime (M:N futures).
     let fetched = g.node_async("fetch_meta", |x: u64| async move {
         if x % 10 == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;

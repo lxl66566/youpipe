@@ -2,6 +2,9 @@ pub mod channel;
 // Crate-internal: the bridge forward loops (recv -> cancel-check -> send)
 // shared by both engines' cross-mode bridges.
 pub(crate) mod forward;
+// Crate-internal: the M:N async consumer driver shared by the stream
+// engine's async stages and the graph engine's async nodes.
+pub(crate) mod mux;
 // Crate-internal: every receiver method here is `pub(crate)`, so a public
 // module would only expose vestigial constructors (review R-5: an external
 // `sharded_mpsc_channel(0, ..)` constructed fine, then panicked at `% 0` on

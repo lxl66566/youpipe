@@ -53,9 +53,10 @@ pub(crate) enum NodeKind {
     Sync,
     /// Sync 1-to-N expansion node: ComputePool workers.
     Expand,
-    /// Async IO node: `io_concurrency` runtime tasks. Constructed only by
-    /// `node_async`, which — like the stream engine's async stages — exists
-    /// only under the `tokio-runtime` feature.
+    /// Async IO node: `io_concurrency` in-flight items over its driver
+    /// tasks. Constructed only by `node_async`, which — like the stream
+    /// engine's async stages — exists only under the `tokio-runtime`
+    /// feature.
     #[cfg_attr(not(feature = "tokio-runtime"), allow(dead_code))]
     Async,
     /// Side-effect or collecting terminal: exactly one sync worker.

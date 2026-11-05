@@ -1,10 +1,10 @@
 //! Async IO with M:N concurrency: youpipe `stream().stage_async()` vs
 //! `tokio::spawn` per-item, on workloads whose waits actually yield.
 //!
-//! The async stage runs `io_concurrency` tokio tasks on a runtime with
-//! `async_workers` OS threads. Each task yields its thread back to the runtime
-//! while awaiting — so thousands of concurrent IO waits can be multiplexed
-//! over a handful of threads. This is the regime where async beats
+//! The async stage keeps up to `io_concurrency` item futures in flight on a
+//! runtime with `async_workers` OS threads. Each future yields its thread back
+//! to the runtime while awaiting — so thousands of concurrent IO waits can be
+//! multiplexed over a handful of threads. This is the regime where async beats
 //! `spawn_blocking` (which holds a thread per item).
 //!
 //! ```text

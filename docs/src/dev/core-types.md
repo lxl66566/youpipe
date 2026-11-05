@@ -407,7 +407,7 @@ stream(items)                       // StreamPipe<StreamStart, I, I>
 | `.stage_with(opts,f)` | same, with `opts.workers` / `opts.buffer` pinning that stage (`SyncStageOptions`) |
 | `.expand(f)`          | 1-to-N. Unordered: per-item messages sharing the parent's `seq`. After `.ordered()`: one `(seq, Vec<N>)` group message per input (see below) |
 | `.fence(mode)`        | dedicated forwarder thread batching between adjacent stages               |
-| `.stage_async(f)`     | `io_concurrency` tokio tasks on the async runtime (M:N)                   |
+| `.stage_async(f)`     | `io_concurrency` in-flight futures over ≤ runtime-worker driver tasks (M:N) |
 | `.stage_async_with(o,f)` | same, with `o.io_concurrency` / `o.buffer` pinning that stage (`AsyncStageOptions`) |
 | `.ordered()`          | feeder tags each item with `seq`; collector reorders via `ReorderBuffer`. Typestate (expand-free chains only) |
 | `.with_cancel(token)` | feeder/workers/bridges check `is_cancelled()` per iteration               |
@@ -523,10 +523,13 @@ plus the grouped blocks of `sharded_terminal(_async).rs`.
 #### Async IO stages
 
 `.stage_async()` is gated behind the `tokio-runtime` feature. It runs an IO
-stage as **`io_concurrency` async tasks** on the [`AsyncRuntime`] backend
-([`TokioPool`] — a `tokio::runtime::Handle` wrapper). The runtime's M:N
-work-stealing scheduler multiplexes those tasks over `async_workers` OS
-threads: each task yields its thread back to the runtime while it awaits (e.g.
+stage with up to **`io_concurrency` item futures in flight** on the
+[`AsyncRuntime`] backend ([`TokioPool`] — a `tokio::runtime::Handle`
+wrapper): `min(io_concurrency, parallelism)` driver tasks (one per runtime
+worker thread at most), each multiplexing its share of the slots in a
+`FuturesUnordered` (`handoff/mux.rs`, see
+[streaming.md](streaming.md#async-stage-drivers-mn-multiplexing)). Each future
+yields its thread back to the runtime while it awaits (e.g.
 `tokio::time::sleep`, real network/disk IO), so concurrency is bounded by
 `io_concurrency` — **not** by the thread count.
 
@@ -540,7 +543,7 @@ A mixed sync-CPU + async-IO chain keeps the CPU stage on the sync compute pool
 overlap with the CPU stage's workers writing **directly** into the IO stage's
 input channel — no bridge thread. The pools do not contend: CPU uses
 `compute_workers` OS threads, IO uses `async_workers` OS threads multiplexing
-`io_concurrency` tasks.
+`io_concurrency` in-flight futures.
 
 Every sync→async edge uses crossfire's mixed-mode channel (`SyncSender` +
 `AsyncReceiver` sharing one `mpmc::Array` — `bounded_blocking_async`).
@@ -548,7 +551,7 @@ Every sync→async edge uses crossfire's mixed-mode channel (`SyncSender` +
 its producers run with least friction: sync stages (sync / expand / fence)
 override it so their ComputePool workers write the `SyncSender` directly
 (backpressure parks the worker on `Full` — correct, since they're OS threads),
-while the async consumers `recv().await` from the _same_ queue. One channel,
+while the async drivers claim from the _same_ queue. One channel,
 zero forwarding threads — for `stream(..).stage_async(..)` *and*
 `stream(..).stage(cpu).stage_async(io)` alike.
 

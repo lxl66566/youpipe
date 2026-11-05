@@ -99,6 +99,11 @@ impl AsyncRuntime for TokioPool {
         Self::build(workers)
     }
 
+    fn parallelism(&self) -> usize {
+        // 1 for a current-thread runtime.
+        self.handle.metrics().num_workers()
+    }
+
     fn spawn<F>(&self, fut: F)
     where
         F: Future<Output = ()> + Send + 'static,

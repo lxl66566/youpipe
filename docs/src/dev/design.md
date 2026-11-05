@@ -149,6 +149,9 @@ crates/youpipe/src/
 │   ├── channel.rs    # MPMC channels (crossfire wrapper: sync + async)
 │   ├── forward.rs    # The bridge forward loops (forward_sync / forward_async /
 │   │                 #   forward_async_to_sync) shared by both engines' bridges
+│   ├── mux.rs        # The M:N async driver (MuxPlan + drive): async stages and
+│   │                 #   graph async nodes multiplex io_concurrency in-flight
+│   │                 #   futures over ≤ runtime-worker driver tasks
 │   ├── worker.rs     # The engine-agnostic claim → map/expand → deliver worker
 │   │                 #   loops (claim_map_deliver / claim_expand_deliver,
 │   │                 #   CancelCheck) + the Delivery output strategies

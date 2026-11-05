@@ -66,8 +66,8 @@ pub type NodeOptions = SyncStageOptions;
 
 /// Per-node tuning for async graph nodes ([`GraphBuilder::node_async_with`]):
 /// the streaming [`AsyncStageOptions`] under its graph name. `io_concurrency`
-/// pins the node's concurrent task fan-out (default 128); `buffer` pins
-/// every outgoing edge's capacity as on [`NodeOptions`].
+/// pins the node's in-flight item bound (default 128); `buffer` pins every
+/// outgoing edge's capacity as on [`NodeOptions`].
 pub type AsyncNodeOptions = AsyncStageOptions;
 
 /// Handle to one node registered on a [`GraphBuilder`].
@@ -455,8 +455,8 @@ impl<R: AsyncRuntime> GraphBuilder<R> {
         self.plan.handle(id)
     }
 
-    /// Async IO node: `f: Fn(I) -> Future<Output = O>` runs as
-    /// `io_concurrency` concurrent tasks on the async runtime backend (see
+    /// Async IO node: `f: Fn(I) -> Future<Output = O>` with up to
+    /// `io_concurrency` items in flight on the async runtime backend (see
     /// [`AsyncNodeOptions`]). The output moves into the node's single
     /// outgoing edge (no `Clone` bound); for several consumers use
     /// [`node_async_broadcast`](Self::node_async_broadcast). Gated behind

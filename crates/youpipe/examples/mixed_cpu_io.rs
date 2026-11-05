@@ -3,7 +3,7 @@
 //!
 //! youpipe's mixed pipeline keeps the CPU stage on the work-stealing compute
 //! pool (rayon-style, sized to cores) and the IO stage on the async runtime
-//! (M:N tasks), connected by a sync→async bridge. The two stages overlap —
+//! (M:N futures), connected by a sync→async bridge. The two stages overlap —
 //! IO consumers start as soon as the first CPU result lands — so a CPU-bound
 //! stage and an IO-bound stage progress in parallel rather than back-to-back.
 //!

@@ -5220,6 +5220,7 @@ dependencies = [
  "criterion 0.8.2",
  "crossbeam-channel",
  "futures",
+ "futures-util",
  "log",
  "loom",
  "rayon",

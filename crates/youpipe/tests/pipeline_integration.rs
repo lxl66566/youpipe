@@ -2207,6 +2207,42 @@ fn test_stage_options_io_concurrency_pins_fanout() {
     assert!(max >= 3, "async stage never reached 3 tasks: {max}");
 }
 
+/// `io_concurrency` above the runtime's worker count multiplexes several
+/// in-flight items per driver task: the stage must still fill every slot
+/// (a driver keeps claiming while its items are in flight) and never
+/// exceed the bound.
+#[test]
+#[cfg_attr(miri, ignore)] // timer-sleep concurrency observation
+#[cfg(feature = "tokio-runtime")]
+fn test_async_stage_fills_io_concurrency_over_narrow_runtime() {
+    use std::time::Duration;
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let (a, m) = (active.clone(), max_active.clone());
+    let n = 64usize;
+    let r: Vec<usize> = stream(0..n)
+        .with_async_workers(2)
+        .with_io_concurrency(16)
+        .stage_async(move |x: usize| {
+            let (a, m) = (a.clone(), m.clone());
+            async move {
+                let cur = a.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                a.fetch_sub(1, Ordering::SeqCst);
+                x + 1
+            }
+        })
+        .run();
+    assert_eq!(r.len(), n);
+    let max = max_active.load(Ordering::SeqCst);
+    assert!(
+        (16..=17).contains(&max), // +1: increment visible before the paired decrement
+        "16 in-flight slots over 2 runtime workers: peak {max}"
+    );
+}
+
 #[test]
 fn test_stage_options_buffer_override_runs() {
     // A tiny explicit buffer tightens backpressure but must not affect

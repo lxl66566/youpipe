@@ -107,6 +107,9 @@ concurrent-queue = { workspace = true }
 # See docs/src/dev/crossfire-waker-designs.md (design C) and
 # docs/src/dev/crossfire-waker-cache.md (archaeology; superseded design A).
 crossfire        = { workspace = true }
+# `FuturesUnordered`: the async stage drivers multiplex their in-flight item
+# futures over it (handoff/mux.rs).
+futures-util     = { version = "0.3.34", default-features = false, features = ["alloc"] }
 hotpath          = { workspace = true, optional = true }
 # Only pulled in by the `crossfire-trace` forensics feature (see [features]).
 log              = { workspace = true, optional = true }
