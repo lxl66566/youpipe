@@ -216,6 +216,56 @@ Two layout-level cleanups, verified as no-regression rather than win-seeking. Bo
 
 Criterion A/B (per-id interleaved, 3 rounds × 2 sessions): `sync_lightweight` 10K/1M ±1.7 % (noise); `stream_pipeline/single_stage_ordered` 1K **−10.6 %** (9/9 dominant), 100K −6.1 %. The one tight family that moved — `sync_cpu_heavy` 100K youpipe +29/+42 % — moved its *untouched* rayon and sequential anchors the same way in the same passes (+13.6 % / +6.3 %, spread ≤1.8 %), the documented code-layout signature; drift-cancelled youpipe-vs-rayon ratios still shifted +13/+25 %, inside the recorded layout swing band but not provably clean. Layout cannot be knob-gated for a struct-layout change, so the cpu_heavy verdict stays "unattributable under recompile noise" — exactly the trap that motivates the runtime-knob rule — and the directional read (stream faster, lightweight flat) stands as the no-regression evidence.
 
+#### Join-completion RMW elimination: the latch registry reborrow (2026-11, accepted)
+
+`SpinLatch::set` — the completion path of every stolen join-B node, i.e. the
+hottest scheduler code under work stealing — cloned the registry `Arc`
+unconditionally (fetch_add + fetch_sub on the Arc header line, two locked
+RMWs from up to N−1 cores per node) to keep a valid `Registry` reference
+across the wake window, though the notify it exists for fires only when the
+waiter was SLEEPING. The latch now stores a pre-read `&'r Registry`
+(dereferenced once in `new`), and soundness rests on executor topology
+instead of the clone: `SpinLatch::set` runs only inside `JobRef` execution,
+JobRefs execute exclusively on this registry's worker threads (local deques
+and the injector are the only conduits; off-pool callers inject rather than
+execute, and the hybrid driver's work-assist hook only runs on-pool), and
+every worker's `WorkerThread` owns an `Arc` clone for its whole thread life
+— so the allocation outlives any `set` call even after the woken waiter
+drops its own clone (full argument on the struct; the raw-pointer
+`Latch::set` escape erases lifetime tracking, which is why the argument is
+topological and not `'r`). The same reborrow replaced the clone in
+`CountLatch::set`'s `Stealing` arm (once per batch). asm-verified on the
+`sync_vs_rayon` bench binary: every `StackJob<SpinLatch>::execute`
+monomorphization drops from 4 to 1 `lock`-prefixed RMW — the survivor is
+panic machinery present on both sides; the completion path is the latch
+`xchg` plus a conditional call.
+
+A/B (3-sided `base/latch/both` to isolate the companion candidate, recompile
+pairs — the lever removes a side effect, so no same-binary knob exists): the
+horizontal `cpu_balanced`(+`_readback`) caliber read flat at every size
+(±1–2 %, rayon/std controls, two independent sessions); criterion
+`nested_single/1K` read −3…−8 % across 7 paired rounds (anchors flat) —
+consistent but below/at the verdict floor; the 100 K criterion cells were
+unattributable under that session's documented layout roulette
+(`sync_cpu_heavy` n=100 k swings on record), and the controls
+(`sync_lightweight`, `zstd_shape`, `mixed_load` `youpipe_stream_cpu`) stayed
+flat. Landed as structural hygiene on the asm confirmation plus no observed
+regression, mirroring the wake-path layout-hygiene precedent above.
+
+The companion candidate of that round — batching the wake cascade's
+sleeping-count decrement into one RMW per cascade — was falsified and
+reverted; see [dead-ends.md](dead-ends.md) "Batching the wake cascade's
+sleeping-count decrement".
+
+A related property now worth stating (it holds in code and explains why the
+poster path is RMW-free in the common case): a poster pays an RMW on the JEC
+only when its parity is even. A worker's sleepy announcement
+(`announce_sleepy` → `increment_jobs_event_counter_if(is_active)`) flips the
+parity to even; the next poster's conditional increment
+(`increment_jobs_event_counter_if(is_sleepy)`) flips it back to odd. A
+fully-awake pool therefore pays **zero** RMWs on every poster path — the JEC
+read degenerates to a load, and only the injector's SeqCst fence remains.
+
 ### Graceful Shutdown
 
 `ComputePool::Drop` calls `Registry::terminate()`, which decrements a ref-count (`terminate_count`); when the last clone drops (count 1→0) it sets each worker's `terminate` OnceLatch and tickles it awake. Each worker's `wait_until_out_of_work` then drains its remaining local-deque work **and the injector** (a `JobRef` owns its heap box — an unexecuted job is a leak, and a revived pool would run it at a random later point), sets its `stopped` latch, and exits; `Registry::Drop` blocks on every spawned worker's `stopped` before returning. Dropping the last handle therefore waits for every submitted job, not just the running ones — whenever the drop actually joins: pools built through `ComputePool::new` are *parked* in the recycling cache on the last external drop instead (see "Transient pool recycling" below; the cache holds a handle, so `terminate_count` never reaches 0), and only eviction, `clear_cached_pools()`, `new_pinned`, or global-registry teardown run this path. A parked pool's workers stay in the idle loop and still execute every submitted job; only the blocking wait is deferred. Note a submit-job closure that panics aborts the process wherever it executes (`HeapJob::execute`'s `AbortIfPanic` — rayon `spawn` semantics).

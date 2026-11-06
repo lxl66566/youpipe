@@ -111,9 +111,35 @@ impl AsCoreLatch for CoreLatch {
 
 /// Spin latch bound to a specific worker thread. Used by `join` to signal
 /// completion of a stolen job back to the originating worker.
+///
+/// `registry` borrows the `Arc`'s heap allocation (deref'd once in `new` via
+/// `&Arc<Registry> -> &Registry` coercion), NOT the waiter's stack: [`set`]
+/// runs on a thief core after the waiter may have woken and popped its frame,
+/// so nothing may point into that frame.
+///
+/// # Soundness of using `registry` after [`set`] invalidated the latch
+///
+/// `set` runs only inside `Job::execute` on a `JobRef`, and a `JobRef` is
+/// executed exclusively by worker threads of the registry that queued it
+/// (the local deques and the injector are the only conduits; off-pool
+/// callers inject rather than execute, and the hybrid driver's work-assist
+/// hook only runs on-pool). Every worker's `WorkerThread` — stack-allocated
+/// in `main_loop`, alive for every job execution including the termination
+/// drain — owns an `Arc<Registry>` clone for its whole thread lifetime. So
+/// even after the woken waiter drops its own clone, the *executing* thread's
+/// clone keeps the `Registry` allocation (and the pre-read `&Registry`)
+/// alive for the duration of the call. The former `Arc::clone` in `set` paid
+/// a fetch_add + fetch_sub pair on the registry Arc header line — two locked
+/// RMWs on the hottest scheduler path, once per stolen join-B completion —
+/// for a guarantee the executor topology already provides. (`'r` additionally
+/// ties the borrow to the waiter's `WorkerThread`, but soundness rests on
+/// the topology argument: the raw-pointer `Latch::set` escape erases
+/// lifetime tracking.)
+///
+/// [`set`]: Latch::set
 pub(crate) struct SpinLatch<'r> {
     core: CoreLatch,
-    registry: &'r Arc<Registry>,
+    registry: &'r Registry,
     target_worker_index: usize,
 }
 
@@ -145,9 +171,10 @@ impl Latch for SpinLatch<'_> {
     unsafe fn set(this: *const Self) {
         unsafe {
             // Read all needed fields BEFORE the set, because `set` may
-            // invalidate `this` once the owning thread wakes.
+            // invalidate `this` once the owning thread wakes. The pre-read
+            // `&Registry` stays valid past the wake by the topology argument
+            // on the struct (the executing worker's own Arc).
             let registry = (*this).registry;
-            let registry = Arc::clone(registry);
             let target_worker_index = (*this).target_worker_index;
 
             if CoreLatch::set(&raw const (*this).core) {
@@ -582,7 +609,16 @@ impl Latch for CountLatch {
                         registry,
                         worker_index,
                     } => {
-                        let registry = Arc::clone(registry);
+                        // Materialize the registry reference (into the Arc's
+                        // heap allocation) BEFORE the set may invalidate
+                        // `this`: the last chunk's `execute` runs on a worker
+                        // of this registry (or the on-pool driver's assist
+                        // hook), whose own Arc clone keeps the allocation
+                        // alive past the waiter's wake — the same topology
+                        // argument as `SpinLatch`'s (see its struct doc).
+                        // Replaces the former `Arc::clone`/drop RMW pair,
+                        // paid once per batch completion.
+                        let registry: &Registry = registry;
                         let worker_index = *worker_index;
                         if CoreLatch::set(latch) {
                             registry.notify_worker_latch_is_set(worker_index);
