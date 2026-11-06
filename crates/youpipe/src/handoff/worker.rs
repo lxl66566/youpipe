@@ -7,6 +7,7 @@
 //! lives once here.
 
 use std::{
+    marker::PhantomData,
     mem::MaybeUninit,
     time::{Duration, Instant},
 };
@@ -426,14 +427,51 @@ impl<T: Send + Clone + 'static> Delivery<T> for Broadcast<T> {
 // ── Activity-gated pre-anchor spin (todo #4 fix, `YOUPIPE_SPIN_ANCHOR`) ──
 
 /// Calibration: one `pause` + one empty `try_recv` ≈ 15 ns on the reference
-/// machine, so 1 µs of window ≈ 64 polls. Doubles as the miri backstop (the
-/// wall-clock deadline may never fire there — time can freeze in a busy
-/// loop); on real hardware the clock check dominates.
+/// machine, so 1 µs of window ≈ 64 polls. Doubles as the ring profile's
+/// frozen-clock backstop (the wall-clock deadline may never fire in miri);
+/// on real hardware the clock check dominates.
 const SPIN_ROUNDS_PER_US: u32 = 64;
 
 /// Backoff ceiling inside the pre-anchor spin: 64 pauses ≈ 1 µs between
 /// polls at the tail of a long window (see [`SpinBudget::spin_poll`]).
 const MAX_POLL_PAUSES: u32 = 64;
+
+/// Compile-time cadence profile for a [`SpinBudget`] instantiation: the
+/// poll closure's cost class decides how often the wall-clock deadline is
+/// checked and how the frozen-clock backstop is scaled. Carried as the
+/// budget's type parameter, so each instantiation folds to its own
+/// constants (no runtime dispatch, no shared hot line).
+pub(crate) trait PollCost {
+    /// Polls between wall-clock deadline checks — a poll is clock-checked
+    /// when its index ANDs to `DEADLINE_STRIDE - 1`; stride 1 = every poll.
+    const DEADLINE_STRIDE: u64;
+    /// Max polls per µs of budget: bounds the loop when the clock does not
+    /// advance (miri).
+    const POLLS_PER_US: u32;
+}
+
+/// Data-plane profile: one non-blocking single-ring claim, ~15 ns per poll —
+/// the vDSO deadline read is a large fraction of the poll itself, so it is
+/// throttled to every 8th poll.
+pub(crate) enum RingPoll {}
+
+/// Pool profile: one idle poll (local deque + injector; a full steal scan
+/// would sit in the same class) costs ~0.2-0.5 µs, so the deadline is
+/// checked every poll (the ring's every-8th throttle would let the 64-pause
+/// tail overshoot a 100 µs window by ~8 polls) and the backstop is
+/// pool-scaled (the ring's 64 polls/µs would permit ~6400 scans per 100 µs
+/// window on a frozen clock).
+pub(crate) enum StealScanPoll {}
+
+impl PollCost for RingPoll {
+    const DEADLINE_STRIDE: u64 = 8;
+    const POLLS_PER_US: u32 = SPIN_ROUNDS_PER_US;
+}
+
+impl PollCost for StealScanPoll {
+    const DEADLINE_STRIDE: u64 = 1;
+    const POLLS_PER_US: u32 = 2;
+}
 
 /// Outcome of one non-blocking poll inside a [`SpinBudget`] window —
 /// [`Claim`] lifted to the poll-closure contract (single-ring claim sites
@@ -480,24 +518,39 @@ impl From<Claim> for SpinPoll {
 /// blocking anchor's latency right after the spin gave up. All state is
 /// per-worker locals touched once per anchor — no atomics, no clock reads
 /// while the channel has a backlog.
-pub(crate) struct SpinBudget {
+// Manual `Clone`/`Copy`: a derive would demand `P: Copy` for the marker
+// type parameters, coupling the profile markers to derive machinery they
+// do not need (PhantomData is Copy for any P).
+pub(crate) struct SpinBudget<P: PollCost = RingPoll> {
     /// Current spin window in µs; 0 = park immediately (baseline behavior).
     budget_us: u32,
     /// Knob value: the largest window worth spinning through.
     max_us: u32,
+    /// Cadence profile marker; drops out of codegen, folding the profile's
+    /// constants into each monomorphization.
+    _profile: PhantomData<P>,
 }
 
-impl SpinBudget {
+impl<P: PollCost> Clone for SpinBudget<P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: PollCost> Copy for SpinBudget<P> {}
+
+impl<P: PollCost> SpinBudget<P> {
     pub(crate) fn new(max_us: u32) -> Self {
         Self {
             budget_us: 0,
             max_us,
+            _profile: PhantomData,
         }
     }
 
     /// Whether the knob arms the spin at all (max window > 0); the anchor
     /// skips its park-latency bookkeeping when not.
-    pub(crate) fn armed(&self) -> bool {
+    pub(crate) fn armed(self) -> bool {
         self.max_us > 0
     }
 
@@ -528,19 +581,24 @@ impl SpinBudget {
         }
         let mut pauses = 1u32;
         let mut polls = 0u64;
-        let max_polls = u64::from(self.budget_us) * u64::from(SPIN_ROUNDS_PER_US);
+        let max_polls = u64::from(self.budget_us) * u64::from(P::POLLS_PER_US);
         let window = Duration::from_micros(u64::from(self.budget_us));
         let start = Instant::now();
+        // Polls whose index ANDs to the stride mask get the clock check;
+        // stride 1 (the pool profile) masks to 0 — every poll.
+        let stride_mask = P::DEADLINE_STRIDE - 1;
         loop {
             match poll() {
                 SpinPoll::Ready(n) => return SpinPoll::Ready(n),
                 SpinPoll::Closed => return SpinPoll::Closed,
                 SpinPoll::Empty => {},
             }
-            // Wall-clock deadline (checked every 8 polls) keeps the window
-            // honest under contention; the poll backstop bounds the loop when
-            // the clock does not advance (miri).
-            if polls >= max_polls || (polls & 7 == 7 && start.elapsed() >= window) {
+            // Wall-clock deadline (per the cadence profile's stride) keeps
+            // the window honest under contention; the poll backstop bounds
+            // the loop when the clock does not advance (miri).
+            if polls >= max_polls
+                || (polls & stride_mask == stride_mask && start.elapsed() >= window)
+            {
                 return SpinPoll::Empty;
             }
             for _ in 0..pauses {
@@ -732,7 +790,7 @@ mod tests {
     /// knob, quiet parks quarter it to zero, a zero knob is inert.
     #[test]
     fn spin_budget_adapts() {
-        let mut s = SpinBudget::new(10);
+        let mut s = SpinBudget::<RingPoll>::new(10);
         assert_eq!(s.budget_us, 0);
         // First live park: initial window (10/16 -> 1).
         s.note_park(Duration::from_micros(2));
@@ -748,7 +806,7 @@ mod tests {
         }
         assert_eq!(s.budget_us, 0);
         // Knob off: stays inert regardless of park latency.
-        let mut off = SpinBudget::new(0);
+        let mut off = SpinBudget::<RingPoll>::new(0);
         off.note_park(Duration::from_nanos(1));
         assert_eq!(off.budget_us, 0);
     }
@@ -760,7 +818,7 @@ mod tests {
     #[test]
     fn spin_poll_phases() {
         let (tx, rx) = channel::<u32>(4);
-        let mut s = SpinBudget::new(100);
+        let mut s = SpinBudget::<RingPoll>::new(100);
         let mut scratch: Vec<u32> = Vec::with_capacity(2);
         let poll = |scratch: &mut Vec<u32>| claim_poll(&rx, scratch, 0).into();
         assert_eq!(s.spin_poll(|| poll(&mut scratch)), SpinPoll::Empty); // budget 0: no spin
@@ -774,6 +832,39 @@ mod tests {
         drop(tx);
         s.budget_us = 100;
         assert_eq!(s.spin_poll(|| poll(&mut scratch)), SpinPoll::Closed);
+    }
+
+    /// The steal-scan cadence profile: the deadline mask selects every poll
+    /// and the backstop is pool-scaled, so an empty poll source exhausts
+    /// after a bounded poll count with no wall clock (miri-safe), and a
+    /// `Closed` verdict propagates from the first poll.
+    #[test]
+    fn steal_scan_cadence_profile() {
+        assert_eq!(StealScanPoll::DEADLINE_STRIDE, 1);
+        assert_eq!(StealScanPoll::POLLS_PER_US, 2);
+        let mut s = SpinBudget::<StealScanPoll>::new(100);
+        // A live window (new starts at budget 0 = no spin at all).
+        s.budget_us = 100;
+        let mut polls = 0;
+        assert_eq!(
+            s.spin_poll(|| {
+                polls += 1;
+                SpinPoll::Closed
+            }),
+            SpinPoll::Closed
+        );
+        assert_eq!(polls, 1);
+        // Backstop: budget 1 µs x 2 polls/µs bounds the empty window.
+        s.budget_us = 1;
+        let mut polls = 0;
+        assert_eq!(
+            s.spin_poll(|| {
+                polls += 1;
+                SpinPoll::Empty
+            }),
+            SpinPoll::Empty
+        );
+        assert!(polls <= 4, "backstop must bound the empty window: {polls}");
     }
 
     /// `ClaimWindow` ramp/collapse: full claims double the window up to the

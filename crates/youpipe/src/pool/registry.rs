@@ -24,6 +24,7 @@ use super::{
     sleep::Sleep,
     unwind,
 };
+use crate::handoff::{SpinBudget, SpinPoll, StealScanPoll};
 
 /// Capacity of each worker's local (LIFO) deque. Rounded up to a power of two
 /// by `st3`. When saturated, overflow spills into the global injector (tokio's
@@ -469,6 +470,12 @@ pub(crate) struct WorkerThread {
     worker: Worker<JobRef>,
     index: usize,
     rng: XorShift64Star,
+    /// Adaptive pre-park spin window for the idle loop (the pool-side port
+    /// of the data plane's `SpinBudget`): plain thread-private state, held
+    /// for the worker's whole lifetime so park-latency feedback adapts the
+    /// window across idle episodes. `Cell` because every accessor runs
+    /// under the TLS `&self` contract (only the owning thread touches it).
+    idle_spin: Cell<SpinBudget<StealScanPoll>>,
     registry: Arc<Registry>,
 }
 
@@ -626,17 +633,73 @@ impl WorkerThread {
             }
 
             let mut idle = self.registry.sleep.start_looking(self.index);
+            // Episode-local copy of the adaptive window state (thread-private
+            // plain data; folded back into `idle_spin` at every exit below).
+            let mut spin = self.idle_spin.get();
             while !latch.probe() {
+                // Adaptive window phase (knob armed): replaces the busy-spin
+                // arm — poll with geometric pause backoff for up to the
+                // current budget, then land on the yield arm. Knob off: the
+                // guard fails and the ladder below runs unchanged.
+                if spin.armed() && idle.in_spin_phase() {
+                    let mut window_job: Option<JobRef> = None;
+                    match spin.spin_poll(|| {
+                        // A set latch ends the wait: stop mid-window, so a
+                        // completed join never lags a full window.
+                        if latch.probe() {
+                            return SpinPoll::Closed;
+                        }
+                        // Stage-1 poll closure: local deque + injector only,
+                        // no steal scan. The gap-idle signal (a new batch
+                        // arriving via `inject_batch`) is fully visible;
+                        // stealable ramp-down subtrees stay with the
+                        // yield-round `find_work` below, delayed by at most
+                        // the window.
+                        match self
+                            .try_pop_local()
+                            .or_else(|| self.registry.pop_injected_job())
+                        {
+                            Some(job) => {
+                                window_job = Some(job);
+                                SpinPoll::Ready(1)
+                            },
+                            None => SpinPoll::Empty,
+                        }
+                    }) {
+                        SpinPoll::Ready(_) => {
+                            self.idle_spin.set(spin);
+                            self.registry.sleep.work_found();
+                            unsafe {
+                                Self::execute(window_job.expect("window poll returned Ready"));
+                            };
+                            continue 'outer;
+                        },
+                        // Latch set mid-window: fall through to the episode
+                        // exit; the probe re-check ends the wait.
+                        SpinPoll::Closed => break,
+                        SpinPoll::Empty => idle.window_exhausted(),
+                    }
+                }
                 if let Some(job) = self.find_work() {
+                    self.idle_spin.set(spin);
                     self.registry.sleep.work_found();
                     unsafe { Self::execute(job) };
                     continue 'outer;
                 }
-                self.registry
+                // `Some(d)` only from rounds that attempted the park protocol
+                // inside `Sleep::sleep`; fold it back into the window.
+                if let Some(parked) = self
+                    .registry
                     .sleep
-                    .no_work_found(&mut idle, latch, || self.has_injected_job());
+                    .no_work_found(&mut idle, latch, || self.has_injected_job())
+                {
+                    if spin.armed() {
+                        spin.note_park(parked);
+                    }
+                }
             }
 
+            self.idle_spin.set(spin);
             self.registry.sleep.work_found();
             break;
         }
@@ -769,6 +832,7 @@ unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usiz
         worker,
         index,
         rng: XorShift64Star::new(),
+        idle_spin: Cell::new(SpinBudget::new(super::sleep::pool_spin_budget_us())),
         registry,
     };
     // Pin the WorkerThread on the stack; its address is stable for the
@@ -831,9 +895,16 @@ impl XorShift64Star {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::mpsc, thread, time::Duration};
+    use std::{
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
 
-    use super::*;
+    use super::{
+        super::sleep::{DEFAULT_POOL_SPIN_BUDGET_US, set_pool_spin_budget_for_tests},
+        *,
+    };
 
     /// Regression test for the spawn-failure hang: `thread_infos` is
     /// pre-created for all workers, so when construction fails at thread k
@@ -878,5 +949,56 @@ mod tests {
                     panic!("Registry::drop hung with {spawned}/{num_threads} workers spawned")
                 });
         }
+    }
+
+    /// Knob-on smoke test: a real small pool with the adaptive window armed
+    /// through the test-only knob override. Burst submissions with µs-spaced
+    /// gaps must stay live (each burst runs the full wake protocol against
+    /// windowing-or-parked workers), termination must join cleanly, and once
+    /// input stops every worker must reach a real park — quiet parks decay
+    /// the budget, so armed workers park rather than spin forever.
+    #[test]
+    fn pool_spin_budget_knob_on_smoke() {
+        set_pool_spin_budget_for_tests(DEFAULT_POOL_SPIN_BUDGET_US);
+
+        let registry = Registry::new(2, false);
+        let ran = AtomicUsize::new(0);
+        for burst in 0..30 {
+            for _ in 0..4 {
+                registry.in_worker(|_, _| {
+                    ran.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            // Alternate a window-sized gap (grows the budget) with a quiet
+            // gap (decays it), exercising both feedback arms.
+            let gap = if burst % 2 == 0 {
+                50
+            } else {
+                2_000
+            };
+            thread::sleep(Duration::from_micros(gap));
+        }
+        assert_eq!(ran.load(Ordering::Relaxed), 120);
+
+        // Input stopped: every worker must reach a real park.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while registry.sleep.sleeping_threads() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "workers never parked after input stopped"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        // Termination joins cleanly.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            drop(registry);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("registry drop (terminate) hung");
+
+        set_pool_spin_budget_for_tests(0);
     }
 }

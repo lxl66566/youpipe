@@ -5,7 +5,10 @@
 //! Atomics/Mutex/Condvar/yield come from `youpipe-sys` so `--cfg loom`
 //! can swap them for simulated ones.
 
-use std::sync::OnceLock;
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 use youpipe_sys::{AtomicUsize, CachePadded, Condvar, Mutex, Ordering, fence, thread_yield};
 
@@ -326,6 +329,83 @@ fn parse_rounds(raw: Option<&str>, default: u32) -> u32 {
     raw.and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+// ── Adaptive idle-spin budget knob (`YOUPIPE_POOL_SPIN_BUDGET`) ──
+
+/// Default max idle-spin window in µs when the knob is `"1"`. The
+/// criterion inter-iteration gap is ~30-100 µs, so the window plus the
+/// retained 32-yield ladder must cover ~100 µs to reach the gap-idle win
+/// class, while 4x of it (the live-park threshold in `note_park`) stays an
+/// order of magnitude below the ms-scale serial phases that make idle
+/// widening harmful. 100 is the A/B hypothesis, not a verdict.
+pub(crate) const DEFAULT_POOL_SPIN_BUDGET_US: u32 = 100;
+
+static POOL_SPIN_BUDGET: OnceLock<u32> = OnceLock::new();
+
+/// Max adaptive pre-park spin window for the pool idle loop, in µs; 0 = off
+/// (the busy-spin ladder runs as-is). Runtime knob so A/B benches compare
+/// the same binary.
+///
+/// Grammar: unset/`"0"` = off; `"1"` = on at [`DEFAULT_POOL_SPIN_BUDGET_US`]
+/// (a boolean stays boolean — `"1"` must never parse as a 1 µs window); a
+/// decimal µs value >= 2 = on at that explicit window; anything else panics
+/// with the grammar (a typo must not silently mis-arm the knob). An empty
+/// value reads as unset (the default is off).
+///
+/// Precedence: an explicit `YOUPIPE_SPIN_ROUNDS` (present at all, even
+/// malformed) pins the busy-spin phase and silently disarms the window —
+/// an operator who pinned the spin phase (especially `=0`, "park fast")
+/// must not get spinning re-introduced by a second knob. The two knobs
+/// cannot compose; documented, silent, no panic.
+pub(crate) fn pool_spin_budget_us() -> u32 {
+    #[cfg(test)]
+    {
+        let override_us = TEST_POOL_SPIN_BUDGET.load(Ordering::Relaxed);
+        if override_us != 0 {
+            return override_us;
+        }
+    }
+    *POOL_SPIN_BUDGET.get_or_init(|| {
+        resolve_pool_spin_budget(
+            std::env::var("YOUPIPE_POOL_SPIN_BUDGET").ok().as_deref(),
+            std::env::var("YOUPIPE_SPIN_ROUNDS").is_ok(),
+        )
+    })
+}
+
+/// Pure resolver (env text in, max window out; 0 = off) so the grammar and
+/// the precedence rule are unit-testable without mutating the process env.
+fn resolve_pool_spin_budget(budget_raw: Option<&str>, spin_rounds_pinned: bool) -> u32 {
+    let max_us = match budget_raw {
+        None => 0,
+        Some(v) if v == "0" || v.is_empty() => 0,
+        Some("1") => DEFAULT_POOL_SPIN_BUDGET_US,
+        Some(other) => match other.parse::<u32>() {
+            Ok(n) if n >= 2 => n,
+            _ => panic!(
+                "YOUPIPE_POOL_SPIN_BUDGET: invalid value {other:?} (leave unset or use \"0\" \
+                 \"1\", or an explicit spin window in µs >= 2)"
+            ),
+        },
+    };
+    // Explicit `YOUPIPE_SPIN_ROUNDS` presence pins the busy-spin phase: the
+    // adaptive window must not reintroduce spinning behind the pin.
+    if max_us != 0 && spin_rounds_pinned {
+        return 0;
+    }
+    max_us
+}
+
+#[cfg(test)]
+static TEST_POOL_SPIN_BUDGET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Test-only override of [`pool_spin_budget_us`] (0 = no override): unit
+/// tests cannot safely mutate the process env (parallel test threads share
+/// it), so the knob-on smoke test arms a real pool through this instead.
+#[cfg(test)]
+pub(crate) fn set_pool_spin_budget_for_tests(us: u32) {
+    TEST_POOL_SPIN_BUDGET.store(us, Ordering::Relaxed);
+}
+
 impl Sleep {
     pub(crate) fn new(n_threads: usize) -> Sleep {
         assert!(n_threads <= THREADS_MAX);
@@ -365,22 +445,25 @@ impl Sleep {
         idle: &mut IdleState,
         latch: &CoreLatch,
         has_injected_jobs: impl FnOnce() -> bool,
-    ) {
+    ) -> Option<Duration> {
         let sleepy = idle.tuning.sleepy_round();
         if idle.rounds < idle.tuning.spin {
             // Busy-spin phase: stay on-core, keep cache warm, no syscall.
             std::hint::spin_loop();
             idle.rounds += 1;
+            None
         } else if idle.rounds < sleepy {
             // Yield phase: cooperate with the OS scheduler but stay runnable.
             thread_yield();
             idle.rounds += 1;
+            None
         } else if idle.rounds == sleepy {
             idle.jobs_counter = self.announce_sleepy();
             idle.rounds += 1;
             thread_yield();
+            None
         } else {
-            self.sleep(idle, latch, has_injected_jobs);
+            self.sleep(idle, latch, has_injected_jobs)
         }
     }
 
@@ -399,11 +482,17 @@ impl Sleep {
         idle: &mut IdleState,
         latch: &CoreLatch,
         has_injected_jobs: impl FnOnce() -> bool,
-    ) {
+    ) -> Option<Duration> {
         let worker_index = idle.worker_index;
+        // Park-attempt duration, entry → return. The abort exits below (JEC
+        // change, injected-job hit) measure ≈0 and count as "work arrived
+        // during the park protocol" — the strongest growth signal for the
+        // caller's `note_park`. The early exits before the park protocol
+        // report `None`.
+        let start = Instant::now();
 
         if !latch.get_sleepy() {
-            return;
+            return None;
         }
 
         let sleep_state = &self.worker_sleep_states[worker_index];
@@ -411,7 +500,7 @@ impl Sleep {
 
         if !latch.fall_asleep() {
             idle.wake_fully();
-            return;
+            return None;
         }
 
         // Pre-publish our sleeping bit *before* the counter commit. A waker
@@ -437,7 +526,7 @@ impl Sleep {
                 self.sleeping_mask.clear(worker_index);
                 idle.wake_partly();
                 latch.wake_up();
-                return;
+                return Some(start.elapsed());
             }
 
             if self.counters.try_add_sleeping_thread(counters) {
@@ -463,6 +552,7 @@ impl Sleep {
 
         idle.wake_fully();
         latch.wake_up();
+        Some(start.elapsed())
     }
 
     /// Notify a specific worker that its latch has been set.
@@ -555,6 +645,13 @@ impl Sleep {
         }
         woken
     }
+
+    /// Test-only: current parked-worker count (smoke tests assert that an
+    /// armed budget still decays to real parks once input stops).
+    #[cfg(test)]
+    pub(crate) fn sleeping_threads(&self) -> usize {
+        self.counters.load(Ordering::SeqCst).sleeping_threads()
+    }
 }
 
 impl IdleState {
@@ -566,6 +663,19 @@ impl IdleState {
     fn wake_partly(&mut self) {
         self.rounds = self.tuning.sleepy_round();
         self.jobs_counter = JobsEventCounter::DUMMY;
+    }
+
+    /// Whether the busy-spin phase still covers this round — the adaptive
+    /// window (knob armed) replaces exactly these rounds of the episode.
+    pub(super) fn in_spin_phase(&self) -> bool {
+        self.rounds < self.tuning.spin
+    }
+
+    /// The adaptive spin window exhausted itself without work: land on the
+    /// yield arm so the unchanged announce/mask/park ladder resumes (the
+    /// window replaces only the busy-spin phase).
+    pub(super) fn window_exhausted(&mut self) {
+        self.rounds = self.tuning.spin;
     }
 }
 
@@ -591,6 +701,58 @@ mod tests {
         assert_eq!(IdleTuning::fixed(32, 32).sleepy_round(), 64);
         assert_eq!(IdleTuning::fixed(0, 8).sleepy_round(), 8);
         assert_eq!(IdleTuning::fixed(4, 0).sleepy_round(), 4);
+    }
+
+    /// Knob grammar: unset/"0"/"" = off, "1" = the default window (never
+    /// 1 µs), an explicit decimal µs >= 2 = that window.
+    #[test]
+    fn pool_spin_budget_grammar() {
+        assert_eq!(resolve_pool_spin_budget(None, false), 0);
+        assert_eq!(resolve_pool_spin_budget(Some("0"), false), 0);
+        assert_eq!(resolve_pool_spin_budget(Some(""), false), 0);
+        assert_eq!(
+            resolve_pool_spin_budget(Some("1"), false),
+            DEFAULT_POOL_SPIN_BUDGET_US
+        );
+        assert_eq!(resolve_pool_spin_budget(Some("2"), false), 2);
+        assert_eq!(resolve_pool_spin_budget(Some("300"), false), 300);
+    }
+
+    /// A malformed knob value fails loudly with the valid grammar.
+    #[test]
+    #[should_panic(expected = "YOUPIPE_POOL_SPIN_BUDGET: invalid value")]
+    fn pool_spin_budget_malformed_panics() {
+        resolve_pool_spin_budget(Some("x"), false);
+    }
+
+    /// An explicitly pinned `YOUPIPE_SPIN_ROUNDS` (present at all, even
+    /// malformed) silently disarms the adaptive window; off stays off.
+    #[test]
+    fn pool_spin_budget_disarmed_by_pinned_spin_rounds() {
+        assert_eq!(resolve_pool_spin_budget(Some("1"), true), 0);
+        assert_eq!(resolve_pool_spin_budget(Some("500"), true), 0);
+        assert_eq!(resolve_pool_spin_budget(Some("0"), true), 0);
+        assert_eq!(resolve_pool_spin_budget(None, true), 0);
+    }
+
+    /// The window's `Empty` verdict lands the idle episode on the yield arm,
+    /// and `wake_partly`'s JEC-abort round overshoots the window guard, so
+    /// a re-entering sleepy worker never re-runs the window; `wake_fully`
+    /// re-arms it for the next episode.
+    #[test]
+    fn window_exhaustion_lands_on_yield_arm() {
+        let mut idle = IdleState {
+            worker_index: 0,
+            rounds: 0,
+            tuning: IdleTuning::fixed(32, 32),
+            jobs_counter: JobsEventCounter::DUMMY,
+        };
+        idle.window_exhausted();
+        assert_eq!(idle.rounds, idle.tuning.spin);
+        idle.wake_partly();
+        assert!(idle.rounds >= idle.tuning.spin);
+        idle.wake_fully();
+        assert!(idle.rounds < idle.tuning.spin);
     }
 }
 

@@ -367,3 +367,22 @@ Shape scans in the slow state (5 pairs each): `8x2` (2 transitions/worker, 4032-
 Verdict: falsified, reverted. The occupancy residual is collectable only as a knife's-edge combination — fine quantum ≈ 25 µs, ~4 tail transitions per worker, and a fast-state park/wake path — so no static shape is stable across machine states, and gating the shape on measured state is the twice-falsified cost-EMA family. The per-transition overhead is real and steep on small quanta (100-item fine chunks cost +17 % @100K). What stands from todo #3 remains the landed pair: NT-store auto and opt-in pinning; the default-path residual (≈1.5 pt @2M) is accepted.
 
 Two methodology notes: (1) the horizontal runner's `--scenarios` filter is substring match — `cpu_balanced` also selects `cpu_balanced_readback`, so a reduce keyed only on `(n, lib)` silently reports the readback rows (the first pass of round 1 did exactly that and inverted the size profile; key on scenario). (2) Same-binary knob A/Bs on this family must record the off-side absolute: a youpipe-specific +39 % state drift with the rayon control flat is what unmasked the state gating here — deltas alone would have read "round 1 win, round 3 noise" with no cause.
+
+## Pool spin-budget port A/B (2026-11-06, todo #35): left opt-in
+
+`YOUPIPE_POOL_SPIN_BUDGET` (the adaptive pre-park spin window ported onto the pool idle loop; mechanism and verdict in [scheduler.md](../scheduler.md) "Adaptive pre-park spin window") ran its promotion gate grid on the NT caliber: same binary (d383a6d), two processes per pair distinguished only by the env knob, 6 alternating pairs per (window, n), `--rounds 2`, `taskset -c 1-31`, per-pair pairing, the rayon and std-threads columns as drift controls (both flat within ±1 % throughout; off-side absolutes match the recorded NT-era values — fast machine state).
+
+| shape @n | off (ms) | Δ @25 µs | Δ @50 µs | Δ @100 µs | dom (25/50/100) |
+| --- | --- | --- | --- | --- | --- |
+| cpu_balanced @100K | 0.051 | +9.6 % | +10.7 % | +18.3 % | 0/6 · 0/6 · 0/6 |
+| cpu_balanced @1M | 0.40 | +5.6 % | +11.1 % | +6.8 % | 2/6 · 0/6 · 0/6 |
+| cpu_balanced @2M | 0.80 | +1.6 % | +5.4 % | +9.4 % | 0/6 · 0/6 · 0/6 |
+| cpu_balanced @4M | 1.56 | +0.4 % | +2.1 % | +5.5 % | 2/6 · 0/6 · 0/6 |
+| cpu_balanced_readback @100K | 0.078 | +3.7 % | +2.2 % | +4.8 % | 0/6 · 2/6 · 0/6 |
+| cpu_balanced_readback @1M | 0.57 | −0.9 % | +4.5 % | +11.6 % | 4/6 · 0/6 · 0/6 |
+| cpu_balanced_readback @2M | 1.11 | −0.1 % | +0.1 % | +5.1 % | 4/6 · 3/6 · 0/6 |
+| cpu_balanced_readback @4M | 2.24 | +0.2 % | −0.5 % | +0.5 % | 2/6 · 4/6 · 3/6 |
+
+Δ = median of per-pair deltas (on − off)/off; dom = pairs where the on side is faster. Readings: the regression is window-monotone on the batch cadence — no window in {25, 50, 100} µs wins any size, and 25 µs already regresses @100K/+9.6 % and @1M/+5.6 %, so the direction cannot be rescued by shrinking the window further. The readback trap closes only at 25 µs (flat-or-noise @1M–4M) and reopens with the window (+11.6 % @1M at 100 µs): the park-latency decay works exactly as designed, but the benefit side — covering the inter-batch gap without parking — does not collect the causal 2048/2048 win, which came from never parking through an ms-scale batch sequence, out of reach of a ≤100 µs window. The only winners are the criterion tight-loop µs-batch cells (`sync_cpu_heavy`/`sync_for_each`/`mixed_load` @1K, −18…−22 %, 25/25 dominant; the same ids regress at 100K) — the sub-100 µs-gap class. Verdict per the design's pattern: leave opt-in, default off.
+
+Raw JSON under `target/horizontal/g-bench35/` (not committed).
