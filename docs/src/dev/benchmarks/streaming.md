@@ -217,7 +217,7 @@ Readings:
 
 ## Stream worker tx batching (`YOUPIPE_STREAM_TX_BATCH`, 2026-10-22)
 
-The same lever as graph data-plane batching, ported to the streaming engine's stage/expand workers: the mapped claim batch is staged and flushed with one `try_send_batch` per free run plus a per-item blocking fallback (`SendItem::send_batch`), instead of one blocking `send` per item. The MPSC ring gained a native fork extension for it (one `sender` CAS per free run; without it the terminal/shard rings rode the per-item fallback and only the mid-MPMC hops benefited, and the workers2 rows moved from noise to −16.5 % the moment it landed). Chains containing an async stage keep the per-item sends on every hop (the gate measured below).
+The same lever as graph data-plane batching, ported to the streaming engine's stage/expand workers: the mapped claim batch is staged and flushed with one `try_send_batch` per free run plus a per-item blocking fallback (`SendItem::send_batch`), instead of one blocking `send` per item. The MPSC ring gained a native fork extension for it (one `sender` CAS per free run; without it the terminal/shard rings rode the per-item fallback and only the mid-MPMC hops benefited, and the workers2 rows moved from noise to −16.5 % the moment it landed). Chains containing an async stage were gated to per-item sends on every hop at landing (the gate measured below); since 2026-11-06 the gate is per hop — see "Async-chain ring contention levers" below.
 
 Same-binary knob A/B (`bench_ab.sh -E`, isolated per-id, 5 interleaved rounds, 32 cores; fused-path `merged` rows and `mixed_load` stream ids are controls):
 
@@ -258,6 +258,45 @@ Same-binary knob A/B (`bench_ab.sh -E off=YOUPIPE_FWD_BATCH=0 on=YOUPIPE_FWD_BAT
 | sync_fuse/fence_pair_{cpu,cheap}_split @100K | 7.857/7.731 ms | 7.254/7.253 ms | −7.7/−6.2 % | 25/25 / 24/25 |
 
 On-side spreads collapse to 0.8–4.2 % (off side 5–119 %) — the bistability the fence family carried at every size. The @1K rows are the quiet headline: the floor clamps to `min(n, 65536)` = n slots there, so small chains lived in the trickle regime the floor could not lift, and the batch arm removes it wholesale (890 → 145 µs). Paired fresh-process soaks (convoy-probe, 8–10 pairs × 12 runs): fence @200K off med 34.2 / max 215.1 / 12 runs >60 ms vs on med 21.7 / **max 31.7** / 0 runs >60 ms — the on side's maximum sits below the off side's median; @100K medians tie at ~12.4 with the off max 70 vs on max 16.7. Barrier mode benefits through the same arm (final-flush free-run claims; spot 45.0 → 31.7 ms mean @200K). The knob's only consumer is `forward_fenced`, so no-fence chains are structurally untouched. Default on; `"0"` recovers the per-item loop.
+
+## Async-chain ring contention levers (todo #34, 2026-11-06)
+
+The todo #34 shape — `stream(v).stage(cheap).stage_async(io)`, ~30 pool workers moving 2000 trivial items through two rings — was re-measured with two levers behind same-binary runtime knobs (`bench_ab.sh -E`, per-id isolated, 5 interleaved rounds, 32 cores): a backlog-scaled claim window (`YOUPIPE_CLAIM_SCALE`: the per-worker claim bound doubles while claims come back full, collapses to the fairness share on partial/park — refresh-based, the fork's ring `len()` is a SeqCst loop over the producer tail line) and a per-hop lift of the async-tail tx-batch gate (`YOUPIPE_ASYNC_TX_BATCH`).
+
+Round 1 — the four corners (base = both off; `claim` = window; `txba` = gate fully lifted; `both`), deltas vs base:
+
+| id | claim | txba (full lift) | both |
+| --- | --- | --- | --- |
+| sync_fuse/async_pair_cpu_merged/1K | **−16.4 %** (25/25) | −15.9 % (25/25) | **−31.6 %** (25/25) |
+| sync_fuse/async_pair_cpu_split/1K | −2.8 % (23/25) | **−17.1 %** (25/25) | −10.6 % (25/25) |
+| sync_fuse/async_pair_cpu_split/100K | +3.3 % (7/25, noise) | **+17.4 %** (0/25) | +7.7 % (0/25) |
+| sync_fuse/async_pair_cpu_merged/100K | +0.1 % | +1.0 % | −1.3 % (24/25) |
+| sharded_term_async/async1_cpu/1K | −3.1 % (25/25) | −4.8 % (25/25) | −6.1 % (25/25) |
+| sharded_term_async/async1_cpu/100K | −2.0 % (21/25) | **−19.3 %** (25/25) | −15.6 % (25/25) |
+| stream_pipeline/with_fence/1000 | **−15.8 %** (25/25) | −0.6 % | −16.4 % (25/25) |
+| stream_pipeline/with_fence/100000 | **+60.0 %** (0/25) | +0.1 % | +60.7 % (0/25) |
+| mixed_load + fused stream_pipeline controls | noise | noise | noise |
+
+Two disqualifiers fell out. The universal claim window regresses the fence family @100K (+60 %, 0/25 — while @1K it wins −15.8 %, size-contradicted; a pure-sync stage drains the ring as fast as it claims, and 64-item claims coarsen the fence's chunk release/park rhythm), so the window is scoped to async-tailed chains (the capacity floor's predicate — pure-sync controls become structurally knob-inert). The fully lifted tx gate regresses `async_pair_cpu_split/100K` +17.4 % (0/25) — the old per-slot-task falsification's shape, now worse — while the mixed hop alone (the `merged`/`async1` rows, whose only hop is mixed) wins. The gate therefore became per-hop (`OutChannel::FEEDS_ASYNC`): default batches exactly the hop into the async stage.
+
+Round 2 — the landed defaults (base = `CLAIM_SCALE=0`+gate off ≡ pre-change; `final` = claim window (scoped) + mixed-hop batching; `mixonly` = mixed-hop batching alone):
+
+| id | final | mixonly |
+| --- | --- | --- |
+| sync_fuse/async_pair_cpu_merged/1K | **−33.2 %** (25/25) | −7.9 % (24/25) |
+| sync_fuse/async_pair_cpu_merged/100K | −0.2 % | −1.2 % |
+| sync_fuse/async_pair_cpu_split/1K | +0.5 % (14/25) | **+6.4 %** (6/25) |
+| sync_fuse/async_pair_cpu_split/100K | −1.5 % (14/25) | −2.0 % (13/25) |
+| sharded_term_async/async1_cpu/1K | **−9.5 %** (25/25) | −4.2 % (16/25) |
+| sharded_term_async/async1_cpu/100K | **−15.3 %** (25/25) | **−24.6 %** (25/25) |
+| stream_pipeline/with_fence/1000, /100000 | +1.5 % / −0.6 % (noise) | −3.0 % / +1.1 % (noise) |
+| stream_pipeline fused rows | noise | noise |
+
+The interaction is the load-bearing finding: mixed-hop batching ALONE loses `split/1K` (+6.4 %, 6/25 — the share-2 claim produces 2-item staged sends, and the staging overhead is not amortized) but is rescued by the claim window (final reads +0.5 % noise there), while on `merged/1K` the two stack (−7.9 % → −33.2 %). The landed default is the pair — claim window (async chains) + `MixedOnly` tx gate — under which every gated row is a dominant win or noise and the pure-sync controls are structurally untouched. The `async1_cpu` @100K wins (−15…−25 %) additionally reclaim most of the M:N drivers' documented instant-future cost on that family (+2.8…+3.7 %). The one red herring: `mixed_load/youpipe_stream_cpu/100000` (fused pass-through, no channels — the knobs' code never executes on that path, and the A/B is same-binary env-only, so a side difference there is environmental by construction) read +15.5 % in round 2's medians with 21–28 % round spreads and sign-flipped vs round 1 (−2.4 % on the same side) — the documented fused-row wobble class; the 2026-10-20 promotion met the identical +14.6 %/19 %-spread pattern on this id and classified it the same way. A dedicated 10-round re-pair on that id (rounds 6–10 appended to the same outdir) closed it: **+0.7 % (40/100 cross-round wins), noise** — the 5-round medians had sampled the wobble.
+
+The primary horizontal cells (`mixed_cpu_io` 500/2000, 6 alternating process pairs × 2 internal rounds, `taskset -c 1-31`) are noise for every side (medians ±0.2 %, per-pair deltas −0.9…+2.1 %): the ~10 ms wall is owned by the 1 ms/8 ms IO tail sleeps, and the µs-scale sync-span compression the levers deliver sits under the noise floor of that shape — the todo #34 span is a profiling-visible, wall-invisible cost at these sizes.
+
+Decision: `YOUPIPE_CLAIM_SCALE` default on (async-tailed chains, stream engine), `YOUPIPE_ASYNC_TX_BATCH` default `MixedOnly` (`"0"` = the historical full gate, `"1"` = the falsified full lift). Falsified variants in [dead-ends.md](../dead-ends.md).
 
 ## Stream-side per-run assembly attribution (2026-11-05, todo #33)
 

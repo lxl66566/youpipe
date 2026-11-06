@@ -38,6 +38,65 @@ pub(crate) fn per_worker_claim_cap(workers: usize) -> usize {
     }
 }
 
+/// Backlog-scaled claim window for a multi-consumer claim site (todo #34,
+/// `YOUPIPE_CLAIM_SCALE`): the claim bound starts at the per-worker
+/// fairness share and doubles while claims keep coming back FULL (the
+/// ring's ready backlog covered the whole window — a deeper claim would
+/// have found more, so grow it and amortize the head CAS), collapsing to
+/// the share on the first partial claim or park wake (the backlog was
+/// shallower than the window, so whatever arrives next belongs to the
+/// parked peers — the contract `per_worker_claim_cap` exists for; the
+/// anchor's blocking wake returns exactly 1 item and collapses through
+/// the same rule). Refresh-based on purpose: the fork's ring `len()` is a
+/// SeqCst loop over the producer-side tail line, which re-shares the
+/// hottest cache line exactly when claiming is contended; the claim's own
+/// return value is a free backlog probe. Constructed with
+/// `share == cap` (knob off, sole consumer, or single worker) the window
+/// is inert — `note` can never move it.
+#[derive(Debug)]
+pub(crate) struct ClaimWindow {
+    /// The fairness share (`per_worker_claim_cap`); the collapse floor.
+    share: usize,
+    /// The largest window (the scratch buffer's capacity).
+    cap: usize,
+    /// The claim bound for the current poll.
+    window: usize,
+}
+
+impl ClaimWindow {
+    pub(crate) fn new(share: usize, cap: usize) -> Self {
+        let share = share.min(cap);
+        Self {
+            share,
+            cap,
+            window: share,
+        }
+    }
+
+    /// The claim bound for the current poll (`claim_poll`'s `batch_cap`).
+    #[inline]
+    pub(crate) fn current(&self) -> usize {
+        self.window
+    }
+
+    /// Fold one claim result into the window. `n == 0` (EOF) is inert;
+    /// a full claim (`n == window`) doubles the window up to `cap`;
+    /// a partial claim collapses to the share.
+    #[inline]
+    pub(crate) fn note(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        // `min`, not `clamp(1, ..)`: a zero cap (batch knob off, share 0)
+        // must stay zero, and `clamp` with min > max panics.
+        self.window = if n >= self.window {
+            self.window.saturating_mul(2).min(self.cap)
+        } else {
+            self.share
+        };
+    }
+}
+
 /// Where the tx-batch arm of the worker loops observes the cancellation
 /// token — an engine policy (the per-item arm always checks per item):
 /// - `PerItem` (stream engine): before every map call, so the tx-batch knob never changes which
@@ -519,7 +578,7 @@ impl SpinBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handoff::channel::{SyncReceiver, channel, claim_poll};
+    use crate::handoff::channel::{Claim, SyncReceiver, channel, claim_poll};
 
     fn drain_n<T: Send + 'static>(rx: &SyncReceiver<T>, n: usize) -> Vec<T> {
         (0..n).map(|_| rx.recv().expect("item buffered")).collect()
@@ -715,6 +774,64 @@ mod tests {
         drop(tx);
         s.budget_us = 100;
         assert_eq!(s.spin_poll(|| poll(&mut scratch)), SpinPoll::Closed);
+    }
+
+    /// `ClaimWindow` ramp/collapse: full claims double the window up to the
+    /// cap, a partial claim collapses to the share, EOF (`note(0)`) is
+    /// inert, and a park wake's 1-item claim collapses anything above the
+    /// share (the anchor's blocking wake returns exactly 1 item).
+    #[test]
+    fn claim_window_ramp_and_collapse() {
+        let mut w = ClaimWindow::new(2, 64);
+        assert_eq!(w.current(), 2);
+        for expected in [4, 8, 16, 32, 64, 64] {
+            w.note(w.current()); // full claim
+            assert_eq!(w.current(), expected);
+        }
+        w.note(0); // EOF: inert
+        assert_eq!(w.current(), 64);
+        w.note(1); // park wake / shallow backlog
+        assert_eq!(w.current(), 2);
+    }
+
+    /// `share == cap` (single worker, sole consumer, or the knob off) is
+    /// inert: the window can never move, full or partial.
+    #[test]
+    fn claim_window_inert_when_share_is_cap() {
+        let mut w = ClaimWindow::new(64, 64);
+        w.note(64);
+        assert_eq!(w.current(), 64);
+        w.note(1);
+        assert_eq!(w.current(), 64);
+    }
+
+    /// Zero cap (batch knob off → share 0): the window stays zero — the
+    /// per-item claim arm (`claim_poll`'s `batch_cap == 0`) — for any
+    /// claim result.
+    #[test]
+    fn claim_window_zero_cap_stays_zero() {
+        let mut w = ClaimWindow::new(0, 0);
+        assert_eq!(w.current(), 0);
+        w.note(5);
+        w.note(0);
+        assert_eq!(w.current(), 0);
+    }
+
+    /// `claim_poll`'s `batch_cap` bound is authoritative below the scratch
+    /// buffer's capacity (the `ClaimWindow` call shape): a 16-slot ring
+    /// with a deeper backlog yields exactly the bound, then the remainder.
+    #[test]
+    fn claim_poll_bound_below_scratch_capacity() {
+        let (tx, rx) = channel::<u32>(16);
+        for v in 0..8 {
+            tx.send(v).unwrap();
+        }
+        let mut scratch: Vec<u32> = Vec::with_capacity(16);
+        assert_eq!(claim_poll(&rx, &mut scratch, 3), Claim::Ready(3));
+        assert_eq!(scratch, vec![0, 1, 2]);
+        scratch.clear();
+        assert_eq!(claim_poll(&rx, &mut scratch, 64), Claim::Ready(5));
+        assert_eq!(scratch, vec![3, 4, 5, 6, 7]);
     }
 
     /// The expand driver's batched arm flushes at `flush_cap` and delivers

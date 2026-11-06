@@ -552,7 +552,13 @@ where
     // one item; the batch claim writes at offset 0 via the spare capacity.
     debug_assert!(scratch.is_empty());
     if batch_cap > 0 {
-        let n = rx.try_recv_batch(scratch.spare_capacity_mut());
+        // `batch_cap` is the authoritative claim bound (the backlog-scaled
+        // window of `ClaimWindow`, todo #34), capped by the scratch buffer's
+        // actual spare capacity — every pre-existing call site passes a cap
+        // equal to that capacity, so this is byte-for-byte their behavior.
+        let spare = scratch.spare_capacity_mut();
+        let bound = batch_cap.min(spare.len());
+        let n = rx.try_recv_batch(&mut spare[..bound]);
         if n > 0 {
             // SAFETY: try_recv_batch initialized exactly scratch[..n].
             unsafe { scratch.set_len(n) };

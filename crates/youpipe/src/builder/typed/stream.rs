@@ -38,7 +38,7 @@ use crate::{
     },
     executor::compute::ComputePool,
     handoff::{
-        CancelCheck, Claim, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem,
+        CancelCheck, Claim, ClaimWindow, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem,
         ShardedReceiver, SpinBudget, SpinPoll, SyncSender, cancel_active, channel::channel,
         claim_expand_deliver, claim_map_deliver, claim_poll, forward_sync, mpsc_channel,
         per_worker_claim_cap, sharded::MIN_SHARD_BUFFER, sharded_mpsc_channel,
@@ -547,6 +547,7 @@ fn spawn_stage_fanout<I, O, Tx, R>(
     rx: Receiver<(u64, I)>,
     txs: Vec<Tx>,
     stage: impl Fn(I) -> O + Send + Sync + 'static,
+    feeds_async: bool,
 ) where
     I: Send + Unpin + 'static,
     O: Send + Unpin + 'static,
@@ -558,17 +559,35 @@ fn spawn_stage_fanout<I, O, Tx, R>(
     // capped at a per-worker share of the batch cap
     // (`per_worker_claim_cap`).
     let claim_cap = per_worker_claim_cap(txs.len().max(1));
+    // Backlog-scaled claim window (YOUPIPE_CLAIM_SCALE, todo #34): with the
+    // knob on the scratch buffer is sized at the full batch cap and each
+    // worker's claim bound adapts (see `ClaimWindow`); off, the fixed
+    // per-worker share — byte-for-byte the pre-knob loops. Async-tailed
+    // chains only: pure-sync chains regressed under the coarser claim
+    // rhythm (`stream_pipeline/with_fence/100K` +60 %), and their stages
+    // drain the ring as fast as they claim — no backlog to amortize (the
+    // capacity floor's predicate, `ctx.has_async_stage`).
+    let scratch_cap =
+        if crate::handoff::claim_scale_enabled() && ctx.has_async_stage && claim_cap > 0 {
+            crate::handoff::batch_recv_cap()
+        } else {
+            claim_cap
+        };
     // Batched output delivery (YOUPIPE_STREAM_TX_BATCH): stage the mapped
     // claim batch, flush with one `try_send_batch` per free run + per-item
     // blocking fallback. Zero-cap claims keep the per-item send (staging
-    // single-item batches only adds moves). Async-tailed chains keep the
-    // per-item rhythm everywhere: on `stage().stage().stage_async()` the
-    // batched delivery measured +2.2…+4.9 % on BOTH hops (sync_fuse
-    // async_pair_cpu_split A/B; convoy-probe async2 median +3-7 %, no slow
-    // mode) — the async terminal's task pacing does not benefit from
-    // send-side runs the way sync consumer loops do (`ctx.has_async_stage`
-    // is known before spawning, same predicate as the capacity floor).
-    let tx_batch = crate::handoff::stream_tx_batch() && claim_cap > 0 && !ctx.has_async_stage;
+    // single-item batches only adds moves). Async-tailed chains are gated
+    // per hop by `YOUPIPE_ASYNC_TX_BATCH` (todo #34 re-measure against the
+    // M:N drivers): the mixed hop into the async stage wins batched, the
+    // sync→sync mid hops keep the per-item rhythm (`feeds_async` is the
+    // spawning factory's `OutChannel::FEEDS_ASYNC`).
+    let tx_batch = crate::handoff::stream_tx_batch()
+        && claim_cap > 0
+        && match crate::handoff::async_tx_gate() {
+            crate::handoff::AsyncTxGate::Full => true,
+            crate::handoff::AsyncTxGate::MixedOnly => feeds_async || !ctx.has_async_stage,
+            crate::handoff::AsyncTxGate::Off => !ctx.has_async_stage,
+        };
     // Collect all worker closures and submit as a single batch. This reduces
     // injector-queue notification overhead from N SeqCst fences + N JEC
     // increments (one per `submit`) down to 1 (one `submit_batch`), which
@@ -594,15 +613,18 @@ fn spawn_stage_fanout<I, O, Tx, R>(
                 // (`CancelCheck::PerItem`: the tx-batch knob must not change
                 // which items are accepted).
                 let mut spin = SpinBudget::new(crate::handoff::spin_anchor_us());
+                let mut win = ClaimWindow::new(claim_cap, scratch_cap);
                 claim_map_deliver(
                     &mut |scratch: &mut Vec<(u64, I)>| {
-                        anchor_claim(&mut spin, &rx, scratch, claim_cap)
+                        let n = anchor_claim(&mut spin, &rx, scratch, win.current());
+                        win.note(n);
+                        n
                     },
                     |(seq, item): (u64, I)| (seq, stage(item)),
                     &mut tx,
                     worker_cancel.as_ref(),
                     tx_batch,
-                    claim_cap,
+                    scratch_cap,
                     CancelCheck::PerItem,
                 );
             }
@@ -632,6 +654,7 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
     rx: Receiver<(u64, I)>,
     txs: Vec<Tx>,
     expand: impl Fn(I, &mut Vec<N>) + Send + Sync + 'static,
+    feeds_async: bool,
 ) where
     I: Send + Unpin + 'static,
     N: Send + Unpin + 'static,
@@ -643,11 +666,23 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
     // turns one input into many outputs, so a monopolized burst costs even
     // more wall time than on a plain stage).
     let claim_cap = per_worker_claim_cap(txs.len().max(1));
-    // Batched output delivery (see `spawn_stage_fanout` for the knob and
-    // the async-tail gate). The staging flush cap sits at the batch cap so
-    // an expansion fan-out cannot grow the staging buffer with a whole
-    // claim batch's outputs.
-    let tx_batch = crate::handoff::stream_tx_batch() && claim_cap > 0 && !ctx.has_async_stage;
+    // Backlog-scaled claim window and the async-tail tx-batch gate — see
+    // `spawn_stage_fanout` (same knobs, same predicates). The staging
+    // flush cap sits at the batch cap so an expansion fan-out cannot grow
+    // the staging buffer with a whole claim batch's outputs.
+    let scratch_cap =
+        if crate::handoff::claim_scale_enabled() && ctx.has_async_stage && claim_cap > 0 {
+            crate::handoff::batch_recv_cap()
+        } else {
+            claim_cap
+        };
+    let tx_batch = crate::handoff::stream_tx_batch()
+        && claim_cap > 0
+        && match crate::handoff::async_tx_gate() {
+            crate::handoff::AsyncTxGate::Full => true,
+            crate::handoff::AsyncTxGate::MixedOnly => feeds_async || !ctx.has_async_stage,
+            crate::handoff::AsyncTxGate::Off => !ctx.has_async_stage,
+        };
     let flush_cap = crate::handoff::batch_recv_cap().max(claim_cap).max(1);
     let jobs: Vec<_> = txs
         .into_iter()
@@ -666,6 +701,7 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
                 // mid-group drops the unforwarded outputs (the worker is on
                 // its abort path anyway).
                 let mut spin = SpinBudget::new(crate::handoff::spin_anchor_us());
+                let mut win = ClaimWindow::new(claim_cap, scratch_cap);
                 let mut raw: Vec<N> = Vec::new();
                 let tag_outputs = move |(seq, item): (u64, I), out: &mut Vec<(u64, N)>| {
                     raw.clear();
@@ -674,13 +710,15 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
                 };
                 claim_expand_deliver(
                     &mut |scratch: &mut Vec<(u64, I)>| {
-                        anchor_claim(&mut spin, &rx, scratch, claim_cap)
+                        let n = anchor_claim(&mut spin, &rx, scratch, win.current());
+                        win.note(n);
+                        n
                     },
                     tag_outputs,
                     &mut tx,
                     worker_cancel.as_ref(),
                     tx_batch,
-                    claim_cap,
+                    scratch_cap,
                     flush_cap,
                     CancelCheck::PerItem,
                 );
@@ -1661,6 +1699,11 @@ fn finalize_prev_rx<T: Send + Unpin + 'static, R: AsyncRuntime>(
 /// sharded floor lift) are noted inside `make`, next to the construction
 /// that causes them.
 trait OutChannel<M: Send + Unpin + 'static> {
+    /// Whether this channel's consumers are async (the `Mixed` handoff into
+    /// an async stage) — the per-hop input of `YOUPIPE_ASYNC_TX_BATCH`'s
+    /// default (todo #34: batched delivery wins on the mixed hop, loses on
+    /// the sync→sync hops of async chains).
+    const FEEDS_ASYNC: bool;
     /// Sender type; the spawn cores feed one entry of the `make`d sender set
     /// to each worker.
     type Tx: SendItem<(u64, M)>;
@@ -1693,6 +1736,8 @@ impl<M: Send + Unpin + 'static> OutChannel<M> for Mpmc {
     type Rx = Receiver<(u64, M)>;
     type Tx = SyncSender<(u64, M)>;
 
+    const FEEDS_ASYNC: bool = false;
+
     fn make<R: AsyncRuntime>(
         _ctx: &StreamCtx<'_, R>,
         buffer: usize,
@@ -1717,6 +1762,8 @@ impl<M: Send + Unpin + 'static> OutChannel<M> for Mpsc {
     type Out = FinalRx<M>;
     type Rx = MpscReceiver<(u64, M)>;
     type Tx = MpscSender<(u64, M)>;
+
+    const FEEDS_ASYNC: bool = false;
 
     fn make<R: AsyncRuntime>(
         _ctx: &StreamCtx<'_, R>,
@@ -1746,6 +1793,8 @@ impl<M: Send + Unpin + 'static> OutChannel<M> for Mixed {
     type Rx = AsyncReceiver<(u64, M)>;
     type Tx = SyncSender<(u64, M)>;
 
+    const FEEDS_ASYNC: bool = true;
+
     fn make<R: AsyncRuntime>(
         _ctx: &StreamCtx<'_, R>,
         buffer: usize,
@@ -1771,6 +1820,8 @@ impl<M: Send + Unpin + 'static> OutChannel<M> for ShardedMpsc {
     type Out = FinalRx<M>;
     type Rx = ShardedReceiver<(u64, M)>;
     type Tx = MpscSender<(u64, M)>;
+
+    const FEEDS_ASYNC: bool = false;
 
     fn make<R: AsyncRuntime>(
         ctx: &StreamCtx<'_, R>,
@@ -2512,7 +2563,7 @@ where
 {
     let buffer = ctx.stage_buffer::<(u64, M)>(opts.buffer, parallelism);
     let (txs, out_rx) = Ch::make(ctx, buffer, parallelism);
-    spawn_stage_fanout(ctx, mid_rx, txs, f);
+    spawn_stage_fanout(ctx, mid_rx, txs, f, Ch::FEEDS_ASYNC);
     Ch::wrap(out_rx)
 }
 
@@ -2649,7 +2700,7 @@ where
 {
     let buffer = ctx.stage_buffer::<(u64, N)>(opts.buffer, parallelism);
     let (txs, out_rx) = Ch::make(ctx, buffer, parallelism);
-    spawn_expand_stage_fanout(ctx, mid_rx, txs, f);
+    spawn_expand_stage_fanout(ctx, mid_rx, txs, f, Ch::FEEDS_ASYNC);
     Ch::wrap(out_rx)
 }
 
@@ -2713,11 +2764,17 @@ where
 {
     let buffer = ctx.stage_buffer::<(u64, Vec<N>)>(opts.buffer, parallelism);
     let (txs, out_rx) = Ch::make(ctx, buffer, parallelism);
-    spawn_stage_fanout(ctx, mid_rx, txs, move |item: A| {
-        let mut group = Vec::new();
-        f(item, &mut group);
-        group
-    });
+    spawn_stage_fanout(
+        ctx,
+        mid_rx,
+        txs,
+        move |item: A| {
+            let mut group = Vec::new();
+            f(item, &mut group);
+            group
+        },
+        Ch::FEEDS_ASYNC,
+    );
     Ch::wrap(out_rx)
 }
 
@@ -2761,9 +2818,13 @@ where
 {
     let buffer = ctx.stage_buffer::<(u64, Vec<B>)>(opts.buffer, parallelism);
     let (txs, out_rx) = Ch::make(ctx, buffer, parallelism);
-    spawn_stage_fanout(ctx, mid_rx, txs, move |group: Vec<A>| {
-        group.into_iter().map(&f).collect()
-    });
+    spawn_stage_fanout(
+        ctx,
+        mid_rx,
+        txs,
+        move |group: Vec<A>| group.into_iter().map(&f).collect(),
+        Ch::FEEDS_ASYNC,
+    );
     Ch::wrap(out_rx)
 }
 
@@ -2809,13 +2870,19 @@ where
 {
     let buffer = ctx.stage_buffer::<(u64, Vec<N>)>(opts.buffer, parallelism);
     let (txs, out_rx) = Ch::make(ctx, buffer, parallelism);
-    spawn_stage_fanout(ctx, mid_rx, txs, move |group: Vec<A>| {
-        let mut out = Vec::new();
-        for a in group {
-            f(a, &mut out);
-        }
-        out
-    });
+    spawn_stage_fanout(
+        ctx,
+        mid_rx,
+        txs,
+        move |group: Vec<A>| {
+            let mut out = Vec::new();
+            for a in group {
+                f(a, &mut out);
+            }
+            out
+        },
+        Ch::FEEDS_ASYNC,
+    );
     Ch::wrap(out_rx)
 }
 

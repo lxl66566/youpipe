@@ -20,8 +20,3 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 - Standing: run `perf/verify/hang-stakeout.sh` (forensics-before-kill) on the next sighting before touching the process.
 
 
-### 34. [P1] sync stage ring contention under trivial per-item work (async-fed chains)
-
-- Context (2026-11-06, found while landing the async stage drivers, [dev/streaming.md](src/dev/streaming.md) "Async stage drivers"): in `stream(v).stage(cheap).stage_async(io)` the sync stage cannot take the fused pass-through, so 30 pool workers move 2000 trivial items through two rings in ~30→500 µs — ~7 µs per item per worker; the async side's last start trails the sync stage's last hop by only ~0.05–0.3 ms. perf: 31 % of samples in the mixed ring's tail-CAS backoff spin (`SyncSender::send`, per-item sends — async chains keep `YOUPIPE_STREAM_TX_BATCH` off); lifting that gate (throwaway prototype) shrank the span only to ~400 µs and moved the spin to the input head (`claim_poll` 29 %): each worker's claim share is `64 / 31 = 2` items per CAS.
-- Candidate levers: a backlog-scaled claim share (claim `clamp(len / workers, 1, batch cap)` — large backlogs amortize the head CAS, small bursts keep the per-worker fairness `per_worker_claim_cap` exists for); re-measuring the async-chain tx-batch gate against the driver consumers (it was falsified against per-slot tasks — the precondition changed); fewer workers for stages whose measured per-item cost is below the ring handoff (the cost-EMA family is falsified twice on the fused side — an explicit hint, not inference).
-- Gate: the horizontal `mixed_cpu_io` cells and `sync_fuse` async rows; `mixed_load` stream rows as the pure-sync control.

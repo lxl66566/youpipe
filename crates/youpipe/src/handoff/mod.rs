@@ -264,6 +264,98 @@ pub(crate) fn stream_tx_batch() -> bool {
     })
 }
 
+// `YOUPIPE_ASYNC_TX_BATCH` refines `YOUPIPE_STREAM_TX_BATCH`'s async-tail
+// gate (todo #34 re-measure): the old gate kept per-item sends on EVERY
+// hop of a chain containing an async stage, falsified against the per-slot
+// consumer tasks (+2.2…+4.9 % on both hops). The M:N drivers (2026-11-06)
+// changed the consumer shape, and the todo #34 four-side A/B split the old
+// verdict by hop: the hop INTO the async stage (the mixed ring, consumers
+// = burst-refilling drivers) now WINS batched — but only with the
+// backlog-scaled claim window armed (`YOUPIPE_CLAIM_SCALE`): with the
+// fixed share-2 claims the 2-item staged sends LOSE on the split shape
+// (async_pair_cpu_split/1K +6.4 % 6/25) while the window's grown claims
+// amortize the staging (split/1K +0.5 % noise, merged/1K −33 % 25/25 with
+// both). The mid hops of async chains lose at either claim shape
+// (async_pair_cpu_split/100K +17.4 % 0/25 fully lifted), so the default
+// (`MixedOnly`) batches exactly the mixed hop; "1" re-lifts the gate on
+// every hop (falsified), "0" restores the historical per-item gate on
+// every async-chain hop (also the fallback for `YOUPIPE_CLAIM_SCALE=0`).
+// Independent of `YOUPIPE_STREAM_TX_BATCH` (the global switch).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AsyncTxGate {
+    /// Every hop of an async-tailed chain keeps per-item sends (the
+    /// 2026-10 gate; the pre-todo-#34 default).
+    Off,
+    /// Batched delivery only on hops whose consumers are async (the mixed
+    /// ring); sync→sync hops of async chains keep per-item sends.
+    MixedOnly,
+    /// Batched delivery on every hop (measured +17.4 % on
+    /// `sync_fuse/async_pair_cpu_split/100K`, 0/25 — kept for A/B
+    /// reproduction).
+    Full,
+}
+
+static ASYNC_TX_BATCH: std::sync::OnceLock<AsyncTxGate> = std::sync::OnceLock::new();
+
+pub(crate) fn async_tx_gate() -> AsyncTxGate {
+    *ASYNC_TX_BATCH.get_or_init(|| match std::env::var("YOUPIPE_ASYNC_TX_BATCH") {
+        Ok(v) if v == "1" => AsyncTxGate::Full,
+        Ok(v) if v == "0" => AsyncTxGate::Off,
+        Ok(v) if v.is_empty() => AsyncTxGate::MixedOnly,
+        Ok(other) => panic!(
+            "YOUPIPE_ASYNC_TX_BATCH: invalid value {other:?} (leave unset or use \"0\"/\"1\")"
+        ),
+        // Unset = the mixed-hop-only default (see the knob comment above).
+        Err(_) => AsyncTxGate::MixedOnly,
+    })
+}
+
+// `YOUPIPE_CLAIM_SCALE` (todo #34): backlog-scaled claim shares for the
+// stream engine's multi-consumer stage/expand workers. The fixed share
+// (`per_worker_claim_cap` = cap / workers, 2 items at 31 workers) costs
+// one ring-head CAS per ~2 items: on async-fed chains with trivial
+// per-item work the sync stage's whole span is that CAS rhythm (perf:
+// 31 % of samples in `SyncSender::send`'s tail-CAS backoff, then 29 % in
+// `claim_poll` after lifting the tx-batch gate). The window starts at the
+// share and doubles while claims keep coming back full (the ready backlog
+// covered the window — bigger claims amortize the head CAS), collapsing
+// to the share on the first partial claim (the backlog was shallower, the
+// remainder belongs to the parked peers — the fairness contract
+// `per_worker_claim_cap` exists for). Refresh-based on purpose: the
+// fork's `len()` reads the producer-side tail line (SeqCst loop) on every
+// claim, re-sharing the hottest cache line exactly when claiming is
+// already contended; the claim's own result is a free backlog probe.
+// Default ON (async-tailed chains only): with the mixed-hop tx gate it
+// stacks (`sync_fuse/async_pair_cpu_merged/1K` −33 % 25/25,
+// `sharded_term_async/async1_cpu/100K` −15 % 25/25, every other gated row
+// noise-or-better, the pure-sync controls structurally untouched);
+// alone it still wins every gated row (merged/1K −16 % 25/25) — the
+// combination is the measured default pair. Scope: stream engine only
+// (the graph `FanIn` round keeps the fixed share; no graph gate was
+// measured), and ASYNC-TAILED CHAINS only: on
+// pure-sync chains the window's coarser claim rhythm regressed the fence
+// family hard (`stream_pipeline/with_fence/100K` +60 % 0/25 — the chunk
+// release/worker park rhythm coarsens with 64-item claims; @1K it read
+// −15.8 %, size-contradicted) while a pure-sync chain's stages drain the
+// ring as fast as they claim, so there is no backlog to amortize — the
+// same chains the capacity floor excludes (`ctx.has_async_stage`, the
+// shared predicate). Default set by the todo #34 A/B; "1" = adaptive
+// window on async-tailed chains, "0" = the fixed share everywhere.
+static CLAIM_SCALE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn claim_scale_enabled() -> bool {
+    *CLAIM_SCALE.get_or_init(|| match std::env::var("YOUPIPE_CLAIM_SCALE") {
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" || v.is_empty() => false,
+        Ok(other) => {
+            panic!("YOUPIPE_CLAIM_SCALE: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
+        },
+        // Unset = the default-on policy, async-tailed chains only (the
+        // scope predicate lives at the stream spawn sites).
+        Err(_) => true,
+    })
+}
+
 // Worker-side batch burst helpers (todo #1 residual (d)); crate-internal.
 pub use channel::{
     AsyncReceiver, AsyncRecvItem, AsyncSendItem, AsyncSender, ChannelError, MpscAsyncReceiver,
@@ -281,6 +373,6 @@ pub(crate) use forward::{forward_async_to_sync, forward_sync};
 pub(crate) use sharded::{ShardedAsyncReceiver, sharded_mpsc_async_channel};
 pub(crate) use sharded::{ShardedReceiver, sharded_mpsc_channel};
 pub(crate) use worker::{
-    Broadcast, CancelCheck, Delivery, SpinBudget, SpinPoll, Unicast, cancel_active,
+    Broadcast, CancelCheck, ClaimWindow, Delivery, SpinBudget, SpinPoll, Unicast, cancel_active,
     claim_expand_deliver, claim_map_deliver, per_worker_claim_cap,
 };
