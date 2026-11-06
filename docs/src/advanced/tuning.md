@@ -82,8 +82,7 @@ narrowing them measured as global regressions there (history in `sleep.rs`)
 tuning levers with known upside.
 
 The fused `.collect()` output-store policy defaults to **auto**:
-eligible 8-byte outputs of at least 8 MB (a 1 M-item batch of 8-byte
-outputs, decimal) per whole batch are
+eligible 8-byte outputs of at least 8 MiB per whole batch are
 written with non-temporal (streaming) stores that bypass the cache
 hierarchy — at those sizes removing read-for-ownership traffic and L3
 pollution dominates everything else. Runtime-overridable tri-state via
@@ -136,12 +135,15 @@ promotion").
 Why auto is safe for consumers that read the output right after collect
 (the feared DRAM round-trip): measured on the reference machine
 (same-binary two-process A/B, rayon drift control) the knob wins *both*
-shapes — write-once outputs +12–18 % wall at 1–4 M items, and a fold
-over the output immediately after collect +12–15 % at 1–4 M
+shapes at 2–4 M items — write-once outputs +14–18 % wall, and a fold
+over the output immediately after collect +12–15 %
 (`cpu_balanced_readback`) — the parallel phase's RFO elimination
-outweighs the consumer's prefetched sequential re-read. Below the
-threshold gains shrink toward ±2 % (output fits cache), which is why
-auto starts at 8 MB; known write-once workloads below it can force the
+outweighs the consumer's prefetched sequential re-read. At 1 M items
+(8 MB, still inside the 32 MB L3) the sign is machine-state gated:
+−12–13 % in a slow memory state, +39…+107 % loss in a fast one, so auto
+keeps that cell on plain stores. Below the threshold gains shrink
+toward ±2 % (output fits cache), which is why
+auto starts at 8 MiB; known write-once workloads below it can force the
 knob on (100 K items measured +9–11 %). Data in the developer guide's
 benchmarks notes ("NT-store attribution").
 ## `YOUPIPE_SHARDED_TERM`: terminal fan-in sharding (streaming)
