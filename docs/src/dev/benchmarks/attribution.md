@@ -388,3 +388,22 @@ Two methodology notes: (1) the horizontal runner's `--scenarios` filter is subst
 Δ = median of per-pair deltas (on − off)/off; dom = pairs where the on side is faster. Readings: the regression is window-monotone on the batch cadence — no window in {25, 50, 100} µs wins any size, and 25 µs already regresses @100K/+9.6 % and @1M/+5.6 %, so the direction cannot be rescued by shrinking the window further. The readback trap closes only at 25 µs (flat-or-noise @1M–4M) and reopens with the window (+11.6 % @1M at 100 µs): the park-latency decay works exactly as designed, but the benefit side — covering the inter-batch gap without parking — does not collect the causal 2048/2048 win, which came from never parking through an ms-scale batch sequence, out of reach of a ≤100 µs window. The only winners are the criterion tight-loop µs-batch cells (`sync_cpu_heavy`/`sync_for_each`/`mixed_load` @1K, −18…−22 %, 25/25 dominant; the same ids regress at 100K) — the sub-100 µs-gap class. Verdict per the design's pattern: leave opt-in, default off.
 
 Raw JSON under `target/horizontal/g-bench35/` (not committed).
+
+## v0.8.0 → 0.9.0 pending regression flags, re-verified (2026-11-06): both do not reproduce as stable
+
+The release round (`target/relbench-report.md` §3.2/§3.3) left two flags pending. Both were re-tested per-id isolated (5 interleaved rounds, taskset 1-31, fresh worktrees per outdir); raw tables under `target/bench-ab/g-rel-expand/`, `g-rel-chain/`, `g-rel-chain-e7/`, `g-rel-chain-post/` (not committed).
+
+`expand_heavy/ordered_push_fanout=64/10000` +19.5 % (1/9, group-pass): the per-id re-test read **−0.1 % (15/25)** — med 2.524 vs 2.520 ms, spread 4.0/1.8 %. The original flag was a group-pass draw on a high-spread id (9.6/11.2 %); no bisect warranted, `be45734`/`3b27b36` exonerated by absence of effect.
+
+`graph_shapes/chain_cpu_stream/1000` +2.8 % stable (0/9, group-pass), layout-lottery vs `e7d25e0` candidates:
+
+| comparison (same outdir, 5 rounds per-id) | Δ% | dom | verdict |
+| --- | --- | --- | --- |
+| same-commit dual binary (two independently compiled `3dcdb78` worktrees, distinct md5) | +0.2 | 3/9 | tight — rematerialization lottery falsified |
+| `v0.8.0` → `dde6387` (`e7d25e0^`) | +0.1 | 11/25 | noise — pre state clean |
+| `dde6387` → `e7d25e0` (async mux) | +1.2 | 10/25 | noise — largest single segment, right direction |
+| `e7d25e0` → `3dcdb78` (contains `3b90b78`'s new graph bench ids) | +0.7 | 5/25 | noise — in-range binary reshuffle falsified as a stable source |
+
+No segment reproduces the +2.8 % stable; the recoverable signal is a ≤ ~2 % cumulative headwind concentrated at `e7d25e0` (async-stage mux adds an edge of cost to this sync-shaped async chain), stacked with un-reproducible remainder from the original group-pass session. Accepted: the same commit family lands −10…−56 % on chain/diamond graph and async rows, and chasing a non-stable +1.2 % would put those at risk. Revisit only if a future release A/B re-flags this id stable.
+
+Methodology notes: (1) a per-id filter must use the id form criterion actually matches — `BenchmarkId` function names keep their embedded `/` (`expand_heavy/ordered_push/fanout=64`); the `_`-joined form in compare.py tables is criterion's on-disk directory naming and silently matches nothing as a filter, producing empty compare tables (a no-op A/B; the empty table is the tell). (2) Same-rev two-label sides materialize independent worktrees (bench_ab.sh caches per label dir), so a same-commit recompile A/B needs no cache-key tricks — verified by distinct binary md5 despite identical source.

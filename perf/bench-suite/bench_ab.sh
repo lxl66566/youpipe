@@ -42,7 +42,13 @@
 #             tree (uncommitted changes allowed — snapshotted up front),
 #             optionally LABEL=REV to name the side in the report.
 #   filter    criterion regex fragment(s); a bench runs if its id matches.
-#             Default: everything.
+#             Default: everything. Use the id form criterion matches (see
+#             `<bin> --list`): BenchmarkId function names keep their
+#             embedded `/` (e.g. `expand_heavy/ordered_push/fanout=64`).
+#             The `_`-joined form shown in compare.py tables is criterion's
+#             on-disk directory naming — as a filter it matches NOTHING and
+#             the A/B runs as a silent no-op (empty compare table; found
+#             2026-11-06 re-testing the ordered_push fanout flag).
 #
 # Options:
 #   -r, --rounds N        interleaved rounds (default 3)
