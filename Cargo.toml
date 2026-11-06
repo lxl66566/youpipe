@@ -11,24 +11,17 @@ members         = [
   "crates/youpipe-st3",
   "crates/youpipe-sys",
 ]
-# cargo-fuzz crate: built by `cargo fuzz ...` from its own directory on a
-# nightly toolchain with sanitizer flags that would break plain workspace
-# builds, so it cannot be a member.
+# cargo-fuzz builds this crate standalone (nightly + sanitizer flags, own
+# Cargo.lock); it must stay out of workspace resolution.
 exclude         = ["crates/youpipe-fuzz"]
-# Plain `cargo build/test/clippy` at the root covers only the library crates;
-# the vendored forks and the bench crates are opt-in via `-p` / `--workspace`
-# (they pull heavyweight deps: aes-gcm, zstd, perf-event, valgrind runner, ...).
+# Plain `cargo build/test/clippy` covers the library crates only; forks and
+# bench crates are opt-in via `-p` / `--workspace` (heavyweight deps:
+# aes-gcm, zstd, perf-event, valgrind runner, ...).
 default-members = ["crates/youpipe", "crates/youpipe-sys"]
 
-# Shared metadata for the crates on the publish train. The vendored source
-# forks (youpipe-st3, youpipe-concurrent-queue, youpipe-crossfire,
-# youpipe-hotpath) inherit
-# these too: manifest inheritance doesn't affect their sources, which stay
-# diffable against their upstream repos. Fork-specific provenance fields
-# (edition, authors, license, description) stay per-crate. Crates off the
-# train (youpipe-bench, youpipe-gungraun, youpipe-criterion-perf-counters,
-# youpipe-fuzz) carry `publish = false`, so `cargo publish --workspace`
-# skips them.
+# Publish-train metadata. Forks inherit it too (manifest only; sources stay
+# diffable upstream), and off-train crates (benches, youpipe-fuzz) set
+# `publish = false`.
 [workspace.package]
 version      = "0.9.0"
 edition      = "2024"
@@ -36,10 +29,9 @@ rust-version = "1.85"
 repository   = "https://github.com/lxl66566/youpipe"
 license      = "Apache-2.0"
 
-# Single-sourced dependency requirements: members inherit with
-# `{ workspace = true }` and may append `features`/`optional`. The vendored
-# forks keep self-contained requirement specs (diffability) and youpipe-fuzz
-# cannot inherit at all (excluded from the workspace).
+# Members inherit with `{ workspace = true }` (may append features/optional);
+# forks keep self-contained specs for diffability; youpipe-fuzz cannot
+# inherit (excluded).
 [workspace.dependencies]
 criterion         = "0.8"
 crossbeam-channel = "0.5"
@@ -49,16 +41,14 @@ loom              = "0.7"
 rayon             = "1"
 tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
-# Internal path+version dual declaration: local builds resolve the path,
-# published manifests resolve the registry requirement
-# (docs/src/dev/publishing.md). Bump these requirement strings in the same
-# commit as `[workspace.package] version`. `youpipe` itself stays local: its
-# lab-bench consumers need divergent `default-features` settings.
+# path+version dual declaration: local builds resolve the path, published
+# manifests the registry version (docs/src/dev/publishing.md). Bump these
+# strings with `[workspace.package] version`. youpipe stays local: bench
+# consumers need divergent `default-features`.
 concurrent-queue = { package = "youpipe-concurrent-queue", path = "crates/youpipe-concurrent-queue", version = "0.9.0" }
 crossfire        = { package = "youpipe-crossfire", path = "crates/youpipe-crossfire", version = "0.9.0" }
-# youpipe's probes and the bench profile binary's `HotpathGuard` share a
-# process-global state: the two crates must resolve ONE hotpath instance, so
-# the (vendored, patched) hotpath is single-sourced here.
+# youpipe's probes and the bench binary's HotpathGuard share process-global
+# state: both crates must resolve one hotpath instance.
 hotpath          = { package = "youpipe-hotpath", path = "crates/youpipe-hotpath", version = "0.9.0" }
 st3              = { package = "youpipe-st3", path = "crates/youpipe-st3", version = "0.9.0" }
 youpipe-sys      = { path = "crates/youpipe-sys", version = "0.9.0" }
@@ -74,45 +64,32 @@ pedantic                = { level = "warn", priority = -1 }
 wildcard_imports        = "allow"
 
 [workspace.lints.rust]
-# `loom` is set via `RUSTFLAGS="--cfg loom"` (see below), not a feature
+# `loom` is activated by `RUSTFLAGS="--cfg loom"` (see youpipe's manifest), not a feature
 unexpected_cfgs       = { level = "warn", check-cfg = ["cfg(loom)"] }
 unsafe_code           = "allow"
 unused_qualifications = "warn"
 
-# Debug symbols and no stripping for the gungraun benches: Callgrind
-# attributes instruction counts to source symbols, so the bench targets
-# must ship them (strip must stay off explicitly in case `[profile
-# release]` ever gains `strip`).
+# Debug symbols, no strip: Callgrind attributes instruction counts to source
+# symbols (explicit `strip = false` in case release ever gains a default).
 [profile.bench]
 debug         = true
 strip         = false
 codegen-units = 1
 
-# The workspace `.cargo/config.toml` sets profile-blind `[build] rustflags`.
-# While `-C opt-level=3` lived there, it applied to dev/test builds too, and
-# rustc silently inferred `debug-assertions = off` / `overflow-checks = off`
-# (its defaults for opt-level > 0): every debug-side invariant in this
-# workspace (reorder accounting, fused geometry asserts, push_n length
-# guards, overflow checks) was compiled out of `cargo test` runs. opt-level
-# belongs in the profile table so cargo sees it when computing the implied
-# debug-assertions default and emits the explicit override. Assertions stay
-# on for the CPU-heavy stress tests, which need opt-level = 3 to finish
-# quickly.
+# opt-level belongs in the profile table: [build] rustflags is profile-blind,
+# and rustc infers debug-assertions/overflow-checks = off from opt-level > 0
+# passed that way, silently compiling every debug-side invariant out of
+# `cargo test` builds (see .cargo/config.toml). opt-level = 3 keeps the
+# CPU-heavy stress tests fast.
 [profile.dev]
 opt-level        = 3
 debug-assertions = true
 overflow-checks  = true
 
-# Single codegen unit for release builds. A project whose value proposition is
-# per-item throughput cannot tolerate the code-layout lottery that
-# `codegen-units = 16` (the Cargo default) triggers: an unrelated edit
-# elsewhere in the crate shifts LLVM's codegen-unit partitioning, which
-# reshuffles the hot-path instruction layout, which silently regresses the
-# leaf loop's auto-vectorization. We measured this directly while deleting an
-# unused `runtime/` module (no behaviour change, ~18% regression at
-# sync_cpu_heavy/100k that vanished the moment the code was reinstated).
-# `codegen-units = 1` makes such phantom regressions impossible at the cost of
-# slower release builds — the standard trade-off for perf-first crates
-# (rayon, crossbeam, etc. all do the same).
+# codegen-units = 1: the cargo default (16) makes hot-path instruction layout
+# a lottery — unrelated edits reshuffle LLVM's codegen-unit partitioning and
+# silently regress the leaf loops (measured ~18% at sync_cpu_heavy/100k from
+# deleting an unused module). The slower release build is the standard
+# perf-first trade-off (rayon, crossbeam, ...).
 [profile.release]
 codegen-units = 1
