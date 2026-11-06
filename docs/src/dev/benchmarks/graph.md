@@ -162,3 +162,28 @@ A/B (`bench_ab.sh -a base=af704fe -b side=8e539c1 -r 5 --per-id`, the same calib
 | mixed_load rows (youpipe_stream_cpu + rayon/tokio controls, 6) | — | — | −0.8…+3.8 % | ≤17/25 (noise; the @100K fused row sits in its documented 26–33 % bimodal band with its rayon control at +1.5 %) |
 
 Both @100K primaries clear the 2 % floor at full 25/25 dominance — consistent with deleting, per completion, the future build+drop cycle (n abandon + n re-arm registry-mutex passes) and, per park episode, three mallocs; what remains per `Done` is the refill round + the poll's round walk plus one state check per input. The instant-future residue family (`sharded_term_async/async1_*`, the documented +2.8…+3.7 % knob rows) did NOT move: the single-ring `RxIntake` was already registration-cheap per completion, so the churn this removed was specific to the multi-input fan-in. Stage 2 (per-input tagged wakers over a ready bitmask, killing the O(n) walk per completion wake) remains open if a `hotpath-profile` attribution shows the walk is still a visible share.
+
+
+## Batched async outlet: landed default-on (2026-11-06, C2)
+
+`AsyncOutlet::deliver` was the last per-item delivery on either engine's hot path: every completion paid its own awaited `send_cached` per edge (k−1 clones + k sends for a broadcast), while completions arrive in clusters — one `FuturesUnordered` wake resolves several futures, and a cheap future resolves on its first inline poll, so the driver re-entered the whole select per item. `YOUPIPE_ASYNC_OUTLET_BATCH` (default on) arms the batched outlet: the driver stages inline-slot completions during refill, drains the rest of the set after the select's first `Done`, and hands the batch to `AsyncOutlet::deliver_batch` — per edge one `try_send_batch` free-run prefix (the fork gained `AsyncTx::try_send_batch`, consumer wakes merged via `fire_n`) plus the per-item awaited fallback (`AsyncSendItem::flush_staged`, the async twin of `SendItem::flush_staged`). The flush always precedes the select's park, so a pending in-flight set cannot delay ready items behind a batch boundary; no EOF/cancel/close exit returns with accepted outputs staged; and the emitted sequence is provably the per-item arm's (`drive_batched_delivery_matches_per_item_sequence` runs one gated schedule through both arms).
+
+Same-binary knob A/B (`bench_ab.sh -a off=wt -b on=wt -E off=YOUPIPE_ASYNC_OUTLET_BATCH=0 -E on=YOUPIPE_ASYNC_OUTLET_BATCH=1 -r 5`, per-id for the graph rows), measured on top of the poll-based-intake baseline:
+
+| id | off @med | on @med | Δ | dominance | verdict |
+| --- | --------- | --------- | --- | --------- | ------- |
+| fanout_async_cheap_graph @100K | 31.6 ms | 26.53 ms | **−16.0 %** | 25/25 | improvement·stable |
+| fanout_async_cpu_graph @100K | 31.7 ms | 26.8 ms | **−15.5 %** | 25/25 | improvement·stable |
+| fanin_async_cheap_graph @1K | 1.384 ms | 1.277 ms | **−7.7 %** | 25/25 | improvement·stable |
+| fanin_async_cpu_graph @1K | 1.383 ms | 1.278 ms | **−7.6 %** | 25/25 | improvement·stable |
+| fanout_async_cheap_graph @1K | 1.21 ms | 1.157 ms | **−4.4 %** | 25/25 | improvement·stable |
+| fanin_async_cheap_graph @100K | 55.63 ms | 53.35 ms | **−4.1 %** | 25/25 | improvement |
+| fanout_async_cpu_graph @1K | 1.206 ms | 1.158 ms | **−4.0 %** | 25/25 | improvement·stable |
+| fanin_async_cpu_graph @100K | 55.47 ms | 53.35 ms | **−3.8 %** | 25/25 | improvement·stable |
+| chain_{cheap,cpu}_graph @1K/@100K (4) | — | — | −0.7…+0.2 % | ≤19/25 | noise (sync-only control) |
+| sharded_term_async/async1_{cheap,cpu,ordered_cpu} @100K | — | — | **−4.9…−5.7 %** | 25/25 | improvement (on top of the todo #34 baseline) |
+| sharded_term_async/async1_* @1K (3) | — | — | −0.6…+0.1 % | ≤17/25 | noise |
+| io_async youpipe rows (4) | — | — | −0.4…+0.1 % | ≤19/25 | noise (dead flat — staging does not delay first delivery) |
+| mixed_load (youpipe_stream_cpu + rayon/tokio controls, 6) | — | — | −0.6…+1.0 % | ≤13/25 | noise |
+
+Every primary row clears the 2 % floor at full dominance; the @1K broadcast rows carry the fixed runtime-build cost, so their −4 % is the per-item path. The unicast fan-in twin improving as much as it did says the cluster-drain + sender-run amortization (not the clone elision — unicast never clones) carries the win; broadcast keeps its k−1 clones per item by contract. The parky `io_async` shapes staying dead flat is the flush-before-park invariant paying off. Promoted default-on with the A/B above; `"0"` recovers the per-item deliveries.

@@ -16,9 +16,15 @@
 //! `YOUPIPE_ASYNC_MUX` (runtime knob, so A/B benches compare one binary):
 //! unset/`"1"` = `min(io_concurrency, runtime workers)` drivers; `"0"` = one
 //! task per in-flight slot; `"N"` (>= 2) = `min(io_concurrency, N)` drivers.
+//!
+//! `YOUPIPE_ASYNC_OUTLET_BATCH` (default on) batches each driver's outlet
+//! delivery — drained completion clusters go out per edge through
+//! [`AsyncOutlet::deliver_batch`] instead of one awaited send per item (see
+//! `handoff`'s knob table for the hop distinction).
 
 use std::{
     future::{Future, poll_fn},
+    mem::MaybeUninit,
     pin::pin,
     task::{Context, Poll},
 };
@@ -26,7 +32,7 @@ use std::{
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use super::{
-    channel::{AsyncReceiver, AsyncSendItem, TryRecvError, WakerSlot},
+    channel::{AsyncReceiver, AsyncSendItem, TryRecvError, WakerSlot, stage_batch},
     worker::cancel_active,
 };
 use crate::sync::CancellationToken;
@@ -120,10 +126,31 @@ pub(crate) trait AsyncIntake<T>: Send {
 }
 
 /// One driver's output side.
-pub(crate) trait AsyncOutlet<T>: Send {
+pub(crate) trait AsyncOutlet<T: Send>: Send {
     /// Deliver one item; `false` once every downstream has closed (the
     /// driver exits).
     fn deliver(&mut self, item: T) -> impl Future<Output = bool> + Send;
+
+    /// Batched delivery (the `YOUPIPE_ASYNC_OUTLET_BATCH` path): deliver
+    /// every item of `batch` in order; same `false` contract. `staged` is
+    /// caller-owned scratch, `clear`-reused per call. The default is the
+    /// per-item [`Self::deliver`] loop — semantically identical, so an
+    /// outlet without a native batch form still delivers a batch correctly
+    /// (only the sender-run amortization is lost).
+    fn deliver_batch(
+        &mut self,
+        batch: &mut Vec<T>,
+        _staged: &mut Vec<MaybeUninit<T>>,
+    ) -> impl Future<Output = bool> + Send {
+        async move {
+            for item in batch.drain(..) {
+                if !self.deliver(item).await {
+                    return false;
+                }
+            }
+            true
+        }
+    }
 }
 
 /// Single-receiver intake: the stream engine's async stage input. One waker
@@ -190,6 +217,15 @@ impl<T: Send, Tx: AsyncSendItem<T>> AsyncOutlet<T> for TxOutlet<Tx> {
     async fn deliver(&mut self, item: T) -> bool {
         self.tx.send_cached(item, &mut self.slot).await.is_ok()
     }
+
+    async fn deliver_batch(
+        &mut self,
+        batch: &mut Vec<T>,
+        staged: &mut Vec<MaybeUninit<T>>,
+    ) -> bool {
+        stage_batch(batch, staged);
+        self.tx.flush_staged(staged, &mut self.slot).await
+    }
 }
 
 enum Event<O, T> {
@@ -204,14 +240,44 @@ enum Event<O, T> {
 /// items accepted before it are still delivered (the per-task loop's
 /// contract — an accepted item is never discarded by cancellation).
 ///
-/// `cap == 1` is the sequential loop, without an in-flight set.
+/// `cap == 1` is the sequential loop, without an in-flight set. Delivery is
+/// per-item unless the `YOUPIPE_ASYNC_OUTLET_BATCH` knob arms the batched
+/// outlet ([`AsyncOutlet::deliver_batch`]); see `drive_inner`.
 pub(crate) async fn drive<T, O, Fut>(
+    intake: impl AsyncIntake<T>,
+    map: impl Fn(T) -> Fut,
+    out: impl AsyncOutlet<O>,
+    cap: usize,
+    cancel: Option<&CancellationToken>,
+) where
+    T: Send,
+    O: Send,
+    Fut: Future<Output = O>,
+{
+    drive_inner(
+        intake,
+        map,
+        out,
+        cap,
+        super::async_outlet_batch_cap(),
+        cancel,
+    )
+    .await;
+}
+
+/// [`drive`] with an explicit outlet batch cap (0 = per-item deliveries);
+/// the knob-free core so tests pin the batched semantics without the
+/// process-global env read.
+async fn drive_inner<T, O, Fut>(
     mut intake: impl AsyncIntake<T>,
     map: impl Fn(T) -> Fut,
     mut out: impl AsyncOutlet<O>,
     cap: usize,
+    batch_cap: usize,
     cancel: Option<&CancellationToken>,
 ) where
+    T: Send,
+    O: Send,
     Fut: Future<Output = O>,
 {
     if cap <= 1 {
@@ -233,9 +299,13 @@ pub(crate) async fn drive<T, O, Fut>(
     let mut next: Option<T> = None;
     // Input still claimable: no EOF and no cancel observed yet.
     let mut open = true;
+    // Batched-outlet scratch: zero capacity when the batch cap is 0, so the
+    // per-item arms below reduce to the historical per-item loop.
+    let mut batch: Vec<O> = Vec::with_capacity(batch_cap);
+    let mut staged: Vec<MaybeUninit<O>> = Vec::with_capacity(batch_cap);
     loop {
         let mut in_flight = overflow.len() + usize::from(head.is_some());
-        while open && in_flight < cap {
+        while open && in_flight < cap && (batch_cap == 0 || batch.len() < batch_cap) {
             let item = match next.take() {
                 Some(item) => item,
                 None => match intake.try_claim() {
@@ -268,12 +338,27 @@ pub(crate) async fn drive<T, O, Fut>(
             match first {
                 Poll::Ready(output) => {
                     head.set(None);
-                    if !out.deliver(output).await {
-                        return;
+                    // The batched arm stages the output (delivery happens
+                    // at the flush below): a cheap future that resolves on
+                    // its first poll keeps the claim → poll → stage loop
+                    // running, so a ready burst shares one sender run.
+                    if batch_cap == 0 {
+                        if !out.deliver(output).await {
+                            return;
+                        }
+                    } else {
+                        batch.push(output);
                     }
                 },
                 Poll::Pending => in_flight += 1,
             }
+        }
+        // Never park the select while holding staged outputs (a pending
+        // in-flight set must not delay ready items behind a batch
+        // boundary), and never return on EOF/cancel with accepted outputs
+        // still staged.
+        if !batch.is_empty() && !out.deliver_batch(&mut batch, &mut staged).await {
+            return;
         }
         let event = if in_flight == 0 {
             if !open {
@@ -308,8 +393,33 @@ pub(crate) async fn drive<T, O, Fut>(
         };
         match event {
             Event::Done(output) => {
-                if !out.deliver(output).await {
-                    return;
+                if batch_cap == 0 {
+                    if !out.deliver(output).await {
+                        return;
+                    }
+                } else {
+                    batch.push(output);
+                    // Completion drain: one wake commonly resolves several
+                    // in-flight futures, so collect the rest of the cluster
+                    // before delivering — per-item delivery would re-enter
+                    // the whole select per output. The head slot needs no
+                    // drain pass: the select polls it first, so its
+                    // completion, if any, IS `output`.
+                    if batch_cap > 1 {
+                        poll_fn(|cx| {
+                            while batch.len() < batch_cap {
+                                match overflow.poll_next_unpin(cx) {
+                                    Poll::Ready(Some(output)) => batch.push(output),
+                                    _ => return Poll::Ready(()),
+                                }
+                            }
+                            Poll::Ready(())
+                        })
+                        .await;
+                    }
+                    if !out.deliver_batch(&mut batch, &mut staged).await {
+                        return;
+                    }
                 }
             },
             Event::Claimed(Some(item)) => next = Some(item),
@@ -387,14 +497,20 @@ mod tests {
         v
     }
 
+    /// Order-observing variant of [`drain`] (delivery-sequence asserts).
+    fn drain_seq(rx: &AsyncReceiver<u32>) -> Vec<u32> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
     /// Spawn one driver over `rx` → `out` on `pool`; the flag flips when
-    /// `drive` returns.
+    /// `drive_inner` returns. `batch_cap` 0 is the knob-off per-item arm.
     fn spawn_driver(
         pool: &LocalPool,
         rx: AsyncReceiver<u32>,
         out: crate::handoff::AsyncSender<u32>,
         g: &Rc<Gated>,
         cap: usize,
+        batch_cap: usize,
         cancel: Option<CancellationToken>,
     ) -> Rc<Cell<bool>> {
         let done = Rc::new(Cell::new(false));
@@ -402,11 +518,12 @@ mod tests {
         let map = g.map();
         pool.spawner()
             .spawn_local(async move {
-                drive(
+                drive_inner(
                     RxIntake::new(rx),
                     map,
                     TxOutlet::new(out),
                     cap,
+                    batch_cap,
                     cancel.as_ref(),
                 )
                 .await;
@@ -421,11 +538,17 @@ mod tests {
     /// returns only after the in-flight items are delivered.
     #[test]
     fn drive_fills_cap_and_claims_while_busy() {
+        for batch_cap in [0, 4] {
+            drive_fills_cap_and_claims_while_busy_at(batch_cap);
+        }
+    }
+
+    fn drive_fills_cap_and_claims_while_busy_at(batch_cap: usize) {
         let (tx, rx) = async_channel::<u32>(16);
         let (otx, orx) = async_channel::<u32>(16);
         let g = Gated::new(6);
         let mut pool = LocalPool::new();
-        let done = spawn_driver(&pool, rx, otx, &g, 3, None);
+        let done = spawn_driver(&pool, rx, otx, &g, 3, batch_cap, None);
         for x in 0..5 {
             tx.try_send(x).unwrap();
         }
@@ -466,6 +589,12 @@ mod tests {
     /// item.
     #[test]
     fn drive_mixes_ready_and_pending_items_under_the_cap() {
+        for batch_cap in [0, 4] {
+            drive_mixes_ready_and_pending_items_at(batch_cap);
+        }
+    }
+
+    fn drive_mixes_ready_and_pending_items_at(batch_cap: usize) {
         let (tx, rx) = async_channel::<u32>(16);
         let (otx, orx) = async_channel::<u32>(16);
         let g = Gated::new(6);
@@ -473,7 +602,7 @@ mod tests {
             g.open(x);
         }
         let mut pool = LocalPool::new();
-        let done = spawn_driver(&pool, rx, otx, &g, 2, None);
+        let done = spawn_driver(&pool, rx, otx, &g, 2, batch_cap, None);
         for x in 0..6 {
             tx.try_send(x).unwrap();
         }
@@ -503,7 +632,7 @@ mod tests {
         let g = Gated::new(8);
         let mut pool = LocalPool::new();
         let token = CancellationToken::new();
-        let done = spawn_driver(&pool, rx, otx, &g, 4, Some(token.clone()));
+        let done = spawn_driver(&pool, rx, otx, &g, 4, 0, Some(token.clone()));
         for x in 0..8 {
             tx.try_send(x).unwrap();
         }
@@ -532,7 +661,7 @@ mod tests {
         drop(orx);
         let g = Gated::new(2);
         let mut pool = LocalPool::new();
-        let done = spawn_driver(&pool, rx, otx, &g, 2, None);
+        let done = spawn_driver(&pool, rx, otx, &g, 2, 0, None);
         tx.try_send(0).unwrap();
         tx.try_send(1).unwrap();
         pool.run_until_stalled();
@@ -607,5 +736,188 @@ mod tests {
                 assert!(*lo >= 1 && hi - lo <= 1, "{caps:?}");
             }
         }
+    }
+
+    /// The batched outlet emits the IDENTICAL delivery sequence as the
+    /// per-item arm under the same gated completion schedule — including
+    /// a cluster (gates 0 and 2 opened before one poll) whose batched
+    /// drain must keep the per-item arm's completion order (0 before 2:
+    /// the FuturesUnordered yield order both arms share).
+    #[test]
+    fn drive_batched_delivery_matches_per_item_sequence() {
+        let run = |batch_cap: usize| -> (Vec<u32>, Vec<u32>) {
+            let (tx, rx) = async_channel::<u32>(16);
+            let (otx, orx) = async_channel::<u32>(16);
+            let g = Gated::new(6);
+            let mut pool = LocalPool::new();
+            let done = spawn_driver(&pool, rx, otx, &g, 3, batch_cap, None);
+            for x in 0..6 {
+                tx.try_send(x).unwrap();
+            }
+            pool.run_until_stalled();
+            assert_eq!(g.started(), [0, 1, 2]);
+            assert_eq!(drain_seq(&orx), Vec::<u32>::new());
+
+            g.open(1); // single completion
+            pool.run_until_stalled();
+            assert_eq!(g.started(), [0, 1, 2, 3]);
+            assert_eq!(drain_seq(&orx), [1]);
+
+            g.open(0);
+            g.open(2); // cluster: both complete before the driver polls
+            pool.run_until_stalled();
+            // Both arms refill the two slots the cluster freed: item 4
+            // into the inline slot (pending), item 5 into the set.
+            assert_eq!(g.started(), [0, 1, 2, 3, 4, 5]);
+            assert_eq!(drain_seq(&orx), [0, 2]);
+
+            g.open(3);
+            g.open(4);
+            pool.run_until_stalled();
+            // Item 4 holds the inline head slot, which the select polls
+            // before the set — its completion precedes item 3's in the
+            // same wake cycle, in both arms.
+            assert_eq!(g.started(), [0, 1, 2, 3, 4, 5]);
+            assert_eq!(drain_seq(&orx), [4, 3]);
+
+            g.open(5);
+            drop(tx);
+            pool.run_until_stalled();
+            assert!(done.get());
+            assert_eq!(drain_seq(&orx), [5]);
+            (drain(&orx), g.started())
+        };
+        let per_item = run(0);
+        let batched = run(4);
+        assert_eq!(per_item, batched);
+    }
+
+    /// Cancel observed on a claim mid-batch: the observing item is dropped
+    /// unmapped, nothing further is claimed, and every item accepted before
+    /// it — including outputs still staged in the pending batch — is still
+    /// delivered (the accepted-item contract, `drive_cancel_delivers_
+    /// accepted_items_only`'s batched twin).
+    #[test]
+    fn drive_batched_cancel_delivers_accepted_items_only() {
+        let (tx, rx) = async_channel::<u32>(16);
+        let probe = rx.clone();
+        let (otx, orx) = async_channel::<u32>(16);
+        let g = Gated::new(8);
+        let mut pool = LocalPool::new();
+        let token = CancellationToken::new();
+        let done = spawn_driver(&pool, rx, otx, &g, 4, 4, Some(token.clone()));
+        for x in 0..8 {
+            tx.try_send(x).unwrap();
+        }
+        pool.run_until_stalled();
+        assert_eq!(g.started(), [0, 1, 2, 3]);
+
+        token.cancel();
+        g.open(0);
+        pool.run_until_stalled();
+        assert_eq!(g.started(), [0, 1, 2, 3], "item 4 observed the token");
+        for x in 1..4 {
+            g.open(x);
+        }
+        pool.run_until_stalled();
+        assert!(done.get());
+        assert_eq!(drain(&orx), [0, 1, 2, 3]);
+        assert_eq!(drain(&probe), [5, 6, 7], "exactly one claim after cancel");
+    }
+
+    /// A closed downstream ends the batched driver at the first failed
+    /// flush; every staged output runs its destructor exactly once (the
+    /// `MaybeUninit` staging must not drop them silently, and the driver
+    /// must not re-deliver).
+    #[test]
+    fn drive_batched_downstream_close_drops_staged_once() {
+        struct Counted(Arc<AtomicUsize>);
+        impl std::fmt::Debug for Counted {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Counted")
+            }
+        }
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = async_channel::<Counted>(16);
+        let (otx, orx) = async_channel::<Counted>(16);
+        drop(orx);
+        let mut pool = LocalPool::new();
+        let done = {
+            let done = Rc::new(Cell::new(false));
+            let flag = Rc::clone(&done);
+            pool.spawner()
+                .spawn_local(async move {
+                    drive_inner(
+                        RxIntake::new(rx),
+                        |c| async move { c },
+                        TxOutlet::new(otx),
+                        4,
+                        4,
+                        None,
+                    )
+                    .await;
+                    flag.set(true);
+                })
+                .unwrap();
+            done
+        };
+        for _ in 0..4 {
+            tx.try_send(Counted(Arc::clone(&drops))).unwrap();
+        }
+        pool.run_until_stalled();
+        assert!(done.get());
+        assert_eq!(drops.load(Ordering::SeqCst), 4, "each staged output once");
+    }
+
+    /// A batch deeper than the outlet ring parks per item on the remainder
+    /// (the awaited fallback) without reordering, and a same-pool drainer
+    /// keeps the parks bounded — the async twin of the sync
+    /// `send_batch_flushes_remainder_per_item`.
+    #[test]
+    fn drive_batched_flushes_full_ring_remainder_in_order() {
+        let (tx, rx) = async_channel::<u32>(8);
+        let (otx, orx) = async_channel::<u32>(2); // ring shallower than the batch
+        let got = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&got);
+        let mut pool = LocalPool::new();
+        pool.spawner()
+            .spawn_local(async move {
+                let mut slot = WakerSlot::new();
+                while let Ok(v) = orx.recv_cached(&mut slot).await {
+                    sink.borrow_mut().push(v);
+                }
+            })
+            .unwrap();
+        let done = {
+            let done = Rc::new(Cell::new(false));
+            let flag = Rc::clone(&done);
+            pool.spawner()
+                .spawn_local(async move {
+                    drive_inner(
+                        RxIntake::new(rx),
+                        |v| async move { v },
+                        TxOutlet::new(otx),
+                        4,
+                        8,
+                        None,
+                    )
+                    .await;
+                    flag.set(true);
+                })
+                .unwrap();
+            done
+        };
+        for v in 0..8 {
+            tx.try_send(v).unwrap();
+        }
+        drop(tx);
+        pool.run_until_stalled();
+        assert!(done.get());
+        assert_eq!(*got.borrow(), (0..8).collect::<Vec<u32>>());
     }
 }

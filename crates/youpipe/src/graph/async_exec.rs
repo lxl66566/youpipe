@@ -9,6 +9,7 @@
 
 use std::{
     future::Future,
+    mem::MaybeUninit,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -23,9 +24,10 @@ use crate::handoff::forward_async_to_sync;
 use crate::{
     builder::{PanicSlot, record_panic},
     handoff::{
-        AsyncReceiver, AsyncSender, Receiver as SyncReceiver, TryRecvError, WakerSlot,
-        cancel_active, channel,
+        AsyncReceiver, AsyncSendItem, AsyncSender, Receiver as SyncReceiver, TryRecvError,
+        WakerSlot, cancel_active, channel,
         mux::{self, AsyncIntake, AsyncOutlet, TryClaim},
+        stage_batch,
     },
     sync::CancellationToken,
 };
@@ -193,6 +195,15 @@ impl<T: Send + Unpin + 'static> AsyncOutlet<T> for AsyncUnicast<T> {
     async fn deliver(&mut self, item: T) -> bool {
         self.tx.send_cached(item, &mut self.slot).await.is_ok()
     }
+
+    async fn deliver_batch(
+        &mut self,
+        batch: &mut Vec<T>,
+        staged: &mut Vec<MaybeUninit<T>>,
+    ) -> bool {
+        stage_batch(batch, staged);
+        self.tx.flush_staged(staged, &mut self.slot).await
+    }
 }
 
 /// Broadcast fan-out over one async node's output edges, owned by ONE task.
@@ -244,6 +255,49 @@ impl<T: Send + Clone + Unpin + 'static> AsyncOutlet<T> for AsyncBroadcast<T> {
             .send_cached(item, &mut self.slots[last])
             .await
             .is_err()
+        {
+            self.txs.swap_remove(last);
+            self.slots.swap_remove(last);
+        }
+        !self.txs.is_empty()
+    }
+
+    /// Batched twin of [`Self::deliver`] — the async counterpart of the
+    /// sync `Broadcast::send_batch` (`handoff::worker`): per edge, one
+    /// `try_send_batch` free-run prefix per batch instead of one awaited
+    /// send per item, the remainder per item with the awaited
+    /// `send_cached` fallback (identical backpressure granularity and
+    /// per-edge FIFO order, including across the prefix/fallback
+    /// boundary). Every open edge but the last receives clones (the
+    /// broadcast contract — one clone per item per edge stays); the last
+    /// surviving edge takes the owned items. A closed edge drops its
+    /// unsent remainder and out of the active set exactly like
+    /// [`Self::deliver`]; the return stays `false` only once every edge
+    /// has closed.
+    async fn deliver_batch(
+        &mut self,
+        batch: &mut Vec<T>,
+        staged: &mut Vec<MaybeUninit<T>>,
+    ) -> bool {
+        let mut i = 0;
+        while i + 1 < self.txs.len() {
+            staged.clear();
+            staged.extend(batch.iter().cloned().map(MaybeUninit::new));
+            if self.txs[i].flush_staged(staged, &mut self.slots[i]).await {
+                i += 1;
+            } else {
+                self.txs.swap_remove(i);
+                self.slots.swap_remove(i);
+            }
+        }
+        if self.txs.is_empty() {
+            return false; // remaining batch items drop with the Vec
+        }
+        let last = self.txs.len() - 1;
+        stage_batch(batch, staged);
+        if !self.txs[last]
+            .flush_staged(staged, &mut self.slots[last])
+            .await
         {
             self.txs.swap_remove(last);
             self.slots.swap_remove(last);
@@ -482,5 +536,48 @@ mod tests {
 
         drop(tx_b);
         assert_eq!(fan.poll_claim(&mut cx), Poll::Ready(None));
+    }
+
+    /// `AsyncBroadcast::deliver_batch`: every open edge receives the whole
+    /// batch in order; an edge closed mid-stream drops out and the
+    /// survivors keep serving; the last-surviving edge taking the owned
+    /// items is observable only as correct content (clone equivalence).
+    /// The async twin of the sync `send_batch_delivers_to_every_open_edge`.
+    #[test]
+    fn async_broadcast_deliver_batch_serves_every_open_edge() {
+        let (tx1, rx1) = async_channel::<u32>(16);
+        let (tx2, rx2) = async_channel::<u32>(16);
+        let (tx3, rx3) = async_channel::<u32>(16);
+        let mut b = AsyncBroadcast::new(vec![tx1, tx2, tx3]);
+        let mut staged = Vec::new();
+        let mut batch = vec![1, 2, 3];
+        assert!(futures::executor::block_on(
+            b.deliver_batch(&mut batch, &mut staged)
+        ));
+        for rx in [&rx1, &rx2, &rx3] {
+            assert_eq!(
+                (0..3).map(|_| rx.try_recv().unwrap()).collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+        }
+        drop(rx2); // one edge closed
+        let mut batch = vec![4, 5];
+        assert!(futures::executor::block_on(
+            b.deliver_batch(&mut batch, &mut staged)
+        ));
+        assert_eq!(
+            (0..2).map(|_| rx1.try_recv().unwrap()).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        assert_eq!(
+            (0..2).map(|_| rx3.try_recv().unwrap()).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        drop(rx1);
+        drop(rx3);
+        let mut batch = vec![6];
+        assert!(!futures::executor::block_on(
+            b.deliver_batch(&mut batch, &mut staged)
+        ));
     }
 }

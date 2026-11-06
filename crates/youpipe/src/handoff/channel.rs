@@ -231,6 +231,26 @@ impl<T: Send + Unpin + 'static> AsyncSender<T> {
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         self.tx.try_send(item).map_err(map_send_err)
     }
+
+    /// Async twin of [`SyncSender::try_send_batch`] (one `sender` CAS per
+    /// free run + one merged consumer-wake pass per run, via the fork's
+    /// `fire_n`). Same contract and `# Safety` section; callers fall back
+    /// to per-item awaited [`Self::send_cached`] for the remainder.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`SyncSender::try_send_batch`]: every slot of `buf`
+    /// must be initialized on entry. The sent prefix (the returned count's
+    /// worth of slots) is moved out — reading or dropping those slots again
+    /// is undefined behavior; the remainder stays initialized and owned by
+    /// the caller.
+    ///
+    /// Probe caliber: one hotpath guard per *batch*.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncSender"))]
+    pub unsafe fn try_send_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        // SAFETY: contract forwarded from the caller (see `# Safety`).
+        unsafe { self.tx.try_send_batch(buf) }
+    }
 }
 
 impl<T: Send + Unpin + 'static> Clone for AsyncSender<T> {
@@ -465,6 +485,24 @@ impl<T: Send + Unpin + 'static> MpscAsyncSender<T> {
     #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncSender"))]
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
         self.tx.try_send(item).map_err(map_send_err)
+    }
+
+    /// MPSC counterpart of [`AsyncSender::try_send_batch`] (same contract
+    /// and `# Safety` section).
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`SyncSender::try_send_batch`]: every slot of `buf`
+    /// must be initialized on entry. The sent prefix (the returned count's
+    /// worth of slots) is moved out — reading or dropping those slots again
+    /// is undefined behavior; the remainder stays initialized and owned by
+    /// the caller.
+    ///
+    /// Probe caliber: one hotpath guard per *batch*.
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncSender"))]
+    pub unsafe fn try_send_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        // SAFETY: contract forwarded from the caller (see `# Safety`).
+        unsafe { self.tx.try_send_batch(buf) }
     }
 }
 
@@ -850,7 +888,10 @@ pub trait AsyncRecvItem<T> {
 /// consumer task loops. Both [`AsyncSender`] (MPMC backing) and
 /// [`MpscAsyncSender`] (MPSC backing) implement this so the consumer task
 /// loop is written once for the mid-channel and terminal channel shapes.
-pub trait AsyncSendItem<T>: Clone + Send + 'static {
+/// `Sync` (both backings are sync-shared sender handles) so the provided
+/// [`AsyncSendItem::flush_staged`] — which holds `&self` across an await —
+/// compiles as `Send`.
+pub trait AsyncSendItem<T: Send>: Clone + Send + Sync + 'static {
     /// Deliver `item`, waiting for space. Resolves to
     /// `Err(ChannelError::Closed)` once every receiver has been dropped.
     /// `slot` is the cross-episode waker-node reuse (one per task, see
@@ -860,6 +901,83 @@ pub trait AsyncSendItem<T>: Clone + Send + 'static {
         item: T,
         slot: &'s mut WakerSlot,
     ) -> impl Future<Output = Result<(), ChannelError>> + Send;
+
+    /// Deliver `item` without blocking. Returns `Err(TrySendError::Full(item))`
+    /// when the bounded ring is full (the item is handed back) or
+    /// `Err(TrySendError::Closed(item))` when every receiver is gone.
+    fn try_send(&self, item: T) -> Result<(), TrySendError<T>>;
+
+    /// Non-blocking batch send of the longest sendable prefix of `values`;
+    /// returns the count sent (0 = nothing sendable right now — full or
+    /// closed; the per-item awaited fallback in [`Self::flush_staged`]
+    /// distinguishes). Async twin of [`SendItem::try_send_batch`]; default:
+    /// per-item `try_send`, parking never.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`SendItem::try_send_batch`]: every slot of `values`
+    /// initialized on entry; the sent prefix is moved out — reading or
+    /// dropping those slots again is undefined behavior; the remainder
+    /// stays initialized and owned by the caller.
+    unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
+        let mut n = 0;
+        while n < values.len() {
+            // SAFETY: only the sent prefix [..n) is ever moved out, so slot
+            // `n` is still initialized.
+            let item = unsafe { values[n].assume_init_read() };
+            match self.try_send(item) {
+                Ok(()) => n += 1,
+                Err(TrySendError::Full(item) | TrySendError::Closed(item)) => {
+                    // SAFETY: the handed-back item re-initializes the slot it
+                    // was read from.
+                    values[n].write(item);
+                    break;
+                },
+            }
+        }
+        n
+    }
+
+    /// Async twin of [`SendItem::flush_staged`]: the free prefix goes out
+    /// with one [`Self::try_send_batch`], the remainder per item with the
+    /// awaited [`Self::send_cached`] — parking at most once per full ring,
+    /// the backpressure granularity of the per-item send loop this
+    /// replaces. Item order is identical across the prefix/fallback
+    /// boundary. Returns whether the channel survived; a failed send drops
+    /// the unsent remainder with its destructors run (a `Vec<MaybeUninit<_>>`
+    /// drop would skip them). Cancellation-blind, like
+    /// [`SendItem::flush_staged`].
+    ///
+    /// Contract: every slot of `staged` must be initialized on entry
+    /// ([`stage_batch`] or an equivalent clone-staging loop established
+    /// that).
+    fn flush_staged<'s>(
+        &'s self,
+        staged: &'s mut [MaybeUninit<T>],
+        slot: &'s mut WakerSlot,
+    ) -> impl Future<Output = bool> + Send {
+        async move {
+            // SAFETY: the caller upholds the initialization contract; the
+            // sent prefix (the returned count's worth of slots) is moved out
+            // and skipped below.
+            let sent = unsafe { self.try_send_batch(staged) };
+            let mut j = sent;
+            while j < staged.len() {
+                // SAFETY: only [..j) was moved out (batch send or this loop);
+                // slot `j` is still initialized.
+                let item = unsafe { staged[j].assume_init_read() };
+                j += 1;
+                if self.send_cached(item, slot).await.is_err() {
+                    // SAFETY: [j..] were never moved out.
+                    for s in &mut staged[j..] {
+                        unsafe { s.assume_init_drop() };
+                    }
+                    return false;
+                }
+            }
+            true
+        }
+    }
 }
 
 impl<T: Send + Unpin + 'static> AsyncSendItem<T> for AsyncSender<T> {
@@ -871,6 +989,17 @@ impl<T: Send + Unpin + 'static> AsyncSendItem<T> for AsyncSender<T> {
     ) -> Result<(), ChannelError> {
         AsyncSender::send_cached(self, item, slot).await
     }
+
+    #[inline]
+    fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
+        AsyncSender::try_send(self, item)
+    }
+
+    #[inline]
+    unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
+        // SAFETY: forwarded to the inherent method's contract.
+        unsafe { AsyncSender::try_send_batch(self, values) }
+    }
 }
 
 impl<T: Send + Unpin + 'static> AsyncSendItem<T> for MpscAsyncSender<T> {
@@ -881,6 +1010,17 @@ impl<T: Send + Unpin + 'static> AsyncSendItem<T> for MpscAsyncSender<T> {
         slot: &'s mut WakerSlot,
     ) -> Result<(), ChannelError> {
         MpscAsyncSender::send_cached(self, item, slot).await
+    }
+
+    #[inline]
+    fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
+        MpscAsyncSender::try_send(self, item)
+    }
+
+    #[inline]
+    unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<T>]) -> usize {
+        // SAFETY: forwarded to the inherent method's contract.
+        unsafe { MpscAsyncSender::try_send_batch(self, values) }
     }
 }
 
@@ -1154,5 +1294,49 @@ mod tests {
         fn drop(&mut self) {
             self.0.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// `AsyncSendItem::flush_staged` keeps item order across the
+    /// try_send-batch prefix / per-item awaited fallback boundary: a batch
+    /// deeper than the ring parks per item for the remainder while a
+    /// concurrent drainer keeps the parks bounded — the async twin of
+    /// `send_batch_preserves_order_across_full_ring`.
+    #[test]
+    fn async_flush_staged_preserves_order_across_full_ring() {
+        for cap in [1, 2, 7] {
+            let (tx, rx) = async_channel::<u32>(cap);
+            let drainer = std::thread::spawn(move || {
+                let mut got = Vec::with_capacity(32);
+                while let Ok(v) = futures::executor::block_on(rx.recv()) {
+                    got.push(v);
+                }
+                got
+            });
+            let mut batch: Vec<u32> = (0..32).collect();
+            let mut staged: Vec<MaybeUninit<u32>> = Vec::with_capacity(32);
+            stage_batch(&mut batch, &mut staged);
+            let mut slot = WakerSlot::new();
+            let alive = futures::executor::block_on(tx.flush_staged(&mut staged, &mut slot));
+            assert!(alive, "cap {cap}");
+            drop(tx);
+            assert_eq!(drainer.join().unwrap(), (0..32).collect::<Vec<u32>>());
+        }
+    }
+
+    /// Closed mid-batch on the async sender: the failed `send_cached`
+    /// consumes item 0, the explicit remainder drop covers the rest — a
+    /// `Vec<MaybeUninit<_>>` drop would skip them silently.
+    #[test]
+    fn async_flush_staged_closed_mid_batch_runs_destructors() {
+        let counter = Arc::new(Drops::default());
+        let (tx, rx) = mpsc_async_channel::<DropCounted>(4);
+        drop(rx);
+        let mut batch: Vec<_> = (0..8).map(|_| DropCounted(counter.clone())).collect();
+        let mut staged: Vec<MaybeUninit<DropCounted>> = Vec::with_capacity(8);
+        stage_batch(&mut batch, &mut staged);
+        let mut slot = WakerSlot::new();
+        let alive = futures::executor::block_on(tx.flush_staged(&mut staged, &mut slot));
+        assert!(!alive);
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 8);
     }
 }

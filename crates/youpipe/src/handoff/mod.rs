@@ -310,6 +310,51 @@ pub(crate) fn async_tx_gate() -> AsyncTxGate {
     })
 }
 
+// `YOUPIPE_ASYNC_OUTLET_BATCH` batches the ASYNC OUTLET hop — an async
+// producer task (the M:N mux drivers of `handoff::mux`, and the graph
+// engine's async broadcast/unicast deliveries) handing completions to its
+// downstream — the async twin of the sync engines' tx-batch lever
+// (`SendItem::send_batch`). A DISTINCT HOP from `YOUPIPE_ASYNC_TX_BATCH`
+// (that one gates the sync worker -> async consumer send on async-tailed
+// stream chains; this one gates the async producer -> downstream send of
+// both engines). When on, a driver that has clustered completions (one
+// wake commonly resolves several in-flight futures; a cheap future
+// resolves on its first inline poll) drains them into one batch and
+// delivers it per edge with the `try_send_batch` prefix + per-item awaited
+// fallback rhythm (`AsyncSendItem::flush_staged`) instead of one awaited
+// `send_cached` per item — one ring CAS per free run and one merged
+// consumer-wake pass per batch per edge. Broadcast keeps its k-1 clones
+// per item (one clone per open edge is semantically required); what
+// amortizes is the ring/waker traffic per edge. Default ON (promoted
+// 2026-11-06 by the same-binary knob A/B: `fanout_async_*_graph` @100K
+// -15.5..-16.0 % and @1K -4.0..-4.4 %, all 25/25; the unicast fan-in twin
+// and the async-terminal `async1_*` @100K improved too (-3.8..-7.7 %,
+// 25/25), while the parky `io_async` rows and `mixed_load` stayed dead
+// flat — the driver's flush-before-park keeps staging from delaying first
+// delivery; readings in docs benchmarks/graph.md). Values: unset = on with
+// the default batch cap; "0" = the per-item deliveries; "1" = on with the
+// default cap; "N" (>= 2) = on with batch cap N (the driver's in-flight
+// bound caps the batch anyway). Runtime knob so A/B benches compare the
+// same binary.
+static ASYNC_OUTLET_BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Batch cap for the async outlet delivery; 0 = per-item deliveries.
+pub(crate) fn async_outlet_batch_cap() -> usize {
+    *ASYNC_OUTLET_BATCH.get_or_init(|| match std::env::var("YOUPIPE_ASYNC_OUTLET_BATCH") {
+        Ok(v) if v == "1" || v.is_empty() => DEFAULT_BATCH_RECV_CAP,
+        Ok(v) if v == "0" => 0,
+        Ok(v) => match v.parse::<usize>() {
+            Ok(n) if n >= 2 => n,
+            _ => panic!(
+                "YOUPIPE_ASYNC_OUTLET_BATCH: invalid value {v:?} (leave unset, or use \
+                 \"0\"/\"1\"/a batch cap >= 2)"
+            ),
+        },
+        // Unset = the default-on policy (see the knob comment above).
+        Err(_) => DEFAULT_BATCH_RECV_CAP,
+    })
+}
+
 // `YOUPIPE_CLAIM_SCALE` (todo #34): backlog-scaled claim shares for the
 // stream engine's multi-consumer stage/expand workers. The fixed share
 // (`per_worker_claim_cap` = cap / workers, 2 items at 31 workers) costs

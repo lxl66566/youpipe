@@ -182,6 +182,25 @@ impl<F: Flavor> AsyncTx<F> {
         }
     }
 
+    /// youpipe fork extension: non-blocking batch send of the longest free
+    /// prefix of `values`; returns the count sent (0 = nothing sendable
+    /// right now). `values` must be fully initialized; the sent prefix is
+    /// moved out. Backpressure granularity is unchanged — callers fall
+    /// back to per-item `send_cached` for the remainder (the async twin of
+    /// [`MTx::try_send_batch`]; consumer wakes
+    /// merge through the same `fire_n` registry pass).
+    ///
+    /// # Safety
+    ///
+    /// Every slot of `values` must be initialized on entry. The sent prefix
+    /// (the returned count's worth of slots) is moved out — reading or
+    /// dropping those slots again is undefined behavior; the remainder
+    /// stays initialized and owned by the caller.
+    #[inline]
+    pub unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<F::Item>]) -> usize {
+        self.shared.try_send_batch(values)
+    }
+
     /// Sends a message with a timeout.
     /// Will await when channel is full.
     ///
