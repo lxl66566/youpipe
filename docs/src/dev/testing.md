@@ -154,8 +154,9 @@ synchronization role (the final mutex acquire) is exercised either way.
 `miri.sh`'s default path is `cargo +nightly miri nextest run`
 (cargo-miri forwards nextest's flags verbatim): the default target list
 runs as six groups — light (9 binaries) / medium (5) / heavy
-(async_waker_alloc + compute_pool) / async (sharded_terminal_async) /
-lib / pipeline_integration — each group one nextest invocation at
+(async_waker_alloc + compute_pool) / async (sharded_terminal_async +
+sharded_terminal_async_one_worker) / lib / pipeline_integration — each
+group one nextest invocation at
 `-j ${MIRI_JOBS:-8}` (`--no-fail-fast`, `--no-tests warn`), the doctests
 stay on `cargo miri test --doc` (nextest does not run doctests), and the
 vendored crossfire lib stays its own `-p youpipe-crossfire --lib` block.
@@ -253,6 +254,15 @@ reference model.
 | `stream`  | streaming topology and the fused pass-through (via the worker-pin flag), `expand_emit`, `fence`, ordered/unordered collection, tiny buffers for backpressure |
 | `channel` | handoff channel: strict FIFO and exact capacity accounting in a single-threaded interleave, close propagation across sender/receiver clones, batch send/claim exact-count + EOF-transition semantics, MPMC and MPSC count/multiset/per-producer-FIFO conservation under real threads |
 | `reorder` | `ReorderBuffer` re-sequencing against a `BTreeMap` model, interleaved with `flush_remaining`/`reset` |
+
+Worktree pitfall: a checkout nested inside the main repository (the shared-cache
+convention puts worktrees under `target/wt/`) cannot run the excluded crate —
+cargo's upward workspace search accepts the worktree root's `exclude` entry and
+then attaches to the outer main-repo manifest, whose exclude list does not cover
+the worktree path, so every cargo invocation from inside `crates/youpipe-fuzz`
+(`cargo fuzz`, `cargo fmt`) fails with `current package believes it's in a
+workspace when it's not`. Fuzz from the main checkout or a worktree outside the
+repository tree (keep shared builds via `CARGO_TARGET_DIR`).
 
 Run from the repo root (nightly toolchain required):
 
@@ -487,6 +497,7 @@ extrapolation artifact).
 | graph_stream_diff     | 4 / 0                 | 59 s (added 2026-10-26, r16; both engines per fixture) |
 | graph_dag             | 20 / 4                | 85 s                          |
 | sharded_terminal_async| 1 / 0                 | 281 s (12 full async topologies; scenario count is the floor) |
+| sharded_terminal_async_one_worker | 1 / 0 | 12 s (measured 2026-11-06; selector-gate regression, miri-scaled n=200) |
 | compute_pool          | 5 / 0                 | 72 s (hybrid-driver test dominates) |
 | pipeline_integration  | 108 / 14              | **~31 min** (extrapolated ±50 %; heavy tier 55–76 s/test) |
 | youpipe-crossfire lib | 52 / 0                | 27 s (measured)               |
@@ -647,7 +658,7 @@ drift anchors only (~187 of 246 kept).
 ## Where the time goes
 
 native + clippy ≈ 1 min · miri ≈ 32 min serial (lib ~9 ·
-pipeline_integration 6 · sharded_terminal_async ~4.7 · the other 18
+pipeline_integration 6 · sharded_terminal_async ~4.7 · the other 19
 targets ~12), ~5–8 min projected at the 2026-11-04 nextest-parallel
 default (470 s measured on the Windows host) · loom ≈ 10–30 min serial,
 st3-bound at ~4.5 min with the concurrent blocks · benches ≥ 30 min for

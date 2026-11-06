@@ -2029,9 +2029,24 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     /// reduce producer contention and only add collector pass cost and
     /// per-run channel construction (a small-`n` run would otherwise build
     /// `io_concurrency` rings up front — up to 512).
+    ///
+    /// `runtime_workers` is the active runtime's actual worker count (a
+    /// pool attached via `with_async_pool` may be smaller than
+    /// `config.async_workers`).
     #[cfg(feature = "tokio-runtime")]
-    fn sharded_async_terminal(&self, concurrency: usize) -> usize {
-        if !self.terminal_policy.sharded_async || concurrency <= 1 {
+    fn sharded_async_terminal(&self, concurrency: usize, runtime_workers: usize) -> usize {
+        if !self.terminal_policy.sharded_async
+            || concurrency <= 1
+            // A one-worker runtime drives a single consumer task: the
+            // single ring is the right shape there (the sync sibling
+            // `sharded_terminal` gates on `parallelism > 1` the same way),
+            // and `AsyncSharded::make` — which re-caps shards at the true
+            // driver count — would otherwise compute zero shards and the
+            // channel constructor panics (`shards must be nonzero`).
+            // Miri's default runtime has one worker
+            // (`available_parallelism() == 1`); that is where this fired.
+            || runtime_workers <= 1
+        {
             return 0;
         }
         concurrency.min(self.config.async_workers.max(1))
@@ -3342,7 +3357,8 @@ where
     B: Send + Unpin + 'static,
     R: AsyncRuntime,
 {
-    if ctx.sharded_async_terminal(ctx.stage_io_concurrency(opts)) > 0 {
+    let pool = ctx.acquire_async().expect("failed to build async runtime");
+    if ctx.sharded_async_terminal(ctx.stage_io_concurrency(opts), pool.parallelism()) > 0 {
         spawn_grouped_async_consumers_into::<AsyncSharded, R, A, B, Fut, F>(f, a_in_rx, opts, ctx)
     } else {
         spawn_grouped_async_consumers_into::<AsyncMpsc, R, A, B, Fut, F>(f, a_in_rx, opts, ctx)
@@ -3706,7 +3722,12 @@ impl<M: Send + Unpin + 'static> AsyncOutChannel<M> for AsyncSharded {
         buffer: usize,
         tasks: usize,
     ) -> (Vec<Self::Tx>, Self::Rx) {
-        let shards = ctx.sharded_async_terminal(tasks);
+        // Re-cap at the true driver count: the selector's `async_workers`
+        // cap is a prediction and `tasks` is the resolved MuxPlan fan-out.
+        // `tasks >= 2` holds because the selector's `runtime_workers > 1`
+        // gate keeps every driver count >= 2, so this cannot degenerate
+        // to zero shards.
+        let shards = tasks.min(ctx.config.async_workers.max(1));
         debug_assert!(
             shards > 0,
             "the terminal selector only picks AsyncSharded when shards > 0"
@@ -3788,7 +3809,8 @@ where
     M: Send + Unpin + 'static,
     R: AsyncRuntime,
 {
-    if ctx.sharded_async_terminal(ctx.stage_io_concurrency(opts)) > 0 {
+    let pool = ctx.acquire_async().expect("failed to build async runtime");
+    if ctx.sharded_async_terminal(ctx.stage_io_concurrency(opts), pool.parallelism()) > 0 {
         spawn_async_consumers_into::<AsyncSharded, R, In, M, Fut, F>(f, a_in_rx, opts, ctx)
     } else {
         spawn_async_consumers_into::<AsyncMpsc, R, In, M, Fut, F>(f, a_in_rx, opts, ctx)
@@ -7003,13 +7025,16 @@ mod tests {
             _marker: PhantomData,
         };
         // Sync knob alone: the async terminal stays on the single ring.
-        assert_eq!(ctx(true, false).sharded_async_terminal(128), 0);
+        assert_eq!(ctx(true, false).sharded_async_terminal(128, 4), 0);
         // Async knob alone: shards form regardless of the sync flag, capped
         // at async_workers.
-        assert_eq!(ctx(false, true).sharded_async_terminal(128), 4);
-        assert_eq!(ctx(true, true).sharded_async_terminal(128), 4);
+        assert_eq!(ctx(false, true).sharded_async_terminal(128, 4), 4);
+        assert_eq!(ctx(true, true).sharded_async_terminal(128, 4), 4);
         // Concurrency floor: one task is already a single SPSC ring.
-        assert_eq!(ctx(true, true).sharded_async_terminal(1), 0);
+        assert_eq!(ctx(true, true).sharded_async_terminal(1, 4), 0);
+        // One-worker runtime: a single consumer driver keeps the single
+        // ring (miri's default runtime shape).
+        assert_eq!(ctx(true, true).sharded_async_terminal(128, 1), 0);
     }
 
     /// `stage_buffer` applies the chain floor only where eligible: the knob

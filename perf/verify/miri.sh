@@ -77,7 +77,7 @@ else
              on_pool_nested pool_cache stream_reduce expand_alloc
              cancel_outcome async_waker_alloc sharded_terminal
              batch_recv graph_stream_diff graph_dag sharded_terminal_async
-             compute_pool pipeline_integration)
+             sharded_terminal_async_one_worker compute_pool pipeline_integration)
 fi
 
 has() { # is target $1 in TARGETS[]?
@@ -173,7 +173,7 @@ else
             cancel_outcome batch_recv sharded_terminal \
             graph_stream_diff graph_dag
         run_nextest_group "heavy" async_waker_alloc compute_pool
-        run_nextest_group "async" sharded_terminal_async
+        run_nextest_group "async" sharded_terminal_async sharded_terminal_async_one_worker
         run_nextest_group "lib" lib
         run_nextest_group "pipeline" pipeline_integration
     else
