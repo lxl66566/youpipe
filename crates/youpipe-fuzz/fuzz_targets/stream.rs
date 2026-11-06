@@ -82,7 +82,11 @@ macro_rules! emit {
         $workers:expr,
         $buffer:expr
     ) => {{
-        let p = if $pin { $p.with_compute_workers($workers) } else { $p };
+        let p = if $pin {
+            $p.with_compute_workers($workers)
+        } else {
+            $p
+        };
         let p = p.with_buffer_size($buffer);
         let got = if $for_each {
             let sink = Arc::new(Mutex::new(Vec::new()));
@@ -133,12 +137,14 @@ fuzz_target!(|data: &[u8]| {
                 .with_async_pool(pool())
                 .stage(map_closure(ops[0]))
                 .stage(map_closure(ops[1]));
-            let p = if ordered {
-                p.ordered()
+            // `.ordered()` is typestate (todo #5: it returns
+            // `StreamPipe<.., Ordered>`), so an `if/else` cannot unify the
+            // two marker types — the terminal call is duplicated per arm.
+            if ordered {
+                emit!(p.ordered(), expect, true, for_each, pin, workers, buffer);
             } else {
-                p
-            };
-            emit!(p, expect, ordered, for_each, pin, workers, buffer);
+                emit!(p, expect, false, for_each, pin, workers, buffer);
+            }
         },
         // stage → expand(0..=5, 0 = drop) → stage: cardinality changes
         1 => {
@@ -164,12 +170,12 @@ fuzz_target!(|data: &[u8]| {
                 .stage(map_closure(ops[0]))
                 .fence(fence_mode(&mut r))
                 .stage(map_closure(ops[1]));
-            let p = if ordered {
-                p.ordered()
+            // Same typestate split as template 0.
+            if ordered {
+                emit!(p.ordered(), expect, true, for_each, pin, workers, buffer);
             } else {
-                p
-            };
-            emit!(p, expect, ordered, for_each, pin, workers, buffer);
+                emit!(p, expect, false, for_each, pin, workers, buffer);
+            }
         },
         // expand → stage → expand: head and tail cardinality changes
         3 => {
