@@ -12,7 +12,9 @@
 # node-state get_waker_state fixes (2026-09 intermittent-hang forensics),
 # the async WakerSlot cross-episode reuse (P-4), RegistryMulti::fire()
 # expressed as _fire_n(1) (one event = one committed wake; the legacy
-# pop_first/pop_again body is deleted), and their tests. The `async_std`
+# pop_first/pop_again body is deleted), the F::Item: Send bound on
+# SendTimeoutFuture's unsafe impl Send (ported from upstream 3.1.22,
+# d8a461b), and their tests. The `async_std`
 # timer methods additionally gate on `not(feature = "tokio")` (tokio wins)
 # — upstream compiles duplicate definitions when both features are on.
 #
