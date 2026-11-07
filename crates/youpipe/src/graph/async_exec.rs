@@ -24,8 +24,8 @@ use crate::handoff::forward_async_to_sync;
 use crate::{
     builder::{PanicSlot, record_panic},
     handoff::{
-        AsyncReceiver, AsyncSendItem, AsyncSender, Receiver as SyncReceiver, TryRecvError,
-        WakerSlot, cancel_active, channel,
+        AsyncReceiver, AsyncSendItem, AsyncSender, ClosedSet, Receiver as SyncReceiver,
+        TryRecvError, WakerSlot, cancel_active, channel,
         mux::{self, AsyncIntake, AsyncOutlet, TryClaim},
         stage_batch,
     },
@@ -41,8 +41,8 @@ use crate::{
 /// the closed marks untouched (they change only after an input resolves).
 pub(crate) struct AsyncFanIn<T: Send + Unpin + 'static> {
     rxs: Vec<AsyncReceiver<T>>,
-    /// Closed inputs are never polled again.
-    closed: Vec<bool>,
+    /// Closed inputs are never polled again (see [`ClosedSet`]).
+    closed: ClosedSet,
     /// Per-input waker-node slots: a parked claim poll re-arms the node in
     /// place instead of allocating one per episode.
     slots: Vec<WakerSlot>,
@@ -56,7 +56,7 @@ impl<T: Send + Unpin + 'static> AsyncFanIn<T> {
     pub(crate) fn new(rxs: Vec<AsyncReceiver<T>>) -> Self {
         let n = rxs.len();
         Self {
-            closed: vec![false; n],
+            closed: ClosedSet::new(n),
             slots: (0..n).map(|_| WakerSlot::new()).collect(),
             rxs,
             cursor: 0,
@@ -70,7 +70,7 @@ impl<T: Send + Unpin + 'static> AsyncFanIn<T> {
         let n = self.rxs.len();
         for k in 0..n {
             let i = (self.cursor + k) % n;
-            if self.closed[i] {
+            if self.closed.is_closed(i) {
                 continue;
             }
             match self.rxs[i].try_recv() {
@@ -79,7 +79,7 @@ impl<T: Send + Unpin + 'static> AsyncFanIn<T> {
                     return TryClaim::Item(item);
                 },
                 Err(TryRecvError::Closed) => {
-                    self.closed[i] = true;
+                    self.closed.close(i);
                     self.open -= 1;
                 },
                 Err(TryRecvError::Empty) => {},
@@ -134,7 +134,7 @@ impl<T: Send + Unpin + 'static> AsyncIntake<T> for AsyncFanIn<T> {
         let n = self.rxs.len();
         for k in 0..n {
             let i = (self.cursor + k) % n;
-            if self.closed[i] {
+            if self.closed.is_closed(i) {
                 continue;
             }
             match self.rxs[i].poll_recv_cached(cx, &mut self.slots[i]) {
@@ -144,7 +144,7 @@ impl<T: Send + Unpin + 'static> AsyncIntake<T> for AsyncFanIn<T> {
                 },
                 // RecvError: senders dropped + ring drained.
                 Poll::Ready(Err(_)) => {
-                    self.closed[i] = true;
+                    self.closed.close(i);
                     self.open -= 1;
                 },
                 Poll::Pending => {},

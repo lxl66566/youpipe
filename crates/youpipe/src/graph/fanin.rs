@@ -1,46 +1,12 @@
 //! Sync-node fan-in primitives: the fair round-robin aggregation over a
 //! node's input edges. The pre-anchor spin state machine (`SpinBudget`) and
 //! the output side (the `Delivery` strategies) live in `handoff::worker`
-//! with the shared worker loops.
+//! with the shared worker loops; the closed-input set (`ClosedSet`, shared
+//! with the sharded terminal) lives in `handoff::closed_set`.
 
 use std::{sync::Arc, time::Instant};
 
-use crate::handoff::{Claim, Receiver, SpinBudget, SpinPoll, claim_poll};
-
-/// Per-worker closed-input set. n <= 64 (every realistic node) is a u64
-/// bitmask — one `vec![false; n]` per worker was a measured share of the
-/// graph engine's fixed per-run assembly cost at µs-scale workloads; wider
-/// fan-ins keep the Vec.
-enum ClosedSet {
-    Bits(u64),
-    Wide(Vec<bool>),
-}
-
-impl ClosedSet {
-    fn new(n: usize) -> Self {
-        if n <= 64 {
-            Self::Bits(0)
-        } else {
-            Self::Wide(vec![false; n])
-        }
-    }
-
-    #[inline]
-    fn is_closed(&self, i: usize) -> bool {
-        match self {
-            Self::Bits(mask) => *mask & (1 << i) != 0,
-            Self::Wide(v) => v[i],
-        }
-    }
-
-    #[inline]
-    fn close(&mut self, i: usize) {
-        match self {
-            Self::Bits(mask) => *mask |= 1 << i,
-            Self::Wide(v) => v[i] = true,
-        }
-    }
-}
+use crate::handoff::{Claim, ClosedSet, Receiver, SpinBudget, SpinPoll, claim_poll};
 
 // ── Graph data-plane batching knob ──
 //
@@ -89,8 +55,7 @@ pub(crate) struct FanIn<T: Send + 'static> {
     /// the last worker's drop closes the input at the same instant the last
     /// per-worker clone would.
     rxs: Arc<[Receiver<T>]>,
-    /// Closed inputs are never polled again (a `try_recv`/`recv` on a closed
-    /// crossfire channel re-reads its disconnect state every call).
+    /// Closed inputs are never polled again (see [`ClosedSet`]).
     closed: ClosedSet,
     /// Round-robin start index; rotated by every round and anchor so no
     /// input systematically waits behind another.

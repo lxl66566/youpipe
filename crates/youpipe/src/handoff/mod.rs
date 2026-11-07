@@ -4,6 +4,9 @@
 use crate::{AsyncTxGate, ChainFloor};
 
 pub mod channel;
+// Crate-internal: closed-input bookkeeping shared by the sharded terminal's
+// ShardSet and the graph engine's FanIn rounds.
+pub(crate) mod closed_set;
 // Crate-internal: the bridge forward loops (recv -> cancel-check -> send)
 // shared by both engines' cross-mode bridges.
 pub(crate) mod forward;
@@ -434,6 +437,7 @@ pub use channel::{
     mpsc_async_channel, mpsc_channel, sync_async_channel,
 };
 pub(crate) use channel::{Claim, claim_poll, stage_batch};
+pub(crate) use closed_set::ClosedSet;
 #[cfg(feature = "tokio-runtime")]
 pub(crate) use forward::forward_async;
 // `forward_async_to_sync` is re-exported ungated: the graph engine's bridge

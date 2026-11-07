@@ -150,6 +150,8 @@ crates/youpipe/src/
 ├── graph/            # Runtime DAG engine (graph()): builder, validation, per-node executors
 ├── handoff/          # Data transfer layer
 │   ├── channel.rs    # MPMC + MPSC channels (crossfire wrapper: sync + async)
+│   ├── closed_set.rs # ClosedSet closed-input marks shared by the sharded
+│   │                 #   terminal and the graph fan-in
 │   ├── forward.rs    # The bridge forward loops (forward_sync / forward_async /
 │   │                 #   forward_async_to_sync) shared by both engines' bridges
 │   ├── mux.rs        # The M:N async driver (MuxPlan + drive): async stages and

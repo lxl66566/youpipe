@@ -24,12 +24,13 @@
 //! producers are runtime tasks sending via `send().await` (todo #1
 //! residual (c)).
 
-use super::channel::{
-    ChannelError, MpscReceiver, MpscSender, RecvItem, TryRecvError, mpsc_channel,
-};
 #[cfg(feature = "tokio-runtime")]
 use super::channel::{
     MpscAsyncReceiver, MpscAsyncSender, TryRecvItem, WakerSlot, mpsc_async_channel,
+};
+use super::{
+    channel::{ChannelError, MpscReceiver, MpscSender, RecvItem, TryRecvError, mpsc_channel},
+    closed_set::ClosedSet,
 };
 
 /// Minimum per-shard capacity. Below this the ring degenerates into a
@@ -68,7 +69,7 @@ pub(crate) fn sharded_mpsc_channel<T: Send + 'static>(
     (txs, ShardedReceiver {
         inner: ShardSet {
             rxs,
-            closed: vec![false; shards],
+            closed: ClosedSet::new(shards),
             cursor: 0,
             open: shards,
         },
@@ -107,7 +108,7 @@ pub(crate) fn sharded_mpsc_async_channel<T: Send + Unpin + 'static>(
     (txs, ShardedAsyncReceiver {
         inner: ShardSet {
             rxs,
-            closed: vec![false; shards],
+            closed: ClosedSet::new(shards),
             cursor: 0,
             open: shards,
         },
@@ -123,10 +124,8 @@ pub(crate) fn sharded_mpsc_async_channel<T: Send + Unpin + 'static>(
 /// terminals.
 struct ShardSet<R> {
     rxs: Vec<R>,
-    /// Closed shards are never polled again — `try_recv`/`recv` on a closed
-    /// crossfire channel re-reads its disconnect state every call, which
-    /// would burn a scan slot per pass after a worker exits early.
-    closed: Vec<bool>,
+    /// Closed shards are never polled again (see [`ClosedSet`]'s module doc).
+    closed: ClosedSet,
     /// Round-robin start index; rotated by every pass and every anchor so no
     /// shard systematically waits behind another (fairness).
     cursor: usize,
@@ -159,7 +158,7 @@ impl<R> ShardSet<R> {
         let n = self.rxs.len();
         for k in 0..n {
             let i = (self.cursor + k) % n;
-            if self.closed[i] {
+            if self.closed.is_closed(i) {
                 continue;
             }
             loop {
@@ -169,7 +168,7 @@ impl<R> ShardSet<R> {
                     Ok(item) => sink(item),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Closed) => {
-                        self.closed[i] = true;
+                        self.closed.close(i);
                         self.open -= 1;
                         break;
                     },
@@ -195,7 +194,7 @@ impl<R> ShardSet<R> {
         let can_batch = scratch.capacity() > 0;
         for k in 0..n {
             let i = (self.cursor + k) % n;
-            if self.closed[i] {
+            if self.closed.is_closed(i) {
                 continue;
             }
             loop {
@@ -232,7 +231,7 @@ impl<R> ShardSet<R> {
                     Ok(item) => sink(item),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Closed) => {
-                        self.closed[i] = true;
+                        self.closed.close(i);
                         self.open -= 1;
                         break;
                     },
@@ -278,7 +277,7 @@ impl<T: Send + 'static> ShardedReceiver<T> {
         let n = self.inner.rxs.len();
         for k in 0..n {
             let i = (self.inner.cursor + k) % n;
-            if self.inner.closed[i] {
+            if self.inner.closed.is_closed(i) {
                 continue;
             }
             match self.inner.rxs[i].recv() {
@@ -287,7 +286,7 @@ impl<T: Send + 'static> ShardedReceiver<T> {
                     return Ok(item);
                 },
                 Err(ChannelError::Closed) => {
-                    self.inner.closed[i] = true;
+                    self.inner.closed.close(i);
                     self.inner.open -= 1;
                 },
             }
@@ -342,7 +341,7 @@ impl<T: Send + Unpin + 'static> ShardedAsyncReceiver<T> {
         let n = self.inner.rxs.len();
         for k in 0..n {
             let i = (self.inner.cursor + k) % n;
-            if self.inner.closed[i] {
+            if self.inner.closed.is_closed(i) {
                 continue;
             }
             match self.inner.rxs[i].recv_cached(&mut self.slots[i]).await {
@@ -351,7 +350,7 @@ impl<T: Send + Unpin + 'static> ShardedAsyncReceiver<T> {
                     return Ok(item);
                 },
                 Err(ChannelError::Closed) => {
-                    self.inner.closed[i] = true;
+                    self.inner.closed.close(i);
                     self.inner.open -= 1;
                 },
             }
