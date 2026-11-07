@@ -89,7 +89,7 @@ pool worker) deadlock-free.
 
 ### Non-`'static` Lifetime Support
 
-The `scope()` API allows closures to borrow stack-local variables without `'static` bounds. The `'env` lifetime is threaded through `ScopedPipe` and the underlying `fused_collect_scoped` drives the same `ComputePool::join` work-stealing core — whose `Registry::in_worker_cold` blocks the calling thread until every spawned sub-task finishes — guaranteeing borrowed references outlive the pool's access to them.
+The `scope()` API allows closures to borrow stack-local variables without `'static` bounds. The `'env` lifetime is threaded through `ScopedPipe` and the underlying `fused_collect_scoped` drives the same work-stealing core as `Pipe::collect`, which returns only after every spawned chunk finishes — `hybrid_dispatch`'s driver waits in `CountLatch::wait_spin`, the single-tree paths (filter chains; on-pool callers by default) inside `ComputePool::join` — guaranteeing borrowed references outlive the pool's access to them.
 
 `pipe_ref` gets the same property without `scope`: the `'a` input borrow brands
 every `PipeRef` closure, and the terminal blocks until every worker finishes —
@@ -104,10 +104,10 @@ abstracted so the streaming code never calls tokio APIs directly. A future
 non-tokio backend slots in as one more `AsyncRuntime` impl without touching
 `stream.rs`.
 
-`StreamPipe<S, I, O, R: AsyncRuntime = DefaultRuntime>` is generic over the
-backend so every `spawn` / `block_on` monomorphises to the concrete type —
-zero virtual dispatch. Sync-only chains never instantiate `R`, so the
-abstraction is free for them. Callers attach a managed runtime via
+`StreamPipe<S, I, O, R: AsyncRuntime = DefaultRuntime, M: StreamMode = Unordered>`
+is generic over the backend so every `spawn` / `block_on` monomorphises to the
+concrete type — zero virtual dispatch. Sync-only chains never instantiate `R`,
+so the abstraction is free for them. Callers attach a managed runtime via
 `.with_async_pool` (changing `R` to the pool's type) or let the pipeline build
 a transient one per `run()` call.
 
@@ -133,17 +133,19 @@ crates/youpipe/src/
 │   │                 #   shared by the stream (resolve_admission) and graph
 │   │                 #   (resolve_budget) runner cores
 │   └── typed/        # Pipe / TryPipe / StreamPipe builder core
-│       ├── mod.rs    # Re-exports
-│       ├── fused.rs  # pipe(), Pipe<S,I,O>, TryPipe<S,I,O,E>, par_index_* core,
-│       │             #   fused_collect_scoped (pub(crate) entry for scope)
-│       ├── stream.rs # stream(), StreamPipe<S,I,O,R>, StageSpawn typestate chain
-│       ├── traits.rs # FusedStage / FusedTryStage / RangeOp / stage markers
-│       │             #   (SyncMap / Filter / TryMap / MapErr / InfallibleChain)
-│       └── slots.rs  # Slots<T> index-based zero-copy buffer
+│       ├── mod.rs      # Re-exports
+│       ├── fused.rs    # pipe(), Pipe<S,I,O>, TryPipe<S,I,O,E>, par_index_* core,
+│       │               #   fused_collect_scoped (pub(crate) entry for scope)
+│       ├── borrowed.rs # pipe_ref(), PipeRef / TryPipeRef; by-ref cores live in fused.rs
+│       ├── stream.rs   # stream(), StreamPipe<S,I,O,R,M>, StageSpawn typestate chain
+│       ├── traits.rs   # FusedStage / FusedTryStage / RangeOp / stage markers
+│       │               #   (SyncMap / Filter / TryMap / MapErr / InfallibleChain)
+│       └── slots.rs    # Slots<T> index-based zero-copy buffer
 ├── executor/
 │   ├── compute/      # st3 work-stealing CPU thread pool
-│   │   ├── mod.rs    # ComputePool unit tests
-│   │   └── worker.rs # ComputePool: Injector/Stealer/sleep counters wake/graceful shutdown/join
+│   │   ├── mod.rs        # Re-exports, MAX_COMPUTE_WORKERS
+│   │   ├── pool_cache.rs # Recycling cache for transient ComputePool::new pools
+│   │   └── worker.rs     # ComputePool: Injector/Stealer/sleep counters wake/graceful shutdown/join
 │   └── mod.rs
 ├── graph/            # Runtime DAG engine (graph()): builder, validation, per-node executors
 ├── handoff/          # Data transfer layer
@@ -153,6 +155,7 @@ crates/youpipe/src/
 │   ├── mux.rs        # The M:N async driver (MuxPlan + drive): async stages and
 │   │                 #   graph async nodes multiplex io_concurrency in-flight
 │   │                 #   futures over ≤ runtime-worker driver tasks
+│   ├── sharded.rs    # Per-worker sharded terminal channel (sync default on)
 │   ├── worker.rs     # The engine-agnostic claim → map/expand → deliver worker
 │   │                 #   loops (claim_map_deliver / claim_expand_deliver,
 │   │                 #   CancelCheck) + the Delivery output strategies

@@ -340,7 +340,7 @@ enum BurstEnd {
 /// The async source task: call `f` until `None` (EOF), delivering items
 /// through the source's [`AsyncDelivery`] strategy. Dense pulls (futures
 /// resolving without suspension) stage into a batch and flush through
-/// [`AsyncDelivery::deliver_batch`] — one ring CAS per free run and one
+/// [`AsyncOutlet::deliver_batch`] — one ring CAS per free run and one
 /// merged consumer-wake pass per batch instead of one awaited send per item
 /// (the sync `source_feeder_worker`'s rhythm; `YOUPIPE_ASYNC_OUTLET_BATCH`
 /// gates the cap, `"0"` keeps the per-item loop). Sparse pulls keep the

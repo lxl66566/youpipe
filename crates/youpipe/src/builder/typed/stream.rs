@@ -634,7 +634,7 @@ fn spawn_stage_fanout<I, O, Tx, R>(
     drop(rx);
 }
 
-/// Like [`spawn_stage`] but expands each input into 0..N outputs via `expand`
+/// Like [`spawn_stage_fanout`] but expands each input into 0..N outputs via `expand`
 /// (the UNORDERED flavour — todo #5): outputs travel as individual
 /// `(seq, N)` messages sharing the parent's seq; the unordered collector
 /// ignores the tag. Ordered chains use the group-payload cores instead
@@ -1182,7 +1182,7 @@ pub struct Unordered;
 
 /// Input-order output, entered by [`.ordered()`](StreamPipe::ordered) on an
 /// expand-free chain. Payloads stay per-item (`(seq, T)` — one message per
-/// input item), so the [`ReorderBuffer`] re-sequences single items.
+/// input item), so the [`ReorderBuffer`](crate::ReorderBuffer) re-sequences single items.
 /// `.expand()` here enters [`Grouped`].
 pub struct Ordered;
 
@@ -1190,7 +1190,7 @@ pub struct Ordered;
 /// carry **group payloads** — one `(seq, Vec<N>)` message per input item
 /// (an empty expansion is an empty-`Vec` message, which still advances the
 /// reorder buffer; a per-item tagging could not signal an empty group at
-/// all). One seq maps to exactly one message, so the [`ReorderBuffer`] is
+/// all). One seq maps to exactly one message, so the [`ReorderBuffer`](crate::ReorderBuffer) is
 /// reused as-is at group granularity. Stages appended in this mode map
 /// payloads elementwise, keeping each group atomic; nested expands flatten
 /// naturally into the same output group (`(seq, sub₁, sub₂)` order).
@@ -1460,7 +1460,7 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
     /// Whether this chain contains at least one async stage — i.e. whether
     /// `run()` will need an async runtime backend at all.
     ///
-    /// [`StreamPipe::try_exec`] pre-warms the lazily-built runtime when this
+    /// [`exec_stream`] pre-warms the lazily-built runtime when this
     /// is `true` *before* spawning the chain: the `OnceLock` then caches the
     /// `Ok`, so every `acquire_async().expect(..)` inside the spawn walk
     /// (bridges, async consumers) is guaranteed to succeed — a construction
@@ -1844,7 +1844,7 @@ impl<M: Send + Unpin + 'static> OutChannel<M> for ShardedMpsc {
 
 /// Terminal data-plane policy: the runtime knobs governing the terminal
 /// channel's shape and the async-chain capacity floor, read once per run in
-/// [`StreamPipe::try_exec`] (see `handoff/mod.rs` for each knob's rationale).
+/// [`exec_stream`] (see `handoff/mod.rs` for each knob's rationale).
 #[derive(Clone, Copy)]
 pub(crate) struct TermPolicy {
     /// `YOUPIPE_SHARDED_TERM`: a multi-worker terminal sync/expand stage
@@ -2096,8 +2096,9 @@ impl<R: AsyncRuntime> StreamCtx<'_, R> {
     /// Dispatch a batch of the run's channel-parking jobs (stage workers,
     /// or the single fence-forwarder job): one batched pool submission in
     /// pool mode, one dedicated OS thread per job in dedicated-thread mode. Threads are detached —
-    /// workers always terminate on channel disconnect (see [`spawn_stage`]), and the collector
-    /// only returns once every sender is dropped, so no thread outlives the run's usefulness.
+    /// workers always terminate on channel disconnect (see [`spawn_stage_fanout`]), and the
+    /// collector only returns once every sender is dropped, so no thread outlives the run's
+    /// usefulness.
     ///
     /// Pool mode wraps each job through the run's [`ParkingLease`] so its
     /// leased slot is returned exactly when the worker leaves the job.
@@ -4013,7 +4014,7 @@ impl<S, I, O, R: AsyncRuntime, M: StreamMode> StreamPipe<S, I, O, R, M> {
     /// latency skew, at the cost of memory proportional to the *observed*
     /// reorder span. Pinning caps that memory: beyond the pinned window a
     /// straggler's overtaking successors are dropped (counted in
-    /// [`ReorderBuffer::dropped`], kept closed by the run's
+    /// [`ReorderBuffer::dropped`](crate::ReorderBuffer::dropped), kept closed by the run's
     /// `emitted + dropped == n` accounting) instead of growing the buffer.
     /// Only pin when a hard memory bound outweighs that robustness — e.g.
     /// very large `n` with a known-bounded reorder spread.
@@ -4358,8 +4359,8 @@ fn push_grouped_async_stage<S, I, O, N, F, R: AsyncRuntime>(
 
 impl<S, I, O, R: AsyncRuntime> StreamPipe<S, I, O, R, Unordered> {
     /// Mark the output as order-preserving. The feeder tags each item with a
-    /// sequence number; the collector uses a [`ReorderBuffer`] to emit results
-    /// in input order. The default is unordered (faster — no reorder pass).
+    /// sequence number; the collector uses a [`ReorderBuffer`](crate::ReorderBuffer) to emit
+    /// results in input order. The default is unordered (faster — no reorder pass).
     ///
     /// Only available on chains without `.expand()` — a per-item expansion
     /// fans one seq out to N channel messages, which no re-sequencing can
@@ -5333,8 +5334,8 @@ where
 }
 
 /// Item-by-item drain of a sync final receiver — the shared
-/// [`drain_unordered`]/[`drain_ordered`] loops with the user closure as the
-/// sink.
+/// [`drain_unordered`](crate::state::stream::drain_unordered)/[`drain_ordered`] loops with the
+/// user closure as the sink.
 #[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
 fn for_each_sync<R, T, F>(
     rx: R,
@@ -5382,8 +5383,8 @@ fn for_each_sync_sharded<T, F>(
 }
 
 /// Async counterpart of [`for_each_sync`] — the shared
-/// [`drain_unordered_async`]/[`drain_ordered_async`] loops with the user
-/// closure as the sink.
+/// [`drain_unordered_async`](crate::state::stream::drain_unordered_async)/
+/// [`drain_ordered_async`] loops with the user closure as the sink.
 #[cfg(feature = "tokio-runtime")]
 #[allow(clippy::needless_pass_by_value)] // terminal drain: sole receiver by value
 async fn for_each_async<R, T, F>(
@@ -6275,7 +6276,7 @@ where
     /// `Vec` that [`run`](Self::run) would allocate.
     ///
     /// Without `.ordered()`, `f` sees items in completion order. With
-    /// `.ordered()`, items are re-sequenced through a [`ReorderBuffer`] in
+    /// `.ordered()`, items are re-sequenced through a [`ReorderBuffer`](crate::ReorderBuffer) in
     /// input order first; on ordered-`expand()` chains `f` sees the groups
     /// flattened, elementwise, in input order.
     ///
@@ -6718,7 +6719,7 @@ where
 /// `final_rx` to the terminal sink, then re-raise any recorded feeder /
 /// async-stage panic ([`Feeder::finish`], `ctx.async_panic`).
 // The fallibility is the async-pool acquisition inside the drain closure
-// (`tokio-runtime` only) — same rationale as `try_exec`'s signature.
+// (`tokio-runtime` only) — same rationale as `exec_stream`'s signature.
 #[cfg_attr(not(feature = "tokio-runtime"), allow(clippy::unnecessary_wraps))]
 fn drain_terminal<T, O, R>(
     terminal: T,
@@ -6853,7 +6854,7 @@ where
 }
 
 /// Async collector: drains `rx` into a `Vec` via the shared async drain
-/// loops. If `ordered`, re-sequences through a [`ReorderBuffer`].
+/// loops. If `ordered`, re-sequences through a [`ReorderBuffer`](crate::ReorderBuffer).
 ///
 /// Generic over the async receiver type so it works with both MPMC
 /// ([`AsyncReceiver`]) and MPSC ([`MpscAsyncReceiver`]) channels — the

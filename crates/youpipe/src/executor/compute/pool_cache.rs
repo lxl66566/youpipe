@@ -70,7 +70,7 @@ impl PoolCache {
             .collect()
     }
 
-    /// Empty the cache. Same outside-the-lock drop contract as [`insert`].
+    /// Empty the cache. Same outside-the-lock drop contract as [`insert`](Self::insert).
     fn clear(&mut self) -> Vec<ComputePool> {
         self.slots.drain(..).map(|(_, pool)| pool).collect()
     }

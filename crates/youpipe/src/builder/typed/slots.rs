@@ -7,8 +7,8 @@ use std::{cell::UnsafeCell, mem::MaybeUninit};
 /// Each slot is `UnsafeCell<MaybeUninit<T>>`. The `MaybeUninit` layer
 /// suppresses item drops when the box itself is dropped, so the box's `Drop`
 /// only frees memory — every slot that holds a live `T` must be dropped by the
-/// caller before the buffer goes out of scope (the recursion in
-/// [`par_index_rec`] guarantees this on both the success and panic paths).
+/// caller before the buffer goes out of scope (fused.rs's `par_tree_rec`
+/// recursion guarantees this on both the success and panic paths).
 ///
 /// Ranges processed by different worker threads are disjoint, so non-atomic
 /// `read`/`write`/`drop_range` on disjoint indices is sound. `Sync` is sound

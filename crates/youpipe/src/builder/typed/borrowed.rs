@@ -200,8 +200,8 @@ where
     O: Send,
 {
     /// Execute the fused pipeline and collect results. Drives the same
-    /// recursive work-stealing / hybrid dispatch core as [`Pipe::collect`]
-    /// (crate::Pipe::collect); the input slice is only read.
+    /// recursive work-stealing / hybrid dispatch core as
+    /// [`Pipe::collect`](crate::Pipe::collect); the input slice is only read.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn collect(self) -> Vec<O> {
         let exec = self.exec.resolve();

@@ -41,7 +41,7 @@ pub enum Workload {
     /// tree is tail-latency insurance for genuinely uneven items (its leaf
     /// budget reaches single items around n ≈ threads × 64); batches of
     /// ns-scale items pay ~+20 % dispatch overhead for it — leave them on
-    /// [`Balanced`].
+    /// [`Balanced`](Workload::Balanced).
     Unbalanced,
     /// Manual oversplit factor, independent of batch size.
     Custom(std::num::NonZeroUsize),

@@ -247,8 +247,9 @@ assume fixed cardinality), or the index-based fast path otherwise.
 (the `try_collect` fast paths) never construct or match `Result<Option<_>, _>`
 per level. Sound only while `MAY_FILTER == false` throughout — the `FusedTryOp`
 construction sites gate it. The path is codegen-layout sensitive (the
-`ErasedStrategy` note under `collect` applies), and the bench suite has no
-fallible pure-path id yet, so a no-regression verdict is still open.
+`ErasedStrategy` note under `collect` applies); its layout canary is
+`try_collect/youpipe_try_deep` (a 6-deep all-`try_map` chain, baseline in
+[benchmarks/sync-fused.md](benchmarks/sync-fused.md)).
 
 ### `Pipe::collect()` / `TryPipe::try_collect()` — Execution
 
@@ -305,7 +306,7 @@ impl<S, I, O> ScopedPipe<'_, S, I, O> {
 ```
 
 The counterpart of rayon's `par_iter().for_each(..)`. Allocates **no output
-buffer** — the sink-only `par_for_each` core (`par_for_each_rec` /
+buffer** — the sink-only `par_for_each` core (`par_tree_rec` /
 `par_for_each_leaf`) drives only an input `Slots<T>` through the same
 recursive `ComputePool::join` tree as `collect`, but each leaf applies the
 fused chain via `FusedSink(stages, f)` (the `SinkOp` wrapper) and discards
@@ -612,11 +613,14 @@ youpipe::scope(|s| {
 
 Mirrors `Pipe`'s compile-time-fused stage chain (`SyncMap` / `Filter` /
 etc.) but with `'env` (non-`'static`) closure bounds. `.collect()` drives the
-same recursive work-stealing `par_index_collect` core as `Pipe::collect`
+same work-stealing cores as `Pipe::collect` (`par_index_collect` via
+`hybrid_dispatch`; filter chains via the `fused_filter_collect` join tree)
 — exposed via the `pub(crate) fused_collect_scoped` entry point — so the
-soundness story rests on `ComputePool::join`: the calling thread blocks in
-`Registry::in_worker_cold` until every sub-task finishes, which guarantees
-every `'env` reference captured by a scoped closure outlives the pool's
-access to it. `.with_compute_pool(pool)` is supported — the headline use case
-is oversubscribing threads for blocking-IO workloads while still borrowing
-stack-local data (key caches, lookup tables) by reference.
+soundness story rests on the driver's completion wait: it blocks in
+`CountLatch::wait_spin` until the chunk counter reaches 0, and a
+`ComputePool::join` tree (filter chains; on-pool callers by default) returns
+only after both halves finish. Either way every `'env` reference captured by
+a scoped closure outlives the pool's access to it. `.with_compute_pool(pool)`
+is supported — the headline use case is oversubscribing threads for
+blocking-IO workloads while still borrowing stack-local data (key caches,
+lookup tables) by reference.

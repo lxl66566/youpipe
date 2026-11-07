@@ -6428,11 +6428,13 @@ where
 /// `crate::scope::ScopedPipeline`, whose closure/stage lifetime is `'env`
 /// (the surrounding `scope` block).
 ///
-/// Soundness rests on the same `ComputePool::join` invariant that rayon-style
-/// scoped parallelism relies on: the calling thread blocks inside
-/// `Registry::in_worker_cold` until every recursively spawned sub-task
-/// finishes, so every `'env` reference captured by `stages` outlives the
-/// pool's access to them.
+/// Soundness rests on the completion invariant rayon-style scoped parallelism
+/// relies on: the driver does not return before the pool is done —
+/// `hybrid_dispatch` waits in `CountLatch::wait_spin` until every chunk has
+/// signalled, and the single-tree paths (filter chains; on-pool callers by
+/// default) return only once every `ComputePool::join` half has finished —
+/// so every `'env` reference captured by `stages` outlives the pool's access
+/// to them.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn fused_collect_scoped<S, T>(
     items: Vec<T>,
@@ -6467,9 +6469,10 @@ where
 /// dispatch logic to `Pipe::for_each` but without `'static` bounds — driven
 /// by `crate::scope::ScopedPipe::for_each`, whose closure lifetime is `'env`.
 ///
-/// Soundness rests on the same `ComputePool::join` invariant as
-/// [`fused_collect_scoped`]: the calling thread blocks inside
-/// `Registry::in_worker_cold` until every sub-task finishes, so every `'env`
+/// Soundness rests on the same completion invariant as
+/// [`fused_collect_scoped`]: `hybrid_dispatch` waits in
+/// `CountLatch::wait_spin` until every chunk has signalled (on-pool callers
+/// by default: the single `ComputePool::join` tree), so every `'env`
 /// reference captured by `stages` / `f` outlives the pool's access to them.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn fused_for_each_scoped<S, T, F>(

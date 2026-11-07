@@ -672,10 +672,10 @@ pub(crate) fn stage_batch<T>(batch: &mut Vec<T>, staged: &mut Vec<MaybeUninit<T>
 
 /// A sender that can deliver one item synchronously (blocking until space is
 /// available in a bounded channel). Implemented by both [`SyncSender`] (MPMC
-/// backing) and [`MpscSender`] (MPSC backing) so that [`spawn_stage`] etc. can
-/// be generic over either — letting the collector channel use the lighter MPSC
-/// ring buffer (store-based recv, no mutex waker registry) when there is only
-/// one consumer.
+/// backing) and [`MpscSender`] (MPSC backing) so that the stream stage cores
+/// (`spawn_stage_fanout` etc.) can be generic over either — letting the
+/// collector channel use the lighter MPSC ring buffer (store-based recv, no
+/// mutex waker registry) when there is only one consumer.
 pub trait SendItem<T>: Clone + Send + 'static {
     /// Deliver `item`, blocking until the channel has space. Returns
     /// `ChannelError::Closed` if all receivers have been dropped.

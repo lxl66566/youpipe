@@ -368,7 +368,7 @@ where
     }
 }
 
-/// `sum()` reducer: `Acc = O` via [`iter::Sum`] — the identity is the empty
+/// `sum()` reducer: `Acc = O` via [`iter::Sum`](std::iter::Sum) — the identity is the empty
 /// sum and fold/combine are two-element sums (fully inlined to `+` for the
 /// numeric types this terminal targets).
 pub(crate) struct SumReducer<O>(pub(crate) std::marker::PhantomData<fn() -> O>);
