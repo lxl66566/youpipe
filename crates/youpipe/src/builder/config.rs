@@ -160,7 +160,8 @@ impl ChainFloor {
 /// Resolution order: an explicitly-set `YOUPIPE_SHARD_DEPTH` env value
 /// shadows a value set here, which shadows the built-in default tier
 /// ([`ShardDepth::Off`] — the todo #48 A/B falsified the claim-cap
-/// promotion; see `handoff`'s knob comment). Streaming-only, and read
+/// promotion and the follow-up shape scan falsified every scoped auto
+/// tier (winners disagree on the depth; see `handoff`'s knob comment). Streaming-only, and read
 /// only by the sync/expand sharded terminal — the async flavour's
 /// per-item drain has no batch claims to amortize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

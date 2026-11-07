@@ -187,12 +187,16 @@ pub(crate) fn ring_recycle_enabled() -> bool {
 // `PipelineConfig::with_shard_depth` (`ShardDepth`), shadowed by an
 // explicit env pin (see `resolve_knob`).
 //
-// Default OFF (todo #48 A/B, 2026-11-08): the claim-cap tier regressed
-// every single-stage target cell (+14…+16 % @1K, +43…+53 % @100K, 0/25 —
-// the shallow cap bounds producer runaway and keeps the collector's
-// round-robin pass balanced); the one winner shape is the terminal behind
-// a mid channel (multi2 @100K −5.7 %, 25/25). Readings in
-// docs benchmarks/streaming.md "Sharded-terminal shard depth".
+// Default OFF (todo #48 A/B + shape scan, 2026-11-08): the claim-cap
+// tier regressed every single-stage target cell (+14…+16 % @1K,
+// +43…+58 % @100K, 0/25 — the shallow cap bounds producer runaway and
+// keeps the collector's round-robin pass balanced). The follow-up scan
+// falsified every scoped auto tier too: the winners disagree on the
+// tier (expand terminals peak at Slots(16) −31…−43 %, the two-stage
+// chain's terminal only responds at 64 @100K −5.6…−6.5 %, longer chains
+// and @1K flat-to-regressive), so no compiled predicate covers the
+// surface. Depth stays a per-shape opt-in. Readings in docs
+// benchmarks/streaming.md "Sharded-terminal shard depth".
 static SHARD_DEPTH: std::sync::OnceLock<Option<ShardDepth>> = std::sync::OnceLock::new();
 
 /// Env tier of the shard-depth knob: `None` = unset (the config tier

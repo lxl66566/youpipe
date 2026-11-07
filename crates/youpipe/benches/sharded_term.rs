@@ -19,6 +19,8 @@
 //! * `single_*` — one stage, the direct todo #1 shape (hotpath: engine paced at ~365 ns/item by the
 //!   collector-side data plane);
 //! * `multi2_*` — two stages (terminal fan-in behind one mid channel);
+//! * `multi3_cpu` — three stages, two mid channels ahead of the terminal (todo #48 residual: the
+//!   terminal-behind-mid-channel depth scan);
 //! * `workers2_*` — `SyncStageOptions::workers(2)` small-terminal shape, the guard against
 //!   per-shard fixed cost regressing low-worker pipelines;
 //! * `expand_*` — expand terminal (per-shard multi-output).
@@ -128,6 +130,57 @@ fn bench_sharded_term(c: &mut Criterion) {
                 |v| {
                     let r = stream(v)
                         .with_cancel(cancel.clone())
+                        .stage(|x: u64| bb(cpu_work(x)))
+                        .stage(bump)
+                        .run();
+                    bb(r)
+                },
+                BatchSize::PerIteration,
+            );
+        });
+
+        group.bench_with_input(BenchmarkId::new("multi2_cheap", size), &data, |b, data| {
+            b.iter_batched(
+                || warm_clone(data),
+                |v| {
+                    let r = stream(v)
+                        .with_cancel(cancel.clone())
+                        .stage(bump)
+                        .stage(bump)
+                        .run();
+                    bb(r)
+                },
+                BatchSize::PerIteration,
+            );
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("multi2_ordered_cpu", size),
+            &data,
+            |b, data| {
+                b.iter_batched(
+                    || warm_clone(data),
+                    |v| {
+                        let r = stream(v)
+                            .with_cancel(cancel.clone())
+                            .stage(|x: u64| bb(cpu_work(x)))
+                            .stage(bump)
+                            .ordered()
+                            .run();
+                        bb(r)
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+
+        group.bench_with_input(BenchmarkId::new("multi3_cpu", size), &data, |b, data| {
+            b.iter_batched(
+                || warm_clone(data),
+                |v| {
+                    let r = stream(v)
+                        .with_cancel(cancel.clone())
+                        .stage(|x: u64| bb(cpu_work(x)))
                         .stage(|x: u64| bb(cpu_work(x)))
                         .stage(bump)
                         .run();

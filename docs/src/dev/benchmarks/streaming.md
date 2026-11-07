@@ -381,3 +381,48 @@ Landed default-off: `ShardDepth::Off` is the built-in tier, `ClaimCap` /
 `with_shard_depth`), for the terminal-behind-mid-channel shape or any
 future depth proposal. Falsification index in
 [dead-ends.md](../dead-ends.md).
+
+### Depth shape scan: no scoped auto tier (todo #48 residual, 2026-11-08)
+
+The `multi2_cpu/100K` control win asked whether a scoped auto tier —
+`ShardDepth::Auto` lifting only terminals whose producers are paced by an
+upstream mid channel, the `YOUPIPE_CHAIN_FLOOR` precedent — should become
+the default. A 3-sided same-binary scan (`off=YOUPIPE_SHARD_DEPTH=0` /
+`d16=16` / `d64=64`, 5 per-id isolated interleaved rounds; `multi2_cheap`,
+`multi2_ordered_cpu`, `multi3_cpu` added as scan calibers) falsifies the
+predicate on every axis. Δ% vs off per cell (`d16 | d64`, `n` = noise,
+bold = stable/dominant; d64 ≡ the `ClaimCap` tier at the default
+`YOUPIPE_BATCH_RECV` cap of 64):
+
+| shape | @1K | @100K |
+| --- | --- | --- |
+| single_unordered_cheap | +5.3 n \| +15.0 dom 0/25 | +10.0 n (2/25) \| **+58.0 stable 0/25** |
+| single_unordered_cpu | +4.6 n \| +15.0 dom 0/25 | +10.8 n (5/25) \| **+57.5 stable 0/25** |
+| single_ordered_cpu | +3.1 n \| +14.1 n | **−8.1 dom 25/25** \| **+48.8 stable 0/25** |
+| multi2_cpu | −1.2 n \| +2.0 n | +0.7 n \| **−5.9 stable 25/25** |
+| multi2_cheap | −0.8 n \| +1.8 n | +1.4 n \| **−5.6 25/25** |
+| multi2_ordered_cpu | +0.1 n \| +1.7 n | +0.5 n \| **−6.5 stable 25/25** |
+| multi3_cpu | +1.0 n \| **+5.5 stable 0/25** | +0.4 n \| −0.6 n (14/25) |
+| expand_cheap | **−31.2 stable 25/25** \| **−21.7 stable 25/25** | **−43.3 stable 25/25** \| **−22.8 25/25** |
+| workers2_cpu (inert split) | −2.1 n \| −1.7 n | +7.5 n \| +2.2 n |
+| with_fence (floor covers it) | flat \| flat | flat \| flat |
+| fused gates | flat \| flat | flat \| flat |
+
+- The predicate's member set is not the winner set: `multi3_cpu` — same
+  predicate, one more mid channel — is flat @100K (−0.6 %, 14/25) while
+  every `multi2_*` @1K leans regressive at d64 (+1.7…+2.0 %), so the win
+  is size-scoped with no measured boundary between the anchors.
+- The biggest winners sit OUTSIDE the predicate: the expand terminal is
+  fed straight off the feeder ring yet reads −31 % @1K / −43 % @100K at
+  d16 (25/25) — and the tiers conflict across winners: expand peaks at 16
+  (64 gives back half the win), `multi2` only responds at 64 (16 is
+  flat), `single_ordered/100K` wins at 16 and inverts to +48.8 % at 64.
+  One compiled tier cannot serve them, and the response surface admits no
+  clean compile-time predicate.
+- The d64 single-stage regressions reproduce the #48 A/B at both sizes
+  (+14…+15 % @1K, +49…+58 % @100K); `with_fence` stays flat (the chain
+  floor already deepened that terminal) and every fused gate flat (no
+  terminal channel).
+
+Depth stays a per-shape opt-in (`Off` default). Falsification index in
+[dead-ends.md](../dead-ends.md).
