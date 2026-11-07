@@ -13,18 +13,21 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `.ordered()` | reorder pass restoring input order | streaming | output must match input order |
 | `.fence(mode)` / `.fence_with(FenceOptions, mode)` | isolation at one stage boundary (`buffer` pin) | streaming | downstream must not see partial upstream |
 | `SyncStageOptions` / `AsyncStageOptions` | per-stage workers (sync) / io_concurrency (async) / buffer (both) | streaming | stages have unequal costs |
+| `with_sharded_terminal(bool)` | terminal fan-in channel shape — per-pipeline tier of `YOUPIPE_SHARDED_TERM` (default `true`; env shadows) | streaming | memory-shape only: many small pipelines in one process sharing the terminal rings |
+| `with_chain_floor(ChainFloor)` | capacity floor tier of async-tailed / `Chunked`-fence chains — per-pipeline tier of `YOUPIPE_CHAIN_FLOOR` (default `ChainFloor::Default` = `min(n, 65536)` slots; env shadows) | streaming | one zero-CPU latency-critical chain in a process of default-tier chains → `Slots(16384)`; tight chain-wide backpressure → `Off` |
+| `with_async_tx_gate(AsyncTxGate)` | which hops of an async-tailed chain batch their sends — per-pipeline tier of `YOUPIPE_ASYNC_TX_BATCH` (default `AsyncTxGate::MixedOnly`; env shadows) | streaming (chains containing an async stage) | chasing a regression on one specific async chain → `Off` |
 | `ComputePool::new_pinned(n)` | workers pinned 1:1 to allowed CPUs | pools | tight loops of large saturated fused batches (**not** streaming — see [pools](pools.md)) |
 | `YOUPIPE_POOL_SPIN_BUDGET` | adaptive pre-park spin window (µs) over the pool idle loop's busy-spin arm — the budget grows on parks shorter than 4× the window and quarters on quiet parks (default off; `"1"` = 100 µs; a decimal ≥ 2 = an explicit window; an explicit `YOUPIPE_SPIN_ROUNDS` disarms it) | pools (fused batch terminals) | a tight driver loop submitting µs-scale batches back-to-back (−18…−22 % on 1K-item criterion batches); a measured loss on ≥100K-item batches and ms-scale cadences (see [dev/scheduler](../dev/scheduler.md)) |
-| `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker SPSC shards (default on; `"0"` = shared ring) | streaming (sync/expand terminals) | leave on for multi-worker terminals; the shared ring only wins single-worker terminals, which never shard anyway |
+| `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker SPSC shards (default on; `"0"` = shared ring; an explicit value shadows `with_sharded_terminal`) | streaming (sync/expand terminals) | leave on for multi-worker terminals; the shared ring only wins single-worker terminals, which never shard anyway |
 | `YOUPIPE_BATCH_RECV` | batched ring claims on the streaming data plane (default on, cap 64; `"0"` = per-item) | streaming | leave on; pairs with `YOUPIPE_SHARDED_TERM` — the two share the default |
 | `YOUPIPE_SHARDED_TERM_ASYNC` | async terminal channel = per-driver-group async shards | streaming (async terminals) | async-only chain whose feeder saturates the single output ring (niche; a measured loss on sync-fed async terminals) |
 | `YOUPIPE_ASYNC_MUX` | async stage/node driver tasks: `min(io_concurrency, runtime workers)`, each multiplexing its share of the in-flight items (default on; `"0"` = one task per in-flight slot; `"N"` = at most N drivers) | streaming + graph (async stages/nodes) | leave on — it removes `io_concurrency` task spawns and per-item cross-thread wakes from the run; `"0"` only to isolate the knob in a bench |
 | `YOUPIPE_SPIN_ANCHOR` | adaptive pre-anchor `try_recv` spin window (µs) in sync worker recv loops | streaming | convoy collapse on shapes the defaults exclude: `Barrier` fences, pinned buffers, or a residual slow-mode sighting (see [dev/streaming](../dev/streaming.md)) |
 | `YOUPIPE_FWD_BATCH` | fence forwarder flushes released chunks via `try_send_batch` (default on; `"0"` = per-item `send`) | streaming (fence forwarder) | leave on — it caps the fence convoy's tail at every size; `"0"` only to isolate the knob in a bench |
-| `YOUPIPE_CHAIN_FLOOR` | unpinned channel capacities of chains with an async stage or a `Chunked` fence floor at `min(n, 65536)` slots (default on; `"0"` = unfloored; a decimal = an explicit tier) | streaming | leave on — it removes the async and fence convoy slow modes; escape only to pin backpressure tightly (per-stage `buffer` pins are the better tool) or to lower the tier on zero-CPU latency-critical chains |
+| `YOUPIPE_CHAIN_FLOOR` | unpinned channel capacities of chains with an async stage or a `Chunked` fence floor at `min(n, 65536)` slots (default on; `"0"` = unfloored; a decimal = an explicit tier; an explicit value shadows `with_chain_floor`) | streaming | leave on — it removes the async and fence convoy slow modes; escape only to pin backpressure tightly (per-stage `buffer` pins are the better tool) or to lower the tier on zero-CPU latency-critical chains |
 | `YOUPIPE_GRAPH_TX_BATCH` | graph node/source outputs flushed per claim batch (`try_send_batch` per edge; default on; `"0"` = per-item `send`) | graph | leave on — the per-item loops cost 2–3× on light items; `"0"` only to isolate the knob in a bench |
 | `YOUPIPE_STREAM_TX_BATCH` | stream stage/expand workers flush the mapped claim batch (`try_send_batch` per free run; default on; `"0"` = per-item `send`) | streaming (pure-sync chains fully; async-tailed chains per `YOUPIPE_ASYNC_TX_BATCH`) | leave on — 1.6–3× on multi-stage light-item chains; `"0"` only to isolate the knob in a bench |
-| `YOUPIPE_ASYNC_TX_BATCH` | which hops of an async-tailed chain may batch their sends: default = only the hop into the async stage (the mixed ring); `"0"` = the historical per-item gate on every async-chain hop; `"1"` = every hop (measured loss) | streaming (chains containing an async stage) | leave at the default — it stacks with `YOUPIPE_CLAIM_SCALE` (−33 % on `stage().stage_async()` @1K); `"0"` if chasing a regression on an async chain |
+| `YOUPIPE_ASYNC_TX_BATCH` | which hops of an async-tailed chain may batch their sends: default = only the hop into the async stage (the mixed ring); `"0"` = the historical per-item gate on every async-chain hop; `"1"` = every hop (measured loss); an explicit value shadows `with_async_tx_gate` | streaming (chains containing an async stage) | leave at the default — it stacks with `YOUPIPE_CLAIM_SCALE` (−33 % on `stage().stage_async()` @1K); `"0"` if chasing a regression on an async chain |
 | `YOUPIPE_CLAIM_SCALE` | stage/expand workers' claim bound grows with the observed ring backlog (doubles on full claims, collapses to the per-worker share on partial/park; default on) | streaming (async-tailed chains only — pure-sync chains keep the fixed share) | leave on — it amortizes the ring-head CAS under an async consumer; `"0"` only to isolate the knob in a bench |
 | `YOUPIPE_ASYNC_OUTLET_BATCH` | async-producer outlet (mux drivers, graph async broadcast/unicast, graph `source_async` feeds) delivers drained clusters per edge via `try_send_batch` prefix + per-item awaited fallback (default on, cap 64; `"0"` = per-item; `"N"` = explicit cap) | streaming + graph (async stages/nodes/sources) | leave on — −4…−16 % on the async broadcast/fan-in graph shapes, −3 % on source-fed fan-out @1K and −5 % on async terminals @100K, parky IO shapes flat (see [dev/benchmarks/graph](../dev/benchmarks/graph.md)); `"0"` only to isolate the knob in a bench; a distinct hop from `YOUPIPE_ASYNC_TX_BATCH` |
 
@@ -38,6 +41,51 @@ applies to chains (by-ref or owned) containing a filter stage and ending in
 `.collect()`/`.try_collect()`; `Ctp` degrades to the merge tree on owned
 chains. An explicit mode beats the `YOUPIPE_FILTER_COLLECT` env knob, which
 beats the `Auto` length gate (by-ref; owned `Auto` is always the merge tree).
+
+## Per-pipeline data-plane policy (streaming)
+
+Three of the `YOUPIPE_*` data-plane knobs also have a per-pipeline
+middle layer — `with_sharded_terminal`, `with_chain_floor`,
+`with_async_tx_gate` — so one process can differentiate two concurrent
+pipelines where the env knob (process-global) cannot. Precedence, for
+each of the three:
+
+> explicitly-set env knob > per-pipeline config field > built-in default
+
+The env tier outranks the config field — the **opposite** of
+`FilterCollectMode`'s order — on purpose: bench A/Bs (`bench_ab.sh -E`)
+compare the *same binary* through env vars, so an operator's explicit
+pin must beat any config a library user set. With neither env nor config
+set the behavior is bit-for-bit the env-knob default. The remaining
+data-plane knobs stay env-only: their off positions are bench-isolation
+vehicles (`YOUPIPE_BATCH_RECV`, `YOUPIPE_STREAM_TX_BATCH`,
+`YOUPIPE_FWD_BATCH`, `YOUPIPE_CLAIM_SCALE`), scheduler A/B vehicles
+(`YOUPIPE_POOL_SPIN_BUDGET`, `ONPOOL_HYBRID`), or niche single-shape
+switches (`YOUPIPE_SHARDED_TERM_ASYNC`) — promote one only with a
+measured per-workload story.
+
+- `with_sharded_terminal(bool)`: terminal fan-in channel shape (see
+  [`YOUPIPE_SHARDED_TERM`](#youpipe_sharded_term-terminal-fan-in-sharding-streaming)).
+  Tune it for memory shape — a process hosting many small pipelines can
+  keep their terminals on one shared ring each; throughput-wise the
+  sharded default wins every measured shape.
+- `with_chain_floor(ChainFloor)`: the tier lifting unpinned channel
+  capacities of async-tailed / `Chunked`-fence chains (see
+  [`YOUPIPE_CHAIN_FLOOR`](#youpipe_chain_floor-chain-capacity-floor-streaming)).
+  `ChainFloor::Default` = `min(n, 65536)` slots, `Slots(n)` = an explicit
+  tier (`Slots(16384)` is the documented zero-CPU latency tier), `Off` =
+  unfloored. The per-pipeline tier is the escape the env knob cannot
+  express: one latency-critical chain on `Slots(16384)` while the rest of
+  the process keeps the default — with the env knob that pin would lower
+  every chain's tier.
+- `with_async_tx_gate(AsyncTxGate)`: which hops of an async-tailed chain
+  may batch their sends (see
+  [`YOUPIPE_ASYNC_TX_BATCH`](#youpipe_async_tx_batch-async-tail-tx-batch-gate-streaming)).
+  `MixedOnly` (default) batches exactly the hop into the async stage,
+  `Off` restores per-item sends on every async-chain hop, `Full` batches
+  every hop (a measured loss; A/B reproduction). Reach for `Off` when
+  chasing a regression on one specific async chain without touching the
+  process's other pipelines.
 
 ## Workload: split granularity (fused)
 
@@ -155,7 +203,10 @@ by the collector; `"0"` = one shared MPSC terminal ring. Sharding
 removes the send-side CAS contention and the shared-ring cache lines of
 the terminal fan-in (−5…−58 % on every measured shape, zero
 regressions). Channel shape only — worker count, backpressure budget,
-ordering and cancellation semantics are unchanged. Default on since
+ordering and cancellation semantics are unchanged. Per-pipeline tier:
+`with_sharded_terminal(bool)` (an explicit env value shadows the field —
+see the [precedence rule](#per-pipeline-data-plane-policy-streaming)).
+Default on since
 2026-10-20, promoted together with `YOUPIPE_BATCH_RECV`: sharded alone
 is bimodal on single-stage fan-in shapes (median wins, convoy slow mode
 in ~30 % of back-to-back runs), while the pair with batched claiming is
@@ -174,6 +225,28 @@ the whole fan-in), so it must not ride along with `YOUPIPE_SHARDED_TERM`.
 Its sole measured winner is the async-only feeder-saturated chain at
 −57.5 % (readings: [dev/benchmarks](../dev/benchmarks/streaming.md)); reach for it
 only on that shape.
+
+## `YOUPIPE_ASYNC_TX_BATCH`: async-tail tx-batch gate (streaming)
+
+Which hops of a chain containing an async stage may batch their output
+sends (`try_send_batch` staging instead of one blocking `send` per item):
+unset = only the hop **into** the async stage (the mixed ring, whose
+consumers are the burst-refilling M:N drivers), `"0"` = the historical
+per-item gate on every async-chain hop, `"1"` = every hop. The default is
+the todo #34 four-side A/B: the mixed hop wins batched (−33 % merged @1K
+stacked with `YOUPIPE_CLAIM_SCALE`) while the sync→sync mid hops lose at
+either claim shape (+17.4 % `async_pair_cpu_split/100K` fully lifted), so
+only the mixed hop batches. Independent of the global
+`YOUPIPE_STREAM_TX_BATCH` switch (`"0"` there keeps per-item sends
+everywhere; its off position is a bench-isolation vehicle, which is why
+it stays env-only).
+
+Per-pipeline tier: `with_async_tx_gate(AsyncTxGate)` — `MixedOnly` /
+`Off` / `Full` mirror unset / `"0"` / `"1"`; an explicit env value shadows
+the field (see the
+[precedence rule](#per-pipeline-data-plane-policy-streaming)). Reach for
+`Off` on one specific async chain that regresses under the mixed-hop
+batching, without touching the process's other pipelines.
 
 ## `YOUPIPE_CHAIN_FLOOR`: chain capacity floor (streaming)
 
@@ -207,7 +280,10 @@ the floor chain-wide. The lift's eager allocation is bounded per ring
 cost of the 64K tier is ~2 % median on zero-CPU latency-bound chains
 (the 1 MiB ring recycles through L3 where the 16K tier's 256 KiB stayed
 inside L2); set `YOUPIPE_CHAIN_FLOOR=16384` if that corner is your
-shape.
+shape — or `with_chain_floor(ChainFloor::Slots(16384))` when only some
+chains of the process are that shape, leaving the others on the default
+tier (an explicit env value shadows the field — see the
+[precedence rule](#per-pipeline-data-plane-policy-streaming)).
 
 ## Worker budget across stages (streaming)
 
@@ -305,4 +381,5 @@ overlaps — the right default for mixed CPU/IO.
 | Blocking IO inside a sync `.stage()` | oversized compute pool via `with_compute_pool` — see [pools](pools.md); `Workload` will not help |
 | Many small async IO ops | raise `io_concurrency` (512+) globally or per stage; widen `buffer_size` for bursty sources |
 | Heavy CPU stage + light IO stage | pin the heavy stage's `SyncStageOptions::workers`; give the async stage its own `AsyncStageOptions::io_concurrency`/`buffer` |
+| One zero-CPU latency-critical async chain in a process of default-tier chains | `with_chain_floor(ChainFloor::Slots(16384))` on that pipeline only (the env pin would lower every chain's tier) |
 | Consumer needs input order | `.ordered()`; drop it if completion order is acceptable |

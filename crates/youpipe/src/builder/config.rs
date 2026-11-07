@@ -95,6 +95,81 @@ pub enum FilterCollectMode {
     Wtc,
 }
 
+/// Chain capacity floor tier — the per-pipeline middle layer of the
+/// `YOUPIPE_CHAIN_FLOOR` env knob, which lifts the unpinned channel
+/// capacities of async-tailed chains and chains with a `Chunked`-mode
+/// fence (the slack removes their per-item wake-chain / convoy slow
+/// modes; measurements in the tuning guide's `YOUPIPE_CHAIN_FLOOR`
+/// entry).
+///
+/// Resolution order: an explicitly-set `YOUPIPE_CHAIN_FLOOR` env value
+/// shadows a value set here, which shadows [`ChainFloor::Default`]. The
+/// distinction matters per pipeline, not per process: one binary may host
+/// a latency-critical zero-CPU chain on a lower tier while the rest keep
+/// the default — the env knob cannot express that.
+///
+/// Streaming-only. Pure-sync chains without a `Chunked` fence never lift
+/// (no slow mode to remove), `Barrier`-mode fences never lift (nothing
+/// overlaps), and explicit per-stage `buffer` pins win verbatim over any
+/// tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChainFloor {
+    /// The built-in tier: lift to `min(n, 65536)` slots, byte-clamped at
+    /// 8 MiB per ring. Identical to leaving the config field unset.
+    #[default]
+    Default,
+    /// No floor — unfloored channel sizing (the `YOUPIPE_CHAIN_FLOOR=0`
+    /// escape). Reach for it only to pin backpressure tightly chain-wide;
+    /// per-stage `buffer` pins are the better tool for one stage.
+    Off,
+    /// An explicit tier: lift to `min(n, slots)` slots, byte-clamped per
+    /// ring. `Slots(16384)` is the documented lower tier for zero-CPU
+    /// latency-bound chains (the 64K tier's 1 MiB rings recycle through
+    /// L3 and cost ~2 % median there).
+    Slots(std::num::NonZeroUsize),
+}
+
+impl ChainFloor {
+    /// The knob value this tier denotes (`None` = off) — the
+    /// representation the `YOUPIPE_CHAIN_FLOOR` env tier pins and the
+    /// stream engine's capacity floor consumes.
+    pub(crate) fn resolved_slots(self) -> Option<usize> {
+        match self {
+            ChainFloor::Default => Some(crate::handoff::CHAIN_FLOOR_SLOTS),
+            ChainFloor::Off => None,
+            ChainFloor::Slots(n) => Some(n.get()),
+        }
+    }
+}
+
+/// Which hops of an async-tailed chain may batch their output sends — the
+/// per-pipeline middle layer of the `YOUPIPE_ASYNC_TX_BATCH` env knob
+/// (which refines the env-only global `YOUPIPE_STREAM_TX_BATCH` switch).
+///
+/// Resolution order: an explicitly-set `YOUPIPE_ASYNC_TX_BATCH` env value
+/// shadows a value set here, which shadows [`AsyncTxGate::MixedOnly`].
+///
+/// Streaming-only, and consulted only on chains containing an async
+/// stage; pure-sync chains batch every hop under the global switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AsyncTxGate {
+    /// Batched delivery only on hops whose consumers are async (the mixed
+    /// ring into the async stage); sync→sync hops of async chains keep
+    /// per-item sends. The measured default: the mixed hop wins batched
+    /// (−33 % merged @1K stacked with `YOUPIPE_CLAIM_SCALE`) while the mid
+    /// hops lose at either claim shape (+17.4 % @100K fully lifted).
+    #[default]
+    MixedOnly,
+    /// Every hop of an async-tailed chain keeps per-item sends (the
+    /// 2026-10 gate). Reach for it when chasing a regression on one
+    /// specific async chain.
+    Off,
+    /// Batched delivery on every hop — a measured loss on split shapes
+    /// (+17.4 % `async_pair_cpu_split/100K`, 0/25); kept for A/B
+    /// reproduction.
+    Full,
+}
+
 /// Top-level configuration for a pipeline run.
 ///
 /// All fields are `pub(crate)` — construction and mutation go through
@@ -172,6 +247,23 @@ pub struct PipelineConfig {
     /// By-ref filter collect implementation. Fused by-ref-only (see
     /// [`FilterCollectMode`]).
     pub(crate) filter_collect: FilterCollectMode,
+    // ── Per-pipeline data-plane policy (r4 audit) ──
+    //
+    // Middle tier of the three-tier precedence `handoff::resolve_knob`
+    // implements: an explicitly-set `YOUPIPE_*` env pin shadows these
+    // fields, these fields shadow the built-in defaults. `None` = unset =
+    // the built-in default, so a config-less pipeline is bit-for-bit the
+    // env-knob-only behavior.
+    /// Terminal fan-in channel shape (streaming-only): `Some(true)` = one
+    /// SPSC output ring per terminal worker, `Some(false)` = one shared
+    /// MPSC ring. Shadowed by an explicit `YOUPIPE_SHARDED_TERM`.
+    pub(crate) sharded_terminal: Option<bool>,
+    /// Chain capacity floor tier (streaming-only; see [`ChainFloor`]).
+    /// Shadowed by an explicit `YOUPIPE_CHAIN_FLOOR`.
+    pub(crate) chain_floor: Option<ChainFloor>,
+    /// Async-tail tx-batch gate (streaming-only; see [`AsyncTxGate`]).
+    /// Shadowed by an explicit `YOUPIPE_ASYNC_TX_BATCH`.
+    pub(crate) async_tx_gate: Option<AsyncTxGate>,
 }
 
 impl Default for PipelineConfig {
@@ -188,6 +280,9 @@ impl Default for PipelineConfig {
             io_concurrency: 128,
             workload: Workload::Balanced,
             filter_collect: FilterCollectMode::Auto,
+            sharded_terminal: None,
+            chain_floor: None,
+            async_tx_gate: None,
         }
     }
 }
@@ -289,6 +384,34 @@ impl PipelineConfig {
     #[must_use]
     pub fn with_filter_collect(mut self, mode: FilterCollectMode) -> Self {
         self.filter_collect = mode;
+        self
+    }
+
+    /// Sets the terminal fan-in channel shape (streaming-only, default
+    /// `true`; see the tuning guide's `YOUPIPE_SHARDED_TERM` entry).
+    /// Precedence: an explicitly-set env value shadows this field (see
+    /// `handoff::resolve_knob`).
+    #[must_use]
+    pub fn with_sharded_terminal(mut self, on: bool) -> Self {
+        self.sharded_terminal = Some(on);
+        self
+    }
+
+    /// Sets the chain capacity floor tier (streaming-only, default
+    /// [`ChainFloor::Default`]; see [`ChainFloor`] for variant semantics
+    /// and the resolution order).
+    #[must_use]
+    pub fn with_chain_floor(mut self, floor: ChainFloor) -> Self {
+        self.chain_floor = Some(floor);
+        self
+    }
+
+    /// Sets which hops of an async-tailed chain may batch their sends
+    /// (streaming-only, default [`AsyncTxGate::MixedOnly`]; see
+    /// [`AsyncTxGate`] for variant semantics and the resolution order).
+    #[must_use]
+    pub fn with_async_tx_gate(mut self, gate: AsyncTxGate) -> Self {
+        self.async_tx_gate = Some(gate);
         self
     }
 }

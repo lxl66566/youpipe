@@ -34,7 +34,7 @@ use crate::state::{
 use crate::{
     builder::{
         admission::{ParkingLease, admit},
-        config::{PipelineConfig, Workload},
+        config::{AsyncTxGate, ChainFloor, PipelineConfig, Workload},
     },
     executor::compute::ComputePool,
     handoff::{
@@ -514,6 +514,26 @@ fn fence_batch_send<T: Send + 'static, Tx: SendItem<T>>(
     tx.send_batch(batch, staged)
 }
 
+/// The async-tail tx-batch gate for one hop (`YOUPIPE_ASYNC_TX_BATCH` /
+/// `with_async_tx_gate`): resolve the gate through the env > config >
+/// default tiers (`handoff::resolve_knob`), then apply the hop predicate.
+/// `feeds_async`: the spawning factory's `OutChannel::FEEDS_ASYNC`. Split
+/// out of [`ClaimKnobs::resolve`] so the precedence tiers are
+/// unit-testable with injected env values (same rationale as
+/// [`TermPolicy::resolve_tiers`]).
+fn resolve_async_tx_gate(
+    env: Option<AsyncTxGate>,
+    config: Option<AsyncTxGate>,
+    feeds_async: bool,
+    has_async_stage: bool,
+) -> bool {
+    match crate::handoff::resolve_knob(env, config, AsyncTxGate::MixedOnly) {
+        AsyncTxGate::Full => true,
+        AsyncTxGate::MixedOnly => feeds_async || !has_async_stage,
+        AsyncTxGate::Off => !has_async_stage,
+    }
+}
+
 /// Claim and delivery knobs of one sync fan-out stage's workers, resolved
 /// once per spawn — the single policy source for [`spawn_stage_fanout`] and
 /// [`spawn_expand_stage_fanout`].
@@ -560,16 +580,18 @@ impl ClaimKnobs {
         // claim batch, flush with one `try_send_batch` per free run + per-item
         // blocking fallback. Zero-cap claims keep the per-item send (staging
         // single-item batches only adds moves). Async-tailed chains are gated
-        // per hop by `YOUPIPE_ASYNC_TX_BATCH` (todo #34 re-measure against the
-        // M:N drivers): the mixed hop into the async stage wins batched, the
-        // sync→sync mid hops keep the per-item rhythm.
+        // per hop by `YOUPIPE_ASYNC_TX_BATCH` / `with_async_tx_gate`
+        // (todo #34 re-measure against the M:N drivers): the mixed hop into
+        // the async stage wins batched, the sync→sync mid hops keep the
+        // per-item rhythm.
         let tx_batch = crate::handoff::stream_tx_batch()
             && claim_cap > 0
-            && match crate::handoff::async_tx_gate() {
-                crate::handoff::AsyncTxGate::Full => true,
-                crate::handoff::AsyncTxGate::MixedOnly => feeds_async || !ctx.has_async_stage,
-                crate::handoff::AsyncTxGate::Off => !ctx.has_async_stage,
-            };
+            && resolve_async_tx_gate(
+                crate::handoff::async_tx_gate_env(),
+                ctx.config.async_tx_gate,
+                feeds_async,
+                ctx.has_async_stage,
+            );
         Self {
             claim_cap,
             scratch_cap,
@@ -1867,31 +1889,60 @@ impl<M: Send + Unpin + 'static> OutChannel<M> for ShardedMpsc {
     }
 }
 
-/// Terminal data-plane policy: the runtime knobs governing the terminal
-/// channel's shape and the async-chain capacity floor, read once per run in
-/// [`exec_stream`] (see `handoff/mod.rs` for each knob's rationale).
+/// Terminal data-plane policy: the resolved terminal channel shape and the
+/// async-chain capacity floor, resolved once per run in [`exec_stream`]
+/// through the three precedence tiers — an explicitly-set `YOUPIPE_*` env
+/// pin > the per-pipeline [`PipelineConfig`] field > the built-in default
+/// (`handoff::resolve_knob`; per-knob rationale in `handoff/mod.rs`).
 #[derive(Clone, Copy)]
 pub(crate) struct TermPolicy {
-    /// `YOUPIPE_SHARDED_TERM`: a multi-worker terminal sync/expand stage
-    /// fans its output channel into per-worker SPSC shards.
+    /// `YOUPIPE_SHARDED_TERM` / `with_sharded_terminal`: a multi-worker
+    /// terminal sync/expand stage fans its output channel into per-worker
+    /// SPSC shards.
     sharded: bool,
-    /// `YOUPIPE_SHARDED_TERM_ASYNC`: the falsified async-sharded flavour.
+    /// `YOUPIPE_SHARDED_TERM_ASYNC`: the falsified async-sharded flavour
+    /// (env-only — not promoted to a config field; niche single-shape
+    /// winner).
     // Read only on the async terminal paths (tokio-runtime).
     #[cfg_attr(not(feature = "tokio-runtime"), allow(dead_code))]
     sharded_async: bool,
-    /// `YOUPIPE_CHAIN_FLOOR`: chains with an async stage or a `Chunked`
-    /// fence lift their unpinned stage-output channel capacities (see
-    /// `stage_buffer`). `None` = the knob is off; `Some(slots)` = the
-    /// floor tier.
+    /// `YOUPIPE_CHAIN_FLOOR` / `with_chain_floor`: chains with an async
+    /// stage or a `Chunked` fence lift their unpinned stage-output channel
+    /// capacities (see `stage_buffer`). `None` = the knob is off;
+    /// `Some(slots)` = the floor tier.
     chain_floor: Option<usize>,
 }
 
 impl TermPolicy {
-    fn from_env() -> Self {
+    /// Resolve from the env OnceLock tiers and the run's config.
+    fn resolve(config: &PipelineConfig) -> Self {
+        Self::resolve_tiers(
+            crate::handoff::sharded_term_env(),
+            crate::handoff::chain_floor_env(),
+            config,
+        )
+    }
+
+    /// Pure core of [`Self::resolve`], parameterized over the env tiers so
+    /// the precedence order is unit-testable with injected values — the
+    /// real tiers sit in process-global OnceLocks that init once, so
+    /// cross-test env isolation is impossible in one binary (the env-set
+    /// end-to-end cases live in one-test-per-binary integration files,
+    /// e.g. tests/sharded_terminal.rs).
+    fn resolve_tiers(
+        sharded_env: Option<bool>,
+        chain_floor_env: Option<ChainFloor>,
+        config: &PipelineConfig,
+    ) -> Self {
         Self {
-            sharded: crate::handoff::sharded_term_enabled(),
+            sharded: crate::handoff::resolve_knob(sharded_env, config.sharded_terminal, true),
             sharded_async: crate::handoff::sharded_term_async_enabled(),
-            chain_floor: crate::handoff::chain_floor_slots(),
+            chain_floor: crate::handoff::resolve_knob(
+                chain_floor_env,
+                config.chain_floor,
+                ChainFloor::Default,
+            )
+            .resolved_slots(),
         }
     }
 }
@@ -1944,7 +1995,8 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     /// `Chunked` forwarder feeds, while a `Barrier` fence overlaps nothing
     /// and only pays the eager allocation.
     pub(crate) has_chunked_fence: bool,
-    /// Terminal channel-shape policy (runtime knobs; see [`TermPolicy`]).
+    /// Terminal channel-shape policy, resolved env > config > default (see
+    /// [`TermPolicy`]).
     pub(crate) terminal_policy: TermPolicy,
     /// The pool-capacity lease backing pool mode (`dedicated_threads ==
     /// false`); `None` in dedicated mode. Every channel-parking job
@@ -4191,6 +4243,35 @@ impl<S, I, O, R: AsyncRuntime, M: StreamMode> StreamPipe<S, I, O, R, M> {
         self.config = self.config.with_io_concurrency(n);
         self
     }
+
+    /// Set the terminal fan-in channel shape (streaming-only): `true`
+    /// (default) = one SPSC output ring per terminal worker, `false` = one
+    /// shared MPSC ring. An explicitly-set `YOUPIPE_SHARDED_TERM` env value
+    /// shadows this — see [`PipelineConfig::with_sharded_terminal`].
+    #[must_use]
+    pub fn with_sharded_terminal(mut self, on: bool) -> Self {
+        self.config = self.config.with_sharded_terminal(on);
+        self
+    }
+
+    /// Set the chain capacity floor tier (streaming-only, default
+    /// [`ChainFloor::Default`]). An explicitly-set `YOUPIPE_CHAIN_FLOOR`
+    /// env value shadows this — see [`PipelineConfig::with_chain_floor`].
+    #[must_use]
+    pub fn with_chain_floor(mut self, floor: ChainFloor) -> Self {
+        self.config = self.config.with_chain_floor(floor);
+        self
+    }
+
+    /// Set which hops of an async-tailed chain may batch their sends
+    /// (streaming-only, default [`AsyncTxGate::MixedOnly`]). An
+    /// explicitly-set `YOUPIPE_ASYNC_TX_BATCH` env value shadows this —
+    /// see [`PipelineConfig::with_async_tx_gate`].
+    #[must_use]
+    pub fn with_async_tx_gate(mut self, gate: AsyncTxGate) -> Self {
+        self.config = self.config.with_async_tx_gate(gate);
+        self
+    }
 }
 
 // ── Node-push helpers (todo #5) ──
@@ -5860,7 +5941,7 @@ where
         dedicated_threads,
         has_async_stage,
         has_chunked_fence,
-        terminal_policy: TermPolicy::from_env(),
+        terminal_policy: TermPolicy::resolve(&config),
         lease,
         worker_slots_left: Cell::new(worker_slots_left),
         stages_left: Cell::new(stages_left),
@@ -7144,6 +7225,73 @@ mod tests {
             ctx(100_000, Some(65536), false, true).stage_buffer::<(u64, u64)>(Some(pin), 8),
             16
         );
+    }
+
+    /// Per-pipeline data-plane knob precedence (r4 audit): an
+    /// explicitly-set env tier shadows the config field, the config field
+    /// shadows the built-in default. Exercised through the pure resolver
+    /// cores with injected env tiers — the real tiers are process-global
+    /// OnceLocks that init once per process, so env-set variants cannot be
+    /// isolated between tests of one binary (the end-to-end env cases live
+    /// in one-test-per-binary files like tests/sharded_terminal.rs).
+    #[test]
+    fn data_plane_knob_precedence() {
+        let cfg = |sharded: Option<bool>, floor: Option<ChainFloor>| PipelineConfig {
+            sharded_terminal: sharded,
+            chain_floor: floor,
+            ..PipelineConfig::default()
+        };
+        // Env-set shadows config-set — including the chain floor's explicit
+        // "0"-off pin against a config-set Slots tier.
+        let p = TermPolicy::resolve_tiers(
+            Some(false),
+            Some(ChainFloor::Slots(NonZeroUsize::new(1024).unwrap())),
+            &cfg(
+                Some(true),
+                Some(ChainFloor::Slots(NonZeroUsize::new(65536).unwrap())),
+            ),
+        );
+        assert!(!p.sharded && p.chain_floor == Some(1024));
+        let p = TermPolicy::resolve_tiers(
+            Some(true),
+            Some(ChainFloor::Off),
+            &cfg(None, Some(ChainFloor::Default)),
+        );
+        assert!(p.sharded && p.chain_floor.is_none());
+        // Config shadows default.
+        let p = TermPolicy::resolve_tiers(None, None, &cfg(Some(false), Some(ChainFloor::Off)));
+        assert!(!p.sharded && p.chain_floor.is_none());
+        // Nothing set anywhere: the built-in defaults — bit-for-bit the
+        // env-knob-only behavior.
+        let p = TermPolicy::resolve_tiers(None, None, &cfg(None, None));
+        assert!(p.sharded && p.chain_floor == Some(crate::handoff::CHAIN_FLOOR_SLOTS));
+
+        // Async tx gate: same tiers, hop predicate applied.
+        // env Full shadows config Off.
+        assert!(resolve_async_tx_gate(
+            Some(AsyncTxGate::Full),
+            Some(AsyncTxGate::Off),
+            true,
+            true
+        ));
+        // config Off shadows the MixedOnly default (the mixed hop goes
+        // per-item).
+        assert!(!resolve_async_tx_gate(
+            None,
+            Some(AsyncTxGate::Off),
+            true,
+            true
+        ));
+        // env unset + config unset: MixedOnly batches exactly the mixed hop.
+        assert!(resolve_async_tx_gate(None, None, true, true));
+        assert!(!resolve_async_tx_gate(None, None, false, true));
+        // Pure-sync chains gate open regardless of the tier.
+        assert!(resolve_async_tx_gate(
+            None,
+            Some(AsyncTxGate::Off),
+            false,
+            false
+        ));
     }
 
     /// `has_chunked_fence` recursion: a `Chunked` fence anywhere in the

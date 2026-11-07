@@ -7,7 +7,7 @@ mod typed;
 // Shared lifecycle and admission helpers the graph engine and both engines'
 // runner cores reuse (see typed/mod.rs and admission.rs).
 pub(crate) use admission::{ParkingLease, admit};
-pub use config::{FilterCollectMode, PipelineConfig, Workload};
+pub use config::{AsyncTxGate, ChainFloor, FilterCollectMode, PipelineConfig, Workload};
 pub use typed::{
     AsyncStageOptions, FenceOptions, Filter, FusedStage, FusedTryStage, Grouped, Identity,
     InfallibleChain, MapErr, Ordered, Pipe, PipeRef, RangePipe, StageMarker, StreamPipe,

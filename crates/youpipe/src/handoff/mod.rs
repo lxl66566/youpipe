@@ -1,3 +1,8 @@
+// The async-tail tx-batch gate and chain-floor-tier enums live with the
+// other public config types (re-exported from the crate root); this module
+// is their env-tier source of truth.
+use crate::{AsyncTxGate, ChainFloor};
+
 pub mod channel;
 // Crate-internal: the bridge forward loops (recv -> cancel-check -> send)
 // shared by both engines' cross-mode bridges.
@@ -58,30 +63,55 @@ pub(crate) fn batch_recv_cap() -> usize {
     })
 }
 
-// ── Sharded terminal channel (runtime knob, todo #1) ──
+// ── Per-pipeline data-plane policy: precedence tiers (r4 audit) ──
+//
+// The knobs below with a per-pipeline `PipelineConfig` field resolve
+// through one fixed chain: an explicitly-set env value > the config field >
+// the built-in default. The env tier must stay authoritative: bench A/Bs
+// (`bench_ab.sh -E`) compare the SAME binary through env vars, so an
+// operator's explicit pin has to beat any config a library user set.
+
+/// Resolve one data-plane policy knob from its three tiers: an
+/// explicitly-set `YOUPIPE_*` env value (process-global OnceLock tier)
+/// shadows the per-pipeline `PipelineConfig` field, which shadows the
+/// built-in default. Inverted from `FilterCollectMode`'s
+/// explicit-mode > env order on purpose: there the builder value is the
+/// user's own choice among implementations, while these env pins are the
+/// operator's process-global instrument and must stay authoritative.
+pub(crate) fn resolve_knob<T>(env: Option<T>, config: Option<T>, default: T) -> T {
+    env.or(config).unwrap_or(default)
+}
+
+// ── Sharded terminal channel (todo #1) ──
 //
 // `YOUPIPE_SHARDED_TERM=1` swaps a multi-worker sync/expand terminal
 // stage's output channel from one shared MPSC ring to one SPSC ring per
-// worker (see `sharded.rs` for the contention rationale). Runtime knob —
-// not a config field — so A/B benchmarks compare the same binary
-// (recompiles swing tight benchmarks ±30 % through pure code layout).
+// worker (see `sharded.rs` for the contention rationale). The env tier
+// stays the A/B vehicle (same-binary comparison; recompiles swing tight
+// benchmarks ±30 % through pure code layout); the per-pipeline middle
+// layer is `PipelineConfig::with_sharded_terminal`, shadowed by an
+// explicit env pin (see `resolve_knob`).
 //
 // Default ON (promoted 2026-10-20 together with `YOUPIPE_BATCH_RECV`):
 // sharded alone is bimodal on single-stage fan-in shapes (median wins but
 // the convoy slow mode returns in ~30 % of back-to-back runs); the pair
 // with batched claiming is tight and wins every soak cell. "0" recovers
 // the shared ring. See docs benchmarks.md "Default-policy soak".
-static SHARDED_TERM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SHARDED_TERM: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
 
-pub(crate) fn sharded_term_enabled() -> bool {
+/// Env tier of the sharded-terminal knob: `None` = unset (the config tier
+/// applies), `Some(v)` = explicitly pinned (shadows the config tier).
+/// Explicit values: `Some(true)` = "1" or empty, `Some(false)` = "0";
+/// anything else panics at first use.
+pub(crate) fn sharded_term_env() -> Option<bool> {
     *SHARDED_TERM.get_or_init(|| match std::env::var("YOUPIPE_SHARDED_TERM") {
-        Ok(v) if v == "1" || v.is_empty() => true,
-        Ok(v) if v == "0" => false,
+        Ok(v) if v == "1" || v.is_empty() => Some(true),
+        Ok(v) if v == "0" => Some(false),
         Ok(other) => {
             panic!("YOUPIPE_SHARDED_TERM: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
         },
-        // Unset = the default-on policy (see the knob comment above).
-        Err(_) => true,
+        // Unset = fall through to the config tier (see `resolve_knob`).
+        Err(_) => None,
     })
 }
 
@@ -108,7 +138,10 @@ pub(crate) fn sharded_term_async_enabled() -> bool {
 // capacities (the feeder ring included) of two chain families — any chain
 // containing an async stage, and any chain containing a `Chunked`-mode
 // fence: each such channel floors at `min(n, CHAIN_FLOOR_SLOTS)` slots,
-// byte-clamped per ring.
+// byte-clamped per ring. Env tier = the A/B vehicle (same-binary
+// comparison); the per-pipeline middle layer is
+// `PipelineConfig::with_chain_floor` (`ChainFloor`), shadowed by an
+// explicit env pin (see `resolve_knob`).
 //
 // Async-tailed chains (todo #4, "Async face re-attribution" in
 // docs/src/dev/streaming-forensics.md): the surviving async2 slow mode is
@@ -130,7 +163,7 @@ pub(crate) fn sharded_term_async_enabled() -> bool {
 // on the barrier probe). Pure-sync chains without a fence do not lift:
 // sync2 shows no slow mode at the small default. Explicit per-stage
 // buffer pins win verbatim (the caller opted into that exact
-// backpressure). Runtime knob so A/B benches compare the same binary.
+// backpressure).
 //
 // Default ON (promoted with the A/Bs above: async2 soak 0/120 collapsed
 // runs vs 18-30/120 off, async0_cheap/100K −41.8 %, every async shape
@@ -162,27 +195,27 @@ pub(crate) const CHAIN_FLOOR_SLOTS: usize = 65536;
 /// wake-RTT pathology anyway (per-item work dwarfs the ~1-2 µs RTT).
 pub(crate) const CHAIN_FLOOR_BYTES: usize = 8 << 20;
 
-static CHAIN_FLOOR: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+static CHAIN_FLOOR: std::sync::OnceLock<Option<ChainFloor>> = std::sync::OnceLock::new();
 
-/// Resolved floor tier: `None` = the knob is off (unfloored sizing),
-/// `Some(slots)` = lift to `min(n, slots)` (byte-clamped per ring).
-/// Values: unset/`"1"` = on at the `CHAIN_FLOOR_SLOTS` tier, `"0"` =
-/// off, a decimal `>= 2` = on at that explicit slot count (the tier A/B
-/// caliber; `1` stays boolean so the bool reading cannot silently become a
-/// one-slot floor).
-pub(crate) fn chain_floor_slots() -> Option<usize> {
+/// Env tier of the chain-floor knob: `None` = unset (the config tier
+/// applies), `Some(floor)` = explicitly pinned (shadows the config tier).
+/// Values: unset = fall through; `"1"`/empty = the `ChainFloor::Default`
+/// tier; `"0"` = `ChainFloor::Off`; a decimal `>= 2` = that explicit slot
+/// count (the tier A/B caliber; `1` stays boolean so the bool reading
+/// cannot silently become a one-slot floor).
+pub(crate) fn chain_floor_env() -> Option<ChainFloor> {
     *CHAIN_FLOOR.get_or_init(|| match std::env::var("YOUPIPE_CHAIN_FLOOR") {
-        Ok(v) if v == "1" || v.is_empty() => Some(CHAIN_FLOOR_SLOTS),
-        Ok(v) if v == "0" => None,
+        Ok(v) if v == "1" || v.is_empty() => Some(ChainFloor::Default),
+        Ok(v) if v == "0" => Some(ChainFloor::Off),
         Ok(other) => match other.parse::<usize>() {
-            Ok(n) if n >= 2 => Some(n),
+            Ok(n) if n >= 2 => Some(ChainFloor::Slots(std::num::NonZeroUsize::new(n).unwrap())),
             _ => panic!(
                 "YOUPIPE_CHAIN_FLOOR: invalid value {other:?} (leave unset or use \"0\" \"1\", or \
                  an explicit slot count >= 2)"
             ),
         },
-        // Unset = the default-on policy (see the knob comment above).
-        Err(_) => Some(CHAIN_FLOOR_SLOTS),
+        // Unset = fall through to the config tier (see `resolve_knob`).
+        Err(_) => None,
     })
 }
 
@@ -280,33 +313,25 @@ pub(crate) fn stream_tx_batch() -> bool {
 // (`MixedOnly`) batches exactly the mixed hop; "1" re-lifts the gate on
 // every hop (falsified), "0" restores the historical per-item gate on
 // every async-chain hop (also the fallback for `YOUPIPE_CLAIM_SCALE=0`).
-// Independent of `YOUPIPE_STREAM_TX_BATCH` (the global switch).
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum AsyncTxGate {
-    /// Every hop of an async-tailed chain keeps per-item sends (the
-    /// 2026-10 gate; the pre-todo-#34 default).
-    Off,
-    /// Batched delivery only on hops whose consumers are async (the mixed
-    /// ring); sync→sync hops of async chains keep per-item sends.
-    MixedOnly,
-    /// Batched delivery on every hop (measured +17.4 % on
-    /// `sync_fuse/async_pair_cpu_split/100K`, 0/25 — kept for A/B
-    /// reproduction).
-    Full,
-}
+// Independent of `YOUPIPE_STREAM_TX_BATCH` (the global switch). The enum
+// lives in `builder::config` (the per-pipeline `with_async_tx_gate` tier);
+// the env pin below shadows that field (see `resolve_knob`).
+static ASYNC_TX_BATCH: std::sync::OnceLock<Option<AsyncTxGate>> = std::sync::OnceLock::new();
 
-static ASYNC_TX_BATCH: std::sync::OnceLock<AsyncTxGate> = std::sync::OnceLock::new();
-
-pub(crate) fn async_tx_gate() -> AsyncTxGate {
+/// Env tier of the async-tail tx-batch gate: `None` = unset (the config
+/// tier applies), `Some(gate)` = explicitly pinned (shadows the config
+/// tier). Explicit values: `Some(Full)` = "1", `Some(Off)` = "0",
+/// `Some(MixedOnly)` = empty; anything else panics at first use.
+pub(crate) fn async_tx_gate_env() -> Option<AsyncTxGate> {
     *ASYNC_TX_BATCH.get_or_init(|| match std::env::var("YOUPIPE_ASYNC_TX_BATCH") {
-        Ok(v) if v == "1" => AsyncTxGate::Full,
-        Ok(v) if v == "0" => AsyncTxGate::Off,
-        Ok(v) if v.is_empty() => AsyncTxGate::MixedOnly,
+        Ok(v) if v == "1" => Some(AsyncTxGate::Full),
+        Ok(v) if v == "0" => Some(AsyncTxGate::Off),
+        Ok(v) if v.is_empty() => Some(AsyncTxGate::MixedOnly),
         Ok(other) => panic!(
             "YOUPIPE_ASYNC_TX_BATCH: invalid value {other:?} (leave unset or use \"0\"/\"1\")"
         ),
-        // Unset = the mixed-hop-only default (see the knob comment above).
-        Err(_) => AsyncTxGate::MixedOnly,
+        // Unset = fall through to the config tier (see `resolve_knob`).
+        Err(_) => None,
     })
 }
 
