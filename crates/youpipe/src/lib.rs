@@ -52,7 +52,7 @@ const _: () = {
                 abort the whole process instead of propagating to the caller. The LeafGuard / \
                 ForEachGuard panic-safety paths never run under abort. To restore panic \
                 propagation, force `panic = \"unwind\"` for youpipe via a `.cargo/config.toml` \
-                override: `[build] rustflags = [\"-C\", \"panic=unwind\"]`. See youpipe's own \
+                override: `[target.'cfg(all())'] rustflags = [\"-C\", \"panic=unwind\"]`. See \
                 `.cargo/config.toml` for the worked example."
     )]
     const PANIC_ABORT_DISABLES_SAFETY: () = ();

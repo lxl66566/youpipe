@@ -6,13 +6,13 @@
 # machinery, so `-C panic=unwind` is forced here for ALL profiles — the
 # library requires unwind semantics everywhere (tests included).
 #
-# `-C opt-level=3` deliberately does NOT live here: `[build] rustflags` is
+# `-C opt-level=3` deliberately does NOT live here: these rustflags are
 # profile-blind, and an opt-level > 0 from this path made rustc infer
 # `debug-assertions = off` for dev/test, silently compiling out the whole
 # debug-side invariant layer of `cargo test` runs. dev/test opt-level is
 # pinned in Cargo.toml's `[profile.dev]` instead, where cargo can emit the
 # matching `-C debug-assertions=on`. Override or disable by setting
-# `RUSTFLAGS` in the environment (Cargo appends those after these).
+# `RUSTFLAGS` in the environment.
 # `-C llvm-args=-align-all-functions=5` (32-byte function alignment): this
 # crate is acutely codegen-layout-sensitive (single codegen unit — any
 # unrelated source edit reshuffles the hot loops' instruction layout).
@@ -27,7 +27,15 @@
 # ≡48 mod 64 (+33..+40 %, fixed in handoff/channel.rs `stage_batch`);
 # `-align-all-functions=6` (64 B) would close that class too but re-rolls
 # every bench baseline once (open, see attribution.md 2026-10-23).
-[build]
+# These live under `[target.'cfg(all())']`, not `[build]`: target-level
+# rustflags from ANY config file in the hierarchy (this host's
+# `~/.cargo/config.toml` sets `[target.'cfg(target_os = "linux")'] rustflags`
+# for the mold linker) make cargo ignore `[build] rustflags` entirely, so a
+# `[build]` section here silently never applied on such hosts (found 2026-11:
+# 1789/3440 bench-binary functions unaligned to 32 B). `cfg(all())` always
+# matches every target, so these flags win the same precedence race and
+# compose with the host's target table.
+[target.'cfg(all())']
 rustflags = [
   "-C",
   "panic=unwind",

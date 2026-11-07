@@ -100,11 +100,13 @@ Fairness survives (both frameworks run the same folded kernel), but every absolu
 
 An acceptance bench surfaced the sharpest instance of the layout trap yet: horizontal `cpu_balanced` 100K–4M regressed +29…+40 % against v0.6.0. A same-session interleaved bisect (the rayon and std-threads controls stayed flat, so the environment was clean) pinned the first bad commit to `5e6bd83`, a change touching only async parking code that the sync fused-collect path never executes. The regression was a pure instruction-layout shift under `codegen-units = 1` (plus thin LTO letting a crossfire-only edit reshuffle the bench binary): the hot leaf loops landed on worse addresses.
 
-Mitigation, now permanent in `.cargo/config.toml`:
+Mitigation, now permanent in `.cargo/config.toml` under `[target.'cfg(all())']`:
 
 ```
 rustflags = ["-C", "panic=unwind", "-C", "llvm-args=-align-all-functions=5"]
 ```
+
+Precedence note (2026-11): these flags originally sat in `[build] rustflags`, which any target-level rustflags anywhere in the config hierarchy silently voids — this host's `~/.cargo/config.toml` mold section did exactly that, so the mitigation never applied here (symbol census of the bench binary: 1789/3440 functions unaligned to 32 B). `[target.'cfg(all())']` always matches, wins the same precedence race and composes with the host table; after the move the census reads 3431/3440 aligned (the 9 stragglers are linker/PLT shims like `_init`/`_fini`).
 
 With 32-byte function alignment both endpoints measure 1.00x (v0.6.0 vs the campaign tip, 4 interleaved pairs), the bad commit itself measures 1.00x against its parent, and v0.6.0 with the flag is 1.00x vs without, so the grid costs nothing on a lucky layout. Alignment does not fix everything: `cpu_balanced_readback/100K` keeps a ~+7 % wobble that bisects to `98c8d4d` (crossfire-only changes, likewise unreachable from that path) and survives both `align-all-functions=6` and LLVM's JCC branch-target alignment (`-x86-align-branch-boundary=32` plus `-x86-align-branch=fused,jcc,jmp,call,ret,indirect`, tested 2026-10-06, no effect, the flags were not adopted). That residual is most likely heap/page placement of the output buffer the fold reads rather than code layout, and no available compiler flag stabilizes it.
 
