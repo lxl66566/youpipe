@@ -55,10 +55,10 @@ pub(crate) struct Registry {
     ///
     /// `concurrent_queue` (not crossbeam): same block-based MPMC algorithm but
     /// without `crossbeam-epoch` (the source of the Miri UB that prompted the
-    /// st3 migration). Pops are guarded by an advisory `is_empty()` (two plain
-    /// index loads — see `pop_injected_job`); the raw empty `pop` behind it is
-    /// 2 Acquire loads + a SeqCst fence, no CAS. A hand-maintained
-    /// `AtomicUsize` length counter is a measured regression (its per-op
+    /// st3 migration). An empty `pop` is 2 Acquire loads + a SeqCst fence, no
+    /// CAS — cheap enough that no `is_empty()` consult is worth a branch in
+    /// front of it (measured, todo #44). A hand-maintained `AtomicUsize`
+    /// length counter is a measured regression (its per-op
     /// `fetch_add`/`fetch_sub` bounces a cache line).
     injected_jobs: concurrent_queue::ConcurrentQueue<JobRef>,
 
@@ -287,27 +287,19 @@ impl Registry {
     }
 
     fn pop_injected_job(&self) -> Option<JobRef> {
-        // Advisory empty short-circuit: `is_empty()` is two plain index loads,
-        // while an empty `pop` additionally pays the head-block deref and the
-        // SeqCst `full_fence` (a locked op) — and `find_work` hits this on
-        // every idle pass of a mostly-empty injector. A false "empty" only
-        // defers the pop: idle passes rescan, and `Sleep::sleep`'s pre-park
-        // true check (fence + `has_injected_jobs`) plus the JEC wake protocol
-        // guarantee the job is seen. A hand-maintained length counter remains
-        // rejected — see the `injected_jobs` field doc. Measured 2026-10-18 in
-        // a double-controlled A/B (solo cherry-pick and main-revert sides
-        // agreeing): the gate costs ~+2.3% on mixed youpipe_stream_cpu/1K and
-        // buys nothing confirmed elsewhere; kept — the earlier −8% "win" was a
-        // layout artifact (benchmarks.md "fifth face of the lottery").
-        // Same-binary knob re-check on sharded_term_async async1 @100K
-        // (2026-10-18, temporary local env patch): gate ON is mildly
-        // favourable there (−6%/−6% vs disabled, noise-grade) and tightens
-        // the round spread — the async1@100K v0.6.1 regression flag was a
-        // draw artifact, not this gate (benchmarks.md "async1@100K draw
-        // band").
-        if self.injected_jobs.is_empty() {
-            return None;
-        }
+        // No advisory `is_empty()` consult in front of the pop: on an empty
+        // queue `pop()` itself is 2 Acquire loads + a SeqCst fence (no CAS, no
+        // block deref) and returns `Err(Empty)` — the same `None`. Its only
+        // wait loops are transient block-install races that a concurrent
+        // pusher (or the popper completing a block transition) resolves in
+        // bounded time; a quiescent drained queue returns immediately
+        // (youpipe-concurrent-queue unbounded.rs). A consult was kept for a
+        // time on a recompile A/B's ~+2.3% mixed/1K reading, but the
+        // same-binary knob A/B (todo #44, 2026-11-08) measured both sides
+        // noise-equal on every cell — that +2.3% was a layout draw — and
+        // removed it; readings in benchmarks/attribution.md. A
+        // hand-maintained length counter remains rejected (see the
+        // `injected_jobs` field doc).
         self.injected_jobs.pop().ok()
     }
 

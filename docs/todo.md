@@ -29,13 +29,6 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 
 ---
 
-### 44. [P2] remove the injector `is_empty()` consult gate (recorded "revisit")
-
-- Context: `Registry::pop_injected_job` gates every pop on `injected_jobs.is_empty()`; a blind A/B measured it at ~+2.3 % on `mixed_load/youpipe_stream_cpu/1000` with no confirmed benefit elsewhere (attribution.md "fifth face of the lottery"). The recorded decision was "keep for now; revisit on the next injector-path touch".
-- Protocol: same-binary env A/B (`bench_ab.sh -E`, per-id): `mixed_load/youpipe_stream_cpu/1000` (primary), `sharded_term_async/async1_{cheap,cpu}/100000` + `io_async` (counter-cells), `zstd_shape`, horizontal `cpu_balanced`.
-
----
-
 ### 45. [P2] per-run ring recycling (channel construction cache)
 
 - Context: per-run assembly is the dominant residual @1K fixed cost — graph edges allocate ~1.4 µs/ring (3 rings/run, graph.md "Per-run assembly attribution") and the stream sharded terminal holds 17.1 µs of `with_fence/1K`'s 164 µs (streaming.md). Analogue of the pool recycling cache: cache drained-and-closed crossfire rings keyed by (slot size, capacity), via a fork `try_reset` extension (acceptable only when both endpoint refcounts are zero and the ring is empty — the same class as `pop_batch`).
