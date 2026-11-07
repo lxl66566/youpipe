@@ -103,7 +103,11 @@ impl<T: Send + 'static> FanIn<T> {
     }
 
     /// Claim the next batch of items into `scratch`; `0` means EOF (every
-    /// input disconnected). Burst round first, knob-gated spin second (the
+    /// input disconnected). `claim_cap` is the caller's per-claim bound —
+    /// the fixed per-worker share, or the backlog-scaled window's current
+    /// value when the node feeds an async consumer (`ClaimWindow` via
+    /// `exec::claim_knobs`, todo #43). Burst round first, knob-gated spin
+    /// second (the
     /// shared [`SpinBudget`] polling whole rounds; a closed input is marked
     /// and rotated past inside [`FanIn::round`], never a spin verdict),
     /// blocking anchor last — the anchor parks registered on every open

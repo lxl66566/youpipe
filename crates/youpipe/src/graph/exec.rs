@@ -11,7 +11,7 @@ use std::{
 use super::{
     GraphBuilder,
     fanin::FanIn,
-    plan::{EdgeConnector, Erased, GraphPlan, NodeKind, NodeOpts, SpawnStep},
+    plan::{ClaimScope, EdgeConnector, Erased, GraphPlan, NodeKind, NodeOpts, SpawnStep},
 };
 use crate::{
     builder::{
@@ -20,8 +20,8 @@ use crate::{
     },
     executor::compute::ComputePool,
     handoff::{
-        CancelCheck, Delivery, Receiver as SyncReceiver, SpinBudget, SyncSender, cancel_active,
-        claim_expand_deliver, claim_map_deliver, mux::MuxPlan, per_worker_claim_cap,
+        CancelCheck, ClaimWindow, Delivery, Receiver as SyncReceiver, SpinBudget, SyncSender,
+        cancel_active, claim_expand_deliver, claim_map_deliver, mux::MuxPlan, per_worker_claim_cap,
     },
     runtime::AsyncRuntime,
     sync::CancellationToken,
@@ -257,6 +257,24 @@ where
     }
 }
 
+/// Resolve a sync/expand node's claim rhythm from its worker count and
+/// claim scope (todo #43, the graph port of the stream engine's
+/// `ClaimKnobs::resolve`): the per-worker fairness share plus the scratch
+/// capacity that bounds it. An async-fed node with the window knob on
+/// grows the scratch to the full batch cap so [`ClaimWindow`] can scale
+/// claims up to it; every other combination keeps `scratch == share`, which
+/// leaves the window inert — the fixed-share rhythm bit-for-bit.
+fn claim_knobs(workers: usize, scope: ClaimScope) -> (usize, usize) {
+    let share = per_worker_claim_cap(workers);
+    let scratch_cap =
+        if scope == ClaimScope::AsyncFed && crate::handoff::claim_scale_enabled() && share > 0 {
+            crate::handoff::batch_recv_cap()
+        } else {
+            share
+        };
+    (share, scratch_cap)
+}
+
 /// One sync node worker: fair fan-in claim, map, deliver through the node's
 /// [`Delivery`] strategy — the shared `claim_map_deliver` driver with
 /// `PerClaim` cancel acceptance (the token check precedes the batch's
@@ -264,30 +282,38 @@ where
 /// either way an accepted item is always delivered, so the emitted set is
 /// independent of ring pressure — todo #21). With the tx-batch knob on the
 /// mapped claim batch is staged and flushed per edge with one
-/// `try_send_batch` per free run (single-item claims — `claim_cap == 0` —
-/// keep the per-item send: staging a 1-item batch only adds moves). Exits
-/// on EOF (every input closed), cancel, or every output edge closed.
+/// `try_send_batch` per free run (zero-cap claims keep the per-item send:
+/// staging a 1-item batch only adds moves). The claim bound is the
+/// backlog-scaled [`ClaimWindow`] (share == cap leaves it inert — see
+/// [`claim_knobs`]). Exits on EOF (every input closed), cancel, or every
+/// output edge closed.
 fn node_worker<I, O, F, D>(
     f: &F,
     mut fanin: FanIn<I>,
     mut out: D,
     cancel: Option<&CancellationToken>,
     claim_cap: usize,
+    scratch_cap: usize,
 ) where
     I: Send + 'static,
     O: Send + 'static,
     F: Fn(I) -> O + Send + Sync,
     D: Delivery<O>,
 {
-    let tx_batch = super::fanin::graph_tx_batch() && claim_cap > 0;
+    let tx_batch = super::fanin::graph_tx_batch() && scratch_cap > 0;
     let mut spin = SpinBudget::new(crate::handoff::spin_anchor_us());
+    let mut win = ClaimWindow::new(claim_cap, scratch_cap);
     claim_map_deliver(
-        &mut |scratch| fanin.claim(scratch, claim_cap, &mut spin),
+        &mut |scratch| {
+            let n = fanin.claim(scratch, win.current(), &mut spin);
+            win.note(n);
+            n
+        },
         f,
         &mut out,
         cancel,
         tx_batch,
-        claim_cap,
+        scratch_cap,
         CancelCheck::PerClaim,
     );
 }
@@ -304,22 +330,28 @@ fn expand_worker<I, O, F, D>(
     mut out: D,
     cancel: Option<&CancellationToken>,
     claim_cap: usize,
+    scratch_cap: usize,
 ) where
     I: Send + 'static,
     O: Send + 'static,
     F: Fn(I, &mut Vec<O>) + Send + Sync,
     D: Delivery<O>,
 {
-    let tx_batch = super::fanin::graph_tx_batch() && claim_cap > 0;
-    let flush_cap = crate::handoff::batch_recv_cap().max(claim_cap).max(1);
+    let tx_batch = super::fanin::graph_tx_batch() && scratch_cap > 0;
+    let flush_cap = crate::handoff::batch_recv_cap().max(scratch_cap).max(1);
     let mut spin = SpinBudget::new(crate::handoff::spin_anchor_us());
+    let mut win = ClaimWindow::new(claim_cap, scratch_cap);
     claim_expand_deliver(
-        &mut |scratch| fanin.claim(scratch, claim_cap, &mut spin),
+        &mut |scratch| {
+            let n = fanin.claim(scratch, win.current(), &mut spin);
+            win.note(n);
+            n
+        },
         f,
         &mut out,
         cancel,
         tx_batch,
-        claim_cap,
+        scratch_cap,
         flush_cap,
         CancelCheck::PerClaim,
     );
@@ -421,7 +453,11 @@ where
     // Convert up front so the Send bound is carried by the iterator itself.
     let iter = iter.into_iter();
     Box::new(
-        move |core: &GraphCore, _workers: usize, _inputs: Vec<Erased>, outputs: Vec<Erased>| {
+        move |core: &GraphCore,
+              _workers: usize,
+              _scope: ClaimScope,
+              _inputs: Vec<Erased>,
+              outputs: Vec<Erased>| {
             let txs = downcast_endpoints::<SyncSender<T>>(outputs, "outputs", "source");
             let cancel = core.cancel.clone();
             core.dispatch_job(move || {
@@ -441,19 +477,23 @@ where
     D: Delivery<O> + From<Vec<SyncSender<O>>>,
 {
     Box::new(
-        move |core: &GraphCore, workers: usize, inputs: Vec<Erased>, outputs: Vec<Erased>| {
+        move |core: &GraphCore,
+              workers: usize,
+              scope: ClaimScope,
+              inputs: Vec<Erased>,
+              outputs: Vec<Erased>| {
             let rxs: Arc<[SyncReceiver<I>]> = Arc::from(downcast_endpoints::<SyncReceiver<I>>(
                 inputs, "inputs", &name,
             ));
             let txs = downcast_endpoints::<SyncSender<O>>(outputs, "outputs", &name);
-            let claim_cap = per_worker_claim_cap(workers);
+            let (claim_cap, scratch_cap) = claim_knobs(workers, scope);
             let f = Arc::new(f);
             core.dispatch_jobs((0..workers).map(|_| {
                 let f = Arc::clone(&f);
                 let fanin = FanIn::new(Arc::clone(&rxs));
                 let out = D::from(txs.clone());
                 let cancel = core.cancel.clone();
-                move || node_worker(&*f, fanin, out, Some(&cancel), claim_cap)
+                move || node_worker(&*f, fanin, out, Some(&cancel), claim_cap, scratch_cap)
             }));
         },
     )
@@ -469,19 +509,23 @@ where
     D: Delivery<O> + From<Vec<SyncSender<O>>>,
 {
     Box::new(
-        move |core: &GraphCore, workers: usize, inputs: Vec<Erased>, outputs: Vec<Erased>| {
+        move |core: &GraphCore,
+              workers: usize,
+              scope: ClaimScope,
+              inputs: Vec<Erased>,
+              outputs: Vec<Erased>| {
             let rxs: Arc<[SyncReceiver<I>]> = Arc::from(downcast_endpoints::<SyncReceiver<I>>(
                 inputs, "inputs", &name,
             ));
             let txs = downcast_endpoints::<SyncSender<O>>(outputs, "outputs", &name);
-            let claim_cap = per_worker_claim_cap(workers);
+            let (claim_cap, scratch_cap) = claim_knobs(workers, scope);
             let f = Arc::new(f);
             core.dispatch_jobs((0..workers).map(|_| {
                 let f = Arc::clone(&f);
                 let fanin = FanIn::new(Arc::clone(&rxs));
                 let out = D::from(txs.clone());
                 let cancel = core.cancel.clone();
-                move || expand_worker(&*f, fanin, out, Some(&cancel), claim_cap)
+                move || expand_worker(&*f, fanin, out, Some(&cancel), claim_cap, scratch_cap)
             }));
         },
     )
@@ -495,7 +539,11 @@ where
     F: Fn(I) + Send + Sync + 'static,
 {
     Box::new(
-        move |core: &GraphCore, _workers: usize, inputs: Vec<Erased>, _outputs: Vec<Erased>| {
+        move |core: &GraphCore,
+              _workers: usize,
+              _scope: ClaimScope,
+              inputs: Vec<Erased>,
+              _outputs: Vec<Erased>| {
             let rxs: Arc<[SyncReceiver<I>]> = Arc::from(downcast_endpoints::<SyncReceiver<I>>(
                 inputs, "inputs", &name,
             ));
@@ -516,7 +564,11 @@ where
     T: Send + 'static,
 {
     Box::new(
-        move |core: &GraphCore, _workers: usize, inputs: Vec<Erased>, _outputs: Vec<Erased>| {
+        move |core: &GraphCore,
+              _workers: usize,
+              _scope: ClaimScope,
+              inputs: Vec<Erased>,
+              _outputs: Vec<Erased>| {
             let rxs: Arc<[SyncReceiver<T>]> = Arc::from(downcast_endpoints::<SyncReceiver<T>>(
                 inputs,
                 "inputs",
@@ -710,6 +762,9 @@ pub(crate) fn run_graph<R: AsyncRuntime>(builder: GraphBuilder<R>) -> std::io::R
     // producing workers always keep a few free slots ahead).
     let n = plan.nodes.len();
     let buffer_pins: Vec<_> = plan.nodes.iter().map(|node| node.opts.buffer).collect();
+    // Kind snapshot for the claim-scope resolution below (the node table is
+    // consumed by the reorder before the walk).
+    let kinds: Vec<NodeKind> = plan.nodes.iter().map(|node| node.kind).collect();
     let mut out_edges: Vec<Vec<OutEdge>> = (0..n).map(|_| Vec::new()).collect();
     for edge in plan.edges {
         let producers = run.workers[edge.up];
@@ -746,6 +801,15 @@ pub(crate) fn run_graph<R: AsyncRuntime>(builder: GraphBuilder<R>) -> std::io::R
     // downstream worker job.
     let mut pending: Vec<Vec<Erased>> = (0..n).map(|_| Vec::new()).collect();
     for (u, node) in ordered {
+        // Claim scope: does any out-edge feed an async consumer (an async
+        // node, or an async source — impossible, sources take no in-edges)?
+        // Inert for sources/sinks/async nodes themselves (single-consumer
+        // or claim-free sites).
+        let scope = if out_edges[u].iter().any(|e| kinds[e.down].is_async()) {
+            ClaimScope::AsyncFed
+        } else {
+            ClaimScope::SyncFed
+        };
         let mut outputs: Vec<Erased> = Vec::with_capacity(out_edges[u].len());
         for edge in std::mem::take(&mut out_edges[u]) {
             let (tx, rx) = (edge.connector)(&core, edge.buffer);
@@ -753,7 +817,7 @@ pub(crate) fn run_graph<R: AsyncRuntime>(builder: GraphBuilder<R>) -> std::io::R
             pending[edge.down].push(rx);
         }
         let inputs = std::mem::take(&mut pending[u]);
-        (node.spawn)(&core, run.workers[u], inputs, outputs);
+        (node.spawn)(&core, run.workers[u], scope, inputs, outputs);
     }
 
     // `done` is decremented only after each task's `CatchPanic` wrapper

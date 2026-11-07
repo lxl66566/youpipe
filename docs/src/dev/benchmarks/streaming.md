@@ -296,7 +296,7 @@ The interaction is the load-bearing finding: mixed-hop batching ALONE loses `spl
 
 The primary horizontal cells (`mixed_cpu_io` 500/2000, 6 alternating process pairs × 2 internal rounds, `taskset -c 1-31`) are noise for every side (medians ±0.2 %, per-pair deltas −0.9…+2.1 %): the ~10 ms wall is owned by the 1 ms/8 ms IO tail sleeps, and the µs-scale sync-span compression the levers deliver sits under the noise floor of that shape — the todo #34 span is a profiling-visible, wall-invisible cost at these sizes.
 
-Decision: `YOUPIPE_CLAIM_SCALE` default on (async-tailed chains, stream engine), `YOUPIPE_ASYNC_TX_BATCH` default `MixedOnly` (`"0"` = the historical full gate, `"1"` = the falsified full lift). Falsified variants in [dead-ends.md](../dead-ends.md).
+Decision: `YOUPIPE_CLAIM_SCALE` default on (async-tailed chains, stream engine), `YOUPIPE_ASYNC_TX_BATCH` default `MixedOnly` (`"0"` = the historical full gate, `"1"` = the falsified full lift). Falsified variants in [dead-ends.md](../dead-ends.md). The claim window's scope grew on 2026-11-08 (todo #43) to the graph engine's async-fed sync/expand nodes — [graph.md](graph.md) "Graph claim window".
 
 ## Stream-side per-run assembly attribution (2026-11-05, todo #33)
 

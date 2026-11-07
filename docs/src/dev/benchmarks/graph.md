@@ -142,7 +142,7 @@ Every id verdicts noise. Falsified structurally, not only by the floor: the leve
 
 ## Async broadcast fan-out ids (2026-11-06)
 
-`graph_shapes` gained `fanout_async_{cheap,cpu}_graph` (@1K/100K): one `source_async` feeder into a `node_async_broadcast` feeding two sinks — the fan-out mirror of the `fanin_async_*` family; until now every async graph id was a unicast 2-in-1-out shape. Purpose: isolate `AsyncBroadcast::deliver`'s unbatched per-item outlet cost — k−1 clones + k awaited `send_cached`s per item (k=2: one clone, two per-edge sends) — the target shape of a future batched-delivery lever. Items stay `u64` per family convention so the ids compare against the diamond/fanin anchors. Instrumentation-only addition, sanity-checked standalone (5 verdict-caliber passes, spreads 0.9–2.5 %, monotone @1K→@100K); no A/B recorded.
+`graph_shapes` gained `fanout_async_{cheap,cpu}_graph` (@1K/100K): one `source_async` feeder into a `node_async_broadcast` feeding two sinks — the fan-out mirror of the `fanin_async_*` family; until now every async graph id was a unicast 2-in-1-out shape. Purpose: isolate `AsyncBroadcast::deliver`'s unbatched per-item outlet cost — k−1 clones + k awaited `send_cached`s per item (k=2: one clone, two per-edge sends) — the target shape of the batched-delivery lever that landed the same day (`YOUPIPE_ASYNC_OUTLET_BATCH`; readings in "Batched async outlet" below, mechanism in [streaming.md](../streaming.md)). Items stay `u64` per family convention so the ids compare against the diamond/fanin anchors. Instrumentation-only addition, sanity-checked standalone (5 verdict-caliber passes, spreads 0.9–2.5 %, monotone @1K→@100K); no A/B recorded.
 
 ## Poll-based async intake: landed (2026-11-06, C1 stage 1)
 
@@ -229,3 +229,22 @@ splits the same mass over two sources). No-regression family
 `mixed_load`): every id noise, `io_async` dead flat (±0.2 %, the stream
 engine never runs `async_source_task`), the fused @100K row in its
 documented bimodal band.
+
+## Graph claim window: landed default-on (2026-11-08, todo #43)
+
+`graph_shapes` gained `chain_async_{cpu,cheap}_graph` (@1K/100K): `source → node(cpu) → node(cpu) → node_async(async bump) → sink`, the graph mirror of `sync_fuse`'s `async_pair_cpu_split` — until now no graph id reached a sync node feeding an async consumer (the `fanin_async`/`fanout_async` families are async-source-fed; their sync twins are pure-sync), which is the exact face the stream engine's backlog-scaled claim window won on (todo #34: a sync stage's span paced by one ring-head CAS per ~2 items under a slow async drain). Node `b` is that face — its workers share one claim source against the mixed ring the async node's M:N drivers drain slowly — while node `a` feeds a pure-sync ring and keeps the fixed share, so one id carries the scope gate's both arms.
+
+The port leaves `FanIn::claim` unchanged: the claim bound it receives per call now comes from a per-worker `ClaimWindow` (double on full claims, collapse to the per-worker share on partial/park — the landed stream rule verbatim). The scope gate is structural, not a runtime switch: the run walk resolves each sync/expand node's `ClaimScope` from its out-edge target kinds (`plan::ClaimScope`, an enum handed to every spawn step — inert for sources/sinks/async nodes), and `exec::claim_knobs` grows the scratch cap to the full batch cap only for `AsyncFed` nodes under `YOUPIPE_CLAIM_SCALE`; pure-sync outputs keep `scratch == share`, which leaves the window inert (byte-for-byte the fixed-share rhythm — the falsified universal window stays falsified, [dead-ends.md](../dead-ends.md)).
+
+Same-binary knob A/B (`bench_ab.sh -E off/on=YOUPIPE_CLAIM_SCALE=0/1`, per-id isolated, 5 interleaved rounds +5 appended on the flagged rows, 32 cores):
+
+| id | off @med | on @med | Δ | dominance | verdict |
+|---|---|---|---|---|---|
+| `chain_async_cheap_graph/100000` | 19.07 ms | 17.77 ms | **−6.8 %** | 100/100 | improvement |
+| `chain_async_cpu_graph/100000` | 18.92 ms | 17.76 ms | **−6.1 %** | 100/100 | improvement |
+| `chain_async_{cpu,cheap}_graph/1000` | — | — | +1.2 / +1.2 | ≤44/100 | noise (the fixed lazy-runtime-build row; load-bimodal spreads 12–69 %, both sides visit the fast and slow modes) |
+| `chain_{cpu,cheap}_graph @1K/@100K` (4) | — | — | −2.5…+0.4 | ≤20/25 | noise (pure-sync controls — the window cannot arm in them) |
+| `diamond_{cpu,cheap}_graph @1K/@100K` (4) | — | — | −2.1…+0.5 | ≤17/25 | noise |
+| `fanin_cheap_graph/100000` | 38.58 ms | 39.33 ms | +1.9 | 41/100 | noise (its known bimodal slow mode — rounds interleave 30.8–41.3 ms on both sides; the shape is pure-sync, the window structurally off) |
+
+Default: on — the knob's existing default now covers the graph face; `ClaimScope` alone decides where it may arm. The @1K lean (+1.2 %) is the larger per-worker staging allocation (scratch 64 vs 2 slots) on rows dominated by the fixed async-runtime build, amortized away at @100K where the win sits. Conservation through the widened claim/staging path is pinned by `sync_node_into_async_node_conserves`.

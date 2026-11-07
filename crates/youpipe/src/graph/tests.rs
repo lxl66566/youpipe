@@ -794,6 +794,47 @@ fn async_node_fills_io_concurrency_over_narrow_runtime() {
     );
 }
 
+/// Multi-worker sync node into an async node — the `ClaimScope::AsyncFed`
+/// shape (todo #43): under `YOUPIPE_CLAIM_SCALE` those claims widen with
+/// the backlog, so conservation must hold through the windowed
+/// claim/staging path exactly as through the fixed share.
+#[cfg(feature = "tokio-runtime")]
+// miri (windows): building the tokio runtime registers an IOCP handle,
+// which the interpreter cannot execute; Linux miri (epoll) stays covered.
+#[cfg_attr(all(miri, target_os = "windows"), ignore)]
+#[test]
+fn sync_node_into_async_node_conserves() {
+    let n = n_items(20_000u64);
+    let count = Arc::new(AtomicU64::new(0));
+    let total = Arc::new(AtomicU64::new(0));
+    let acc_n = Arc::clone(&count);
+    let acc_sum = Arc::clone(&total);
+    let mut g = graph();
+    let src = g.source("src", 0..n);
+    let map = g.node_with("map", NodeOptions::new().workers(4), |x: u64| {
+        x.wrapping_mul(3)
+    });
+    let io = g.node_async_with(
+        "io",
+        AsyncNodeOptions::new().io_concurrency(4),
+        |x: u64| async move {
+            tokio::task::yield_now().await;
+            x.wrapping_add(1)
+        },
+    );
+    let out = g.sink("out", move |x: u64| {
+        acc_n.fetch_add(1, Ordering::Relaxed);
+        acc_sum.fetch_add(x, Ordering::Relaxed);
+    });
+    g.edge(src, map).edge(map, io).edge(io, out);
+    g.run();
+    assert_eq!(count.load(Ordering::Relaxed), n);
+    assert_eq!(
+        total.load(Ordering::Relaxed),
+        (0..n).map(|x| x * 3 + 1).sum::<u64>()
+    );
+}
+
 /// The async move path drops the `Clone` bound too: a non-`Clone` payload
 /// through `source` -> `node_async` -> `sink_collect` compiles and conserves.
 #[cfg(feature = "tokio-runtime")]

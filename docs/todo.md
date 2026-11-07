@@ -21,12 +21,6 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 
 ---
 
-### 43. [P2] backlog-scaled claim window for graph FanIn claims (r4 audit)
-
-- Context: graph node workers claim with a fixed fair share (`per_worker_claim_cap` → `FanIn::claim`); the stream twin of exactly this face (31 workers on a trivial map feeding an async consumer) measured 31 % of span in the `SyncSender::send` tail CAS and won the mixed hop (merged/1K −33 %, 25/25) via `ClaimWindow`. handoff/mod.rs explicitly notes the port was never measured for the graph engine.
-- Dead-ends check: the falsified entry is the *universal* window (pure-sync fence +60 %); scope here follows the landed async-fed rule (graph `MixedOnly` analogue).
-- Protocol: add a `graph_shapes` id mirroring `sync_fuse/async_pair_cpu_split` (cheap sync node → async node), then same-binary env-scoped per-id A/B on it plus the existing `chain_*_graph`/`fanin_*_graph` ids as no-regression gates.
-
 ---
 
 ### 45. [P2] per-run ring recycling (channel construction cache)
@@ -35,3 +29,19 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 - Risk: the fork must stay diffable; the waker-registry reset semantics are the hard part.
 - Protocol: `stream_pipeline/with_fence/1000`, `graph_shapes/chain_cheap_graph/1000`, `sharded_term` @1K cells; default-off env gate, then per-id `-E` A/B.
 
+
+---
+
+### 48. [P2] sharded-terminal per-shard depth caps the collector's batch claims (r5 audit)
+
+- Context: the sync sharded terminal sizes each shard at `max(MIN_SHARD_BUFFER, buffer / workers)` (`sharded_mpsc_channel`), and `buffer` resolves to `max(256, parallelism * 4)` (`floored_channel_capacity`) — a 32-worker single-stage terminal runs 8-deep shards while the collector's `drain_pass_batched` claims with a 64-slot scratch (`batch_recv_cap`). r5 attribution (`hotpath-profile stream-engine-ordered` / `stream-engine`, 1M x 20, one process per scenario, bench.lock): the collector paces both shapes (`drain_ordered_sharded` 150.7 / `drain_unordered_sharded` 164.5 ns/item, inside the family's bistability band), `MpscReceiver::try_recv_batch` holds 77-84 % of the drain at 5.0 M calls / 20 M items = 0.25 claims/item — real claims cluster at the shard cap (~8 items), paying the stamp-walk preamble plus one SeqCst cursor store per ~4 items (0-claim probes P50 50-81 ns, full claims µs-scale). Deep terminal shards are already the landed verdict where `YOUPIPE_CHAIN_FLOOR` reaches the terminal buffer through `stage_buffer` (`Chunked`-fence chains run 2048/shard at 100K); the 8-deep cell is pure-sync chains — cancel-token / worker-pin forced streaming, the fused-eligible shapes.
+- Dead-ends check: distinct from the falsified async-terminal in-flight bound (wake-chain mechanism, async flavour), from the universal claim window (input-ring claim size; `with_fence` +60 %), and from the seq-less slot flavor. Not a `chain_floor` predicate extension: pure-sync chains stay unlifted, only the terminal factory's per-shard floor moves (aggregate rises above the single-channel backpressure point — the documented trade to beat).
+- Protocol: same-binary env knob (e.g. `YOUPIPE_SHARD_DEPTH`) flooring per-shard capacity at `max(current, batch_recv_cap())` when `YOUPIPE_BATCH_RECV` is on; `bench_ab.sh -E` per-id isolated interleaving on `sharded_term/single_unordered_{cheap,cpu}` + `single_ordered_cpu` @1K/@100K (the collector-paced cells), `workers2_cpu` / `multi2_cpu` as shallow-shape controls, `stream_pipeline/single_stage_{ordered,unordered}` + `mixed_load/youpipe_stream_cpu` as no-regression gates; accept only above the 2 % floor on the target cells with the controls flat.
+
+---
+
+### 49. [P2] hotpath probe for `ReorderBuffer::insert_into` (r5 audit, caliber)
+
+- Context: every ordered drain (`drain_ordered_with` / `drain_ordered_sharded` / async twins) carries `#[hotpath::measure]`, but the reorder slice inside them has no probe — r5 had to size it by subtraction (`drain_ordered_sharded` 150.7 vs `drain_unordered_sharded` 164.5 ns/item: the reorder + scratch-drain + accounting slice is sub-noise on the in-order-dominated shape). The skew-heavy shapes (a straggler worker forcing the slot-write slow path per item; the 2026-10 `sharded_term/single_ordered_cpu` bistability investigation, ~29 vs ~80 ms from unchanged binaries) have no direct reading of the fast/slow path split inside `insert_into`. One `#[cfg_attr(feature = "hotpath", hotpath::measure)]` on `insert_into` (not also on `flush_ready_into` — the nested span would double-count) closes the gap; zero-cost with the feature off.
+- Dead-ends check: none — pure instrumentation.
+- Protocol: after landing the probe, rerun `stream-engine-ordered` (fast path ≈ 1 call/item) and a straggler-shaped variant before proposing any further ordered-path change; r5's negative result — ordered ≈ unordered within the family's bistability band, per-item reorder cost below the action floor — is the baseline any proposal must beat.

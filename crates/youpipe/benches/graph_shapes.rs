@@ -27,6 +27,12 @@
 //!   the shape — the async outlet path no other id reaches (the `fanin_async` ids are unicast).
 //!   Items stay `u64` per family convention; the waker-slot send machinery, not the trivial clone,
 //!   carries the cost. `cpu` vs `cheap` as above.
+//! * `chain_async_{cpu,cheap}_graph` — the graph mirror of `sync_fuse`'s `async_pair_cpu_split`
+//!   shape (two sync map nodes into an async node): the mixed-hop target of the backlog-scaled
+//!   claim window (todo #43). Node `b`'s worker population shares one claim source against the
+//!   mixed ring the async node drains slowly — the ring-head CAS rhythm `ClaimWindow` amortizes —
+//!   while node `a` feeds a pure-sync ring and keeps the fixed share (the scope gate's both arms in
+//!   one shape). `cpu` vs `cheap` pairs the amortized read with the channel-dominated one.
 //!
 //! Same-binary engine selection via `YOUPIPE_GRAPH_VARIANT=graph|stream`
 //! (unset = both), mirroring `sync_fuse`'s knob so recompile layout noise
@@ -255,6 +261,40 @@ fn run_fanin_async_graph(v1: Vec<u64>, v2: Vec<u64>, cheap: bool) -> u64 {
     total.load(Ordering::Relaxed)
 }
 
+/// `source → node(cpu) → node(cpu) → node_async(bump) → sink`: the graph
+/// mirror of `sync_fuse`'s `async_pair_cpu_split` (two sync map stages into
+/// an async stage). Node `b` feeds the mixed ring (`ClaimScope::AsyncFed`):
+/// its workers claim from the source-`a` ring under a downstream the async
+/// runtime drains slowly, so a ready backlog forms and the fixed share
+/// costs one ring-head CAS per ~2 items at 30 workers — the face the
+/// backlog-scaled claim window (todo #43) targets. Node `a` keeps the
+/// fixed share (pure-sync output). Like the other async ids, each `g.run()`
+/// lazily builds the async runtime backend, a fixed cost the @1K rows
+/// carry.
+#[cfg(feature = "tokio-runtime")]
+fn run_chain_async_graph(v: Vec<u64>, cheap: bool) -> u64 {
+    let total = Arc::new(AtomicU64::new(0));
+    let acc = Arc::clone(&total);
+    let stage = move |x: u64| {
+        if cheap {
+            bump(x)
+        } else {
+            bb(cpu_work(x))
+        }
+    };
+    let mut g = graph();
+    let src = g.source("src", v);
+    let a = g.node("a", stage);
+    let b = g.node("b", stage);
+    let aout = g.node_async("aout", |x: u64| async move { x.wrapping_add(1) });
+    let out = g.sink("out", move |x: u64| {
+        acc.fetch_add(x, Ordering::Relaxed);
+    });
+    g.edge(src, a).edge(a, b).edge(b, aout).edge(aout, out);
+    g.run();
+    total.load(Ordering::Relaxed)
+}
+
 /// One async source into an async broadcast node feeding two sinks (2n
 /// deliveries, n per sink): the fan-out twin of [`run_fanin_async_graph`],
 /// isolating `AsyncBroadcast::deliver`'s unbatched per-item outlet cost —
@@ -361,6 +401,20 @@ fn bench_graph_shapes(c: &mut Criterion) {
                     );
                 },
             );
+            #[cfg(feature = "tokio-runtime")]
+            for (tag, cheap) in [("cpu", false), ("cheap", true)] {
+                group.bench_with_input(
+                    BenchmarkId::new(format!("chain_async_{tag}_graph"), size),
+                    &data,
+                    |b, data| {
+                        b.iter_batched(
+                            || warm_clone(data),
+                            |v| bb(run_chain_async_graph(v, cheap)),
+                            BatchSize::PerIteration,
+                        );
+                    },
+                );
+            }
             #[cfg(feature = "tokio-runtime")]
             for (tag, cheap) in [("cpu", false), ("cheap", true)] {
                 group.bench_with_input(

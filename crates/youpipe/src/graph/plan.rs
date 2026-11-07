@@ -27,13 +27,35 @@ use super::exec::GraphCore;
 /// — so a downcast mismatch is an internal bug, never a user error.
 pub(crate) type Erased = Box<dyn Any + Send>;
 
+/// The consumer mix on a node's output edges, resolved by the run walk from
+/// the out-edge target kinds and handed to the spawn step: the scope gate of
+/// the backlog-scaled claim window (`ClaimWindow`, todo #43 — the graph
+/// analogue of the stream engine's async-tailed `MixedOnly` rule). Sources,
+/// sinks and async nodes receive it too (signature uniformity) but their
+/// claim sites are single-consumer or claim-free, so it is inert there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimScope {
+    /// Every out-edge feeds a sync consumer: claims keep the fixed
+    /// per-worker share (`per_worker_claim_cap`) — pure-sync stages drain
+    /// the ring as fast as they claim, so there is no backlog to amortize
+    /// and a coarser claim rhythm only coarsens the park/fairness contract
+    /// (the falsified universal window, dead-ends.md).
+    SyncFed,
+    /// At least one out-edge feeds an async consumer (the mixed ring): a
+    /// slow async drain forms a ready backlog upstream, which the window
+    /// amortizes (bigger claims, fewer ring-head CAS) under
+    /// `YOUPIPE_CLAIM_SCALE`.
+    AsyncFed,
+}
+
 /// One node's type-erased spawn step: receives the run context, the node's
-/// resolved worker count, its input endpoints (in in-edge registration
-/// order) and its output endpoints (in out-edge registration order), and
-/// spawns the node's workers or runtime tasks. Endpoint ownership transfers
-/// wholly — the run walk never retains a clone that would hold a channel
-/// open after the node took over.
-pub(crate) type SpawnStep = Box<dyn FnOnce(&GraphCore, usize, Vec<Erased>, Vec<Erased>) + Send>;
+/// resolved worker count, its claim scope, its input endpoints (in in-edge
+/// registration order) and its output endpoints (in out-edge registration
+/// order), and spawns the node's workers or runtime tasks. Endpoint
+/// ownership transfers wholly — the run walk never retains a clone that
+/// would hold a channel open after the node took over.
+pub(crate) type SpawnStep =
+    Box<dyn FnOnce(&GraphCore, usize, ClaimScope, Vec<Erased>, Vec<Erased>) + Send>;
 
 /// One edge's type-erased channel factory: receives the run context and the
 /// edge's resolved buffer capacity, creates the channel (and, for an async

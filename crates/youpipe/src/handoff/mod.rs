@@ -403,17 +403,20 @@ pub(crate) fn async_outlet_batch_cap() -> usize {
 // `sharded_term_async/async1_cpu/100K` −15 % 25/25, every other gated row
 // noise-or-better, the pure-sync controls structurally untouched);
 // alone it still wins every gated row (merged/1K −16 % 25/25) — the
-// combination is the measured default pair. Scope: stream engine only
-// (the graph `FanIn` round keeps the fixed share; no graph gate was
-// measured), and ASYNC-TAILED CHAINS only: on
-// pure-sync chains the window's coarser claim rhythm regressed the fence
+// combination is the measured default pair. Scope, the async-fed faces
+// only: stream ASYNC-TAILED CHAINS (`ctx.has_async_stage`, todo #34) and
+// graph sync/expand nodes with an async consumer on some out-edge
+// (`ClaimScope::AsyncFed`, todo #43 — the graph FanIn keeps the fixed
+// share on pure-sync outputs). On pure-sync chains the window's coarser
+// claim rhythm regressed the fence
 // family hard (`stream_pipeline/with_fence/100K` +60 % 0/25 — the chunk
 // release/worker park rhythm coarsens with 64-item claims; @1K it read
 // −15.8 %, size-contradicted) while a pure-sync chain's stages drain the
 // ring as fast as they claim, so there is no backlog to amortize — the
-// same chains the capacity floor excludes (`ctx.has_async_stage`, the
-// shared predicate). Default set by the todo #34 A/B; "1" = adaptive
-// window on async-tailed chains, "0" = the fixed share everywhere.
+// same chains the capacity floor excludes (the stream predicate lives in
+// `ClaimKnobs::resolve`, the graph twin in `exec::claim_knobs`). Default
+// set by the todo #34 A/B; "1" = adaptive window on the async-fed faces,
+// "0" = the fixed share everywhere.
 static CLAIM_SCALE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 pub(crate) fn claim_scale_enabled() -> bool {
@@ -423,8 +426,9 @@ pub(crate) fn claim_scale_enabled() -> bool {
         Ok(other) => {
             panic!("YOUPIPE_CLAIM_SCALE: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
         },
-        // Unset = the default-on policy, async-tailed chains only (the
-        // scope predicate lives in the stream engine's `ClaimKnobs::resolve`).
+        // Unset = the default-on policy, async-fed faces only (the scope
+        // predicates live in the stream engine's `ClaimKnobs::resolve` and
+        // the graph engine's `exec::claim_knobs`).
         Err(_) => true,
     })
 }

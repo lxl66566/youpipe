@@ -17,7 +17,7 @@ use std::{
 
 use super::{
     exec::{GraphCore, downcast_endpoints},
-    plan::SpawnStep,
+    plan::{ClaimScope, SpawnStep},
 };
 // The async-to-sync bridge forward loop (the graph bridge body).
 use crate::handoff::forward_async_to_sync;
@@ -476,13 +476,15 @@ where
     Fut: Future<Output = Option<T>> + Send,
     D: AsyncDelivery<T>,
 {
-    Box::new(move |core: &GraphCore, _workers: usize, _inputs, outputs| {
-        let txs = downcast_endpoints::<AsyncSender<T>>(outputs, "outputs", "async source");
-        let cancel = core.cancel.clone();
-        core.spawn_task(async move {
-            async_source_task(f, D::new(txs), cancel).await;
-        });
-    })
+    Box::new(
+        move |core: &GraphCore, _workers: usize, _scope: ClaimScope, _inputs, outputs| {
+            let txs = downcast_endpoints::<AsyncSender<T>>(outputs, "outputs", "async source");
+            let cancel = core.cancel.clone();
+            core.spawn_task(async move {
+                async_source_task(f, D::new(txs), cancel).await;
+            });
+        },
+    )
 }
 
 /// Type-erased spawn step for one async IO node (see `GraphBuilder::node_async`):
@@ -500,7 +502,7 @@ where
     D: AsyncDelivery<O>,
 {
     Box::new(
-        move |core: &GraphCore, concurrency: usize, inputs, outputs| {
+        move |core: &GraphCore, concurrency: usize, _scope: ClaimScope, inputs, outputs| {
             let rxs = downcast_endpoints::<AsyncReceiver<I>>(inputs, "inputs", &name);
             let txs = downcast_endpoints::<AsyncSender<O>>(outputs, "outputs", &name);
             let plan = core.mux_plan(concurrency);
