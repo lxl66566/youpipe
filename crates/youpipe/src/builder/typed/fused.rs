@@ -1488,7 +1488,7 @@ where
 /// `ErasedStrategy` / `latch` / failure slot, which all live on the driver's
 /// stack frame — sound because the driver blocks on the `CountLatch`
 /// until every chunk has executed.
-struct ChunkJob<IN: ?Sized> {
+struct ChunkJob<'r, IN: ?Sized> {
     input: *const IN,
     strategy: ErasedStrategy<IN>,
     start: usize,
@@ -1499,7 +1499,9 @@ struct ChunkJob<IN: ?Sized> {
     /// blocks on the `CountLatch` until every chunk finishes.
     pool: *const ComputePool,
     /// Shared count latch; decremented on completion (success or panic).
-    latch: *const CountLatch,
+    /// `'r` is the driver's registry borrow — the latch's `Stealing` arm
+    /// holds `&'r Registry` (no Arc clone), so the borrow threads through.
+    latch: *const CountLatch<'r>,
     /// Shared first-failure slot (panic, and for fallible strategies the op's
     /// first `Err`).
     fail_slot: *const Mutex<Option<ErasedFailure>>,
@@ -1519,9 +1521,9 @@ struct ChunkJob<IN: ?Sized> {
 // types (`ErasedStrategy: Sync`, `ComputePool: Sync`, `CountLatch`, `Mutex`);
 // each `ChunkJob` itself is executed by exactly one thread (a pool worker or
 // the off-pool driver — whoever pops its `JobRef` from the injector).
-unsafe impl<IN: ?Sized + Sync> Send for ChunkJob<IN> {}
+unsafe impl<IN: ?Sized + Sync> Send for ChunkJob<'_, IN> {}
 
-impl<IN: ?Sized + Sync> Job for ChunkJob<IN> {
+impl<IN: ?Sized + Sync> Job for ChunkJob<'_, IN> {
     unsafe fn execute(this: *const ()) {
         unsafe {
             let this = &*this.cast::<Self>();
@@ -1766,7 +1768,7 @@ where
     } else {
         (0, 0)
     };
-    let mut jobs_vec: Vec<ChunkJob<IN>> = Vec::with_capacity(pool_chunks);
+    let mut jobs_vec: Vec<ChunkJob<'_, IN>> = Vec::with_capacity(pool_chunks);
     let mut start = driver_end;
     for i in first_pool_chunk..num_chunks {
         let size = chunk + usize::from(i < rem);
@@ -1785,7 +1787,7 @@ where
         start = end;
     }
     debug_assert_eq!(start, n);
-    let jobs: Box<[ChunkJob<IN>]> = jobs_vec.into_boxed_slice();
+    let jobs: Box<[ChunkJob<'_, IN>]> = jobs_vec.into_boxed_slice();
     // The tail `reserve` jobs are driver-owned (never injected); only
     // `jobs[..injected_len]` get JobRefs.
     let injected_len = jobs.len() - reserve;
@@ -1868,7 +1870,7 @@ where
             // their sole executor, and its frame outlives the latch wait.
             // Runs the same `execute` a worker would (panic capture, failure
             // recording, latch decrement).
-            unsafe { <ChunkJob<IN> as Job>::execute(ptr::from_ref(j).cast::<()>()) };
+            unsafe { <ChunkJob<'_, IN> as Job>::execute(ptr::from_ref(j).cast::<()>()) };
             true
         };
         latch.wait_spin_assist(assist);

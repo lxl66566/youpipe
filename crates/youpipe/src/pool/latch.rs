@@ -277,17 +277,23 @@ impl AsCoreLatch for OnceLatch {
 
 /// Counting latch used by `scope`. Tracks a counter; only "set" when the
 /// counter reaches zero.
-pub(crate) struct CountLatch {
+pub(crate) struct CountLatch<'r> {
     counter: AtomicUsize,
-    kind: CountLatchKind,
+    kind: CountLatchKind<'r>,
 }
 
-enum CountLatchKind {
+enum CountLatchKind<'r> {
     /// A latch for scopes created on a pool worker thread which will
     /// participate in work stealing while it waits.
+    ///
+    /// `registry` borrows the `Arc`'s heap allocation (deref'd once in
+    /// `with_count`), never cloned: the same reborrow and executor-topology
+    /// soundness argument as `SpinLatch`'s (see its struct doc, landed in
+    /// 503503a) — every executor of the chunks that set this latch is a
+    /// worker of this registry whose own `Arc` clone outlives the call.
     Stealing {
         latch: CoreLatch,
-        registry: Arc<Registry>,
+        registry: &'r Registry,
         worker_index: usize,
     },
     /// A latch for scopes created on a non-pool thread which will block.
@@ -342,7 +348,10 @@ mod loom_tests {
             use std::cell::Cell;
 
             struct Hooked {
-                latch: CountLatch,
+                // Blocking kind (`owner: None`): no registry borrow exists,
+                // so any lifetime works — `'static` pins the inference
+                // todo #38's `CountLatch<'r>` rework left open here.
+                latch: CountLatch<'static>,
                 flag: AtomicUsize,
             }
 
@@ -409,7 +418,7 @@ mod loom_tests {
     }
 }
 
-impl std::fmt::Debug for CountLatch {
+impl std::fmt::Debug for CountLatch<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.kind {
             CountLatchKind::Stealing { .. } => f.debug_tuple("Stealing").finish(),
@@ -418,14 +427,16 @@ impl std::fmt::Debug for CountLatch {
     }
 }
 
-impl CountLatch {
-    pub(crate) fn with_count(count: usize, owner: Option<(&Arc<Registry>, usize)>) -> Self {
+impl<'r> CountLatch<'r> {
+    pub(crate) fn with_count(count: usize, owner: Option<(&'r Arc<Registry>, usize)>) -> Self {
         Self {
             counter: AtomicUsize::new(count),
             kind: match owner {
+                // `&Arc<Registry>` coerces to the `&Registry` field (same
+                // deref coercion as `SpinLatch::new`).
                 Some((registry, worker_index)) => CountLatchKind::Stealing {
                     latch: CoreLatch::new(),
-                    registry: Arc::clone(registry),
+                    registry,
                     worker_index,
                 },
                 None => CountLatchKind::Blocking {
@@ -598,7 +609,7 @@ const OFF_POOL_SPIN_ITERS: usize = 4096;
 #[cfg(loom)]
 const OFF_POOL_SPIN_ITERS: usize = 2;
 
-impl Latch for CountLatch {
+impl Latch for CountLatch<'_> {
     #[inline]
     unsafe fn set(this: *const Self) {
         unsafe {
@@ -609,15 +620,15 @@ impl Latch for CountLatch {
                         registry,
                         worker_index,
                     } => {
-                        // Materialize the registry reference (into the Arc's
-                        // heap allocation) BEFORE the set may invalidate
-                        // `this`: the last chunk's `execute` runs on a worker
-                        // of this registry (or the on-pool driver's assist
-                        // hook), whose own Arc clone keeps the allocation
-                        // alive past the waiter's wake — the same topology
-                        // argument as `SpinLatch`'s (see its struct doc).
-                        // Replaces the former `Arc::clone`/drop RMW pair,
-                        // paid once per batch completion.
+                        // The pattern binding already copied the reference
+                        // (and the index) out of `this` BEFORE the set may
+                        // invalidate it. Soundness of using `registry` after
+                        // the wake: the last chunk's `execute` runs on a
+                        // worker of this registry (or the on-pool driver's
+                        // assist hook), whose own Arc clone keeps the
+                        // allocation alive past the waiter's wake — the
+                        // topology argument on `CountLatchKind::Stealing`
+                        // and `SpinLatch`'s struct doc.
                         let registry: &Registry = registry;
                         let worker_index = *worker_index;
                         if CoreLatch::set(latch) {

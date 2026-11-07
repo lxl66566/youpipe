@@ -568,17 +568,26 @@ impl WorkerThread {
         // wake cascade exactly like `inject_batch` does.
         let queue_was_empty = self.worker.is_empty();
         let mut pushed = 0usize;
+        let mut spill: Vec<JobRef> = Vec::new();
         for job in jobs {
             if let Err(overflow) = self.worker.push(job) {
-                // Local deque full → spill this job to the injector (see
-                // LOCAL_DEQUE_CAPACITY). Stealers may drain concurrently, so
-                // each later job retries the local deque instead of the whole
-                // tail spilling. Cold path: capacity is 256 while the hybrid
-                // batch is ≤ num_threads + chunk_slack.
-                self.registry.inject(overflow);
+                // Local deque full → spill (see LOCAL_DEQUE_CAPACITY). The
+                // deque only fills when the batch exceeds its 256 slots:
+                // the hybrid batch is num_threads + chunk_slack chunks, so
+                // this path is cold up to ~240 workers and then fires on
+                // EVERY dispatch — collect the overflow tail and inject it
+                // as ONE batch (single SeqCst fence + JEC increment) instead
+                // of per-job injects serializing on the driver. Stealers may
+                // drain concurrently, so every job still retries the local
+                // deque first; only the actual overflows reach the tail.
+                spill.push(overflow);
             } else {
                 pushed += 1;
             }
+        }
+        if !spill.is_empty() {
+            note_spill_tail_batch();
+            self.registry.inject_batch(spill.into_iter());
         }
         if pushed > 0 {
             // One JEC increment after all deque writes — a sleepy worker that
@@ -893,6 +902,20 @@ impl XorShift64Star {
     }
 }
 
+/// Test instrumentation for `push_batch`'s overflow-tail path (see there):
+/// counts one per batched tail injection. Compiled out of non-test builds.
+#[cfg(test)]
+static SPILL_TAIL_BATCHES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(not(test))]
+#[inline]
+fn note_spill_tail_batch() {}
+
+#[cfg(test)]
+fn note_spill_tail_batch() {
+    SPILL_TAIL_BATCHES.fetch_add(1, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1000,5 +1023,104 @@ mod tests {
             .expect("registry drop (terminate) hung");
 
         set_pool_spin_budget_for_tests(0);
+    }
+
+    /// Cross-registry TLS identity: a worker of pool A calling pool B's
+    /// worker-scoped entry points must be rejected by `current_worker_of`
+    /// and take the cold path (`in_worker_cold` → inject into B + block on
+    /// B's latch). This check is the single guard keeping a foreign worker
+    /// off B's fast paths (pool threads routinely call into another pool's
+    /// methods — see `current_worker_of`'s SAFETY doc); a regression routes
+    /// B's `Stealing` `CountLatch` owner to A's `worker_index` inside B's
+    /// sleep state (wrong-worker wake at best, out-of-bounds when A is the
+    /// larger pool). Pins all three faces: identity, the injected flag, and
+    /// an end-to-end `join` on B from A's worker.
+    #[test]
+    fn cross_registry_worker_identity_is_rejected() {
+        let registry_a = Arc::new(Registry::new(2, false));
+        let registry_b = Arc::new(Registry::new(2, false));
+        let b_id = registry_b.id();
+
+        let (tx, rx) = mpsc::channel();
+        // `in_worker` from a plain thread runs the op ON a worker of A, which
+        // is the context under test; the spawned thread + timeout keep a
+        // blocking regression from wedging the test binary.
+        let a = Arc::clone(&registry_a);
+        let b = Arc::clone(&registry_b);
+        thread::spawn(move || {
+            let sum = a.in_worker(|_, _| {
+                // Identity faces: own registry recognized, foreign rejected.
+                assert!(a.current_worker_of().is_some());
+                assert!(b.current_worker_of().is_none());
+                // `in_worker` on B must run the op as an INJECTED job on one
+                // of B's own workers, never inline on A's worker.
+                b.in_worker(|wt_b, injected| {
+                    assert!(injected, "op must take B's cold path");
+                    assert_eq!(wt_b.registry_id(), b_id);
+                });
+                // End-to-end: `join` on B from A's worker routes the same way.
+                let (x, y) = crate::pool::join::join(&b, || 1u32, || 2u32);
+                x + y
+            });
+            tx.send(sum).unwrap();
+        });
+        let sum = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("cross-registry in_worker/join hung");
+        assert_eq!(sum, 3);
+    }
+
+    /// `push_batch` overflow: a batch larger than `LOCAL_DEQUE_CAPACITY`
+    /// (256) must fill the local deque, then spill the whole remaining tail
+    /// to the injector as ONE batch (`SPILL_TAIL_BATCHES` pins the single
+    /// fence+JEC round-trip) — the path every hybrid dispatch takes on
+    /// pools above ~240 workers. Deterministic on a ONE-worker pool: no
+    /// stealers exist, so the push loop fills all 256 slots before the
+    /// 44-job tail spills (on multi-worker pools peers woken by the
+    /// dispatch itself can drain the deque mid-loop, which is exactly why
+    /// the tail batches rather than assuming a fixed split). The op is the
+    /// only executor, so it drains its own deque and the spilled tail
+    /// itself instead of waiting.
+    #[test]
+    fn push_batch_overflow_spills_tail_as_one_batch() {
+        SPILL_TAIL_BATCHES.store(0, Ordering::Relaxed);
+        let registry = Arc::new(Registry::new(1, false));
+        let ran = Arc::new(AtomicUsize::new(0));
+
+        let r2 = Arc::clone(&registry);
+        let ran2 = Arc::clone(&ran);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            r2.in_worker(|wt, _| {
+                let jobs = (0..300).map(|_| {
+                    let ran = Arc::clone(&ran2);
+                    crate::pool::job::HeapJob::new(move || {
+                        ran.fetch_add(1, Ordering::Relaxed);
+                    })
+                    .into_static_job_ref()
+                });
+                // Contract: the caller must be a worker of this registry
+                // (we are inside `in_worker`).
+                r2.push_local_batch(jobs);
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while ran2.load(Ordering::Relaxed) < 300 {
+                    assert!(Instant::now() < deadline, "overflow-tail jobs stalled");
+                    if let Some(job) = wt.try_pop_local().or_else(|| r2.pop_injected_job()) {
+                        // SAFETY: popped by the owning worker / from our own
+                        // registry's injector, executed exactly once.
+                        unsafe { WorkerThread::execute(job) };
+                    }
+                }
+            });
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("push_batch overflow test hung");
+        assert_eq!(ran.load(Ordering::Relaxed), 300);
+        assert_eq!(
+            SPILL_TAIL_BATCHES.load(Ordering::Relaxed),
+            1,
+            "the whole overflow tail must reach the injector as one batch"
+        );
     }
 }

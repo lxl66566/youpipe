@@ -45,7 +45,7 @@ A fused terminal (`.collect()` / `.for_each()` / `.try_collect()`) reached from 
 
 A same-pool worker cannot service the `LockLatch` condvar, which is why on-pool callers historically fell back to the single `par_index_rec` tree at a cost of a log2(num_threads) fork/join ramp-up per nested terminal. The `Stealing` routing removes that for large batches (`chunk_splits > 0`). Small batches keep the tree — see the regime comment in `hybrid_dispatch` for the measured split (P concurrent nested small batches under hybrid collapse the single injector, +430 %). One behavioural note: the off-pool driver's assist reserve is 0 on-pool (`wait_spin_assist`'s `Stealing` arm cannot run the reserve-chunk hook, so a withheld chunk would have no executor).
 
-`YOUPIPE_ONPOOL_HYBRID` is a three-level same-binary A/B knob (0 = tree, default; 1 = injector hybrid; 2 = local-deque hybrid, 2026-09-25). Level 2 pushes the driver's whole chunk batch onto its OWN local LIFO deque (`WorkerThread::push_batch`: one JEC increment + one wake cascade for the batch, overflow spills to the injector — measured 0 spills, 32 chunks vs a 256-slot deque); peers steal from the FIFO end, so P concurrent nested batches distribute across P deques instead of converging on the one global MPMC, and the driver's own `Stealing` wait consumes the LIFO end exactly like `join`'s B branch (`counter == 0` ⇒ every JobRef consumed holds on every consumption surface). Measured (5 interleaved rounds, taskset 1–31, 32 cores):
+`YOUPIPE_ONPOOL_HYBRID` is a three-level same-binary A/B knob (0 = tree, default; 1 = injector hybrid; 2 = local-deque hybrid, 2026-09-25). Level 2 pushes the driver's whole chunk batch onto its OWN local LIFO deque (`WorkerThread::push_batch`: one JEC increment + one wake cascade for the batch, overflow spills to the injector as one `inject_batch` for the whole tail — measured 0 spills, 32 chunks vs a 256-slot deque; on pools above ~240 workers the hybrid batch itself exceeds the deque and the spill path runs on every dispatch, which is why the tail batches instead of per-job injecting); peers steal from the FIFO end, so P concurrent nested batches distribute across P deques instead of converging on the one global MPMC, and the driver's own `Stealing` wait consumes the LIFO end exactly like `join`'s B branch (`counter == 0` ⇒ every JobRef consumed holds on every consumption surface). Measured (5 interleaved rounds, taskset 1–31, 32 cores):
 
 * level 2 vs level 1 (the mechanism check): `nested_single/100K` −2.9 % (24/25 dominant), `nested_saturated/100K` −1.7 % (25/25) — the +2 %-lean injector convergence penalty under saturation is gone; level 1 is dominated in every measured row.
 * level 2 vs tree: the margin is small and session-unstable (one session +3.3 % for the tree on `nested_single/100K`, another −6.4 % for level 2; `nested_saturated/100K` lean-better for level 2 in both, −0.4 %/−1.0 %). No stable cross-session win either way ⇒ the default stays 0; level 2 is the opt-in for saturation-heavy shapes and the A/B instrument.
@@ -273,6 +273,31 @@ The companion candidate of that round — batching the wake cascade's
 sleeping-count decrement into one RMW per cascade — was falsified and
 reverted; see [dead-ends.md](dead-ends.md) "Batching the wake cascade's
 sleeping-count decrement".
+
+The construction side of the same reborrow (2026-11-07, review r3):
+`CountLatch::with_count`'s `Stealing` variant still *created* an
+`Arc<Registry>` clone per batch — the fetch_add at construction plus the
+fetch_sub at latch drop, the very pair the set paths had just lost, paid
+once per on-pool hybrid dispatch. The field is now `&'r Registry` (the
+same deref-once reborrow and topology argument, threaded through
+`hybrid_dispatch`'s `ChunkJob<'r>`). asm on the `sync_vs_rayon` bench
+binary: both `hybrid_dispatch` monomorphizations lose the
+construction-path `lock inc` (it sat under the `owner.is_some()` branch)
+and every Arc-drop `lock dec`; the only inc/dec survivor is the
+panic-count machinery present on both sides — the same survivor class as
+the SpinLatch round. Expected ≈ 0 (the pair fired once per batch, not per
+job); A/B (recompile, layout-trap protocol): criterion nested family, 3
+interleaved rounds — every youpipe cell noise (`nested_saturated/100K`
++0.2 %, `nested_single/100K` −0.3 %, the 1K cells inside 14–18 % spreads)
+while the `rayon_nested_single/100K` anchor shifted +15.4 % *stable* —
+the deterministic recompile-layout signature (rayon executes no youpipe
+code; the recorded +31 % class), its drift-cancelled youpipe/rayon ratio
+moving −13.6 % in youpipe's favor; horizontal `cpu_balanced`(+`readback`)
+@100K–4M, alternating two-process pairs, 3 usable of 5 (two discarded —
+co-worker build load inflated one side, caught by the rayon column and
+per-pair pairing) — youpipe/rayon-cancelled deltas −4.0…+2.2 %,
+mixed-sign, no dominance. Landed as consistency hygiene on the asm
+confirmation plus no observed regression (the `503503a` precedent).
 
 A related property now worth stating (it holds in code and explains why the
 poster path is RMW-free in the common case): a poster pays an RMW on the JEC
