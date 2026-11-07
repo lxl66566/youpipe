@@ -46,7 +46,7 @@ slow items strand a few workers while the rest go idle.
 | Variant | Oversplit | Behaviour |
 | --- | --- | --- |
 | `Workload::Balanced` (default) | adaptive: 1 below ~1024 items/worker, else 4 | right for near-equal costs |
-| `Workload::Unbalanced` | fixed 32, plus 8 extra top-level chunks (16 when `n / (workers + 16)` ≥ 48) | idle workers can steal the remaining leaves around a slow item; late-arriving workers find a leftover chunk in the injector; the wider tier scatters heavy-tail chunk-boundary luck |
+| `Workload::Unbalanced` | fixed 64, plus 8 extra top-level chunks (16 when `n / (workers + 16)` ≥ 48) | idle workers can steal the remaining leaves around a slow item; late-arriving workers find a leftover chunk in the injector; the wider tier scatters heavy-tail chunk-boundary luck |
 | `Workload::Custom(n)` | pinned `n` | manual; useful envelope 8..=32 on large machines |
 
 ```rust
@@ -67,7 +67,7 @@ pools automatically (run 2 onward is spawn-free), but a pre-created
 form — see [pools](pools.md).
 
 For same-binary A/B benchmarking the two `Unbalanced` knobs are
-runtime-overridable: `YOUPIPE_OVERSPLIT` (leaf-count factor, default 32)
+runtime-overridable: `YOUPIPE_OVERSPLIT` (leaf-count factor, default 64)
 and `YOUPIPE_CHUNK_SLACK` (extra top-level chunks; overrides the adaptive
 8/16 tiering; set 0 to recover the cheap-item side, which pays ~2–7 %
 for slack it cannot use — see the scheduler notes in the developer

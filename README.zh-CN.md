@@ -21,7 +21,7 @@ youpipe 是一个 Rust 并行 pipeline 库。数据从入口输入，各阶段�
 
 ```rust
 use youpipe::prelude::*;
-let r: Vec<i32> = data.pipe_ref().map(|&x| x * 2).collect();  // par_iter 改为 pipe_ref 即可
+let r: Vec<i32> = pipe_ref(&data).map(|&x| x * 2).collect();  // par_iter 改为 pipe_ref 即可
 ```
 
 其他引擎详解：

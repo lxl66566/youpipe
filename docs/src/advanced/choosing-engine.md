@@ -1,6 +1,6 @@
 # Choosing the right engine
 
-youpipe has two engines — fused `pipe()` for CPU chains and streaming `stream()` for everything else — plus two regimes where youpipe is the wrong tool entirely.
+youpipe has two linear engines — fused `pipe()` for CPU chains and streaming `stream()` for everything else — plus the runtime-DAG `graph()` for non-linear topologies, and two regimes where youpipe is the wrong tool entirely.
 
 ## Decision table
 
@@ -12,6 +12,7 @@ youpipe has two engines — fused `pipe()` for CPU chains and streaming `stream(
 | Async IO, mixed sync CPU + async IO | streaming | `stream(items).stage(..).stage_async(..)` |
 | Blocking IO in sync stages | streaming | `stream(items).with_compute_pool(ComputePool::new(512))` |
 | Cancellation, fences, 1-to-N, ordered output | streaming | `stream(items).with_cancel(..).fence(..).expand(..).ordered()` |
+| Non-linear dataflow (broadcast fan-out, joins, several sources/sinks) | graph | `graph()` — see [DAG pipelines](../guide/graph.md) |
 
 Knob details: [tuning](tuning.md). Pool sizing: [pools](pools.md).
 

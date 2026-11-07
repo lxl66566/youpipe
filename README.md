@@ -21,7 +21,7 @@ For the simplest rayon usage (one round of CPU parallelism, as in `data.par_iter
 
 ```rust
 use youpipe::prelude::*;
-let r: Vec<i32> = data.pipe_ref().map(|&x| x * 2).collect();  // par_iter -> pipe_ref
+let r: Vec<i32> = pipe_ref(&data).map(|&x| x * 2).collect();  // par_iter -> pipe_ref
 ```
 
 The other engines:
