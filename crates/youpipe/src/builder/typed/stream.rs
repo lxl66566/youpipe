@@ -34,14 +34,17 @@ use crate::state::{
 use crate::{
     builder::{
         admission::{ParkingLease, admit},
-        config::{AsyncTxGate, ChainFloor, PipelineConfig, Workload},
+        config::{AsyncTxGate, ChainFloor, PipelineConfig, ShardDepth, Workload},
     },
     executor::compute::ComputePool,
     handoff::{
         CancelCheck, Claim, ClaimWindow, MpscReceiver, MpscSender, Receiver, RecvItem, SendItem,
-        ShardedReceiver, SpinBudget, SpinPoll, SyncSender, cancel_active, channel::channel,
+        ShardedReceiver, SpinBudget, SpinPoll, SyncSender, cancel_active,
+        channel::channel,
         claim_expand_deliver, claim_map_deliver, claim_poll, forward_sync, mpsc_channel,
-        per_worker_claim_cap, sharded::MIN_SHARD_BUFFER, sharded_mpsc_channel,
+        per_worker_claim_cap,
+        sharded::{MIN_SHARD_BUFFER, per_shard_capacity},
+        sharded_mpsc_channel,
     },
     runtime::{AsyncRuntime, DefaultRuntime},
     state::{
@@ -1875,13 +1878,23 @@ impl<M: Send + Unpin + 'static> OutChannel<M> for ShardedMpsc {
         buffer: usize,
         workers: usize,
     ) -> (Vec<Self::Tx>, Self::Rx) {
+        let depth = ctx.terminal_policy.shard_depth;
         // In-flight hint: `stage_buffer` already noted the logical `buffer`;
-        // the shard floor lifts each shard to at least `MIN_SHARD_BUFFER`,
-        // growing the aggregate by up to that floor per extra shard. The
-        // estimate only pre-sizes the ordered reorder window
-        // (`next_pow2(n)` ceiling, grows on demand), never gates correctness.
-        ctx.note_in_flight((workers - 1) * MIN_SHARD_BUFFER);
-        sharded_mpsc_channel::<(u64, M)>(workers, buffer)
+        // the per-shard floors lift the aggregate to `workers * per` slots,
+        // so the hint notes the excess (the depth floor raising the
+        // aggregate past the single-channel backpressure point is the
+        // documented trade, todo #48), floored at the historical
+        // `(workers - 1) * MIN_SHARD_BUFFER` estimate so the Off tier does
+        // not shrink it. The estimate only pre-sizes the ordered reorder
+        // window (`next_pow2(n)` ceiling, grows on demand), never gates
+        // correctness.
+        let per = per_shard_capacity(workers, buffer, depth);
+        ctx.note_in_flight(
+            (per * workers)
+                .saturating_sub(buffer)
+                .max((workers - 1) * MIN_SHARD_BUFFER),
+        );
+        sharded_mpsc_channel::<(u64, M)>(workers, buffer, depth)
     }
 
     fn wrap(rx: Self::Rx) -> Self::Out {
@@ -1911,6 +1924,13 @@ pub(crate) struct TermPolicy {
     /// capacities (see `stage_buffer`). `None` = the knob is off;
     /// `Some(slots)` = the floor tier.
     chain_floor: Option<usize>,
+    /// `YOUPIPE_SHARD_DEPTH` / `with_shard_depth` (`ShardDepth`): the sync
+    /// sharded terminal's per-shard capacity floor tier (todo #48). Kept as
+    /// the tier, not the number: the `ClaimCap` tier floors at the
+    /// collector's batch claim cap, resolved in the factory where the cap
+    /// is read. The async flavour never reads it (per-item drain — no
+    /// batch claims to amortize).
+    shard_depth: ShardDepth,
 }
 
 impl TermPolicy {
@@ -1919,6 +1939,7 @@ impl TermPolicy {
         Self::resolve_tiers(
             crate::handoff::sharded_term_env(),
             crate::handoff::chain_floor_env(),
+            crate::handoff::shard_depth_env(),
             config,
         )
     }
@@ -1932,6 +1953,7 @@ impl TermPolicy {
     fn resolve_tiers(
         sharded_env: Option<bool>,
         chain_floor_env: Option<ChainFloor>,
+        shard_depth_env: Option<ShardDepth>,
         config: &PipelineConfig,
     ) -> Self {
         Self {
@@ -1943,6 +1965,13 @@ impl TermPolicy {
                 ChainFloor::Default,
             )
             .resolved_slots(),
+            shard_depth: crate::handoff::resolve_knob(
+                shard_depth_env,
+                config.shard_depth,
+                // Off = the todo #48 A/B verdict (the claim-cap tier
+                // regressed every single-stage target cell).
+                ShardDepth::Off,
+            ),
         }
     }
 }
@@ -4251,6 +4280,16 @@ impl<S, I, O, R: AsyncRuntime, M: StreamMode> StreamPipe<S, I, O, R, M> {
     #[must_use]
     pub fn with_sharded_terminal(mut self, on: bool) -> Self {
         self.config = self.config.with_sharded_terminal(on);
+        self
+    }
+
+    /// Set the sync sharded terminal's per-shard capacity floor
+    /// (streaming-only; see [`ShardDepth`] for the tiers, todo #48). An
+    /// explicitly-set `YOUPIPE_SHARD_DEPTH` env value shadows this — see
+    /// [`PipelineConfig::with_shard_depth`].
+    #[must_use]
+    pub fn with_shard_depth(mut self, depth: ShardDepth) -> Self {
+        self.config = self.config.with_shard_depth(depth);
         self
     }
 
@@ -7120,6 +7159,7 @@ mod tests {
                 sharded: sync,
                 sharded_async: async_,
                 chain_floor: None,
+                shard_depth: ShardDepth::Off,
             },
             lease: None,
             worker_slots_left: Cell::new(0),
@@ -7171,6 +7211,7 @@ mod tests {
                     sharded: false,
                     sharded_async: false,
                     chain_floor: floor,
+                    shard_depth: ShardDepth::Off,
                 },
                 lease: None,
                 worker_slots_left: Cell::new(0),
@@ -7236,35 +7277,69 @@ mod tests {
     /// in one-test-per-binary files like tests/sharded_terminal.rs).
     #[test]
     fn data_plane_knob_precedence() {
-        let cfg = |sharded: Option<bool>, floor: Option<ChainFloor>| PipelineConfig {
-            sharded_terminal: sharded,
-            chain_floor: floor,
-            ..PipelineConfig::default()
+        let cfg = |sharded: Option<bool>, floor: Option<ChainFloor>, depth: Option<ShardDepth>| {
+            PipelineConfig {
+                sharded_terminal: sharded,
+                chain_floor: floor,
+                shard_depth: depth,
+                ..PipelineConfig::default()
+            }
         };
         // Env-set shadows config-set — including the chain floor's explicit
         // "0"-off pin against a config-set Slots tier.
         let p = TermPolicy::resolve_tiers(
             Some(false),
             Some(ChainFloor::Slots(NonZeroUsize::new(1024).unwrap())),
+            None,
             &cfg(
                 Some(true),
                 Some(ChainFloor::Slots(NonZeroUsize::new(65536).unwrap())),
+                None,
             ),
         );
         assert!(!p.sharded && p.chain_floor == Some(1024));
         let p = TermPolicy::resolve_tiers(
             Some(true),
             Some(ChainFloor::Off),
-            &cfg(None, Some(ChainFloor::Default)),
+            None,
+            &cfg(None, Some(ChainFloor::Default), None),
         );
         assert!(p.sharded && p.chain_floor.is_none());
         // Config shadows default.
-        let p = TermPolicy::resolve_tiers(None, None, &cfg(Some(false), Some(ChainFloor::Off)));
+        let p = TermPolicy::resolve_tiers(
+            None,
+            None,
+            None,
+            &cfg(Some(false), Some(ChainFloor::Off), None),
+        );
         assert!(!p.sharded && p.chain_floor.is_none());
         // Nothing set anywhere: the built-in defaults — bit-for-bit the
         // env-knob-only behavior.
-        let p = TermPolicy::resolve_tiers(None, None, &cfg(None, None));
+        let p = TermPolicy::resolve_tiers(None, None, None, &cfg(None, None, None));
         assert!(p.sharded && p.chain_floor == Some(crate::handoff::CHAIN_FLOOR_SLOTS));
+        assert_eq!(p.shard_depth, ShardDepth::Off, "the depth default is Off");
+
+        // Shard depth: same tiers (todo #48).
+        let slots = || ShardDepth::Slots(NonZeroUsize::new(1024).unwrap());
+        // env Off shadows config ClaimCap.
+        let p = TermPolicy::resolve_tiers(
+            None,
+            None,
+            Some(ShardDepth::Off),
+            &cfg(None, None, Some(ShardDepth::ClaimCap)),
+        );
+        assert_eq!(p.shard_depth, ShardDepth::Off);
+        // env ClaimCap shadows config Slots.
+        let p = TermPolicy::resolve_tiers(
+            None,
+            None,
+            Some(ShardDepth::ClaimCap),
+            &cfg(None, None, Some(slots())),
+        );
+        assert_eq!(p.shard_depth, ShardDepth::ClaimCap);
+        // Config shadows the built-in default.
+        let p = TermPolicy::resolve_tiers(None, None, None, &cfg(None, None, Some(slots())));
+        assert_eq!(p.shard_depth, slots());
 
         // Async tx gate: same tiers, hop predicate applied.
         // env Full shadows config Off.
@@ -7446,6 +7521,7 @@ mod tests {
                 sharded: false,
                 sharded_async: false,
                 chain_floor: None,
+                shard_depth: ShardDepth::Off,
             },
             lease: None,
             worker_slots_left: Cell::new(0),
@@ -7504,6 +7580,7 @@ mod tests {
                 sharded: false,
                 sharded_async: false,
                 chain_floor: None,
+                shard_depth: ShardDepth::Off,
             },
             lease: None,
             worker_slots_left: Cell::new(0),
@@ -7566,6 +7643,7 @@ mod tests {
                 sharded: false,
                 sharded_async: false,
                 chain_floor: None,
+                shard_depth: ShardDepth::Off,
             },
             lease: None,
             worker_slots_left: Cell::new(0),

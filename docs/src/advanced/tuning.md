@@ -14,6 +14,7 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `.fence(mode)` / `.fence_with(FenceOptions, mode)` | isolation at one stage boundary (`buffer` pin) | streaming | downstream must not see partial upstream |
 | `SyncStageOptions` / `AsyncStageOptions` | per-stage workers (sync) / io_concurrency (async) / buffer (both) | streaming | stages have unequal costs |
 | `with_sharded_terminal(bool)` | terminal fan-in channel shape — per-pipeline tier of `YOUPIPE_SHARDED_TERM` (default `true`; env shadows) | streaming | memory-shape only: many small pipelines in one process sharing the terminal rings |
+| `with_shard_depth(ShardDepth)` | sync sharded terminal's per-shard capacity floor — per-pipeline tier of `YOUPIPE_SHARD_DEPTH` (default `Off`; env shadows) | streaming | the one measured winner shape — a terminal behind a mid channel @100K (−5.7 %); a measured loss on single-stage terminals |
 | `with_chain_floor(ChainFloor)` | capacity floor tier of async-tailed / `Chunked`-fence chains — per-pipeline tier of `YOUPIPE_CHAIN_FLOOR` (default `ChainFloor::Default` = `min(n, 65536)` slots; env shadows) | streaming | one zero-CPU latency-critical chain in a process of default-tier chains → `Slots(16384)`; tight chain-wide backpressure → `Off` |
 | `with_async_tx_gate(AsyncTxGate)` | which hops of an async-tailed chain batch their sends — per-pipeline tier of `YOUPIPE_ASYNC_TX_BATCH` (default `AsyncTxGate::MixedOnly`; env shadows) | streaming (chains containing an async stage) | chasing a regression on one specific async chain → `Off` |
 | `ComputePool::new_pinned(n)` | workers pinned 1:1 to allowed CPUs | pools | tight loops of large saturated fused batches (**not** streaming — see [pools](pools.md)) |
@@ -21,6 +22,7 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | `YOUPIPE_SHARDED_TERM` | terminal channel = per-worker SPSC shards (default on; `"0"` = shared ring; an explicit value shadows `with_sharded_terminal`) | streaming (sync/expand terminals) | leave on for multi-worker terminals; the shared ring only wins single-worker terminals, which never shard anyway |
 | `YOUPIPE_BATCH_RECV` | batched ring claims on the streaming data plane (default on, cap 64; `"0"` = per-item) | streaming | leave on; pairs with `YOUPIPE_SHARDED_TERM` — the two share the default |
 | `YOUPIPE_SHARDED_TERM_ASYNC` | async terminal channel = per-driver-group async shards | streaming (async terminals) | async-only chain whose feeder saturates the single output ring (niche; a measured loss on sync-fed async terminals) |
+| `YOUPIPE_SHARD_DEPTH` | per-shard capacity floor of the sync sharded terminal (default off; `"1"` = floor at the batch claim cap; `"0"` = off; `"N"` (≥ 2) = explicit per-shard floor; an explicit value shadows `with_shard_depth`) | streaming (sync/expand terminals) | not a default — the claim-cap tier measured +14…+53 % on single-stage terminals; reach for it on the terminal-behind-mid-channel shape (−5.7 % @100K) or as the depth sweep caliber |
 | `YOUPIPE_ASYNC_MUX` | async stage/node driver tasks: `min(io_concurrency, runtime workers)`, each multiplexing its share of the in-flight items (default on; `"0"` = one task per in-flight slot; `"N"` = at most N drivers) | streaming + graph (async stages/nodes) | leave on — it removes `io_concurrency` task spawns and per-item cross-thread wakes from the run; `"0"` only to isolate the knob in a bench |
 | `YOUPIPE_SPIN_ANCHOR` | adaptive pre-anchor `try_recv` spin window (µs) in sync worker recv loops | streaming | convoy collapse on shapes the defaults exclude: `Barrier` fences, pinned buffers, or a residual slow-mode sighting (see [dev/streaming](../dev/streaming.md)) |
 | `YOUPIPE_FWD_BATCH` | fence forwarder flushes released chunks via `try_send_batch` (default on; `"0"` = per-item `send`) | streaming (fence forwarder) | leave on — it caps the fence convoy's tail at every size; `"0"` only to isolate the knob in a bench |
@@ -44,11 +46,11 @@ beats the `Auto` length gate (by-ref; owned `Auto` is always the merge tree).
 
 ## Per-pipeline data-plane policy (streaming)
 
-Three of the `YOUPIPE_*` data-plane knobs also have a per-pipeline
-middle layer — `with_sharded_terminal`, `with_chain_floor`,
-`with_async_tx_gate` — so one process can differentiate two concurrent
-pipelines where the env knob (process-global) cannot. Precedence, for
-each of the three:
+Four of the `YOUPIPE_*` data-plane knobs also have a per-pipeline
+middle layer — `with_sharded_terminal`, `with_shard_depth`,
+`with_chain_floor`, `with_async_tx_gate` — so one process can
+differentiate two concurrent pipelines where the env knob (process-global)
+cannot. Precedence, for each of the four:
 
 > explicitly-set env knob > per-pipeline config field > built-in default
 
@@ -69,6 +71,13 @@ measured per-workload story.
   Tune it for memory shape — a process hosting many small pipelines can
   keep their terminals on one shared ring each; throughput-wise the
   sharded default wins every measured shape.
+- `with_shard_depth(ShardDepth)`: the sync sharded terminal's per-shard
+  capacity floor (see
+  [`YOUPIPE_SHARD_DEPTH`](#youpipe_shard_depth-sharded-terminal-shard-depth-streaming)).
+  Default `Off` — the claim-cap tier is a measured loss on single-stage
+  terminals; the per-pipeline tier exists so the one winner shape (a
+  terminal behind a mid channel) can take `ClaimCap`/`Slots(n)` without
+  raising the process default.
 - `with_chain_floor(ChainFloor)`: the tier lifting unpinned channel
   capacities of async-tailed / `Chunked`-fence chains (see
   [`YOUPIPE_CHAIN_FLOOR`](#youpipe_chain_floor-chain-capacity-floor-streaming)).
@@ -225,6 +234,31 @@ the whole fan-in), so it must not ride along with `YOUPIPE_SHARDED_TERM`.
 Its sole measured winner is the async-only feeder-saturated chain at
 −57.5 % (readings: [dev/benchmarks](../dev/benchmarks/streaming.md)); reach for it
 only on that shape.
+
+## `YOUPIPE_SHARD_DEPTH`: sharded-terminal shard depth (streaming)
+
+Per-shard capacity floor of the sync sharded terminal (the async flavour
+never lifts — its per-item drain has no batch claims to amortize, deep
+rings would only add eager allocation). Default off: each shard keeps
+`max(4, buffer / workers)` slots. `"1"` floors every shard at the
+collector's batch claim cap (`YOUPIPE_BATCH_RECV`, 64) so
+`try_recv_batch` can claim a full-cap run from one shard; a decimal
+`>= 2` pins an explicit floor (the sweep caliber). Per-pipeline tier:
+`with_shard_depth(ShardDepth)` (`ClaimCap` / `Off` / `Slots(n)`),
+shadowed by an explicit env value (see the
+[precedence rule](#per-pipeline-data-plane-policy-streaming)).
+
+The claim-cap tier is a measured **loss** on the shape it was proposed
+for — the single-stage multi-worker terminal (r5 read claims clustering
+at the 8-slot shard cap and expected claim amortization; the A/B read
++14…+16 % @1K and +43…+53 % @100K, 0/25 — the shallow cap is what bounds
+producer runaway and keeps the collector's round-robin pass balanced).
+Its one measured winner is the terminal fed by an upstream stage
+(`multi2` @100K, −5.7 %, 25/25 — paced producers only gain drain slack),
+and the floor is inert wherever `buffer / workers >= cap` (e.g.
+`workers(2)` at the default buffer). Readings:
+[dev/benchmarks](../dev/benchmarks/streaming.md) "Sharded-terminal shard
+depth"; falsification index in [dev/dead-ends](../dev/dead-ends.md).
 
 ## `YOUPIPE_ASYNC_TX_BATCH`: async-tail tx-batch gate (streaming)
 

@@ -73,8 +73,9 @@ pub mod sync;
 pub use builder::{
     AsyncStageOptions, AsyncTxGate, ChainFloor, FenceOptions, Filter, FilterCollectMode,
     FusedStage, FusedTryStage, Grouped, Identity, InfallibleChain, MapErr, Ordered, Pipe, PipeRef,
-    PipelineConfig, RangePipe, StageMarker, StreamPipe, StreamStart, SyncMap, SyncStageOptions,
-    TryMap, TryPipe, TryPipeRef, Unordered, Workload, pipe, pipe_range, pipe_ref, stream,
+    PipelineConfig, RangePipe, ShardDepth, StageMarker, StreamPipe, StreamStart, SyncMap,
+    SyncStageOptions, TryMap, TryPipe, TryPipeRef, Unordered, Workload, pipe, pipe_range, pipe_ref,
+    stream,
 };
 pub use executor::{ComputePool, KeepWarm, compute::MAX_COMPUTE_WORKERS};
 // `graph` names the module (type namespace) and the entry function (value

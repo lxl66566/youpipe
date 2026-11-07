@@ -42,6 +42,36 @@ fn sharded_terminal_config_tier_end_to_end() {
     }
 }
 
+/// The shard-depth floor only changes the sync sharded terminal's ring
+/// sizing (todo #48), never the output — every tier must complete
+/// identically. Like the sharded-terminal field above this exercises the
+/// config tier (this binary sets no `YOUPIPE_*` env var).
+#[test]
+fn shard_depth_config_tier_end_to_end() {
+    use std::num::NonZeroUsize;
+
+    use youpipe::ShardDepth;
+
+    let items: Vec<u64> = (0..n() as u64).collect();
+    let expected: Vec<u64> = items.iter().map(|x| x * 3 + 1).collect();
+    for depth in [
+        ShardDepth::ClaimCap,
+        ShardDepth::Off,
+        ShardDepth::Slots(NonZeroUsize::new(1024).unwrap()),
+    ] {
+        let mut got = stream(items.clone())
+            .with_cancel(inert_cancel())
+            .with_shard_depth(depth)
+            .stage(|x: u64| x.wrapping_mul(3).wrapping_add(1))
+            .run();
+        got.sort_unstable();
+        assert_eq!(
+            got, expected,
+            "output is ring-sizing independent ({depth:?})"
+        );
+    }
+}
+
 /// The chain floor and the async tx gate only bind on async-tailed chains,
 /// so this run pins both config fields on the shape that reads them.
 #[cfg(feature = "tokio-runtime")]

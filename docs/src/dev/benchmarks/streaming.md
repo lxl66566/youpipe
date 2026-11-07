@@ -318,3 +318,52 @@ The graph engine's shared-sender attempt (the todo #33 sender bullet; falsified,
 | **TOTAL** | **10.5 µs** | **164 µs** |
 
 Two structural facts fall out. First, `single_stage_*` (and `multi_stage_2`, `mixed_load/youpipe_stream_cpu`) are the type-level fused pass-through — no channels, no spawn walk, no senders — so no delivery-side change can reach them at all. Second, on the one gated shape that does run the streaming topology, the per-worker sender-clone slice (the stream-side twin of the graph's `From<Vec<SyncSender>>` builds) is ≈ 0.7 µs of a 164 µs run — half a percent, an order of magnitude below the family's ±10 % drift. The assembly budget is actually dominated by ring allocations (~27 µs, of which the default-on sharded terminal's 32 SPSC rings alone cost 17 µs) and pool job submission (~16 µs) — the todo #33 channel-creation and pool-submission bullets. Sharing the stream fan-out was therefore not attempted; the graph side, where the spawn walk pays the per-worker Vec build 32×, then measured the lever as noise as well (tcache-cheap builds — [graph.md](graph.md) "Shared sender sets: falsified").
+
+## Sharded-terminal shard depth (`YOUPIPE_SHARD_DEPTH`, todo #48, 2026-11-08)
+
+r5 attribution read the collector's batch claims clustering at the shard
+cap (~8 items at 32 workers, 0.25 claims/item — one stamp-walk preamble
+plus one SeqCst cursor store per ~4 items) and proposed flooring each
+sync terminal shard at the 64-slot claim cap so a claim could amortize
+both. Same-binary knob A/B (`bench_ab.sh -E
+off=YOUPIPE_SHARD_DEPTH=0 -E on=YOUPIPE_SHARD_DEPTH=1`, 5 per-id
+isolated interleaved rounds, 32 cores) falsifies it — the direction of
+the effect is inverted on every target cell:
+
+| id | off | on | Δ% | dom b | verdict |
+| --- | --- | --- | --- | --- | --- |
+| single_unordered_cheap @1K | 198.3 µs | 230.2 µs | +16.1 | 0/25 | regression (stable) |
+| single_unordered_cpu @1K | 197.4 µs | 227.2 µs | +15.1 | 0/25 | regression |
+| single_ordered_cpu @1K | 201.8 µs | 230.0 µs | +13.9 | 0/25 | regression (stable) |
+| single_unordered_cheap @100K | 12.06 ms | 18.39 ms | +52.5 | 0/25 | regression (stable) |
+| single_unordered_cpu @100K | 12.37 ms | 18.91 ms | +52.9 | 0/25 | regression |
+| single_ordered_cpu @100K | 12.79 ms | 18.28 ms | +43.0 | 0/25 | regression |
+| multi2_cpu @100K (control) | 9.293 ms | 8.768 ms | −5.7 | 25/25 | improvement (dominant) |
+| multi2_cpu @1K (control) | 135.9 µs | 139.1 µs | +2.4 | 4/25 | noise |
+| workers2_cpu @1K/@100K (control) | — | — | +0.9 / +0.4 | ≤13/25 | noise (floor inert: 256/2 = 128 ≥ 64) |
+
+All no-regression gates flat (`stream_pipeline/single_stage_{ordered,unordered}`,
+`mixed_load/youpipe_stream_cpu` @1K/@100K within ±0.8 % — the fused
+pass-through builds no terminal channel; the knob does not leak outside
+the streaming terminal path).
+
+Mechanism: the shallow shard cap is not a claim-amplifier bottleneck, it
+is what bounds producer runaway. At 8-deep shards a worker blocks after
+8 undelivered items, keeping every shard's readiness short and the
+collector's round-robin pass balanced; at 64-deep one racing producer
+parks a 64-slot run in its shard while the pass walks 32 mostly-empty
+rings — the stamp-walk preamble moves from per-claim to per-shard-per-pass
+exactly when the claim count needed to fall. @1K the lifted aggregate
+(32 × 64 = 2048) additionally exceeds n, removing terminal backpressure
+for the whole run. The r5 claim-frequency reading was pacing evidence,
+not headroom. The one control that wins fits the same mechanism: behind
+a mid channel (`multi2`) the terminal's producers are paced upstream, so
+depth only adds drain slack — the same reason deep terminals win on fence
+chains through `YOUPIPE_CHAIN_FLOOR` (paced chunk releases) and lose
+here (unpaced direct feeder).
+
+Landed default-off: `ShardDepth::Off` is the built-in tier, `ClaimCap` /
+`Slots(n)` stay as the depth A/B/sweep calibers (env knob +
+`with_shard_depth`), for the terminal-behind-mid-channel shape or any
+future depth proposal. Falsification index in
+[dead-ends.md](../dead-ends.md).

@@ -142,6 +142,51 @@ impl ChainFloor {
     }
 }
 
+/// Sync sharded terminal's per-shard capacity floor tier — the per-pipeline
+/// middle layer of the `YOUPIPE_SHARD_DEPTH` env knob (todo #48).
+///
+/// The sync sharded terminal splits the logical `buffer` budget across one
+/// SPSC ring per terminal worker (`max(4, buffer / workers)` slots each),
+/// while the collector's batched drain claims a ready run of slots per
+/// `try_recv_batch` with a 64-slot scratch (`YOUPIPE_BATCH_RECV`) — a shard
+/// shallower than the claim cap caps every claim at the shard depth (r5:
+/// claims cluster at ~8 items on a 32-worker terminal, one stamp-walk
+/// preamble + SeqCst cursor store per ~4 items). The floor lets a claim
+/// amortize both over a full batch. Trade: the aggregate terminal capacity
+/// rises above the single-channel backpressure point (`workers x floor`
+/// instead of `buffer`) — bounded rings, blocking on `Full` past the floor,
+/// so the semantics are unchanged, only the depth.
+///
+/// Resolution order: an explicitly-set `YOUPIPE_SHARD_DEPTH` env value
+/// shadows a value set here, which shadows the built-in default tier
+/// ([`ShardDepth::Off`] — the todo #48 A/B falsified the claim-cap
+/// promotion; see `handoff`'s knob comment). Streaming-only, and read
+/// only by the sync/expand sharded terminal — the async flavour's
+/// per-item drain has no batch claims to amortize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardDepth {
+    /// Floor each shard at the collector's batch claim cap
+    /// (`YOUPIPE_BATCH_RECV`; the floor is inert while that knob is off).
+    ClaimCap,
+    /// No depth floor — the historical `max(4, buffer / workers)` sizing.
+    Off,
+    /// An explicit per-shard floor in slots (the A/B sweep caliber).
+    Slots(std::num::NonZeroUsize),
+}
+
+impl ShardDepth {
+    /// The per-shard capacity floor this tier denotes: `ClaimCap` resolves
+    /// through the runtime claim cap (env-read, hence not part of the pure
+    /// `resolve_tiers` unit-test surface), `Off` to no floor.
+    pub(crate) fn resolved_floor(self) -> usize {
+        match self {
+            ShardDepth::ClaimCap => crate::handoff::batch_recv_cap(),
+            ShardDepth::Off => 0,
+            ShardDepth::Slots(n) => n.get(),
+        }
+    }
+}
+
 /// Which hops of an async-tailed chain may batch their output sends — the
 /// per-pipeline middle layer of the `YOUPIPE_ASYNC_TX_BATCH` env knob
 /// (which refines the env-only global `YOUPIPE_STREAM_TX_BATCH` switch).
@@ -258,6 +303,9 @@ pub struct PipelineConfig {
     /// SPSC output ring per terminal worker, `Some(false)` = one shared
     /// MPSC ring. Shadowed by an explicit `YOUPIPE_SHARDED_TERM`.
     pub(crate) sharded_terminal: Option<bool>,
+    /// Sync sharded terminal's per-shard capacity floor (streaming-only;
+    /// see [`ShardDepth`]). Shadowed by an explicit `YOUPIPE_SHARD_DEPTH`.
+    pub(crate) shard_depth: Option<ShardDepth>,
     /// Chain capacity floor tier (streaming-only; see [`ChainFloor`]).
     /// Shadowed by an explicit `YOUPIPE_CHAIN_FLOOR`.
     pub(crate) chain_floor: Option<ChainFloor>,
@@ -281,6 +329,7 @@ impl Default for PipelineConfig {
             workload: Workload::Balanced,
             filter_collect: FilterCollectMode::Auto,
             sharded_terminal: None,
+            shard_depth: None,
             chain_floor: None,
             async_tx_gate: None,
         }
@@ -394,6 +443,16 @@ impl PipelineConfig {
     #[must_use]
     pub fn with_sharded_terminal(mut self, on: bool) -> Self {
         self.sharded_terminal = Some(on);
+        self
+    }
+
+    /// Sets the sync sharded terminal's per-shard capacity floor
+    /// (streaming-only; see [`ShardDepth`] for the tiers). Precedence: an
+    /// explicitly-set env value shadows this field (see
+    /// `handoff::resolve_knob`).
+    #[must_use]
+    pub fn with_shard_depth(mut self, depth: ShardDepth) -> Self {
+        self.shard_depth = Some(depth);
         self
     }
 

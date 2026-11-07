@@ -44,6 +44,10 @@ fn sharded_terminal_semantics() {
     // exist yet — the first `run()` (which initializes the knob's OnceLock)
     // happens after this line.
     unsafe { std::env::set_var("YOUPIPE_SHARDED_TERM", "1") };
+    // Claim-cap shard depth (todo #48): every scenario below also runs the
+    // floored per-shard sizing — semantics identical (bounded rings either
+    // way), so the output assertions pin that the floor changes nothing.
+    unsafe { std::env::set_var("YOUPIPE_SHARD_DEPTH", "1") };
 
     // ── Unordered single stage: same multiset as sequential ──
     let items: Vec<u64> = (0..n_main() as u64).collect();

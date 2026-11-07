@@ -1,7 +1,7 @@
 // The async-tail tx-batch gate and chain-floor-tier enums live with the
 // other public config types (re-exported from the crate root); this module
 // is their env-tier source of truth.
-use crate::{AsyncTxGate, ChainFloor};
+use crate::{AsyncTxGate, ChainFloor, ShardDepth};
 
 pub mod channel;
 // Crate-internal: closed-input bookkeeping shared by the sharded terminal's
@@ -134,6 +134,53 @@ pub(crate) fn sharded_term_async_enabled() -> bool {
             "YOUPIPE_SHARDED_TERM_ASYNC: invalid value {other:?} (leave unset or use \"0\"/\"1\")"
         ),
         Err(_) => false,
+    })
+}
+
+// `YOUPIPE_SHARD_DEPTH` (todo #48) floors the sync sharded terminal's
+// per-shard capacity at the collector's batch claim cap
+// (`YOUPIPE_BATCH_RECV`'s cap): the budget split
+// `max(MIN_SHARD_BUFFER, buffer / workers)` runs 8-deep shards on a
+// 32-worker single-stage terminal while `drain_pass_batched` claims with a
+// 64-slot scratch, so every claim is capped at the shard depth (r5: 0.25
+// claims/item, real claims clustering at ~8 items, one stamp-walk preamble
+// plus one SeqCst cursor store per ~4 items). Deep terminal shards are
+// already the landed verdict where `YOUPIPE_CHAIN_FLOOR` reaches the
+// terminal through `stage_buffer`; this floor covers the 8-deep cell —
+// pure-sync chains forced onto the streaming topology (cancel token,
+// worker pin). The trade: the aggregate rises above the single-channel
+// backpressure point (`workers x cap` slots). The async flavour never
+// lifts: its per-item drain has no batch claims to amortize, deep rings
+// would only add eager allocation. Env tier = the A/B vehicle
+// (same-binary comparison); the per-pipeline middle layer is
+// `PipelineConfig::with_shard_depth` (`ShardDepth`), shadowed by an
+// explicit env pin (see `resolve_knob`).
+//
+// Default OFF (todo #48 A/B, 2026-11-08): the claim-cap tier regressed
+// every single-stage target cell (+14…+16 % @1K, +43…+53 % @100K, 0/25 —
+// the shallow cap bounds producer runaway and keeps the collector's
+// round-robin pass balanced); the one winner shape is the terminal behind
+// a mid channel (multi2 @100K −5.7 %, 25/25). Readings in
+// docs benchmarks/streaming.md "Sharded-terminal shard depth".
+static SHARD_DEPTH: std::sync::OnceLock<Option<ShardDepth>> = std::sync::OnceLock::new();
+
+/// Env tier of the shard-depth knob: `None` = unset (the config tier
+/// applies), `Some(depth)` = explicitly pinned (shadows the config tier).
+/// Values: unset = fall through; `"1"`/empty = the claim-cap tier; `"0"` =
+/// off; a decimal `>= 2` = an explicit per-shard floor in slots.
+pub(crate) fn shard_depth_env() -> Option<ShardDepth> {
+    *SHARD_DEPTH.get_or_init(|| match std::env::var("YOUPIPE_SHARD_DEPTH") {
+        Ok(v) if v == "1" || v.is_empty() => Some(ShardDepth::ClaimCap),
+        Ok(v) if v == "0" => Some(ShardDepth::Off),
+        Ok(other) => match other.parse::<usize>() {
+            Ok(n) if n >= 2 => Some(ShardDepth::Slots(std::num::NonZeroUsize::new(n).unwrap())),
+            _ => panic!(
+                "YOUPIPE_SHARD_DEPTH: invalid value {other:?} (leave unset or use \"0\"/\"1\" or \
+                 a per-shard floor >= 2)"
+            ),
+        },
+        // Unset = fall through to the config tier (see `resolve_knob`).
+        Err(_) => None,
     })
 }
 

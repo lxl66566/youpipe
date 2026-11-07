@@ -32,30 +32,48 @@ use super::{
     channel::{ChannelError, MpscReceiver, MpscSender, RecvItem, TryRecvError, mpsc_channel},
     closed_set::ClosedSet,
 };
+use crate::ShardDepth;
 
 /// Minimum per-shard capacity. Below this the ring degenerates into a
 /// producer/consumer ping-pong (park on every `Full`), which the
 /// burst-drain rhythm on both sides needs some slack to absorb.
 pub(crate) const MIN_SHARD_BUFFER: usize = 4;
 
+/// Per-shard capacity of the sync sharded terminal: the logical budget
+/// split across shards, floored at [`MIN_SHARD_BUFFER`] and at the resolved
+/// [`ShardDepth`] tier — the `ClaimCap` tier floors at the collector's
+/// batch claim cap (`batch_recv_cap()`; 0 while `YOUPIPE_BATCH_RECV` is
+/// off, which makes the floor inert), so `drain_pass_batched`'s
+/// `try_recv_batch` can find a full-cap run in one shard instead of every
+/// claim being capped at the split depth (todo #48). Shared by
+/// [`sharded_mpsc_channel`] and the stream engine's in-flight estimate so
+/// the two cannot drift.
+pub(crate) fn per_shard_capacity(shards: usize, total_capacity: usize, depth: ShardDepth) -> usize {
+    (total_capacity / shards)
+        .max(MIN_SHARD_BUFFER)
+        .max(depth.resolved_floor())
+}
+
 /// Create `shards` independent bounded MPSC channels presenting one logical
 /// fan-in. Each returned sender feeds exactly one shard — **do not `Clone`
 /// them** (a cloned sender turns the shard back into a multi-producer ring
 /// and reintroduces the send-side CAS contention this type exists to
 /// remove). `total_capacity` is the logical buffer budget; each shard gets
-/// `max(MIN_SHARD_BUFFER, total_capacity / shards)` so the aggregate stays
-/// close to the single-channel backpressure point.
+/// [`per_shard_capacity`] = `max(MIN_SHARD_BUFFER, total_capacity / shards)`
+/// floored at the `depth` tier, so the aggregate stays close to the
+/// single-channel backpressure point unless the depth floor lifts it.
 #[must_use]
 pub(crate) fn sharded_mpsc_channel<T: Send + 'static>(
     shards: usize,
     total_capacity: usize,
+    depth: ShardDepth,
 ) -> (Vec<MpscSender<T>>, ShardedReceiver<T>) {
     // A 0-shard set used to construct "successfully" (`shards.max(1)`
     // masked the division) and then panic far away on the first
     // `drain_pass`/`recv_anchor` (`% 0`). Fail fast at the construction
     // boundary instead.
     assert!(shards > 0, "shards must be nonzero");
-    let per = (total_capacity / shards).max(MIN_SHARD_BUFFER);
+    let per = per_shard_capacity(shards, total_capacity, depth);
     let mut txs = Vec::with_capacity(shards);
     let mut rxs = Vec::with_capacity(shards);
     for _ in 0..shards {
@@ -81,6 +99,10 @@ pub(crate) fn sharded_mpsc_channel<T: Send + 'static>(
 /// logical fan-in — the async-terminal flavour of [`sharded_mpsc_channel`].
 /// The producers are the async stage's driver tasks sending via
 /// [`MpscAsyncSender::send`](super::channel::MpscAsyncSender::send).await.
+///
+/// The `YOUPIPE_SHARD_DEPTH` floor deliberately does NOT apply here: the
+/// async collector drains per item (`drain_pass`), so a deeper shard has no
+/// batch claim to amortize — it would only add eager allocation.
 ///
 /// Unlike the sync constructor, senders here MAY be shared by several tasks:
 /// the caller caps `shards` at the runtime's worker-thread count (only that
@@ -375,7 +397,7 @@ mod tests {
         // the blocking sends complete before the drain starts (a send
         // exceeding the per-shard capacity would block on a collector that
         // has not started yet — deadlocking the test).
-        let (txs, mut rx) = sharded_mpsc_channel::<usize>(3, 33);
+        let (txs, mut rx) = sharded_mpsc_channel::<usize>(3, 33, ShardDepth::Off);
         let mut it = txs.into_iter();
         let tx0 = it.next().unwrap();
         let rest: Vec<_> = it.collect();
@@ -410,7 +432,7 @@ mod tests {
     /// one) until a send lands — the wake must deliver the item exactly once.
     #[test]
     fn anchor_blocks_until_send() {
-        let (txs, mut rx) = sharded_mpsc_channel::<usize>(2, 16);
+        let (txs, mut rx) = sharded_mpsc_channel::<usize>(2, 16, ShardDepth::Off);
         let mut it = txs.into_iter();
         let tx0 = it.next().unwrap();
         let tx1 = it.next().unwrap();
@@ -439,6 +461,31 @@ mod tests {
             }
         }
         assert_eq!(seen, vec![42]);
+    }
+
+    /// `per_shard_capacity` tiers (todo #48): the budget split floored at
+    /// the burst minimum; `Slots(n)` floors at n; `Off` keeps the
+    /// historical sizing. `ClaimCap` resolves through the runtime claim cap
+    /// (env-read) and is exercised end-to-end instead.
+    #[test]
+    fn per_shard_capacity_tiers() {
+        let nz = std::num::NonZeroUsize::new;
+        // 32 workers, budget 256: split = 8 — the todo #48 baseline cell.
+        assert_eq!(per_shard_capacity(32, 256, ShardDepth::Off), 8);
+        assert_eq!(
+            per_shard_capacity(32, 256, ShardDepth::Slots(nz(64).unwrap())),
+            64
+        );
+        // A floor below the split is inert; the burst minimum holds under
+        // any tier.
+        assert_eq!(
+            per_shard_capacity(2, 512, ShardDepth::Slots(nz(64).unwrap())),
+            256
+        );
+        assert_eq!(
+            per_shard_capacity(4, 4, ShardDepth::Slots(nz(64).unwrap())),
+            64
+        );
     }
 
     /// Async EOF aggregation (mirror of the sync test): shard 0's task exits
