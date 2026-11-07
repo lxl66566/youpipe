@@ -43,6 +43,11 @@ fn bench_mixed_load(c: &mut Criterion) {
             BenchmarkId::new("youpipe_stream_cpu", size),
             &data,
             |b, data| {
+                // todo #40 A/B gate: declare keep-warm only on the tight-gap
+                // (µs-batch) cell; see common::keep_warm_hint. `stream` with
+                // no custom pool dispatches its sync stages on the global
+                // compute pool, so the guard covers this run's dispatch.
+                let _keep_warm = common::keep_warm_hint(size == 1_000);
                 b.iter_batched(
                     || warm_clone(data),
                     |v| {

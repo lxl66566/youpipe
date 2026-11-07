@@ -257,6 +257,48 @@ impl ComputePool {
     }
 }
 
+/// Caller-declared keep-warm hint (todo #40). While alive, workers that go
+/// idle spin through the adaptive pre-park window (local deque + injector
+/// polls) instead of parking, so the next batch's wake latency leaves the
+/// critical path.
+///
+/// Declare it around a loop that submits batches back-to-back with gaps of
+/// at most ~100 µs. The window is engine-fixed and self-tuning: if batches
+/// stop arriving (or gaps grow), park-latency feedback collapses the window
+/// to pure parking within a few idle episodes — a too-broad scope costs
+/// bounded idle burn, never a hang or a permanent spin.
+///
+/// Not a time parameter, by design: the wrong shape (ms-cadence batches,
+/// straggler tails) loses while the window is grown — see the scheduler
+/// docs before arming this outside a tight loop. Nesting is refcounted:
+/// armed until the last guard drops. Orthogonal to the other spin controls,
+/// silently and with the same precedence both ways: an explicit
+/// `YOUPIPE_SPIN_ROUNDS` (any value, even malformed) pins the ladder and the
+/// declaration stays disarmed; `YOUPIPE_POOL_SPIN_BUDGET` already arms the
+/// same machinery and the declaration is a no-op.
+#[must_use = "the hint is armed by holding the guard; dropping it disarms"]
+pub struct KeepWarm {
+    /// A pool handle (cheap clone): keeps the pool alive like any handle, so
+    /// the declaration outlives pool drops through the recycling-cache
+    /// semantics as usual.
+    pool: ComputePool,
+}
+
+impl ComputePool {
+    /// Arm the keep-warm hint for as long as the returned guard is alive
+    /// (see [`KeepWarm`]).
+    pub fn keep_warm(&self) -> KeepWarm {
+        self.registry.declare_keep_warm();
+        KeepWarm { pool: self.clone() }
+    }
+}
+
+impl Drop for KeepWarm {
+    fn drop(&mut self) {
+        self.pool.registry.release_keep_warm();
+    }
+}
+
 impl Drop for ComputePool {
     fn drop(&mut self) {
         // Decrement the ref-count started by Clone (or Registry::new for the
@@ -386,6 +428,104 @@ mod tests {
         let a = ComputePool::new_pinned(2);
         let b = ComputePool::new_pinned(2);
         assert_ne!(a.registry().id(), b.registry().id());
+    }
+
+    /// Keep-warm guard nesting is refcounted (todo #40): armed on the first
+    /// `keep_warm`, stays armed through nested guards, disarms on the LAST
+    /// drop. A leaked guard leaves the declaration live — the documented
+    /// worst case (idle burn decays to pure parking via `note_park`, pinned
+    /// by the registry-side smoke test).
+    ///
+    /// Cache-bypassing `build`, not `new`: `new` recycles registries
+    /// process-wide keyed by worker count, and the leak test below
+    /// deliberately leaves a permanent declaration on its pool — through
+    /// the cache both tests shared one registry and the leaked +1 made
+    /// these `keep_warm_declared` observations racy (2026-11 flake, 3/6
+    /// full-suite runs). Assert on registry-global state only from a pool
+    /// no parallel test can acquire.
+    #[test]
+    fn keep_warm_guard_nesting_refcounts() {
+        let pool = ComputePool::build(2);
+        assert!(!pool.registry().keep_warm_declared());
+        let g1 = pool.keep_warm();
+        assert!(pool.registry().keep_warm_declared());
+        {
+            let _g2 = pool.keep_warm();
+            assert!(pool.registry().keep_warm_declared());
+        }
+        // Inner guard dropped: still armed.
+        assert!(pool.registry().keep_warm_declared());
+        drop(g1);
+        assert!(!pool.registry().keep_warm_declared());
+    }
+
+    /// End-to-end liveness under a LEAKED guard (the declaration's worst
+    /// case): µs-gapped bursts run every job, and once input stops every
+    /// worker must still reach a real park — quiet parks quarter the
+    /// declared window (`SpinBudget::note_park`), so a declaration can never
+    /// become a permanent spin. Mirrors the knob-on smoke test's protocol.
+    #[test]
+    fn keep_warm_leaked_guard_decays_to_parking() {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::{Duration, Instant},
+        };
+
+        let pool = ComputePool::build(2);
+        // Leaked on purpose: `mem::forget` keeps the declaration live for
+        // the pool's whole remaining lifetime (worst-case scope). The pool
+        // must bypass the recycling cache for that: through `new` the
+        // poisoned declaration sat on the process-wide cached 2-worker
+        // registry that sibling tests acquire (see the nesting test above).
+        std::mem::forget(pool.keep_warm());
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        for burst in 0..30 {
+            for _ in 0..4 {
+                let ran = Arc::clone(&ran);
+                pool.submit(move || {
+                    ran.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            // Alternate a window-sized gap (grows the budget) with a quiet
+            // gap (decays it), exercising both feedback arms under the
+            // declaration.
+            let gap = if burst % 2 == 0 {
+                50
+            } else {
+                2_000
+            };
+            std::thread::sleep(Duration::from_micros(gap));
+        }
+        // Completion barrier: off-pool `submit` always injects, so the
+        // injector's FIFO guarantees the sentinel was popped after every
+        // job; the one ambiguous case is a job popped-but-not-yet-run by
+        // the other worker — the sentinel's spin bounds exactly that (no
+        // deadlock: nothing is queued behind the sentinel). A bare
+        // assert-on-main-thread is racy the same way (found by miri).
+        let (tx, rx) = mpsc::channel();
+        pool.submit(move || {
+            while ran.load(Ordering::Acquire) < 120 {
+                std::hint::spin_loop();
+            }
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("keep-warm burst jobs stalled");
+
+        // Input stopped, declaration still live: every worker must reach a
+        // real park anyway (the decay safety net).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pool.registry().sleeping_threads() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "workers never parked under a leaked keep-warm declaration"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     /// The documented round-robin contract: with `num_workers > allowed.len()`,

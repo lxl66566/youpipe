@@ -144,6 +144,17 @@ wake heuristic's `awake_but_idle_threads()` computes
 (`start_looking` precedes any sleep attempt) — a violation wraps in
 release and silently skips wakes. A `debug_assert` now catches it.
 
+The one work-scan face outside the loom cores is pinned deterministically:
+`WorkerThread::steal`'s `Busy`-retry contract — an open `Worker::drain`
+booking on the victim makes every `steal_and_pop` return `Busy`, dropping
+the drain mid-booking releases it for the retry — is a unit test in
+`pool/registry.rs` driving the st3 API directly. A youpipe loom model
+cannot race it: under the `--cfg loom` block st3 compiles with real
+atomics (its simulations need the fork's own `st3_loom` cfg, see above),
+so such a model would pass vacuously; booking contention is instead
+model-checked by the fork's `multi_stealer`/`drain_overflow` models in the
+st3 block.
+
 `CountLatch::wait_spin`'s spin budget (`OFF_POOL_SPIN_ITERS`) shrinks to 2
 under loom to keep the model's state space small; the budget's only
 synchronization role (the final mutex acquire) is exercised either way.

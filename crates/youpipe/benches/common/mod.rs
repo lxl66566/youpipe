@@ -32,12 +32,34 @@
 use std::time::Duration;
 
 use criterion::Criterion;
+use youpipe::{ComputePool, KeepWarm};
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Same-binary A/B gate for the caller-declared keep-warm hint (todo #40):
+/// with `YOUPIPE_KEEPWARM_HINT=on` and `arm`, the driver plays the
+/// documented batch-streaming producer — it holds
+/// `ComputePool::global().keep_warm()` across the whole timed loop. The env
+/// only toggles the declaration site (the established no-recompile rule for
+/// scheduler-class A/B, see `bench_ab.sh -E`); the guard code is exactly
+/// what a user writes. Call it only in the tight-gap (µs-batch) cells: the
+/// ms-cadence cells are the documented wrong shape for the hint, and their
+/// staying flat with the env on is the harness-scoping control of the #40
+/// gate grid.
+// `common` is included per bench target; only `sync_vs_rayon` and
+// `mixed_load` carry keep-warm declaration sites today.
+#[allow(dead_code)]
+pub fn keep_warm_hint(arm: bool) -> Option<KeepWarm> {
+    if arm && std::env::var("YOUPIPE_KEEPWARM_HINT").as_deref() == Ok("on") {
+        Some(ComputePool::global().keep_warm())
+    } else {
+        None
+    }
 }
 
 /// Build the shared `Criterion` config (see module docs).

@@ -76,7 +76,7 @@ pub use builder::{
     StageMarker, StreamPipe, StreamStart, SyncMap, SyncStageOptions, TryMap, TryPipe, TryPipeRef,
     Unordered, Workload, pipe, pipe_range, pipe_ref, stream,
 };
-pub use executor::{ComputePool, compute::MAX_COMPUTE_WORKERS};
+pub use executor::{ComputePool, KeepWarm, compute::MAX_COMPUTE_WORKERS};
 // `graph` names the module (type namespace) and the entry function (value
 // namespace) — the same one-name pattern as the `stream` fn, which lives in
 // a module named after its engine.

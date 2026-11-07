@@ -32,6 +32,9 @@ fn bench_par_map_vs_rayon(c: &mut Criterion) {
             BenchmarkId::new("youpipe_par_map", size),
             &data,
             |b, data| {
+                // todo #40 A/B gate: declare keep-warm only on the tight-gap
+                // (µs-batch) cell; see common::keep_warm_hint.
+                let _keep_warm = common::keep_warm_hint(size == 1_000);
                 b.iter(|| {
                     let r: Vec<u64> = youpipe::pipe_ref(data)
                         .map(|&x| black_box(cpu_work(x)))
@@ -364,6 +367,9 @@ fn bench_for_each_vs_rayon(c: &mut Criterion) {
             BenchmarkId::new("youpipe_cpu_heavy", size),
             &data,
             |b, data| {
+                // todo #40 A/B gate: declare keep-warm only on the tight-gap
+                // (µs-batch) cell; see common::keep_warm_hint.
+                let _keep_warm = common::keep_warm_hint(size == 1_000);
                 b.iter(|| {
                     youpipe::pipe_ref(data)
                         .map(|&x| black_box(cpu_work(x)))

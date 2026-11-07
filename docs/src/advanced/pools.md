@@ -94,6 +94,41 @@ share it with `stream` pipelines or run several pinned pools on overlapping
 CPUs. `YOUPIPE_PIN_WORKERS=1` is the same-binary benchmarking knob (it pins
 every pool in the process); the supported API is the constructor.
 
+## Keep-warm hint for tight batch loops (opt-in)
+
+`pool.keep_warm()` returns a scoped guard. While it is alive, a worker that
+goes idle spins through a short self-tuning window (local queue + injector
+polls) instead of parking, so the next batch's wake latency leaves the
+critical path:
+
+```rust
+use youpipe::{ComputePool, prelude::*};
+
+let pool = ComputePool::global();
+let warm = pool.keep_warm();            // #[must_use]: hold it, don't drop
+for batch in batches {                  // gaps of at most ~100 µs
+    let r: Vec<_> = pipe_ref(&batch).map(transform).with_compute_pool(&pool).collect();
+}
+drop(warm);                             // workers park per the default ladder
+```
+
+| Batch cadence through the pool | Measured effect of the hint |
+| --- | --- |
+| µs-scale batches, sub-100 µs gaps (1K-item fused terminals) | **−19 %** |
+| ms-scale batch cadence, ≥100K-item batches | a real loss while the window is grown — do not declare |
+
+The window is engine-fixed and adaptive: if batches stop arriving (or gaps
+grow), park-latency feedback collapses it to pure parking within a few idle
+episodes, so a too-broad scope costs bounded idle burn (~0.1 ms CPU per 10 s
+idle with the guard leaked), never a hang or a permanent spin. Nesting is
+refcounted (armed until the last guard drops). Orthogonal to the other spin
+controls, silently and in both directions: an explicit `YOUPIPE_SPIN_ROUNDS`
+keeps the ladder pinned (the declaration stays disarmed), and
+`YOUPIPE_POOL_SPIN_BUDGET` already arms the same machinery (the declaration
+is a no-op). No user-settable window — the shape, not a time parameter, is
+the API (see [dev/scheduler](../dev/scheduler.md) "Caller-declared
+keep-warm").
+
 ## Blocking IO: the numbers
 
 Blocking work in a sync `.stage()` must oversubscribe, or waits serialize.

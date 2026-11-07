@@ -391,6 +391,38 @@ Two methodology notes: (1) the horizontal runner's `--scenarios` filter is subst
 
 Raw JSON under `target/horizontal/g-bench35/` (not committed).
 
+## Keep-warm declaration A/B (2026-11-07, todo #40): API landed
+
+`ComputePool::keep_warm()` — the caller-declared scoped guard riding the landed C2 window machinery (mechanism, precedence resolver and readings: [scheduler.md](../scheduler.md) "Caller-declared keep-warm") — ran its gate grid as same-binary env A/B: both sides are snapshots of the same working tree, distinguished only by `YOUPIPE_KEEPWARM_HINT=on`, which toggles a declaration the bench driver holds across the timed loop (the guard code is exactly what a user writes; the env exists so scheduler-class A/Bs keep the no-recompile rule, `bench_ab.sh -E`). Declaration sites: only the three tight-gap 1K cells (`benches/common/mod.rs::keep_warm_hint`); every other cell runs with the env on and *no* declaration — that is the scoping control itself (a leak of the declaration into those loops would reproduce the knob's losses below).
+
+**Main gate** (`bench_ab.sh --per-id -r 5`, taskset 1-31; bar median ≤ −10 % with ≥ 20/25 dominant — parity expected, the machinery is identical to the knob's):
+
+| id @1K | off | Δ on | dom |
+| --- | --- | --- | --- |
+| `sync_cpu_heavy/youpipe_par_map` | 9.33 µs | **−19.0 %** | 25/25 |
+| `sync_for_each/youpipe_cpu_heavy` | 9.12 µs | **−18.8 %** | 25/25 |
+| `mixed_load/youpipe_stream_cpu` | 9.12 µs | **−19.1 %** | 25/25 |
+
+C2 knob references: −18.5 / −17.9 / −21.6 %. Parity confirmed; no arming-path shortfall.
+
+**No-regression** (same protocol; C2 knob references in parens):
+
+| cell | Δ on | C2 knob |
+| --- | --- | --- |
+| `youpipe_par_map/100K` | −0.4 % noise (18/25) | (+12.2 %) |
+| `youpipe_cpu_heavy/100K` | −0.1 % noise (13/25) | (noise) |
+| `youpipe_stream_cpu/100K` | +0.3 % noise (12/25) | (+40.6 %) |
+| `zstd_shape/heavy_tail` n=2000, seeds s1–s5 | −0.8…+0.3 % seed-medians | (−0.6…+0.8 %) |
+| horizontal `cpu_balanced` @100K/1M/2M/4M | −0.4/−0.1/−0.5/+0.8 % (6 pairs, rayon ctrl ±0.3 %) | (+9.6…+18.3 % @100 µs) |
+| horizontal `cpu_balanced_readback` @100K/1M/2M/4M | +0.1/−0.3/+0.7/−0.3 % | (+4.8…+11.6 %) |
+| idle burn, guard LEAKED after 3×2M batches | 0.64 ms / 10 s idle (baseline 1.03 ms) | (0.03–0.67 ms) |
+
+The @100K and horizontal cells are the knob's loss class: with the declaration correctly absent they read dead flat, which is the guard-scope correctness check (the harness declares only around the tight-gap cells; a mis-scoped declaration would have reproduced the parenthesized losses). Horizontal protocol: standalone runner, 6 alternating pairs (lead flipped), `--rounds 2`, `taskset 1-31`, per-pair pairing keyed on (scenario, lib, n) — the `--scenarios cpu_balanced` substring selects readback too, so the reduce keys on scenario. Idle-burn probe: `examples/keep_warm_idle_burn.rs` (getrusage whole-process utime+stime over a 10 s idle window; the probe's RUsage struct must be full-size — getrusage writes all 144 bytes and a 2-timeval stub lets it smash the stack).
+
+Methodology notes: (1) a criterion id filter like `youpipe_par_map/1000` is an unanchored regex — it also matches `/100000`; the main-gate runs therefore measured both sizes in one process (harmless here, and it delivered the @100K control cells for free, but per-id isolation claims need explicit trailing anchors). (2) `cargo test --release` fails `profile_guard::debug_assertions_are_active` by construction (release has no debug-assertions; the guard targets the dev-test profile) — the release gate is `perf/verify/full.sh`'s stage set, not a bare `--release` run.
+
+Raw data: `target/bench-ab/g-kw40-gate/`, `target/bench-ab/g-kw40-noreg/`, `target/horizontal/g-kw40/` (not committed).
+
 ## v0.8.0 → 0.9.0 pending regression flags, re-verified (2026-11-06): both do not reproduce as stable
 
 The release round (`target/relbench-report.md` §3.2/§3.3) left two flags pending. Both were re-tested per-id isolated (5 interleaved rounds, taskset 1-31, fresh worktrees per outdir); raw tables under `target/bench-ab/g-rel-expand/`, `g-rel-chain/`, `g-rel-chain-e7/`, `g-rel-chain-post/` (not committed).

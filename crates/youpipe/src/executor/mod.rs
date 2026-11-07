@@ -1,3 +1,3 @@
 pub mod compute;
 
-pub use compute::ComputePool;
+pub use compute::{ComputePool, KeepWarm};

@@ -17,6 +17,7 @@ use st3::{
     StealError,
     lifo::{Stealer, Worker},
 };
+use youpipe_sys::CachePadded;
 
 use super::{
     job::{JobRef, StackJob},
@@ -75,6 +76,13 @@ pub(crate) struct Registry {
     /// atomically per run (`try_reserve_parking`) before the run's first job
     /// is submitted; released per job on completion (see `stream.rs`).
     parking_slots: AtomicUsize,
+    /// Live `ComputePool::keep_warm` guard count (todo #40); >0 = declared.
+    /// `CachePadded`: idle workers load it once per idle episode (see
+    /// `wait_until_cold`) — keep that load off the other registry lines.
+    /// Refcounted like `terminate_count`, so a leaked guard only leaves the
+    /// declared state on (the window decays to pure parking via
+    /// `SpinBudget::note_park`).
+    keep_warm: CachePadded<AtomicUsize>,
 }
 
 struct ThreadInfo {
@@ -118,6 +126,7 @@ impl Registry {
             injected_jobs: concurrent_queue::ConcurrentQueue::unbounded(),
             terminate_count: AtomicUsize::new(1),
             parking_slots: AtomicUsize::new(0),
+            keep_warm: CachePadded(AtomicUsize::new(0)),
         });
 
         // Worker→core pinning (`ComputePool::new_pinned`, or the
@@ -401,6 +410,35 @@ impl Registry {
         assert!(prev != usize::MAX, "overflow in terminate_count");
     }
 
+    // ── Caller-declared keep-warm (todo #40) ──
+
+    /// One declaration level up (`KeepWarm` construction). `Release`: paired
+    /// with the episode-snapshot load below, an idle worker that observes
+    /// the declaration also observes everything sequenced before the
+    /// declaring call site.
+    #[inline]
+    pub(crate) fn declare_keep_warm(&self) {
+        self.keep_warm.fetch_add(1, Ordering::Release);
+    }
+
+    /// Whether a keep-warm declaration is live. One padded `Acquire` load
+    /// per idle episode — the sole cost the keep-warm machinery adds to the
+    /// default (undeclared, knob-off) path; the precedence resolver runs
+    /// only when this returns `true` (see `wait_until_cold`).
+    #[inline]
+    pub(crate) fn keep_warm_declared(&self) -> bool {
+        self.keep_warm.load(Ordering::Acquire) > 0
+    }
+
+    /// One declaration level down (`KeepWarm::drop`). `AcqRel`: the RMW both
+    /// releases the declaring thread's prior writes and acquires the
+    /// counter's latest value, so a racing `declare` on the same level is
+    /// never lost.
+    #[inline]
+    pub(crate) fn release_keep_warm(&self) {
+        self.keep_warm.fetch_sub(1, Ordering::AcqRel);
+    }
+
     pub(crate) fn terminate(&self) {
         if self.terminate_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             // Only signal workers that exist (see `spawned`).
@@ -411,6 +449,14 @@ impl Registry {
                 }
             }
         }
+    }
+
+    /// Test-only: number of workers currently in a real condvar park. Used
+    /// by keep-warm leak tests outside the `pool` module to pin the decay
+    /// safety net (a live declaration must not prevent parking).
+    #[cfg(test)]
+    pub(crate) fn sleeping_threads(&self) -> usize {
+        self.sleep.sleeping_threads()
     }
 
     /// Wait for all workers to become ready (benchmark warm-up).
@@ -645,6 +691,31 @@ impl WorkerThread {
             // Episode-local copy of the adaptive window state (thread-private
             // plain data; folded back into `idle_spin` at every exit below).
             let mut spin = self.idle_spin.get();
+            // Caller-declared keep-warm (todo #40): a live declaration lends
+            // this episode the default window when neither the env knob (same
+            // machinery, already armed) nor an explicit `YOUPIPE_SPIN_ROUNDS`
+            // pin (precedence: the operator pinned the ladder) covers it.
+            // `base_max` is the strip target for every fold-back below: the
+            // learned budget persists across episodes, the declared ceiling
+            // never does, so a declaration cannot mutate the env-armed state.
+            // When the resolver yields 0 the strip is an identity and the
+            // ladder runs unchanged.
+            let base_max = spin.max_us();
+            // The counter load is the declaration signal and the ONLY cost on
+            // the default (undeclared) path; the OnceLock read and the
+            // resolver's precedence run only under a live declaration.
+            let declared_max = if self.registry.keep_warm_declared() {
+                super::sleep::resolve_keep_warm_window(
+                    base_max,
+                    super::sleep::spin_rounds_pinned(),
+                    true,
+                )
+            } else {
+                0
+            };
+            if declared_max != 0 {
+                spin = spin.with_max_us(declared_max);
+            }
             while !latch.probe() {
                 // Adaptive window phase (knob armed): replaces the busy-spin
                 // arm — poll with geometric pause backoff for up to the
@@ -676,7 +747,7 @@ impl WorkerThread {
                         }
                     }) {
                         SpinPoll::Ready(_) => {
-                            self.idle_spin.set(spin);
+                            self.idle_spin.set(spin.with_max_us(base_max));
                             self.registry.sleep.work_found();
                             unsafe {
                                 Self::execute(window_job.expect("window poll returned Ready"));
@@ -690,7 +761,7 @@ impl WorkerThread {
                     }
                 }
                 if let Some(job) = self.find_work() {
-                    self.idle_spin.set(spin);
+                    self.idle_spin.set(spin.with_max_us(base_max));
                     self.registry.sleep.work_found();
                     unsafe { Self::execute(job) };
                     continue 'outer;
@@ -708,7 +779,7 @@ impl WorkerThread {
                 }
             }
 
-            self.idle_spin.set(spin);
+            self.idle_spin.set(spin.with_max_us(base_max));
             self.registry.sleep.work_found();
             break;
         }
@@ -956,6 +1027,7 @@ mod tests {
                 injected_jobs: concurrent_queue::ConcurrentQueue::unbounded(),
                 terminate_count: AtomicUsize::new(1),
                 parking_slots: AtomicUsize::new(0),
+                keep_warm: CachePadded(AtomicUsize::new(0)),
             });
             for info in &registry.thread_infos[..spawned] {
                 // SAFETY: `info` outlives the drop below.
@@ -1101,6 +1173,9 @@ mod tests {
                 });
                 // Contract: the caller must be a worker of this registry
                 // (we are inside `in_worker`).
+                // `push_local_batch` is a safe fn (it does its own
+                // `current_worker_of` dispatch) — the `unsafe` wrapper here
+                // was stale from before todo #39 made it so.
                 r2.push_local_batch(jobs);
                 let deadline = Instant::now() + Duration::from_secs(30);
                 while ran2.load(Ordering::Relaxed) < 300 {
@@ -1122,5 +1197,50 @@ mod tests {
             1,
             "the whole overflow tail must reach the injector as one batch"
         );
+    }
+
+    /// The `StealError::Busy` retry contract `WorkerThread::steal` loops on
+    /// (todo #41): while a victim's head booking is held open by a concurrent
+    /// stealer — modelled deterministically by an open `Worker::drain`, the
+    /// same `book_items` CAS a competing `steal_and_pop` takes — every steal
+    /// attempt must return `Busy`, and releasing the booking (the drain
+    /// dropped mid-iteration) must let the retry succeed and hand over the
+    /// first unbooked item. No loom model races this in youpipe: under the
+    /// `--cfg loom` block st3 keeps real atomics (its simulations need the
+    /// fork's own `st3_loom` cfg), so a model here would pass vacuously;
+    /// booking contention is model-checked by the fork's `multi_stealer` /
+    /// `drain_overflow` models instead.
+    #[test]
+    fn steal_and_pop_busy_until_drain_booking_released() {
+        let victim = Worker::<u32>::new(LOCAL_DEQUE_CAPACITY);
+        let stealer = victim.stealer();
+        // The thief's own deque, as `steal`'s budget-1 destination.
+        let thief = Worker::<u32>::new(LOCAL_DEQUE_CAPACITY);
+
+        victim.push(1).unwrap();
+        victim.push(2).unwrap();
+
+        // Book only the head item (budget 1, the pool's steal idiom), leaving
+        // item 2 beyond the booking for the post-release retry to steal.
+        let booking = victim.drain(|_| 1).unwrap();
+        assert_eq!(
+            stealer.steal_and_pop(&thief, |_| 1),
+            Err(StealError::Busy),
+            "an open booking must block concurrent stealers"
+        );
+
+        // Dropping mid-booking consumes the booked item and advances the
+        // head, releasing the booking.
+        drop(booking);
+        assert_eq!(
+            stealer.steal_and_pop(&thief, |_| 1),
+            Ok((2, 0)),
+            "retry after release must steal the first unbooked item"
+        );
+        // Full accounting: of the two pushed items one was consumed by the
+        // dropped booking, one was stolen — the victim is empty and nothing
+        // leaked into the thief's deque (budget 1 returns the job directly).
+        assert_eq!(victim.pop(), None);
+        assert_eq!(thief.pop(), None);
     }
 }

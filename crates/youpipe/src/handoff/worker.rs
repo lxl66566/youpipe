@@ -554,6 +554,24 @@ impl<P: PollCost> SpinBudget<P> {
         self.max_us > 0
     }
 
+    /// The knob ceiling in µs (0 = disarmed).
+    pub(crate) fn max_us(self) -> u32 {
+        self.max_us
+    }
+
+    /// Replace the knob ceiling, keeping the learned budget. The pool idle
+    /// loop's keep-warm declaration arms the window per idle episode with
+    /// `with_max_us` and strips the declared ceiling again at every
+    /// fold-back, so a declaration never mutates the env-armed state
+    /// persisted across episodes. A budget carried under a zero ceiling is
+    /// inert: every caller gates the spin on [`SpinBudget::armed`], and a
+    /// re-armed episode resumes from the learned budget instead of re-growing
+    /// it from zero.
+    pub(crate) fn with_max_us(mut self, max_us: u32) -> Self {
+        self.max_us = max_us;
+        self
+    }
+
     /// First growth step (first "live" park): max/16 clamped to ≥1 µs, so
     /// geometric doubling reaches a covering window in ~4 anchors without
     /// ever spinning near the full knob on the first try.
@@ -809,6 +827,31 @@ mod tests {
         let mut off = SpinBudget::<RingPoll>::new(0);
         off.note_park(Duration::from_nanos(1));
         assert_eq!(off.budget_us, 0);
+    }
+
+    /// `with_max_us` swaps only the ceiling: the learned budget survives a
+    /// declare (0 -> window) and the fold-back strip (window -> 0) — the
+    /// keep-warm declaration's persistence contract. The stripped state is
+    /// inert because callers gate on `armed()` (max == 0), not on the
+    /// residual budget.
+    #[test]
+    fn with_max_us_keeps_learned_budget() {
+        let mut s = SpinBudget::<StealScanPoll>::new(0);
+        assert!(!s.armed());
+        // Episode under a live declaration: a live park grows the budget.
+        s = s.with_max_us(100);
+        assert!(s.armed());
+        s.note_park(Duration::from_micros(50));
+        assert_eq!(s.budget_us, 100 / 16);
+        let learned = s.budget_us;
+        // Fold-back strip: ceiling gone, budget persisted for the next
+        // declared episode.
+        let stripped = s.with_max_us(0);
+        assert!(!stripped.armed());
+        assert_eq!(stripped.budget_us, learned);
+        // Re-armed episode resumes from the learned budget.
+        let rearmed = stripped.with_max_us(100);
+        assert_eq!(rearmed.budget_us, learned);
     }
 
     /// `spin_poll`: a zero budget never spins; with a budget it catches a

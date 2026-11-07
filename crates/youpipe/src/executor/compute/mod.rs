@@ -1,7 +1,7 @@
 mod pool_cache;
 mod worker;
 
-pub use worker::ComputePool;
+pub use worker::{ComputePool, KeepWarm};
 
 /// Hard cap on worker threads per [`ComputePool`] (511 on 64-bit targets,
 /// 255 on 32-bit).

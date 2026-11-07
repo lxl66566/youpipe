@@ -87,6 +87,52 @@ The 2048/2048 causal win is out of reach of a ≤100 µs window: windowed spinni
 
 Reach for the knob only on a tight driver loop submitting µs-scale pool batches back-to-back; it is a measured loss on every ms-scale batch cadence and on ≥100K-item fused batches — the same load-shape-local cost face that keeps `YOUPIPE_SPIN_ANCHOR` opt-in.
 
+#### Caller-declared keep-warm (`ComputePool::keep_warm()`, todo #40, 2026-11)
+
+The knob's win class is a driver *pattern*, not a workload property: the one
+entity that knows another µs-scale batch follows is the code submitting them.
+`ComputePool::keep_warm()` returns a `#[must_use]` scoped guard (nesting
+refcounts on a padded `Registry` counter); while alive, every idle episode
+resolves at its start with the precedence **explicit `YOUPIPE_SPIN_ROUNDS`
+pin > declaration > `YOUPIPE_POOL_SPIN_BUDGET`** (pin: an operator who
+pinned the ladder must not get spinning re-introduced; knob on: the
+declaration is a redundant no-op — same machinery). A live declaration
+lends the episode `DEFAULT_POOL_SPIN_BUDGET_US` via
+`SpinBudget::with_max_us` — the landed C2 state machine runs unchanged, no
+time parameters (the r2 rejection of user-settable time windows stands).
+The learned budget persists across episodes; the declared ceiling never
+does — every fold-back into the worker's `idle_spin` strips to the
+env-knob ceiling first, so a declaration cannot mutate the env-armed
+state, and a mid-episode disarm just finishes that µs-scale window.
+
+Cost when not declared: one padded `Acquire` load per idle episode
+(asm-checked on the release build: the counter load + branch are the only
+added instructions on the default path; the OnceLock read and the
+precedence resolver sit behind the not-declared jump). A leaked guard
+decays to pure parking via `note_park` — idle burn with the declaration
+leaked after 3×2M batches reads within the knob-on band (see below).
+
+A/B (same-binary env A/B — `YOUPIPE_KEEPWARM_HINT=on` toggles a declaration
+the bench driver holds across the timed loop, exactly the code a user
+writes; per-id isolated, 5 interleaved rounds, taskset 1-31):
+
+| id @1K | off | Δ on | dom |
+| --- | --- | --- | --- |
+| `sync_cpu_heavy/youpipe_par_map` | 9.33 µs | **−19.0 %** | 25/25 |
+| `sync_for_each/youpipe_cpu_heavy` | 9.12 µs | **−18.8 %** | 25/25 |
+| `mixed_load/youpipe_stream_cpu` | 9.12 µs | **−19.1 %** | 25/25 |
+
+Parity with the knob's win class (−18…−22 %) — the declaration path
+delivers the same mechanism. No-regression grid: the same ids @100K stay
+noise (−0.4 / −0.1 / +0.3 %, 5 isolated rounds — the declaration correctly
+does not cover the ms-cadence cells), horizontal
+`cpu_balanced`(+`_readback`) @100K–4M flat under the env on (no declaration
+site: the scoping control; medians −0.5…+0.8 %, rayon controls ±0.8 %,
+off-side absolutes matching the NT-era values), `zstd_shape/heavy_tail`
+seed-medians −0.8…+0.3 %, leaked-guard idle burn 0.64 ms / 10 s idle
+(no-declaration baseline 1.03 ms — both inside the knob-on band
+0.03–0.67 ms). Full grid and protocol: [benchmarks/attribution.md](benchmarks/attribution.md) "Keep-warm declaration A/B".
+
 #### Dispatch granularity — cost-adaptive chunk counts (tried, rejected)
 
 Hypothesis (2026-09): at small batches (1 K `cpu_heavy`), the hybrid dispatcher's fixed cost is dominated by the inject + wake cascade, so shrinking the top-level chunk count from `num_threads` to `ceil(estimated_total_work / 8 µs)` — estimated via a per-pool chunk-cost EMA sampled by `ChunkJob::execute` — should cut overhead. **Rejected by measurement**: p50 wall at 1 K went 32.1 → 37.7 µs (+17 %), consistently across interleaved runs. The causal read: hotpath showed ~13 workers per batch reach the condvar park *between* back-to-back batches, and each park's wake latency is skewed; `num_threads` fine-grained chunks are precisely the load-balancing unit that hides that skew (late-waking workers pick up remaining chunks instead of gating the batch with their wake latency). Fewer, meatier chunks hand the batch's tail to whichever workers wake last.

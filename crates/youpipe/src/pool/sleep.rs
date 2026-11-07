@@ -367,9 +367,46 @@ pub(crate) fn pool_spin_budget_us() -> u32 {
     *POOL_SPIN_BUDGET.get_or_init(|| {
         resolve_pool_spin_budget(
             std::env::var("YOUPIPE_POOL_SPIN_BUDGET").ok().as_deref(),
-            std::env::var("YOUPIPE_SPIN_ROUNDS").is_ok(),
+            spin_rounds_pinned(),
         )
     })
+}
+
+/// Whether an explicit `YOUPIPE_SPIN_ROUNDS` pins the busy-spin ladder
+/// (present at all, even malformed). Cached: the same precedence input
+/// `pool_spin_budget_us` applies, re-used per idle episode by the keep-warm
+/// declaration below — one guarded load, never on the per-round path.
+pub(crate) fn spin_rounds_pinned() -> bool {
+    static PINNED: OnceLock<bool> = OnceLock::new();
+    *PINNED.get_or_init(|| std::env::var("YOUPIPE_SPIN_ROUNDS").is_ok())
+}
+
+// ── Caller-declared keep-warm window (`ComputePool::keep_warm`, todo #40) ──
+
+/// Max window (µs) a live keep-warm declaration lends the idle episode's
+/// `SpinBudget`; 0 = leave the episode on the env-knob ceiling.
+///
+/// Precedence (documented, silent, no panics — mirrors
+/// `resolve_pool_spin_budget`):
+/// 1. an explicit `YOUPIPE_SPIN_ROUNDS` pin disarms the window — the operator pinned the ladder and
+///    must not get spinning re-introduced;
+/// 2. the env knob already armed (`env_max_us > 0`) makes the declaration a redundant no-op — same
+///    machinery, already covered;
+/// 3. otherwise a live declaration arms the window at [`DEFAULT_POOL_SPIN_BUDGET_US`]. No new
+///    tunable: the r2 rejection of user-settable time parameters stands.
+///
+/// Pure resolver (inputs in, window out) so the precedence rule is
+/// unit-testable without a live pool or env mutation.
+pub(crate) fn resolve_keep_warm_window(
+    env_max_us: u32,
+    spin_rounds_pinned: bool,
+    declared: bool,
+) -> u32 {
+    if !spin_rounds_pinned && env_max_us == 0 && declared {
+        DEFAULT_POOL_SPIN_BUDGET_US
+    } else {
+        0
+    }
 }
 
 /// Pure resolver (env text in, max window out; 0 = off) so the grammar and
@@ -733,6 +770,27 @@ mod tests {
         assert_eq!(resolve_pool_spin_budget(Some("500"), true), 0);
         assert_eq!(resolve_pool_spin_budget(Some("0"), true), 0);
         assert_eq!(resolve_pool_spin_budget(None, true), 0);
+    }
+
+    /// Keep-warm declaration precedence (todo #40): the `YOUPIPE_SPIN_ROUNDS`
+    /// pin wins over everything, the env knob makes the declaration a
+    /// redundant no-op, and only a live declaration on an otherwise disarmed
+    /// ladder lends the window.
+    #[test]
+    fn keep_warm_window_precedence() {
+        use super::resolve_keep_warm_window as resolve;
+        // Declaration on the default (disarmed) ladder: arms the window.
+        assert_eq!(resolve(0, false, true), DEFAULT_POOL_SPIN_BUDGET_US);
+        // No declaration: nothing.
+        assert_eq!(resolve(0, false, false), 0);
+        // Explicit SPIN_ROUNDS pin beats the declaration (rule 1).
+        assert_eq!(resolve(0, true, true), 0);
+        // Env knob already armed: the declaration adds nothing — the knob's
+        // own ceiling stays in force (rule 2; a 50 µs knob stays 50 µs).
+        assert_eq!(resolve(50, false, true), 0);
+        assert_eq!(resolve(DEFAULT_POOL_SPIN_BUDGET_US, false, true), 0);
+        // Both suppressors at once.
+        assert_eq!(resolve(50, true, true), 0);
     }
 
     /// The window's `Empty` verdict lands the idle episode on the yield arm,
