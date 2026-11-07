@@ -9,7 +9,7 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -419,8 +419,18 @@ fn cancel_mid_run_truncates() {
 /// item on a full ring until the downstream drains or exits — so this pins
 /// the drain cascade's liveness: the run must still finish promptly and
 /// truncate (todo #21; the flush never drops to dodge the park).
+///
+/// The cancel fires from the sink once it consumed `n/10` items — NOT from a
+/// wall-clock timer. A timer cannot place the cancel mid-run here: the full
+/// 20k tight-ring run measures ~8–10 ms, so a 10 ms sleep lands at EOF and
+/// the truncation assert flips a coin (observed 20000/20000 flakes under
+/// parallel load, where tight-ring throughput swings 2x). The consumption
+/// trigger is machine-speed independent and still fires with every ring full
+/// (~0.9n items upstream) — the pressure the drain must survive. A signed
+/// countdown fires exactly once (post-zero wraps go negative, never through
+/// 1 again).
 #[test]
-#[cfg_attr(miri, ignore)] // wall-clock cancellation timing
+#[cfg_attr(miri, ignore)] // wall-clock drain bound; 20k items too heavy for the interpreter
 fn cancel_mid_run_tight_rings_drains() {
     let n: u64 = 20_000;
     let token = CancellationToken::new();
@@ -430,22 +440,24 @@ fn cancel_mid_run_tight_rings_drains() {
     let a = g.node_with("a", tight, |x: u64| x.wrapping_mul(3).wrapping_add(1));
     let b = g.node_with("b", tight, |x: u64| x.wrapping_add(1));
     let (seen, sink) = collector_sink::<u64>();
-    let out = g.sink("out", sink);
+    let arm = Arc::new(AtomicI64::new(i64::try_from(n / 10).unwrap()));
+    let fire_token = token.clone();
+    let out = g.sink("out", move |x: u64| {
+        sink(x);
+        if arm.fetch_sub(1, Ordering::Relaxed) == 1 {
+            fire_token.cancel();
+        }
+    });
     g.edge(src, a).edge(a, b).edge(b, out);
-    g = g.with_cancel(token.clone());
-    {
-        let token = token.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
-            token.cancel();
-        });
-    }
+    g = g.with_cancel(token);
 
     let start = Instant::now();
     run_with_timeout("tight-ring cancel", move || g.run());
 
-    // Serial full-chain work is far above this bound (see the test above);
-    // the cancel must drain the parked flushes, not park forever.
+    // The uncanceled remainder (0.9n) dwarfs the in-flight window (a few
+    // hundred items), so truncation is guaranteed rather than sampled; the
+    // bound below stays the drain-liveness check (an uncanceled full run
+    // takes ~10 ms, far under it even under load).
     assert!(
         start.elapsed() < Duration::from_secs(2),
         "cancelled tight-ring run must drain quickly, took {:?}",
