@@ -157,6 +157,9 @@ crates/youpipe/src/
 │   ├── mux.rs        # The M:N async driver (MuxPlan + drive): async stages and
 │   │                 #   graph async nodes multiplex io_concurrency in-flight
 │   │                 #   futures over ≤ runtime-worker driver tasks
+│   ├── ring_cache.rs # Per-run channel ring recycling (YOUPIPE_RING_CACHE,
+│   │                 #   default off — falsified on its target shapes, kept as
+│   │                 #   the A/B vehicle over the fork's try_reset)
 │   ├── sharded.rs    # Per-worker sharded terminal channel (sync default on)
 │   ├── worker.rs     # The engine-agnostic claim → map/expand → deliver worker
 │   │                 #   loops (claim_map_deliver / claim_expand_deliver,
