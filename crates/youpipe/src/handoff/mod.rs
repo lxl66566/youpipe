@@ -311,9 +311,9 @@ pub(crate) fn async_tx_gate() -> AsyncTxGate {
 }
 
 // `YOUPIPE_ASYNC_OUTLET_BATCH` batches the ASYNC OUTLET hop — an async
-// producer task (the M:N mux drivers of `handoff::mux`, and the graph
-// engine's async broadcast/unicast deliveries) handing completions to its
-// downstream — the async twin of the sync engines' tx-batch lever
+// producer task (the M:N mux drivers of `handoff::mux`, the graph engine's
+// async broadcast/unicast deliveries, and its async source feeds) handing
+// completions to its downstream — the async twin of the sync engines' tx-batch lever
 // (`SendItem::send_batch`). A DISTINCT HOP from `YOUPIPE_ASYNC_TX_BATCH`
 // (that one gates the sync worker -> async consumer send on async-tailed
 // stream chains; this one gates the async producer -> downstream send of

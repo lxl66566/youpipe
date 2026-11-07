@@ -19,6 +19,10 @@
 //! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- stream-engine-foreach 1000000 20
 //! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- stream-engine-fence 1000000 5
 //! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- stream-engine-async 1000000 10
+//!
+//! # graph engine, async data plane (see run_graph_fanin_async):
+//! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- graph-fanin-async 100000 10
+//! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- graph-chain-async 100000 10
 //! ```
 //!
 //! For machine-readable output (A/B comparisons), override without touching the
@@ -87,6 +91,14 @@ fn main() {
         Some("stream-engine-async") => {
             let (size, iters) = size_iters(&args, 1_000_000, 10);
             run_stream_engine_async(size, iters);
+        },
+        Some("graph-fanin-async") => {
+            let (size, iters) = size_iters(&args, 1_000_000, 10);
+            run_graph_fanin_async(size, iters);
+        },
+        Some("graph-chain-async") => {
+            let (size, iters) = size_iters(&args, 1_000_000, 10);
+            run_graph_chain_async(size, iters);
         },
         Some(size) => {
             let size: usize = size.parse().expect("size must be a usize");
@@ -245,6 +257,64 @@ fn run_stream_engine_async(size: usize, iters: usize) {
         black_box(out);
     }
     println!("ran stream-engine-async size={size} iters={iters}");
+}
+
+/// Diagnostic scenarios for the graph engine's async data plane (audit
+/// r2-dataplane): attribute the `AsyncFanIn` round walk (one `try_recv` per
+/// open input per `try_claim`/`poll_claim`) against the send/deliver probes
+/// on the same hotpath report. `graph-fanin-async` mirrors
+/// `fanin_async_cheap_graph` (two `source_async` into one `node_async`,
+/// instant futures); `graph-chain-async` is the single-input control where
+/// the round walk is one `try_recv` deep.
+fn counter_source(
+    v: Vec<u64>,
+) -> impl Fn() -> std::future::Ready<Option<u64>> + Send + Sync + 'static {
+    let items = std::sync::Arc::new(v);
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    move || {
+        let k = usize::try_from(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)).ok();
+        std::future::ready(k.and_then(|k| items.get(k).copied()))
+    }
+}
+
+fn run_graph_fanin_async(size: usize, iters: usize) {
+    let data: Vec<u64> = (0..size as u64).collect();
+    for _ in 0..iters {
+        let v1 = data.clone();
+        let v2 = data.clone();
+        let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let acc = std::sync::Arc::clone(&total);
+        let mut g = graph();
+        let s1 = g.source_async("s1", counter_source(v1));
+        let s2 = g.source_async("s2", counter_source(v2));
+        let m = g.node_async("m", |x: u64| async move { black_box(x.wrapping_add(1)) });
+        let out = g.sink("out", move |x: u64| {
+            acc.fetch_add(x, std::sync::atomic::Ordering::Relaxed);
+        });
+        g.edge(s1, m).edge(s2, m).edge(m, out);
+        g.run();
+        black_box(total.load(std::sync::atomic::Ordering::Relaxed));
+    }
+    println!("ran graph-fanin-async size={size} iters={iters}");
+}
+
+fn run_graph_chain_async(size: usize, iters: usize) {
+    let data: Vec<u64> = (0..size as u64).collect();
+    for _ in 0..iters {
+        let v = data.clone();
+        let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let acc = std::sync::Arc::clone(&total);
+        let mut g = graph();
+        let s = g.source_async("s", counter_source(v));
+        let m = g.node_async("m", |x: u64| async move { black_box(x.wrapping_add(1)) });
+        let out = g.sink("out", move |x: u64| {
+            acc.fetch_add(x, std::sync::atomic::Ordering::Relaxed);
+        });
+        g.edge(s, m).edge(m, out);
+        g.run();
+        black_box(total.load(std::sync::atomic::Ordering::Relaxed));
+    }
+    println!("ran graph-chain-async size={size} iters={iters}");
 }
 
 fn run_focused(size: usize, light: bool, iters: usize) {

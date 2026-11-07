@@ -187,3 +187,45 @@ Same-binary knob A/B (`bench_ab.sh -a off=wt -b on=wt -E off=YOUPIPE_ASYNC_OUTLE
 | mixed_load (youpipe_stream_cpu + rayon/tokio controls, 6) | — | — | −0.6…+1.0 % | ≤13/25 | noise |
 
 Every primary row clears the 2 % floor at full dominance; the @1K broadcast rows carry the fixed runtime-build cost, so their −4 % is the per-item path. The unicast fan-in twin improving as much as it did says the cluster-drain + sender-run amortization (not the clone elision — unicast never clones) carries the win; broadcast keeps its k−1 clones per item by contract. The parky `io_async` shapes staying dead flat is the flush-before-park invariant paying off. Promoted default-on with the A/B above; `"0"` recovers the per-item deliveries.
+
+## Batched async source delivery: landed (2026-11-07, todo #37 / review-r2 N2)
+
+`async_source_task` was the last per-item producer on either engine's async
+face: every pull awaited its own `deliver` (`send_cached`) per item — one
+sender CAS and one consumer-wake per item on the source→node rings — while
+its sync twin (`source_feeder_worker`) already stages `cap`-sized batches
+under `YOUPIPE_GRAPH_TX_BATCH`. The source task now runs the same two-phase
+rhythm the mux drivers use: pulls that resolve without suspension stage into
+a batch flushed through `AsyncDelivery::deliver_batch` (per edge one
+`try_send_batch` free-run prefix + the per-item awaited fallback), and the
+first *suspension* flushes everything staged BEFORE the task parks on that
+pull (flush-on-idle) — a slow pull never delays an already-produced item
+behind a batch boundary, so sparse sources keep their per-item latency. The
+pull in flight is kept pinned in one slot across polls (hand-pinned, the
+`CatchPanic` precedent): a started pull is never dropped, and the burst's
+inline polls allocate nothing. Cancel keeps the per-item loop's contract:
+the check runs before *starting* a pull, a pull already in flight delivers
+its item, nothing further starts (`source_task_cancel_delivers_accepted_
+and_inflight_only`). `YOUPIPE_ASYNC_OUTLET_BATCH` gates the cap (`"0"` keeps
+the historical per-item loop).
+
+A/B (`bench_ab.sh -a base=114198c -b wt -r 5 --per-id`, graph_shapes):
+
+| id | base @med | wt @med | Δ | dominance | verdict |
+| --- | --------- | ------- | --- | --------- | ------- |
+| fanout_async_cheap_graph @1K | 1.164 ms | 1.126 ms | **−3.3 %** | 25/25 | improvement·stable |
+| fanout_async_cpu_graph @1K | 1.172 ms | 1.133 ms | **−3.3 %** | 25/25 | improvement·stable |
+| fanout_async_cpu_graph @100K | 27.29 ms | 26.75 ms | −2.0 | 22/25 | at the floor (leaning) |
+| fanin_async_cpu_graph @1K | 1.286 ms | 1.263 ms | −1.8 | 25/25 | noise (consistent lean) |
+| fanin_async_cpu_graph @100K | 53.74 ms | 52.96 ms | −1.5 | 24/25 | noise (consistent lean) |
+| fanin_async_cheap_graph @1K | 1.282 ms | 1.264 ms | −1.4 | 24/25 | noise (consistent lean) |
+| fanout_async_cheap_graph @100K | 26.93 ms | 26.55 ms | −1.4 | 25/25 | noise (consistent lean) |
+| fanin_async_cheap_graph @100K | 53.54 ms | 53.08 ms | −0.9 | 19/25 | noise |
+
+All 8 ids lean the same way (the fan-out family is the single-source shape
+where the per-item sender CAS and wake live on one task; the fan-in family
+splits the same mass over two sources). No-regression family
+(`chain_*_graph`, `sharded_term_async/async1_*`, `io_async/*`,
+`mixed_load`): every id noise, `io_async` dead flat (±0.2 %, the stream
+engine never runs `async_source_task`), the fused @100K row in its
+documented bimodal band.

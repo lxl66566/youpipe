@@ -8,7 +8,7 @@
 //! sync engine's job wrapper enforces.
 
 use std::{
-    future::Future,
+    future::{Future, poll_fn},
     mem::MaybeUninit,
     pin::Pin,
     sync::Arc,
@@ -306,8 +306,47 @@ impl<T: Send + Clone + Unpin + 'static> AsyncOutlet<T> for AsyncBroadcast<T> {
     }
 }
 
-/// The async source task: call `f` until `None` (EOF), delivering each item
-/// through the source's [`AsyncDelivery`] strategy.
+/// Poll the async source's in-flight pull future in place.
+///
+/// # Safety
+///
+/// `slot` must hold a future that has never moved since its creation (the
+/// caller keeps it in one async-fn local for the task's lifetime and takes
+/// it out only after `Poll::Ready`, which ends every pin obligation); the
+/// future must be dropped before `slot`'s storage moves.
+unsafe fn poll_slot<Fut>(slot: &mut Option<Fut>, cx: &mut Context<'_>) -> Poll<Fut::Output>
+where
+    Fut: Future,
+{
+    debug_assert!(slot.is_some(), "a pull is in flight");
+    // SAFETY: this function's contract (see `# Safety`).
+    let fut = unsafe { Pin::new_unchecked(slot.as_mut().expect("pull in flight")) };
+    fut.poll(cx)
+}
+
+/// Outcome of one burst phase (the inline poll drain inside
+/// [`async_source_task`]).
+enum BurstEnd {
+    /// The batch filled to the cap; the slot is empty (fresh anchor next).
+    Full,
+    /// The pull in the slot suspended; staged items were flushed before the
+    /// task parks on it (the slot stays occupied).
+    Pended,
+    /// EOF or cancel observed before starting a new pull; the accepted
+    /// prefix was flushed.
+    Exit,
+}
+
+/// The async source task: call `f` until `None` (EOF), delivering items
+/// through the source's [`AsyncDelivery`] strategy. Dense pulls (futures
+/// resolving without suspension) stage into a batch and flush through
+/// [`AsyncDelivery::deliver_batch`] — one ring CAS per free run and one
+/// merged consumer-wake pass per batch instead of one awaited send per item
+/// (the sync `source_feeder_worker`'s rhythm; `YOUPIPE_ASYNC_OUTLET_BATCH`
+/// gates the cap, `"0"` keeps the per-item loop). Sparse pulls keep the
+/// per-item latency: the first suspension flushes everything staged BEFORE
+/// the task parks on that pull (flush-on-idle), so a slow pull never delays
+/// an already-produced item behind a batch boundary.
 async fn async_source_task<T, F, Fut, D>(f: F, mut out: D, cancel: CancellationToken)
 where
     T: Send + Unpin + 'static,
@@ -315,17 +354,89 @@ where
     Fut: Future<Output = Option<T>>,
     D: AsyncDelivery<T>,
 {
-    loop {
-        if cancel_active(Some(&cancel)) {
-            return;
+    let cap = crate::handoff::async_outlet_batch_cap();
+    if cap == 0 {
+        // The historical per-item loop, verbatim.
+        loop {
+            if cancel_active(Some(&cancel)) {
+                return;
+            }
+            match f().await {
+                Some(item) => {
+                    if !out.deliver(item).await {
+                        return;
+                    }
+                },
+                None => return,
+            }
         }
-        match f().await {
-            Some(item) => {
-                if !out.deliver(item).await {
-                    return;
+    }
+    let mut batch: Vec<T> = Vec::with_capacity(cap);
+    let mut staged: Vec<MaybeUninit<T>> = Vec::with_capacity(cap);
+    // The pull in flight, pinned in place across polls. Hand-pinned (the
+    // `CatchPanic` precedent): `slot` is a local of this async fn, parked in
+    // its state machine for the task's lifetime, so its address is stable;
+    // the future inside is created once (only while `slot.is_none()`) and
+    // moved out only after `Poll::Ready` — completion ends every pin
+    // obligation, and a suspension never moves it.
+    let mut slot: Option<Fut> = None;
+    loop {
+        // Phase 1: obtain ONE item — complete the pull in the slot (if any)
+        // or start a fresh one after the cancel check. The batch is EMPTY
+        // at every park point here (Phase 2 flushed before the last
+        // suspension), so a slow pull delays nothing staged.
+        if slot.is_none() {
+            if cancel_active(Some(&cancel)) {
+                return;
+            }
+            slot = Some(f());
+        }
+        // A `Pending` poll parks the task here (the waker fires on the
+        // pull's completion; the poll_fn re-polls the same slot future);
+        // the batch is empty, so nothing staged waits behind the park.
+        let Some(item) = poll_fn(|cx| unsafe { poll_slot(&mut slot, cx) }).await else {
+            return; // EOF with nothing staged
+        };
+        // Drop the completed future before anything can re-poll it.
+        slot = None;
+        batch.push(item);
+        // Phase 2 (burst): drain pulls while they resolve WITHOUT
+        // suspension. The poll_fn never returns `Pending` to the executor —
+        // the first suspension becomes `BurstEnd::Pended` with the pull
+        // kept in the slot, so the flush below (which may park) runs first.
+        let end = poll_fn(|cx| {
+            loop {
+                if batch.len() == cap {
+                    return Poll::Ready(BurstEnd::Full);
                 }
-            },
-            None => return,
+                if slot.is_none() {
+                    if cancel_active(Some(&cancel)) {
+                        return Poll::Ready(BurstEnd::Exit);
+                    }
+                    slot = Some(f());
+                }
+                match unsafe { poll_slot(&mut slot, cx) } {
+                    Poll::Ready(Some(item)) => {
+                        slot = None;
+                        batch.push(item);
+                    },
+                    Poll::Ready(None) => {
+                        slot = None;
+                        return Poll::Ready(BurstEnd::Exit); // EOF
+                    },
+                    Poll::Pending => return Poll::Ready(BurstEnd::Pended),
+                }
+            }
+        })
+        .await;
+        // Deliver the accepted batch before any park on the pended pull —
+        // and on Exit the accepted prefix goes out (the per-item loop's
+        // contract: a completed pull's item is always delivered).
+        if !out.deliver_batch(&mut batch, &mut staged).await {
+            return; // every downstream closed (the pended pull drops with the task)
+        }
+        if matches!(end, BurstEnd::Exit) {
+            return;
         }
     }
 }
@@ -578,6 +689,139 @@ mod tests {
         let mut batch = vec![6];
         assert!(!futures::executor::block_on(
             b.deliver_batch(&mut batch, &mut staged)
+        ));
+    }
+    /// ── async source task: batched delivery semantics ──
+    use crate::sync::CancellationToken as TestToken;
+
+    /// Dense pulls stage and flush in order, the EOF tail batch is
+    /// delivered, and the loop exits.
+    #[test]
+    fn source_task_dense_pulls_deliver_in_order() {
+        let (tx, rx) = async_channel::<u32>(256);
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls2 = Arc::clone(&calls);
+        let src = move || {
+            let k = calls2.fetch_add(1, Ordering::SeqCst);
+            std::future::ready((k < 10).then_some(k))
+        };
+        let cancel = TestToken::new();
+        futures::executor::block_on(async_source_task(src, AsyncUnicast::new(vec![tx]), cancel));
+        let got: Vec<u32> = (0..10).map(|_| rx.try_recv().unwrap()).collect();
+        assert_eq!(got, (0..10).collect::<Vec<_>>());
+        assert!(rx.try_recv().is_err(), "EOF closed the run");
+    }
+
+    /// Flush-on-idle: a pending pull never delays an already-produced item.
+    /// Pull 0 is ready; pull 1 parks on a gate — item 0 must be downstream
+    /// BEFORE the gate opens; opening the gate releases 1, then 2, then EOF.
+    #[test]
+    fn source_task_flushes_before_a_pending_pull() {
+        use std::sync::Mutex;
+
+        use futures::channel::oneshot;
+
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let gate = Arc::new(Mutex::new(Some(gate_rx)));
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls2 = Arc::clone(&calls);
+        let gate2 = Arc::clone(&gate);
+        let src = move || {
+            let k = calls2.fetch_add(1, Ordering::SeqCst);
+            let g = (k == 1).then(|| gate2.lock().unwrap().take().expect("one gated pull"));
+            async move {
+                match k {
+                    1 => {
+                        let _ = g.unwrap().await;
+                        Some(1)
+                    },
+                    _ => (k < 3).then_some(k),
+                }
+            }
+        };
+        let (tx, rx) = async_channel::<u32>(16);
+        let cancel = TestToken::new();
+        let task = std::thread::spawn(move || {
+            futures::executor::block_on(async_source_task(
+                src,
+                AsyncUnicast::new(vec![tx]),
+                cancel,
+            ));
+        });
+        // Pull 1 is gated: item 0 must already be flushed downstream.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(rx.try_recv(), Ok(0), "staged item flushed before the park");
+        gate_tx.send(()).unwrap();
+        task.join().unwrap();
+        assert_eq!(rx.try_recv(), Ok(1));
+        assert_eq!(rx.try_recv(), Ok(2));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Cancel semantics match the per-item loop: the cancel check runs
+    /// before STARTING a pull; a pull already in flight delivers its item,
+    /// and nothing further is started (exactly one claim past the fire).
+    #[test]
+    fn source_task_cancel_delivers_accepted_and_inflight_only() {
+        use std::sync::Mutex;
+
+        use futures::channel::oneshot;
+
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let gate = Arc::new(Mutex::new(Some(gate_rx)));
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls2 = Arc::clone(&calls);
+        let gate2 = Arc::clone(&gate);
+        let src = move || {
+            let k = calls2.fetch_add(1, Ordering::SeqCst);
+            let g = (k == 1).then(|| gate2.lock().unwrap().take().expect("one gated pull"));
+            async move {
+                match k {
+                    1 => {
+                        let _ = g.unwrap().await;
+                        Some(1)
+                    },
+                    _ => Some(k),
+                }
+            }
+        };
+        let (tx, rx) = async_channel::<u32>(16);
+        let cancel = TestToken::new();
+        let token = cancel.clone();
+        let task = std::thread::spawn(move || {
+            futures::executor::block_on(async_source_task(
+                src,
+                AsyncUnicast::new(vec![tx]),
+                cancel,
+            ));
+        });
+        // Item 0 staged, pull 1 gated: fire the token while it parks.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(rx.try_recv(), Ok(0), "flush-on-idle preceded the fire");
+        token.cancel();
+        gate_tx.send(()).unwrap();
+        task.join().unwrap();
+        // Pull 1 was in flight: its item is delivered; no pull 2 starts.
+        assert_eq!(rx.try_recv(), Ok(1));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "no pull past the fire");
+    }
+
+    /// A closed downstream ends the source at the first failed delivery.
+    #[test]
+    fn source_task_exits_on_downstream_close() {
+        let (tx, rx) = async_channel::<u32>(4);
+        drop(rx);
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls2 = Arc::clone(&calls);
+        let src = move || {
+            let k = calls2.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Some(k))
+        };
+        futures::executor::block_on(async_source_task(
+            src,
+            AsyncUnicast::new(vec![tx]),
+            TestToken::new(),
         ));
     }
 }
