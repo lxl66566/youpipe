@@ -3426,14 +3426,15 @@ where
     l
 }
 
-/// Drive the filter-chain collect over an owned batch with the single
-/// range-based tree. Off-pool callers enter the pool through the first
-/// `join`'s injection — the same entry the old `Vec::split_off` tree used
-/// (see the section comment for why filter chains do not take the hybrid
-/// dispatcher).
+/// Drive the filter-chain collect over an owned batch. Off-pool callers
+/// enter the pool through the first `join`'s injection — the same entry the
+/// old `Vec::split_off` tree used (see the section comment for why filter
+/// chains do not take the hybrid dispatcher). `mode` resolves to the merge
+/// tree (default) or the owned write-then-compact core
+/// (`resolve_owned_filter_collect_variant`).
 ///
-/// A/B vs the old `Vec::split_off` tree (5 interleaved rounds, 32-core,
-/// `sync_filter/youpipe_filter_map_owned`): 100 k −6…−9 % (stable — every
+/// A/B of the merge tree vs the old `Vec::split_off` tree (5 interleaved
+/// rounds, 32-core, `sync_filter/youpipe_filter_map_owned`): 100 k −6…−9 % (stable — every
 /// round of the range tree beat every round of the split_off tree), 1 k/10 k
 /// within round spread (+1…+2 %, rounds interleave). The split_off tree paid
 /// one allocation + memcpy of the *input* half per internal node (~n·levels/2
@@ -3448,6 +3449,7 @@ fn fused_filter_collect<T, S>(
     stages: &S,
     splits: usize,
     pool: &ComputePool,
+    mode: FilterCollectMode,
 ) -> Vec<S::Output>
 where
     T: Send,
@@ -3456,12 +3458,19 @@ where
 {
     let n = items.len();
     debug_assert!(n > 0);
-    let input = Slots::from_vec(items);
-    let out = par_filter_rec(pool, &input, 0, n, stages, splits);
-    // Input fully consumed (every slot read → uninit): freeing just drops
-    // the buffer.
-    drop(input);
-    out
+    match resolve_owned_filter_collect_variant(mode) {
+        OwnedFilterCollectVariant::Merge => {
+            let input = Slots::from_vec(items);
+            let out = par_filter_rec(pool, &input, 0, n, stages, splits);
+            // Input fully consumed (every slot read → uninit): freeing just
+            // drops the buffer.
+            drop(input);
+            out
+        },
+        OwnedFilterCollectVariant::Wtc => {
+            fused_filter_collect_owned_wtc(pool, items, stages, splits)
+        },
+    }
 }
 
 /// Fallible counterpart of [`filter_leaf`]: consume `input` sequentially,
@@ -3567,21 +3576,24 @@ where
     }
 }
 
-/// Drive the fallible filter-chain collect over an owned batch with the
-/// single range-based tree — the counterpart of [`fused_filter_collect`] for
-/// `MAY_FILTER` `try_collect` chains, which cannot use the index-based fast
-/// path (output cardinality is unknown up front).
+/// Drive the fallible filter-chain collect over an owned batch — the
+/// counterpart of [`fused_filter_collect`] for `MAY_FILTER` `try_collect`
+/// chains, which cannot use the index-based fast path (output cardinality is
+/// unknown up front). `mode` resolves to the merge tree (default) or the
+/// owned write-then-compact core (`resolve_owned_filter_collect_variant`).
 ///
-/// Replaced the old `Vec::split_off` tree (one allocation + input-half memcpy
-/// per internal node); same shape as [`fused_filter_collect`] — the input is
-/// shared via ranges (never copied), outputs still concatenate level by level
-/// (`extend` moves one side per internal node, O(depth) moves per survivor).
+/// The merge tree replaced the old `Vec::split_off` tree (one allocation +
+/// input-half memcpy per internal node); same shape as
+/// [`fused_filter_collect`] — the input is shared via ranges (never copied),
+/// outputs still concatenate level by level (`extend` moves one side per
+/// internal node, O(depth) moves per survivor).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn fused_try_filter_collect<T, S>(
     items: Vec<T>,
     stages: &S,
     splits: usize,
     pool: &ComputePool,
+    mode: FilterCollectMode,
 ) -> Result<Vec<S::Output>, S::Error>
 where
     T: Send,
@@ -3591,13 +3603,20 @@ where
 {
     let n = items.len();
     debug_assert!(n > 0);
-    let input = Slots::from_vec(items);
-    let out = par_filter_try_rec(pool, &input, 0, n, stages, splits);
-    // Input fully consumed on both arms (success: every slot read → uninit;
-    // failure: tails dropped by the leaves/guards): freeing just drops the
-    // buffer.
-    drop(input);
-    out
+    match resolve_owned_filter_collect_variant(mode) {
+        OwnedFilterCollectVariant::Merge => {
+            let input = Slots::from_vec(items);
+            let out = par_filter_try_rec(pool, &input, 0, n, stages, splits);
+            // Input fully consumed on both arms (success: every slot read →
+            // uninit; failure: tails dropped by the leaves/guards): freeing
+            // just drops the buffer.
+            drop(input);
+            out
+        },
+        OwnedFilterCollectVariant::Wtc => {
+            fused_try_filter_collect_owned_wtc(pool, items, stages, splits)
+        },
+    }
 }
 
 // ── Pipe (data-first fused pipeline) ──
@@ -3671,6 +3690,17 @@ impl<S, I, O> Pipe<S, I, O> {
     #[must_use]
     pub fn with_workload(mut self, workload: Workload) -> Self {
         self.exec.config.workload = workload;
+        self
+    }
+
+    /// Set the filter collect implementation for this chain — see
+    /// [`FilterCollectMode`]. Owned filter collects default to the merge
+    /// tree; `Ctp` degrades to it (a count pass cannot re-run consumed
+    /// items), `Wtc` selects the single-pass write-then-compact core.
+    /// Output is identical across variants.
+    #[must_use]
+    pub fn with_filter_collect(mut self, mode: FilterCollectMode) -> Self {
+        self.exec.config.filter_collect = mode;
         self
     }
 
@@ -3942,7 +3972,13 @@ where
             TerminalPlan::Serial => serial_stage_collect(items, &stages),
             TerminalPlan::Parallel(plan) => {
                 if S::MAY_FILTER {
-                    fused_filter_collect(items, &stages, plan.depth, pool)
+                    fused_filter_collect(
+                        items,
+                        &stages,
+                        plan.depth,
+                        pool,
+                        self.exec.config.filter_collect,
+                    )
                 } else {
                     let op = FusedOp(stages);
                     par_index_collect(items, &op, plan, pool)
@@ -4256,7 +4292,18 @@ impl<S, I, O, E> TryPipe<S, I, O, E> {
     exec_setters! {
         with_oversubscribe:
             "Same semantics: creates a transient `factor × num_cpus` thread pool at"
-            "`.try_collect()` time.";
+            ".try_collect()` time.";
+    }
+
+    /// Set the filter collect implementation for this chain — see
+    /// [`FilterCollectMode`]. Owned filter collects default to the merge
+    /// tree; `Ctp` degrades to it (a count pass cannot re-run consumed
+    /// items), `Wtc` selects the single-pass write-then-compact core.
+    /// Output is identical across variants.
+    #[must_use]
+    pub fn with_filter_collect(mut self, mode: FilterCollectMode) -> Self {
+        self.exec.config.filter_collect = mode;
+        self
     }
 
     /// Append an infallible map stage. The error type `E` is unchanged.
@@ -4373,7 +4420,13 @@ where
             TerminalPlan::Serial => serial_stage_try_collect(items.into_iter(), &stages),
             TerminalPlan::Parallel(plan) => {
                 if S::MAY_FILTER {
-                    fused_try_filter_collect(items, &stages, plan.depth, pool)
+                    fused_try_filter_collect(
+                        items,
+                        &stages,
+                        plan.depth,
+                        pool,
+                        self.exec.config.filter_collect,
+                    )
                 } else {
                     // Fast path: no filter → output cardinality == input
                     // cardinality. Pre-allocate the output buffer and write at
@@ -4627,7 +4680,13 @@ where
                     // Filters change output cardinality (the range-tree path
                     // needs materialized items): fill once, then the shared
                     // filter core.
-                    fused_filter_collect(self.range.collect(), &self.stages, plan.depth, pool)
+                    fused_filter_collect(
+                        self.range.collect(),
+                        &self.stages,
+                        plan.depth,
+                        pool,
+                        self.exec.config.filter_collect,
+                    )
                 } else {
                     let op = FusedOp(self.stages);
                     par_range_gen_collect(self.range, &op, plan, pool)
@@ -5326,6 +5385,33 @@ fn resolve_filter_collect_variant(mode: FilterCollectMode, n: usize) -> FilterCo
     }
 }
 
+/// Which implementation OWNED filter collects use (`pipe(..).filter(..)`
+/// `.collect()` and the `try_collect` twin) — the owned subset of
+/// [`FilterCollectVariant`]: ctp needs a second chain pass over items that
+/// were consumed by value on the first, so it does not exist here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnedFilterCollectVariant {
+    Merge,
+    Wtc,
+}
+
+/// Owned counterpart of [`resolve_filter_collect_variant`]: same
+/// explicit-mode > env-knob > Auto order, but `Ctp` (explicit or knob)
+/// degrades to the merge tree, and `Auto` keeps the merge tree — owned wtc
+/// is a 1K-only win that regresses at ≥ 100K (todo #42 verdict, see the
+/// wtc section comment), so no length gate applies.
+fn resolve_owned_filter_collect_variant(mode: FilterCollectMode) -> OwnedFilterCollectVariant {
+    match mode {
+        // ctp degrades: a count pass cannot re-run an owned chain.
+        FilterCollectMode::Merge | FilterCollectMode::Ctp => OwnedFilterCollectVariant::Merge,
+        FilterCollectMode::Wtc => OwnedFilterCollectVariant::Wtc,
+        FilterCollectMode::Auto => match env_filter_collect_override() {
+            Some(FilterCollectVariant::Wtc) => OwnedFilterCollectVariant::Wtc,
+            _ => OwnedFilterCollectVariant::Merge,
+        },
+    }
+}
+
 /// Number of leaves the range-split recursion produces for a `len`-item
 /// range with `splits` levels left — mirrors the `mid = len / 2` split of
 /// [`par_filter_rec`] exactly, so leaf ordinals can be threaded top-down
@@ -5655,12 +5741,23 @@ where
 // blockwise: the only memory-bandwidth cost of low selectivity is the
 // n-sized buffer allocation itself, never touched beyond `kept` slots.
 //
-// Owned/try filter paths keep the merge tree. Owned is mechanically
-// possible (a wtc leaf would `ptr::read` each input slot once and panic
-// cleanup mirrors `FilterGuard`) but is deferred: this round pins down the
-// borrowed caliber, where the merge tree's output-side cost was measured.
-// The try path additionally entangles `Err` short-circuit with the meta
-// cleanup walk — the merge tree already short-circuits cheaply there.
+// Owned and owned-try filter paths port onto the same single-pass core
+// (`write_filter_rec_owned` / `write_filter_try_rec_owned`, todo #42): the
+// shape survives move semantics — each leaf `ptr::read`s its input slots
+// once, and the leaf guard owns BOTH halves (`WtcOwnedLeafGuard`: the
+// written survivor prefix plus the unread input tail), so the by-ref
+// driver's meta walk drops exactly the live outputs on panic. The try twin
+// reuses the walk for the `Err` path: an `Err` leaf self-cleans and never
+// stores its meta, completed siblings' survivors drop in the walk. ctp
+// stays impossible for owned inputs (a count pass cannot re-run consumed
+// items). Owned default: merge tree; wtc is opt-in via the knob /
+// `with_filter_collect` (`resolve_owned_filter_collect_variant`). Verdict
+// (same-binary env-knob A/B, 5 interleaved per-id rounds, todo #42): the
+// owned grid INVERTS the by-ref one — 1K −13.8 % (25/25), 10K try −13 %
+// (drift-covered), but 100K +6.2 % (0/25) / +9.4 % where by-ref wtc wins
+// −24…−31 %, so the by-ref 100K `Auto` gate must NOT be extended to owned
+// (falsified face in dead-ends.md; readings in
+// docs/src/dev/benchmarks/sync-fused.md "Owned port").
 
 /// Per-leaf record for the compaction sweep: where the leaf's input range
 /// starts and how many survivors it wrote at the low end of that range.
@@ -5772,6 +5869,253 @@ fn write_filter_rec<'i, S, E>(
             );
         },
     );
+}
+
+/// Owned wtc leaf guard: drops the leaf's written survivor prefix AND its
+/// unread input tail on unwind. Two counters, unlike the single-counter
+/// [`LeafCleanup`]: output position (survivors written) and input position
+/// (items scanned) diverge as soon as a filter drops an item, so one shared
+/// `written` cannot address both halves. At the failure point in the op for
+/// item `scanned`: `out_ptr[..written]` is init, slot `scanned` was moved
+/// into the op and is gone with the failure (never dropped here),
+/// `in_ptr[scanned + 1..n]` is still init. Raw pointers for the same Tree
+/// Borrows reason as `LeafCleanup` (`mem::forget` on the success path).
+struct WtcOwnedLeafGuard<T, R> {
+    in_ptr: *const T,
+    out_ptr: *mut R,
+    n: usize,
+    scanned: usize,
+    written: usize,
+}
+
+impl<T, R> WtcOwnedLeafGuard<T, R> {
+    /// Run the cleanup now instead of on unwind — the try leaf's `Err`
+    /// short-circuit path (item `scanned` was consumed by the op either
+    /// way), after which the caller `mem::forget`s the guard so `Drop` does
+    /// not double-clean.
+    ///
+    /// # Safety
+    ///
+    /// `scanned`/`written` must be the guard's live counters; the enabled
+    /// halves must hold live values (`out_ptr[..written]` init,
+    /// `in_ptr[scanned + 1..n]` init).
+    unsafe fn cleanup(&self) {
+        // SAFETY: contract above — the same drops the unwind path performs.
+        unsafe {
+            for j in 0..self.written {
+                ptr::drop_in_place(self.out_ptr.add(j));
+            }
+            for j in (self.scanned + 1)..self.n {
+                ptr::drop_in_place(self.in_ptr.add(j).cast_mut());
+            }
+        }
+    }
+}
+
+impl<T, R> Drop for WtcOwnedLeafGuard<T, R> {
+    fn drop(&mut self) {
+        // SAFETY: counters reflect the actual progress at the unwind point.
+        unsafe { self.cleanup() };
+    }
+}
+
+/// Owned write pass: [`write_filter_rec`]'s counterpart for `FusedStage<T>`
+/// chains that consume items by value. Same leaf-contiguous geometry and
+/// `WtcLeafMeta` record (so the compaction, [`wtc_compact`], is shared), but
+/// each input slot is `ptr::read` exactly once — consumed, not borrowed.
+///
+/// On panic the leaf guard drops the written prefix and the unread input
+/// tail and the meta store is never reached, so the driver's walk skips the
+/// leaf (same zero-init `kept` protocol as the by-ref pass).
+fn write_filter_rec_owned<T, S>(
+    pool: &ComputePool,
+    input: &Slots<T>,
+    stages: &S,
+    start: usize,
+    end: usize,
+    splits_left: usize,
+    output: &Slots<S::Output>,
+    meta: &mut [WtcLeafMeta],
+) where
+    T: Send,
+    S: FusedStage<T> + Sync,
+    S::Output: Send,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: this leaf owns the disjoint input range `[start, end)`
+        // exclusively; the slots are init (the pass consumes each once).
+        // Raw pointer reads only — the slice borrow ends here.
+        let in_ptr = unsafe { input.as_slice(start, end) }.as_ptr();
+        // SAFETY: disjoint output range `[start, end)`; the slots are uninit.
+        let out_ptr = unsafe { output.as_mut_slice(start, end) }.as_mut_ptr();
+        let n = end - start;
+        let mut g = WtcOwnedLeafGuard {
+            in_ptr,
+            out_ptr,
+            n,
+            scanned: 0,
+            written: 0,
+        };
+        while g.scanned < n {
+            let i = g.scanned;
+            // SAFETY: slot i is init; the read moves the item out — never
+            // re-read.
+            let item = unsafe { ptr::read(in_ptr.add(i)) };
+            if let Some(o) = stages.apply(item) {
+                // SAFETY: `written` counts survivors among the items scanned
+                // so far, so the store stays inside this leaf's slice — even
+                // a keep-everything predicate cannot overflow it. Slot
+                // `written` is uninit; disjoint index.
+                unsafe { ptr::write(g.out_ptr.add(g.written), o) };
+                g.written += 1;
+            }
+            g.scanned = i + 1;
+        }
+        meta[0] = WtcLeafMeta {
+            start,
+            kept: g.written,
+        };
+        // Success: disarm the cleanup Drop.
+        std::mem::forget(g);
+        return;
+    }
+    let mid = start + (end - start) / 2;
+    let left_leaves = split_leaf_count(mid - start, splits_left - 1);
+    let (lmeta, rmeta) = meta.split_at_mut(left_leaves);
+    pool.join(
+        || {
+            write_filter_rec_owned(
+                pool,
+                input,
+                stages,
+                start,
+                mid,
+                splits_left - 1,
+                output,
+                lmeta,
+            );
+        },
+        || {
+            write_filter_rec_owned(
+                pool,
+                input,
+                stages,
+                mid,
+                end,
+                splits_left - 1,
+                output,
+                rmeta,
+            );
+        },
+    );
+}
+
+/// Fallible counterpart of [`write_filter_rec_owned`]: the same single owned
+/// pass, short-circuiting on the first `Err`. An `Err` leaf runs the guard's
+/// cleanup itself (outputs so far plus the unread input tail) and never
+/// stores its meta — the driver's walk then drops exactly the completed
+/// leaves' survivors, nothing of the failing leaf's. Panics unwind through
+/// the guard with the same protocol; `pool.join` waits out every sibling,
+/// so by the time the root sees a failure no leaf is mid-flight.
+fn write_filter_try_rec_owned<T, S>(
+    pool: &ComputePool,
+    input: &Slots<T>,
+    stages: &S,
+    start: usize,
+    end: usize,
+    splits_left: usize,
+    output: &Slots<S::Output>,
+    meta: &mut [WtcLeafMeta],
+) -> Result<(), S::Error>
+where
+    T: Send,
+    S: FusedTryStage<T> + Sync,
+    S::Output: Send,
+    S::Error: Send,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: same disjoint init/uninit contracts as the infallible
+        // leaf above.
+        let in_ptr = unsafe { input.as_slice(start, end) }.as_ptr();
+        let out_ptr = unsafe { output.as_mut_slice(start, end) }.as_mut_ptr();
+        let n = end - start;
+        let mut g = WtcOwnedLeafGuard {
+            in_ptr,
+            out_ptr,
+            n,
+            scanned: 0,
+            written: 0,
+        };
+        while g.scanned < n {
+            let i = g.scanned;
+            // SAFETY: slot i is init; the read moves the item out — never
+            // re-read.
+            let item = unsafe { ptr::read(in_ptr.add(i)) };
+            match stages.try_apply(item) {
+                Ok(Some(o)) => {
+                    // SAFETY: `written` counts survivors among scanned items
+                    // — the store stays inside the leaf's slice; slot
+                    // `written` is uninit.
+                    unsafe { ptr::write(g.out_ptr.add(g.written), o) };
+                    g.written += 1;
+                },
+                Ok(None) => {},
+                Err(e) => {
+                    // Short-circuit: same cleanup the guard would run on
+                    // unwind, then disarm it so `Drop` does not double-clean.
+                    // SAFETY: `scanned == i`; input slots `(i, n)` are still
+                    // init, `out_ptr[..written]` is init.
+                    unsafe { g.cleanup() };
+                    std::mem::forget(g);
+                    return Err(e);
+                },
+            }
+            g.scanned = i + 1;
+        }
+        meta[0] = WtcLeafMeta {
+            start,
+            kept: g.written,
+        };
+        // Success: disarm the cleanup Drop.
+        std::mem::forget(g);
+        return Ok(());
+    }
+    let mid = start + (end - start) / 2;
+    let left_leaves = split_leaf_count(mid - start, splits_left - 1);
+    let (lmeta, rmeta) = meta.split_at_mut(left_leaves);
+    let (l, r) = pool.join(
+        || {
+            write_filter_try_rec_owned(
+                pool,
+                input,
+                stages,
+                start,
+                mid,
+                splits_left - 1,
+                output,
+                lmeta,
+            )
+        },
+        || {
+            write_filter_try_rec_owned(
+                pool,
+                input,
+                stages,
+                mid,
+                end,
+                splits_left - 1,
+                output,
+                rmeta,
+            )
+        },
+    );
+    match (l, r) {
+        (Ok(()), Ok(())) => Ok(()),
+        // Both halves run to completion (`join` waits), so the surviving
+        // `Err` needs no extra cleanup here: each failing leaf self-cleaned,
+        // completed leaves' survivors are the driver walk's job.
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    }
 }
 
 /// [`WTC_PARALLEL_COMPACT_MIN_BYTES`]'s survivor-payload threshold, from
@@ -5898,11 +6242,26 @@ where
         unwind::resume_unwinding(p);
     }
 
-    // Compaction: prefix-sum the kept counts into final offsets (`dst`
-    // trails `src` monotonically — after the first filtered-out item, every
-    // later segment shifts down by the cumulative filtered count), then move
-    // the segments. Sequential on the driver for small payloads; one
-    // parallel copy wave for large ones (see the section comment).
+    // Compaction (shared with the owned drivers below).
+    wtc_compact(pool, output, &meta, depth)
+}
+
+/// Compaction half of every wtc driver (by-ref and owned): prefix-sum the
+/// per-leaf kept counts into final offsets (`dst` trails `src` monotonically
+/// — after the first filtered-out item, every later segment shifts down by
+/// the cumulative filtered count), then move the segments. Sequential on the
+/// driver for small payloads; one parallel copy wave for large ones (see the
+/// section comment). `output` is the n-slot stage-pass buffer with every
+/// completed leaf's survivors at `[start, start + kept)`.
+fn wtc_compact<R>(
+    pool: &ComputePool,
+    output: Slots<R>,
+    meta: &[WtcLeafMeta],
+    depth: usize,
+) -> Vec<R>
+where
+    R: Send,
+{
     let mut total = 0;
     let segs: Vec<WtcSeg> = meta
         .iter()
@@ -5917,7 +6276,7 @@ where
         })
         .collect();
 
-    if total.saturating_mul(size_of::<S::Output>()) >= WTC_PARALLEL_COMPACT_MIN_BYTES {
+    if total.saturating_mul(size_of::<R>()) >= WTC_PARALLEL_COMPACT_MIN_BYTES {
         let dest = Slots::uninit(total);
         compact_filter_rec(pool, &output, &dest, &segs, 0, segs.len(), depth);
         // The n-slot buffer now holds only moved-from stale bits — freeing
@@ -5944,6 +6303,124 @@ where
     output.into_vec_with_len(total)
 }
 
+/// Drive the single-pass write-then-compact filter collect over an OWNED
+/// batch (see the wtc section comment): the counterpart of
+/// [`fused_filter_collect_by_ref_wtc`] for `FusedStage<T>` chains that
+/// consume items by value. `depth` is the same split budget the merge tree
+/// would use.
+///
+/// # Panics
+///
+/// Propagates any panic raised by `stages` after dropping every live output
+/// and input slot (the meta walk for outputs, the leaf guards for input
+/// tails) — nothing leaks, nothing drops twice.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn fused_filter_collect_owned_wtc<T, S>(
+    pool: &ComputePool,
+    items: Vec<T>,
+    stages: &S,
+    depth: usize,
+) -> Vec<S::Output>
+where
+    T: Send,
+    S: FusedStage<T> + Sync,
+    S::Output: Send,
+{
+    let n = items.len();
+    debug_assert!(n > 0);
+    let input = Slots::from_vec(items);
+    let leaves = split_leaf_count(n, depth);
+    let output = Slots::uninit(n);
+    let mut meta = vec![WtcLeafMeta { start: 0, kept: 0 }; leaves];
+
+    // Same walk protocol as the by-ref driver; the extra `drop(input)` is
+    // sound because a panicking leaf's guard dropped its unread tail and the
+    // panicking slot itself was consumed by the op, so every input slot is
+    // gone by the time the panic leaves this function.
+    let result = unwind::halt_unwinding(|| {
+        write_filter_rec_owned(pool, &input, stages, 0, n, depth, &output, &mut meta);
+    });
+    if let Err(p) = result {
+        for m in &meta {
+            // SAFETY: a stored meta means the leaf completed —
+            // `[m.start, m.start + m.kept)` is fully init.
+            unsafe { output.drop_range(m.start, m.start + m.kept) };
+        }
+        // All live slots dropped: freeing the buffers just frees memory.
+        drop(output);
+        drop(input);
+        unwind::resume_unwinding(p);
+    }
+
+    // Input fully consumed (every slot read → uninit): freeing just drops
+    // the buffer.
+    drop(input);
+    wtc_compact(pool, output, &meta, depth)
+}
+
+/// Drive the single-pass write-then-compact filter collect over an owned
+/// batch of a FALLIBLE chain — [`fused_try_filter_collect`]'s wtc twin.
+/// Short-circuits on the first `Err`.
+///
+/// On `Err`/panic every output and input slot is dropped exactly once: an
+/// `Err` leaf cleans its own prefix and tail (and stores no meta), the walk
+/// below drops every completed leaf's survivors, and the input slots are
+/// consumed or guard-dropped either way. On `Ok` the compacted `Vec` is
+/// returned.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn fused_try_filter_collect_owned_wtc<T, S>(
+    pool: &ComputePool,
+    items: Vec<T>,
+    stages: &S,
+    depth: usize,
+) -> Result<Vec<S::Output>, S::Error>
+where
+    T: Send,
+    S: FusedTryStage<T> + Sync,
+    S::Output: Send,
+    S::Error: Send,
+{
+    let n = items.len();
+    debug_assert!(n > 0);
+    let input = Slots::from_vec(items);
+    let leaves = split_leaf_count(n, depth);
+    let output = Slots::uninit(n);
+    let mut meta = vec![WtcLeafMeta { start: 0, kept: 0 }; leaves];
+
+    let result = unwind::halt_unwinding(|| {
+        write_filter_try_rec_owned(pool, &input, stages, 0, n, depth, &output, &mut meta)
+    });
+    match result {
+        Ok(Ok(())) => {
+            // Input fully consumed: freeing just drops the buffer.
+            drop(input);
+            Ok(wtc_compact(pool, output, &meta, depth))
+        },
+        Ok(Err(e)) => {
+            // The failing leaf self-cleaned; drop the completed leaves'
+            // survivors, then free both buffers as plain memory.
+            for m in &meta {
+                // SAFETY: a stored meta means the leaf completed.
+                unsafe { output.drop_range(m.start, m.start + m.kept) };
+            }
+            drop(output);
+            drop(input);
+            Err(e)
+        },
+        Err(p) => {
+            for m in &meta {
+                // SAFETY: a stored meta means the leaf completed — the
+                // panicking leaf unwound through its guard and stored
+                // nothing.
+                unsafe { output.drop_range(m.start, m.start + m.kept) };
+            }
+            drop(output);
+            drop(input);
+            unwind::resume_unwinding(p);
+        },
+    }
+}
+
 // ── pub(crate) scoped entry point ──
 
 /// `pub(crate)` entry point for scoped pipelines. Identical dispatch logic to
@@ -5961,6 +6438,7 @@ pub(crate) fn fused_collect_scoped<S, T>(
     items: Vec<T>,
     stages: S,
     workload: Workload,
+    mode: FilterCollectMode,
     pool: &ComputePool,
 ) -> Vec<S::Output>
 where
@@ -5976,7 +6454,7 @@ where
         TerminalPlan::Serial => serial_stage_collect(items, &stages),
         TerminalPlan::Parallel(plan) => {
             if S::MAY_FILTER {
-                fused_filter_collect(items, &stages, plan.depth, pool)
+                fused_filter_collect(items, &stages, plan.depth, pool, mode)
             } else {
                 let op = FusedOp(stages);
                 par_index_collect(items, &op, plan, pool)
@@ -6035,6 +6513,7 @@ pub(crate) fn fused_try_collect_scoped<S, T, E>(
     items: Vec<T>,
     stages: S,
     workload: Workload,
+    mode: FilterCollectMode,
     pool: &ComputePool,
 ) -> Result<Vec<S::Output>, E>
 where
@@ -6054,7 +6533,7 @@ where
         TerminalPlan::Serial => serial_stage_try_collect(items.into_iter(), &stages),
         TerminalPlan::Parallel(plan) => {
             if S::MAY_FILTER {
-                fused_try_filter_collect(items, &stages, plan.depth, pool)
+                fused_try_filter_collect(items, &stages, plan.depth, pool, mode)
             } else {
                 let op = FusedTryOp(stages);
                 par_index_try_collect(items, &op, plan, pool)
@@ -6903,6 +7382,312 @@ mod tests {
             // completes (`join` runs both sides), so at least the items
             // before the leaf boundary must have been produced.
             assert!(c > 0, "some outputs must precede the panic (depth={depth})");
+        }
+    }
+
+    /// Owned write-then-compact filter collect: identical output to the merge
+    /// tree across selectivity shapes, split depths (including the `len <= 1`
+    /// early exit) and the empty-output edge — the owned twin of
+    /// [`test_filter_wtc_by_ref_matches_merge_tree`]. Drives the wtc driver
+    /// directly (the env knob is a process-global `OnceLock`); the public
+    /// `with_filter_collect` dispatch over owned pipes is pinned at the end.
+    #[test]
+    fn test_filter_wtc_owned_matches_merge_tree() {
+        let pool = ComputePool::global();
+        let n: u64 = if cfg!(miri) {
+            503
+        } else {
+            10_007
+        };
+        let data: Vec<u64> = (0..n).collect();
+
+        for (name, keep) in [("all", 1u64), ("none", 10_000), ("third", 3)] {
+            let stages = SyncMap {
+                prev: Filter {
+                    prev: SyncMap {
+                        prev: Identity,
+                        f: |x: u64| x + 1,
+                    },
+                    f: move |&x: &u64| x % keep == 0,
+                },
+                f: |x: u64| x * 2,
+            };
+            let expected: Vec<u64> = data
+                .iter()
+                .map(|&x| x + 1)
+                .filter(|&x| x % keep == 0)
+                .map(|x| x * 2)
+                .collect();
+
+            for depth in [0, 1, 6, 20] {
+                let merged = fused_filter_collect(
+                    data.clone(),
+                    &stages,
+                    depth,
+                    pool,
+                    FilterCollectMode::Merge,
+                );
+                let wtc = fused_filter_collect_owned_wtc(pool, data.clone(), &stages, depth);
+                assert_eq!(merged, expected, "merge tree, keep={name} depth={depth}");
+                assert_eq!(
+                    wtc, expected,
+                    "owned write-then-compact, keep={name} depth={depth}"
+                );
+                assert_eq!(
+                    wtc.len(),
+                    expected.len(),
+                    "wtc len, keep={name} depth={depth}"
+                );
+            }
+        }
+
+        // Public dispatch: explicit modes through the owned `Pipe` chain
+        // (Auto = merge for owned, Wtc = the ported core, Ctp degrades to
+        // merge) all produce the chain's output.
+        if !cfg!(miri) {
+            use crate::pipe;
+            let n: u64 = 20_007;
+            let data: Vec<u64> = (0..n).collect();
+            let expected: Vec<u64> = data
+                .iter()
+                .map(|&x| x + 1)
+                .filter(|&x| x % 3 == 0)
+                .map(|x| x * 2)
+                .collect();
+            for mode in [
+                FilterCollectMode::Auto,
+                FilterCollectMode::Merge,
+                FilterCollectMode::Ctp,
+                FilterCollectMode::Wtc,
+            ] {
+                let out: Vec<u64> = pipe(data.clone())
+                    .map(|x: u64| x + 1)
+                    .filter(|&x: &u64| x % 3 == 0)
+                    .map(|x| x * 2)
+                    .with_filter_collect(mode)
+                    .collect();
+                assert_eq!(out, expected, "owned pipe mode={mode:?}");
+            }
+        }
+    }
+
+    /// Panic accounting for the owned wtc driver: after the re-raised panic
+    /// every constructed output AND every input item drops exactly once. The
+    /// input half is the owned path's novel face vs the by-ref driver (a
+    /// borrowed input has no drops): the leaf guard owns both halves, and
+    /// the panicking item itself unwinds out of `apply` (dropped there).
+    #[test]
+    fn test_filter_wtc_owned_panic_drop_accounting() {
+        struct InCounter {
+            id: u64,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for InCounter {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        struct OutCounter {
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for OutCounter {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let n: u64 = if cfg!(miri) {
+            500
+        } else {
+            20_000
+        };
+        let panic_marker = n / 3;
+        for depth in [3, 0] {
+            let in_drops = Arc::new(AtomicUsize::new(0));
+            let out_drops = Arc::new(AtomicUsize::new(0));
+            let created = Arc::new(AtomicUsize::new(0));
+            let (di, d_out, c_new) = (in_drops.clone(), out_drops.clone(), created.clone());
+            // Keep-all filter: every item reaches the panicking map (the
+            // filter leaf loop still runs — MAY_FILTER shapes only).
+            let stages = SyncMap {
+                prev: Filter {
+                    prev: Identity,
+                    f: |_: &InCounter| true,
+                },
+                f: move |x: InCounter| {
+                    assert!(x.id != panic_marker, "boom");
+                    c_new.fetch_add(1, Ordering::Relaxed);
+                    OutCounter {
+                        drops: d_out.clone(),
+                    }
+                },
+            };
+            let data: Vec<InCounter> = (0..n)
+                .map(|id| InCounter {
+                    id,
+                    drops: di.clone(),
+                })
+                .collect();
+            let r = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                fused_filter_collect_owned_wtc(ComputePool::global(), data, &stages, depth)
+            }));
+            assert!(
+                r.is_err(),
+                "panic must propagate through the owned wtc tree (depth={depth})"
+            );
+            let (created_n, out_d, in_d) = (
+                created.load(Ordering::Relaxed),
+                out_drops.load(Ordering::Relaxed),
+                in_drops.load(Ordering::Relaxed),
+            );
+            assert_eq!(
+                created_n, out_d,
+                "every produced output must drop exactly once (depth={depth}): \
+                 created={created_n}, dropped={out_d}"
+            );
+            assert_eq!(
+                in_d,
+                usize::try_from(n).unwrap(),
+                "every input must drop exactly once — guard tail + unwind of the panicking item \
+                 (depth={depth}): dropped={in_d}"
+            );
+            assert!(
+                created_n > 0,
+                "some outputs must precede the panic (depth={depth})"
+            );
+        }
+    }
+
+    /// Owned try wtc: Ok-path output matches the merge tree, and the `Err`
+    /// short-circuit drops every input and produced output exactly once (the
+    /// `Err` leaf self-cleans both halves, the driver walk drops completed
+    /// leaves' survivors — the try path's novel face vs the by-ref driver).
+    #[test]
+    fn test_filter_wtc_try_owned_matches_and_err_accounting() {
+        struct InCounter {
+            id: u64,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for InCounter {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        struct OutCounter {
+            drops: Arc<AtomicUsize>,
+        }
+        impl Drop for OutCounter {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let pool = ComputePool::global();
+        // ── Ok path: identical output to the merge tree ──
+        let n: u64 = if cfg!(miri) {
+            503
+        } else {
+            10_007
+        };
+        let data: Vec<u64> = (0..n).collect();
+        for (name, keep) in [("all", 1u64), ("third", 3)] {
+            let stages = TryMap {
+                prev: InfallibleChain(
+                    Filter {
+                        prev: SyncMap {
+                            prev: Identity,
+                            f: |x: u64| x + 1,
+                        },
+                        f: move |&x: &u64| x % keep == 0,
+                    },
+                    PhantomData,
+                ),
+                f: |x: u64| -> Result<u64, &'static str> { Ok(x * 2) },
+            };
+            let expected: Vec<u64> = data
+                .iter()
+                .map(|&x| x + 1)
+                .filter(|&x| x % keep == 0)
+                .map(|x| x * 2)
+                .collect();
+            for depth in [0, 1, 6] {
+                let merged = fused_try_filter_collect(
+                    data.clone(),
+                    &stages,
+                    depth,
+                    pool,
+                    FilterCollectMode::Merge,
+                );
+                let wtc = fused_try_filter_collect_owned_wtc(pool, data.clone(), &stages, depth);
+                assert_eq!(
+                    merged.unwrap(),
+                    expected,
+                    "merge tree, keep={name} d={depth}"
+                );
+                assert_eq!(
+                    wtc.unwrap(),
+                    expected,
+                    "owned wtc, keep={name} depth={depth}"
+                );
+            }
+        }
+
+        // ── Err path: exactly-once drops ──
+        let n: u64 = if cfg!(miri) {
+            500
+        } else {
+            20_000
+        };
+        let err_marker = n / 3;
+        for depth in [3, 0] {
+            let in_drops = Arc::new(AtomicUsize::new(0));
+            let out_drops = Arc::new(AtomicUsize::new(0));
+            let created = Arc::new(AtomicUsize::new(0));
+            let (di, d_out, c_new) = (in_drops.clone(), out_drops.clone(), created.clone());
+            let stages = TryMap {
+                prev: InfallibleChain(
+                    Filter {
+                        prev: Identity,
+                        f: |_: &InCounter| true,
+                    },
+                    PhantomData,
+                ),
+                f: move |x: InCounter| -> Result<OutCounter, &'static str> {
+                    if x.id == err_marker {
+                        return Err("boom");
+                    }
+                    c_new.fetch_add(1, Ordering::Relaxed);
+                    Ok(OutCounter {
+                        drops: d_out.clone(),
+                    })
+                },
+            };
+            let data: Vec<InCounter> = (0..n)
+                .map(|id| InCounter {
+                    id,
+                    drops: di.clone(),
+                })
+                .collect();
+            let r = fused_try_filter_collect_owned_wtc(ComputePool::global(), data, &stages, depth);
+            match r {
+                Err(e) => assert_eq!(e, "boom", "the chain's Err propagates (depth={depth})"),
+                Ok(_) => panic!("expected Err (depth={depth})"),
+            }
+            let (created_n, out_d, in_d) = (
+                created.load(Ordering::Relaxed),
+                out_drops.load(Ordering::Relaxed),
+                in_drops.load(Ordering::Relaxed),
+            );
+            assert_eq!(
+                created_n, out_d,
+                "every produced output must drop exactly once on Err (depth={depth}): \
+                 created={created_n}, dropped={out_d}"
+            );
+            assert_eq!(
+                in_d,
+                usize::try_from(n).unwrap(),
+                "every input must drop exactly once on Err (depth={depth}): dropped={in_d}"
+            );
         }
     }
 

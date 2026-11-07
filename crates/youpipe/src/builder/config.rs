@@ -47,27 +47,31 @@ pub enum Workload {
     Custom(std::num::NonZeroUsize),
 }
 
-/// Which implementation a by-ref **filter collect** uses: a `pipe_ref(..)`
-/// chain that contains a [`Filter`](crate::Filter) stage, terminated by
-/// `.collect()`. Output is identical across all variants — same values, same
-/// order — only performance differs (and the returned `Vec`'s spare
-/// capacity, see [`FilterCollectMode::Wtc`]).
+/// Which implementation a **filter collect** uses: a chain that contains a
+/// [`Filter`](crate::Filter) stage, terminated by `.collect()` /
+/// `.try_collect()` (by-ref or owned). Output is identical across all
+/// variants — same values, same order — only performance differs (and the
+/// returned `Vec`'s spare capacity, see [`FilterCollectMode::Wtc`]).
 ///
 /// Resolution order: an explicit variant set here wins; otherwise the
 /// `YOUPIPE_FILTER_COLLECT` environment knob (`"merge"` / `"ctp"` / `"wtc"`)
 /// applies; otherwise [`FilterCollectMode::Auto`]'s length gate decides.
 ///
-/// Fused by-ref only: owned and fallible filter collects always use the
-/// merge tree (their stages consume items by value, so the count-then-place
-/// and compact cores cannot re-run or move them), and non-filtering chains
-/// have no variant to choose.
+/// Fused only. By-ref chains follow [`FilterCollectMode::Auto`]'s length
+/// gate; owned and fallible filter collects keep the merge tree under
+/// `Auto` — their stages consume items by value, so `Ctp`'s counting pass
+/// cannot re-run them (`Ctp` degrades to the merge tree) — but honor `Wtc`
+/// (the single-pass write-then-compact core works unchanged on consumed
+/// items) via the explicit mode or the knob. Non-filtering chains have no
+/// variant to choose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterCollectMode {
-    /// Length-gated: merge tree below `100_000` items, write-then-compact at
-    /// or above. See [`FilterCollectMode::Wtc`] for the measured basis of
-    /// the gate, and why the (at >= 100K high selectivity even faster)
-    /// count-then-place variant is never chosen automatically: it runs the
-    /// chain TWICE, which is observable to side-effecting closures.
+    /// By-ref: length-gated — merge tree below `100_000` items,
+    /// write-then-compact at or above. See [`FilterCollectMode::Wtc`] for
+    /// the measured basis of the gate, and why the (at >= 100K high
+    /// selectivity even faster) count-then-place variant is never chosen
+    /// automatically: it runs the chain TWICE, which is observable to
+    /// side-effecting closures. Owned filter collects: merge tree (no gate).
     #[default]
     Auto,
     /// Per-leaf `Vec`s concatenated up a join tree. Best for small/mid
@@ -76,9 +80,11 @@ pub enum FilterCollectMode {
     Merge,
     /// Count-then-place: pass 1 counts survivors per leaf, pass 2 re-runs the
     /// chain and writes straight into one exactly-sized buffer. Fastest for
-    /// batches of 100K+ items keeping ~30 % or more, but the chain runs
-    /// TWICE (observable side effects, double stage cost) and it loses on
-    /// every smaller shape.
+    /// by-ref batches of 100K+ items keeping ~30 % or more, but the chain
+    /// runs TWICE (observable side effects, double stage cost) and it loses
+    /// on every smaller shape. By-ref only — for owned collects this
+    /// degrades to [`FilterCollectMode::Merge`] (consumed items cannot be
+    /// re-counted).
     Ctp,
     /// Write-then-compact: one pass writes survivors leaf-contiguously into
     /// an n-slot buffer, a compaction pass moves each surviving segment down
@@ -100,9 +106,9 @@ pub enum FilterCollectMode {
 /// # Field scope
 ///
 /// Not every field applies to every engine — a fused `pipe()` run reads only
-/// `compute_workers` and `workload` (there are no channels and no async
-/// runtime in the fused path; only by-ref filter collects additionally read
-/// `filter_collect`); a `stream()` run reads all of them. Setting a
+/// `compute_workers`, `workload` and (for filter collects) `filter_collect`
+/// (there are no channels and no async runtime in the fused path); a
+/// `stream()` run reads all of them. Setting a
 /// field your engine ignores is harmless (it is silently unused), but the
 /// per-engine builders (`Pipe::with_compute_workers`, `StreamPipe::with_*`)
 /// expose only the knobs that actually take effect.

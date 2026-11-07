@@ -18,3 +18,33 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 - Context: the graph-engine occurrences are root-caused and fixed (2026-10-23, [benchmarks/graph.md](src/dev/benchmarks/graph.md)); the crossfire waker fire-steal — both faces (§12.5 cross-registry stale entry, §12.6 pop/wake waiter migration) — is fixed in the fork, records in [dev/crossfire-waker-designs.md](src/dev/crossfire-waker-designs.md). Attribution for the 09-28 stream-side occurrence remains circumstantial (no runtime evidence).
 - Closed (2026-11-05): the async face audit found no race — every youpipe async re-arm site is clean by argument plus model check (3 loom arbiters pinning the async re-arm shapes: retire-keep, `_reg_waker_async` Reuse's stamp-preserving reset, future-Drop abandon; 4 exactly-once cancel-storm tests). Records in crossfire-waker-designs.md §16 (local doc, gitignored) and the test commit.
 - Standing: run `perf/verify/hang-stakeout.sh` (forensics-before-kill) on the next sighting before touching the process.
+
+---
+
+### 43. [P2] backlog-scaled claim window for graph FanIn claims (r4 audit)
+
+- Context: graph node workers claim with a fixed fair share (`per_worker_claim_cap` → `FanIn::claim`); the stream twin of exactly this face (31 workers on a trivial map feeding an async consumer) measured 31 % of span in the `SyncSender::send` tail CAS and won the mixed hop (merged/1K −33 %, 25/25) via `ClaimWindow`. handoff/mod.rs explicitly notes the port was never measured for the graph engine.
+- Dead-ends check: the falsified entry is the *universal* window (pure-sync fence +60 %); scope here follows the landed async-fed rule (graph `MixedOnly` analogue).
+- Protocol: add a `graph_shapes` id mirroring `sync_fuse/async_pair_cpu_split` (cheap sync node → async node), then same-binary env-scoped per-id A/B on it plus the existing `chain_*_graph`/`fanin_*_graph` ids as no-regression gates.
+
+---
+
+### 44. [P2] remove the injector `is_empty()` consult gate (recorded "revisit")
+
+- Context: `Registry::pop_injected_job` gates every pop on `injected_jobs.is_empty()`; a blind A/B measured it at ~+2.3 % on `mixed_load/youpipe_stream_cpu/1000` with no confirmed benefit elsewhere (attribution.md "fifth face of the lottery"). The recorded decision was "keep for now; revisit on the next injector-path touch".
+- Protocol: same-binary env A/B (`bench_ab.sh -E`, per-id): `mixed_load/youpipe_stream_cpu/1000` (primary), `sharded_term_async/async1_{cheap,cpu}/100000` + `io_async` (counter-cells), `zstd_shape`, horizontal `cpu_balanced`.
+
+---
+
+### 45. [P2] per-run ring recycling (channel construction cache)
+
+- Context: per-run assembly is the dominant residual @1K fixed cost — graph edges allocate ~1.4 µs/ring (3 rings/run, graph.md "Per-run assembly attribution") and the stream sharded terminal holds 17.1 µs of `with_fence/1K`'s 164 µs (streaming.md). Analogue of the pool recycling cache: cache drained-and-closed crossfire rings keyed by (slot size, capacity), via a fork `try_reset` extension (acceptable only when both endpoint refcounts are zero and the ring is empty — the same class as `pop_batch`).
+- Risk: the fork must stay diffable; the waker-registry reset semantics are the hard part.
+- Protocol: `stream_pipeline/with_fence/1000`, `graph_shapes/chain_cheap_graph/1000`, `sharded_term` @1K cells; default-off env gate, then per-id `-E` A/B.
+
+---
+
+### 46. [P2] `pipe_range` filter without terminal materialization
+
+- Context: `RangePipe::filter`/`try_map` materialize the input buffer at the terminal (documented fallback) — measured 56–70 % of @1M/4M owned range calls (attribution.md "Input materialization"). The merge-tree leaves build a per-leaf Vec from generated indices, so generation-inside-the-leaf (e.g. `par_range_gen_leaf`) removes both the input buffer and the serial O(n) fill.
+- Protocol: new `range_gen_filter` cells in `sync_lightweight_input_materialize` @1M/4M against the `range_input`/`range_gen` rows; same-binary env gate feasible (terminals already know `MAY_FILTER`).

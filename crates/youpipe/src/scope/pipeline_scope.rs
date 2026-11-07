@@ -364,7 +364,13 @@ where
     pub fn try_collect(self) -> Result<Vec<O>, E> {
         let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        fused_try_collect_scoped(self.items, self.stages, self.exec.config.workload, pool)
+        fused_try_collect_scoped(
+            self.items,
+            self.stages,
+            self.exec.config.workload,
+            self.exec.config.filter_collect,
+            pool,
+        )
     }
 
     /// Execute the fused fallible pipeline and reduce the outputs,
@@ -425,7 +431,13 @@ where
     pub fn collect(self) -> Vec<O> {
         let exec = self.exec.resolve();
         let pool = exec.as_pool();
-        fused_collect_scoped(self.items, self.stages, self.exec.config.workload, pool)
+        fused_collect_scoped(
+            self.items,
+            self.stages,
+            self.exec.config.workload,
+            self.exec.config.filter_collect,
+            pool,
+        )
     }
 
     /// Execute the fused pipeline, applying `f` to each output for its side

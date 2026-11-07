@@ -7,7 +7,7 @@ Every knob has a sensible default; tune only when a measured problem points at o
 | Knob | Effect | Applies to | Reach for when |
 | --- | --- | --- | --- |
 | `with_workload(Workload)` | fork/join split granularity | fused + `stream()`'s fused cores | item costs are skewed |
-| `with_filter_collect(FilterCollectMode)` | implementation of by-ref filter collects (default `Auto`: merge tree < 100K items, write-then-compact ≥ 100K) | fused by-ref `.collect()` with a filter stage | the Auto gate mismatches your shape (all identical output; see [dev/benchmarks](../dev/benchmarks/sync-fused.md) "Filter-chain collect") |
+| `with_filter_collect(FilterCollectMode)` | implementation of filter collects (by-ref default `Auto`: merge tree < 100K items, write-then-compact ≥ 100K; owned default: merge tree, `Wtc` opt-in — wins ~1K batches −14 %, regresses ≥ 100K +6…+9 %) | fused `.collect()` / `.try_collect()` with a filter stage | the Auto gate mismatches your shape, or a small owned batch wants wtc (all identical output; see [dev/benchmarks](../dev/benchmarks/sync-fused.md) "Filter-chain collect") |
 | `with_buffer_size(n)` | channel capacity between stages | streaming | bursty producers, memory bounds |
 | `with_io_concurrency(n)` | in-flight async items per async stage | streaming + graph | IO waits are cheap and plentiful |
 | `.ordered()` | reorder pass restoring input order | streaming | output must match input order |
@@ -33,10 +33,11 @@ fused `pipe()` ignores the streaming knobs (it has no channels and no async
 runtime); `stream()`'s channel topology ignores `Workload` (its MPMC channels
 load-balance skew per item already) — `StreamPipe::with_workload` reaches only
 the fused cores a pure sync chain can take (the `run()` pass-through and the
-fused reduce/fold cores). `with_filter_collect` is likewise fused-only — and within
-the fused path only a by-ref chain (`pipe_ref`) containing a filter stage and
-ending in `.collect()` consults it; an explicit mode beats the
-`YOUPIPE_FILTER_COLLECT` env knob, which beats the `Auto` length gate.
+fused reduce/fold cores). `with_filter_collect` is likewise fused-only — it
+applies to chains (by-ref or owned) containing a filter stage and ending in
+`.collect()`/`.try_collect()`; `Ctp` degrades to the merge tree on owned
+chains. An explicit mode beats the `YOUPIPE_FILTER_COLLECT` env knob, which
+beats the `Auto` length gate (by-ref; owned `Auto` is always the merge tree).
 
 ## Workload: split granularity (fused)
 
