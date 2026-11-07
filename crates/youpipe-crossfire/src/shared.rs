@@ -35,6 +35,13 @@ pub struct ChannelShared<F: Flavor> {
     pub(crate) large: bool,
 }
 
+// youpipe fork extension (ring recycling): every endpoint wrapper
+// (`MTx`/`MRx`/`MAsyncTx`/...) is `Sync` and derefs into this type, so
+// the fork already asserts cross-thread `&ChannelShared` sharing for
+// every `Flavor`; surfacing it as an impl lets the recycling cache erase
+// the handle as `dyn Any + Send + Sync`.
+unsafe impl<F: Flavor> Sync for ChannelShared<F> {}
+
 impl<F: Flavor> ChannelShared<F> {
     pub(crate) fn new(inner: F, senders: F::Send, recvs: F::Recv) -> Arc<Self> {
         let mut large = false;
@@ -113,6 +120,47 @@ impl<F: Flavor> ChannelShared<F> {
             self.on_recv();
             Ok(item)
         }
+    }
+
+    /// youpipe fork extension (ring recycling): reset a fully-drained,
+    /// fully-closed channel so its endpoints can be rebuilt over the same
+    /// allocation (a recycling cache holds the shared handle between
+    /// incarnations). Atomically claims both endpoint refcounts (0 -> 1);
+    /// on success the ring cursors and both waker registries are back at
+    /// construction state and the refcounts are left at 1/1 for the
+    /// caller's `SenderType::new` / `ReceiverType::new` pair. Returns
+    /// false — touching nothing beyond the rolled-back claims — when any
+    /// endpoint is still alive, the ring was not drained (leftover items
+    /// must drop through the normal teardown), or the flavor has no
+    /// recyclable ring.
+    ///
+    /// Ordering: each claim CAS is Acquire on success, so the Release
+    /// decrement of the last endpoint drop (`close_tx`/`close_rx`, with
+    /// the registry `close()` sequenced after it) happens-before
+    /// everything this method writes — the reset runs on quiescent state.
+    ///
+    /// Precondition (the recycling cache's contract): no `WeakTx` may
+    /// upgrade while `try_reset` runs — a resurrection grafted onto the
+    /// claimed counts would corrupt the refcount the rebuilt endpoints
+    /// assume.
+    pub fn try_reset(&self) -> bool {
+        if self.tx_count.compare_exchange(0, 1, Ordering::SeqCst, Ordering::Acquire).is_err() {
+            return false;
+        }
+        if self.rx_count.compare_exchange(0, 1, Ordering::SeqCst, Ordering::Acquire).is_err() {
+            // Roll back with a decrement, not a store: a racing weak
+            // upgrade that bumped the claimed count must survive it.
+            self.tx_count.fetch_sub(1, Ordering::Release);
+            return false;
+        }
+        if !self.inner.try_reset() {
+            self.rx_count.fetch_sub(1, Ordering::Release);
+            self.tx_count.fetch_sub(1, Ordering::Release);
+            return false;
+        }
+        self.senders.reset();
+        self.recvs.reset();
+        true
     }
 
     /// The number of messages in the channel.
@@ -421,4 +469,119 @@ pub fn check_timeout(deadline: Option<Instant>) -> Result<Option<Duration>, ()> 
         }
     }
     Ok(None)
+}
+
+// youpipe fork extension (ring recycling, todo #45): the contract of
+// `ChannelShared::try_reset` — exclusive claim, drained-only, and a
+// fully functional rebuilt channel (park/wake included: the reset
+// registries must serve a new incarnation exactly like fresh ones).
+#[cfg(test)]
+mod recycle_tests {
+    use crate::mpmc;
+    use crate::mpsc;
+    use crate::{MRx, MTx, ReceiverType, Rx, SenderType};
+
+    #[test]
+    fn try_reset_refuses_live_endpoints_and_undrained_ring() {
+        let (tx, rx) = mpmc::bounded_blocking::<usize>(4);
+        let shared = tx.shared_handle();
+        assert!(!shared.try_reset(), "endpoints alive must refuse");
+        assert_eq!(shared.get_tx_count(), 1);
+        assert_eq!(shared.get_rx_count(), 1);
+
+        // Undrained: drop both endpoints with an item still inside.
+        drop(rx);
+        drop(tx);
+        let (tx2, rx2) = mpmc::bounded_blocking::<usize>(4);
+        let shared2 = tx2.shared_handle();
+        tx2.send(7).unwrap();
+        drop(tx2);
+        drop(rx2);
+        assert!(!shared2.try_reset(), "leftover items must refuse");
+        // The refused claim rolled both refcounts back to 0.
+        assert_eq!(shared2.get_tx_count(), 0);
+        assert_eq!(shared2.get_rx_count(), 0);
+    }
+
+    #[test]
+    fn try_reset_rebuilds_fully_functional_mpmc_channel() {
+        let (tx, rx) = mpmc::bounded_blocking::<usize>(4);
+        let shared = tx.shared_handle();
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        assert_eq!(rx.recv(), Ok(1));
+        assert_eq!(rx.recv(), Ok(2));
+        drop(tx);
+        drop(rx);
+        assert!(shared.try_reset());
+        assert_eq!(shared.get_tx_count(), 1);
+        assert_eq!(shared.get_rx_count(), 1);
+        assert!(shared.is_empty());
+        assert_eq!(shared.get_wakers_count(), (0, 0));
+
+        // Rebuild over the same allocation and prove the full contract:
+        // data plane, EOF, and a real park/wake round through the reset
+        // registries.
+        let tx: MTx<mpmc::Array<usize>> = SenderType::new(shared.clone());
+        let rx: MRx<mpmc::Array<usize>> = ReceiverType::new(shared);
+        tx.send(10).unwrap();
+        let worker = {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                // Fill past capacity: the second send parks on the reset
+                // senders registry until the main thread drains.
+                tx.send(11).unwrap();
+                tx.send(12).unwrap();
+            })
+        };
+        assert_eq!(rx.recv(), Ok(10));
+        assert_eq!(rx.recv(), Ok(11));
+        assert_eq!(rx.recv(), Ok(12));
+        worker.join().unwrap();
+        drop(tx);
+        assert!(rx.recv().is_err(), "EOF must survive the recycle");
+        drop(rx);
+    }
+
+    #[test]
+    fn try_reset_rebuilds_mpsc_channel() {
+        let (tx, rx) = mpsc::bounded_blocking::<usize>(4);
+        let shared = tx.shared_handle();
+        tx.send(1).unwrap();
+        assert_eq!(rx.recv(), Ok(1));
+        drop(tx);
+        drop(rx);
+        assert!(shared.try_reset());
+        let tx: MTx<mpsc::Array<usize>> = SenderType::new(shared.clone());
+        let rx: Rx<mpsc::Array<usize>> = ReceiverType::new(shared);
+        tx.send(2).unwrap();
+        assert_eq!(rx.recv(), Ok(2));
+        drop(tx);
+        assert!(rx.recv().is_err());
+        drop(rx);
+    }
+
+    #[test]
+    fn try_reset_across_many_laps_keeps_stamp_protocol() {
+        // Wrap the ring through several laps first so the reset must
+        // overwrite real residue stamps, then prove the protocol accepts
+        // the restored state on both sides.
+        let (tx, rx) = mpmc::bounded_blocking::<usize>(3);
+        let shared = tx.shared_handle();
+        for i in 0..20 {
+            tx.send(i).unwrap();
+            assert_eq!(rx.recv(), Ok(i));
+        }
+        drop(tx);
+        drop(rx);
+        assert!(shared.try_reset());
+        let tx: MTx<mpmc::Array<usize>> = SenderType::new(shared.clone());
+        let rx: MRx<mpmc::Array<usize>> = ReceiverType::new(shared);
+        for i in 0..20 {
+            tx.send(i).unwrap();
+            assert_eq!(rx.recv(), Ok(i));
+        }
+        drop(tx);
+        drop(rx);
+    }
 }

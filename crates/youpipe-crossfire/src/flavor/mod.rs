@@ -128,6 +128,16 @@ pub(crate) trait FlavorImpl: Queue {
         n
     }
 
+    /// youpipe fork extension (ring recycling): restore construction state
+    /// under exclusive access (the caller is `ChannelShared::try_reset`,
+    /// which claims both endpoint refcounts first). Default false = flavor
+    /// not recyclable (unbounded / one-slot flavors keep their teardown
+    /// through Drop).
+    #[inline]
+    fn try_reset(&self) -> bool {
+        false
+    }
+
     fn backoff_limit(&self) -> u16;
 }
 
@@ -216,6 +226,11 @@ macro_rules! flavor_dispatch {
         #[inline]
         unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<Self::Item>]) -> usize {
             $wrap_method!(self, try_send_batch values)
+        }
+
+        #[inline]
+        fn try_reset(&self) -> bool {
+            $wrap_method!(self, try_reset)
         }
     };
 }

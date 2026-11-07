@@ -319,6 +319,20 @@ The graph engine's shared-sender attempt (the todo #33 sender bullet; falsified,
 
 Two structural facts fall out. First, `single_stage_*` (and `multi_stage_2`, `mixed_load/youpipe_stream_cpu`) are the type-level fused pass-through — no channels, no spawn walk, no senders — so no delivery-side change can reach them at all. Second, on the one gated shape that does run the streaming topology, the per-worker sender-clone slice (the stream-side twin of the graph's `From<Vec<SyncSender>>` builds) is ≈ 0.7 µs of a 164 µs run — half a percent, an order of magnitude below the family's ±10 % drift. The assembly budget is actually dominated by ring allocations (~27 µs, of which the default-on sharded terminal's 32 SPSC rings alone cost 17 µs) and pool job submission (~16 µs) — the todo #33 channel-creation and pool-submission bullets. Sharing the stream fan-out was therefore not attempted; the graph side, where the spawn walk pays the per-worker Vec build 32×, then measured the lever as noise as well (tcache-cheap builds — [graph.md](graph.md) "Shared sender sets: falsified").
 
+The channel-creation bullet got its own lever on 2026-11-08 (todo #45):
+`YOUPIPE_RING_CACHE` parks every handoff factory's fresh ring and
+rebuilds the endpoints over the parked allocation via the fork's
+`ChannelShared::try_reset` when the previous run's ring died
+drained-and-closed. The A/B **falsified it on exactly these shapes** —
+`with_fence/1K` +23.6 % (regression verdict; the family's bimodal slow
+mode arrived a round earlier and deeper on the on-side), every
+`sharded_term/*` @1K row a +6…+10 % consistent lean, the fused controls
+flat — because the allocator's tcache already recycles the freed
+chunks, so the reset pays nearly the same per-ring initialization the
+constructor pays while the cache adds ~35 mutex+scan round trips per
+run. Full table and mechanism in [graph.md](graph.md) "Per-run ring
+recycling: falsified"; the knob stays default-off.
+
 ## Sharded-terminal shard depth (`YOUPIPE_SHARD_DEPTH`, todo #48, 2026-11-08)
 
 r5 attribution read the collector's batch claims clustering at the shard

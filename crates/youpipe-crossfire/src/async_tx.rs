@@ -105,6 +105,12 @@ impl<F: Flavor> AsyncTx<F> {
         self.into()
     }
 
+    /// youpipe fork extension (ring recycling): clone the shared-context
+    /// handle without touching the endpoint refcounts — see Tx's twin.
+    pub fn shared_handle(&self) -> Arc<ChannelShared<F>> {
+        self.shared.clone()
+    }
+
     /// Return true if the other side has closed
     #[inline(always)]
     pub fn is_disconnected(&self) -> bool {

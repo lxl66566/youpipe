@@ -76,6 +76,11 @@ impl<T> FlavorImpl for ArrayMpsc<T> {
         self.0.try_push_batch(values)
     }
 
+    #[inline]
+    fn try_reset(&self) -> bool {
+        self.0.try_reset()
+    }
+
     #[inline(always)]
     fn try_recv_cached(&self) -> Option<T> {
         self.0.pop_cached()

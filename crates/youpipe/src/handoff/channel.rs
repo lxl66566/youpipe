@@ -1,4 +1,9 @@
-use std::{future::Future, mem::MaybeUninit, ptr, task::Poll};
+use std::{
+    future::Future,
+    mem::{MaybeUninit, size_of},
+    ptr,
+    task::Poll,
+};
 
 use crossfire::{mpmc, mpsc};
 
@@ -65,6 +70,14 @@ pub type Receiver<T> = SyncReceiver<T>;
 /// Create a bounded blocking MPMC channel.
 #[must_use]
 pub fn channel<T: Send + 'static>(capacity: usize) -> (SyncSender<T>, SyncReceiver<T>) {
+    if super::ring_recycle_enabled() {
+        if let Some((tx, rx)) = super::ring_cache::recycled::<mpmc::Array<T>, _, _>(capacity) {
+            return (SyncSender { tx }, SyncReceiver { rx });
+        }
+        let (tx, rx) = mpmc::bounded_blocking::<T>(capacity);
+        super::ring_cache::park_shared(capacity, size_of::<T>(), tx.shared_handle());
+        return (SyncSender { tx }, SyncReceiver { rx });
+    }
     let (tx, rx) = mpmc::bounded_blocking::<T>(capacity);
     (SyncSender { tx }, SyncReceiver { rx })
 }
@@ -190,6 +203,14 @@ pub struct AsyncReceiver<T: Send + Unpin + 'static> {
 pub fn async_channel<T: Send + Unpin + 'static>(
     capacity: usize,
 ) -> (AsyncSender<T>, AsyncReceiver<T>) {
+    if super::ring_recycle_enabled() {
+        if let Some((tx, rx)) = super::ring_cache::recycled::<mpmc::Array<T>, _, _>(capacity) {
+            return (AsyncSender { tx }, AsyncReceiver { rx });
+        }
+        let (tx, rx) = mpmc::bounded_async::<T>(capacity);
+        super::ring_cache::park_shared(capacity, size_of::<T>(), tx.shared_handle());
+        return (AsyncSender { tx }, AsyncReceiver { rx });
+    }
     let (tx, rx) = mpmc::bounded_async::<T>(capacity);
     (AsyncSender { tx }, AsyncReceiver { rx })
 }
@@ -206,6 +227,14 @@ pub fn async_channel<T: Send + Unpin + 'static>(
 pub fn sync_async_channel<T: Send + Unpin + 'static>(
     capacity: usize,
 ) -> (SyncSender<T>, AsyncReceiver<T>) {
+    if super::ring_recycle_enabled() {
+        if let Some((tx, rx)) = super::ring_cache::recycled::<mpmc::Array<T>, _, _>(capacity) {
+            return (SyncSender { tx }, AsyncReceiver { rx });
+        }
+        let (tx, rx) = mpmc::bounded_blocking_async::<T>(capacity);
+        super::ring_cache::park_shared(capacity, size_of::<T>(), tx.shared_handle());
+        return (SyncSender { tx }, AsyncReceiver { rx });
+    }
     let (tx, rx) = mpmc::bounded_blocking_async::<T>(capacity);
     (SyncSender { tx }, AsyncReceiver { rx })
 }
@@ -335,6 +364,14 @@ pub struct MpscReceiver<T: Send + 'static> {
 /// MPSC section comment above for the profiled rationale.
 #[must_use]
 pub fn mpsc_channel<T: Send + 'static>(capacity: usize) -> (MpscSender<T>, MpscReceiver<T>) {
+    if super::ring_recycle_enabled() {
+        if let Some((tx, rx)) = super::ring_cache::recycled::<mpsc::Array<T>, _, _>(capacity) {
+            return (MpscSender { tx }, MpscReceiver { rx });
+        }
+        let (tx, rx) = mpsc::bounded_blocking::<T>(capacity);
+        super::ring_cache::park_shared(capacity, size_of::<T>(), tx.shared_handle());
+        return (MpscSender { tx }, MpscReceiver { rx });
+    }
     let (tx, rx) = mpsc::bounded_blocking::<T>(capacity);
     (MpscSender { tx }, MpscReceiver { rx })
 }
@@ -523,6 +560,14 @@ impl<T: Send + Unpin + 'static> Clone for MpscAsyncSender<T> {
 pub fn mpsc_async_channel<T: Send + Unpin + 'static>(
     capacity: usize,
 ) -> (MpscAsyncSender<T>, MpscAsyncReceiver<T>) {
+    if super::ring_recycle_enabled() {
+        if let Some((tx, rx)) = super::ring_cache::recycled::<mpsc::Array<T>, _, _>(capacity) {
+            return (MpscAsyncSender { tx }, MpscAsyncReceiver { rx });
+        }
+        let (tx, rx) = mpsc::bounded_async::<T>(capacity);
+        super::ring_cache::park_shared(capacity, size_of::<T>(), tx.shared_handle());
+        return (MpscAsyncSender { tx }, MpscAsyncReceiver { rx });
+    }
     let (tx, rx) = mpsc::bounded_async::<T>(capacity);
     (MpscAsyncSender { tx }, MpscAsyncReceiver { rx })
 }

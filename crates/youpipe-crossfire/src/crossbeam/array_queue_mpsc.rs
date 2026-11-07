@@ -522,6 +522,23 @@ impl<T> ArrayQueueMpsc<T> {
         head.wrapping_add(self.one_lap) == tail
     }
 
+    /// youpipe fork extension (ring recycling): see the MPMC twin's doc —
+    /// both packed cursor words go back to their construction value 0
+    /// (head = tail = 0 and both cached halves 0). Same exclusive-access
+    /// contract (the caller claimed both endpoint refcounts) and the same
+    /// non-empty refusal.
+    pub fn try_reset(&self) -> bool {
+        if !self.is_empty() {
+            return false;
+        }
+        for (i, slot) in self.buffer.iter().enumerate() {
+            slot.stamp.store(i, Ordering::Release);
+        }
+        self.recv.store(0, Ordering::Release);
+        self.sender.store(0, Ordering::Release);
+        true
+    }
+
     /// Returns the number of elements in the queue.
     #[inline]
     pub fn len(&self) -> usize {

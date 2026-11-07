@@ -248,3 +248,44 @@ Same-binary knob A/B (`bench_ab.sh -E off/on=YOUPIPE_CLAIM_SCALE=0/1`, per-id is
 | `fanin_cheap_graph/100000` | 38.58 ms | 39.33 ms | +1.9 | 41/100 | noise (its known bimodal slow mode — rounds interleave 30.8–41.3 ms on both sides; the shape is pure-sync, the window structurally off) |
 
 Default: on — the knob's existing default now covers the graph face; `ClaimScope` alone decides where it may arm. The @1K lean (+1.2 %) is the larger per-worker staging allocation (scratch 64 vs 2 slots) on rows dominated by the fixed async-runtime build, amortized away at @100K where the win sits. Conservation through the widened claim/staging path is pinned by `sync_node_into_async_node_conserves`.
+## Per-run ring recycling: falsified (2026-11-08, todo #45)
+
+The @1K assembly residual's last member with real mass — the per-edge
+ring allocation (~1.4 µs/ring, "Per-run assembly attribution") — got its
+dedicated lever: the crossfire fork grew `ChannelShared::try_reset`
+(claim both endpoint refcounts 0→1, restore the drained ring's stamps
+and both waker registries to construction state; the vendored-copy
+extension list in its manifest records the surface) and `handoff/
+ring_cache.rs` parks each fresh ring's shared handle keyed on (channel
+type, capacity), rebuilding the endpoint pair over the parked allocation
+on the next same-key construction (`YOUPIPE_RING_CACHE`, default off).
+Correctness held everywhere — fork unit tests, the `ring_recycle.rs`
+end-to-end suite, full miri (the reset runs on quiescent state: the
+Acquire claim CASes happen-after the last endpoint drop's Release
+decrement) — but the performance premise was false.
+
+A/B (`bench_ab.sh -a off=wt -b on=wt -E …RING_CACHE=0/1`, 5 per-id
+interleaved rounds; the fused `single_stage_*` controls read ±1.3 %,
+so the session is drift-clean):
+
+| id | off @med | on @med | Δ | dom on | verdict |
+| --- | -------- | ------- | --- | ------ | ------- |
+| stream_pipeline/with_fence @1K | 144.4 µs | 178.5 µs | **+23.6 %** | 10/25 | regression (bimodal family: both sides jumped in late rounds, on earlier and deeper) |
+| sharded_term/single_unordered_cpu @1K | 199.3 µs | 219.8 µs | +10.3 % | 7/25 | noise (consistent lean) |
+| sharded_term/single_unordered_cheap @1K | 199.5 µs | 218.2 µs | +9.3 % | 7/25 | noise (consistent lean) |
+| sharded_term/single_ordered_cpu @1K | 204 µs | 218.7 µs | +7.2 % | 10/25 | noise (consistent lean) |
+| sharded_term/expand_cheap @1K | 293.3 µs | 310.9 µs | +6.0 % | 9/25 | noise (consistent lean) |
+| chain_cheap_graph @1K | 128.4 µs | 131.3 µs | +2.3 % | 10/25 | noise (ceiling was 3.3 %) |
+| chain_cheap_graph @100K | 8.602 ms | 8.601 ms | −0.0 % | 14/25 | noise |
+| stream_pipeline/with_fence @100K | 8.654 ms | 8.730 ms | +0.9 % | 12/25 | noise |
+
+Falsified premise: glibc's tcache already recycles a run's freed ring
+chunks into the next run's allocations, so most of the measured 1.4
+µs/ring construction cost is the part `try_reset` pays too (per-slot
+stamp initialization, registry re-init) — while the cache adds a global
+mutex + linear key scan + vector shifts per construction, ~35
+constructions per `with_fence` run (feeder + mid rings + 32 terminal
+shards). Net: a small real regression on the stream shapes it targeted,
+noise on the graph side. The knob stays default-off (the A/B vehicle
+and the fork's reset surface are kept — both miri-clean); the @1K
+assembly residual remains owned by per-job pool submission.

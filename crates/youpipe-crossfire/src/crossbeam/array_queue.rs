@@ -546,6 +546,26 @@ impl<T, const MP: bool, const MC: bool> ArrayQueue<T, MP, MC> {
         head.wrapping_add(self.one_lap) == tail
     }
 
+    /// youpipe fork extension (ring recycling): restore construction state
+    /// (head = tail = 0, every slot stamp = its index) so endpoints can be
+    /// rebuilt over the same allocation. Exclusive access is the caller's
+    /// contract (`ChannelShared::try_reset` claims both endpoint refcounts
+    /// first, so no push/pop/claim can be in flight; a claim abandoned by
+    /// a panicked producer leaves head != tail and fails below). Returns
+    /// false when the ring still holds items — leftover values must go
+    /// through the Drop path, not be buried under fresh stamps.
+    pub fn try_reset(&self) -> bool {
+        if !self.is_empty() {
+            return false;
+        }
+        for (i, slot) in self.buffer.iter().enumerate() {
+            slot.stamp.store(i, Ordering::Release);
+        }
+        self.head.store(0, Ordering::Release);
+        self.tail.store(0, Ordering::Release);
+        true
+    }
+
     /// Returns the number of elements in the queue.
     #[inline]
     pub fn len(&self) -> usize {

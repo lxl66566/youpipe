@@ -88,6 +88,11 @@ impl<T> FlavorImpl for Array<T> {
     }
 
     #[inline]
+    fn try_reset(&self) -> bool {
+        self.0.try_reset()
+    }
+
+    #[inline]
     fn backoff_limit(&self) -> u16 {
         if self.0.capacity() > 10 {
             crate::backoff::DEFAULT_LIMIT

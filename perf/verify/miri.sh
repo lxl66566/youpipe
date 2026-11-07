@@ -171,7 +171,7 @@ else
             pool_cache stream_reduce expand_alloc
         run_nextest_group "medium" \
             cancel_outcome batch_recv sharded_terminal \
-            graph_stream_diff graph_dag
+            graph_stream_diff graph_dag ring_recycle
         run_nextest_group "heavy" async_waker_alloc compute_pool
         run_nextest_group "async" sharded_terminal_async sharded_terminal_async_one_worker
         run_nextest_group "lib" lib

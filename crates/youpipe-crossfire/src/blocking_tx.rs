@@ -94,6 +94,13 @@ impl<F: Flavor> Tx<F> {
     pub fn into_async(self) -> AsyncTx<F> {
         self.into()
     }
+
+    /// youpipe fork extension (ring recycling): clone the shared-context
+    /// handle without touching the endpoint refcounts — the recycling
+    /// cache parks this clone while the endpoints live and drop normally.
+    pub fn shared_handle(&self) -> Arc<ChannelShared<F>> {
+        self.shared.clone()
+    }
 }
 
 impl<F: Flavor> Tx<F> {

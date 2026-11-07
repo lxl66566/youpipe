@@ -106,6 +106,14 @@ pub trait Registry: Send + Sync + 'static {
             self.fire();
         }
     }
+
+    /// youpipe fork extension (ring recycling): restore construction state
+    /// under exclusive access — the caller (`ChannelShared::try_reset`)
+    /// holds both endpoint refcounts claimed, so no registration, fire or
+    /// close can race. Default no-op for registries whose `close()` alone
+    /// leaves them reusable (RegistryDummy).
+    #[inline(always)]
+    fn reset(&self) {}
 }
 
 pub(crate) trait RegistrySend: Registry {
@@ -312,6 +320,15 @@ impl Registry for RegistrySingle {
     #[inline(always)]
     fn close(&self) {
         self._fire();
+    }
+
+    /// youpipe fork extension (ring recycling): close() drains the cell;
+    /// the extra clear() covers a stale entry a cancelled waiter left
+    /// behind (its node was retired in place, the entry goes stale until
+    /// the next registration).
+    #[inline(always)]
+    fn reset(&self) {
+        self.cell.clear();
     }
 
     #[inline(always)]
@@ -764,6 +781,20 @@ impl Registry for RegistryMulti {
                 trace_log!("close {} wake {:?} {}", self._tag, waker, _r);
             }
         }
+        self.state.store(0, Ordering::SeqCst);
+    }
+
+    /// youpipe fork extension (ring recycling): close() drains the waker
+    /// queue but leaves the woken selectors in `selectors` (their only
+    /// cancellation path runs through an endpoint, which no longer
+    /// exists) — a stale wrapper would break the `selectors.is_empty()`
+    /// state-flag bookkeeping on the recycled registry's first
+    /// registration, so reset clears both vectors under the mutex.
+    #[inline(always)]
+    fn reset(&self) {
+        let mut guard = reg_lock(&self.inner);
+        guard.queue.clear();
+        guard.selectors.clear();
         self.state.store(0, Ordering::SeqCst);
     }
 

@@ -18,6 +18,8 @@ pub(crate) mod mux;
 // `sharded_mpsc_channel(0, ..)` constructed fine, then panicked at `% 0` on
 // the first drain pass).
 pub(crate) mod sharded;
+// Crate-internal: the per-run channel ring recycling cache (todo #45).
+pub(crate) mod ring_cache;
 // Crate-internal: the shared worker loop and delivery strategies serve the
 // stream and graph engines' spawn cores.
 pub(crate) mod worker;
@@ -133,6 +135,35 @@ pub(crate) fn sharded_term_async_enabled() -> bool {
         Ok(other) => panic!(
             "YOUPIPE_SHARDED_TERM_ASYNC: invalid value {other:?} (leave unset or use \"0\"/\"1\")"
         ),
+        Err(_) => false,
+    })
+}
+
+// `YOUPIPE_RING_CACHE=1` (todo #45) recycles per-run channel rings: a
+// run's rings die drained-and-closed, exactly the state the crossfire
+// fork's `ChannelShared::try_reset` can rebuild endpoints over, so the
+// handoff factories park each fresh ring's shared handle and the next
+// construction of the same (channel type, capacity) takes it back
+// instead of allocating (see `ring_cache.rs` for the budget and the
+// deferred-drop caveat for cancelled runs).
+//
+// FALSIFIED and default OFF (todo #45 A/B, 2026-11-08): with_fence/1K
+// +23.6 % regression, every sharded_term @1K row +6…+10 % — the
+// allocator's tcache already recycles a run's freed ring chunks, so
+// try_reset pays nearly the same per-ring initialization the
+// constructor pays while the cache adds ~35 mutex+scan round trips per
+// run (readings in benchmarks/graph.md "Per-run ring recycling:
+// falsified"). Kept as the A/B vehicle over the (miri-clean) fork
+// reset surface.
+static RING_CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn ring_recycle_enabled() -> bool {
+    *RING_CACHE.get_or_init(|| match std::env::var("YOUPIPE_RING_CACHE") {
+        Ok(v) if v == "1" => true,
+        Ok(v) if v == "0" || v.is_empty() => false,
+        Ok(other) => {
+            panic!("YOUPIPE_RING_CACHE: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
+        },
         Err(_) => false,
     })
 }
