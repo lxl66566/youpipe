@@ -194,7 +194,8 @@ core statically (`S: FusedStage<usize, Output = O>`).
 | --------------------------- | ------------------------- | ---------------------------- |
 | input                       | any `IntoIterator`        | `Range<usize>`               |
 | input buffer                | materialized `Vec`        | none (items generated)      |
-| `filter` chains / `try_map` | native paths              | materialize at the terminal |
+| `filter` chains             | native paths              | native paths (gen-in-leaf filter cores) |
+| `try_map`                   | native paths              | materializes at the builder call |
 | `collect`/`for_each` (no filter) | `par_index_collect`  | `par_range_gen_collect`      |
 
 Dispatch rides the same `hybrid_dispatch` with a third input handle — the
@@ -205,6 +206,15 @@ the input half elided: `par_range_gen_leaf`'s `GenLeafGuard` drops only the
 partial output range on unwind (a generated item is never stored), and the
 sink core has no guard at all. NT-store tiering is shared
 (`nt_store_enabled::<R>` per whole-batch output size).
+
+Filter chains generate inside the leaves too (todo #46): the merge tree and
+wtc geometry of the owned filter cores is unchanged, but each leaf produces
+its items (`filter_gen_leaf` / `write_filter_rec_gen`) instead of reading a
+`Slots` input — the same elision means their unwind cleanup has no input
+half at all, and `for_each` needs no separate core (`FusedSink` already
+dispatches on `MAY_FILTER`). −55 % vs the old materialize-at-terminal
+fallback at 1 M/4 M (see [benchmarks/sync-fused.md](benchmarks/sync-fused.md)
+"Filter-chain generation").
 
 `RangePipe` shares `Pipe`'s builder surface through the common `ExecOptions`
 field + `exec_setters!` macro (see the `Pipe` section above);

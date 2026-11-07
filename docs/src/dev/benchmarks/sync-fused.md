@@ -64,7 +64,18 @@ The owned rows are one-shot-cost calibers (fresh buffer + free inside the timed 
 
 Regression check (3 interleaved per-id rounds vs the branch point, `bench_ab.sh -B sync_vs_rayon`): every youpipe family within ±3 % noise; the only flagged row was the `rayon_nested_saturated/1000` anchor (+5.4 %, 0/9 dominant, layout/drift wobble on untouched rayon code). Horizontal `cpu_balanced`/`cpu_balanced_readback` two-binary alternating A/B (5 pairs × 2 rounds, `taskset 1-31`): pooled +0.1…+1.0 % at 1M/4M with mixed per-pair signs, no regression. Miri (Tree Borrows) covers the generation cores' guards via the `pipe_range` integration tests.
 
-`pipe_range(range)` removes the input buffer entirely: the item at index `i` IS the index, generated inside the leaves (`RangeGenStrategy` / `par_range_gen_*` over the same `hybrid_dispatch`, input handle `IN = ()`), so there is no input allocation, no serial fill, and no input cache traffic. Allocation proof: `tests/pipe_range_alloc.rs` counts N-sized allocations and finds exactly 1 (the output buffer) vs 2 on the materialized path. Filter chains and the fallible terminal materialize once at the terminal (documented fallback, the same fill `pipe(range)` always paid). If you already own a `Vec`, `pipe(v)` stays zero-copy, and a `pipe_vec` constructor would add nothing.
+`pipe_range(range)` removes the input buffer entirely: the item at index `i` IS the index, generated inside the leaves (`RangeGenStrategy` / `par_range_gen_*` over the same `hybrid_dispatch`, input handle `IN = ()`), so there is no input allocation, no serial fill, and no input cache traffic. Allocation proof: `tests/pipe_range_alloc.rs` counts N-sized allocations and finds exactly 1 (the output buffer) vs 2 on the materialized path. Filter chains used to materialize once at the terminal (the same fill `pipe(range)` always paid); since todo #46 the filter cores' leaves generate their items too (`filter_gen_leaf` merge tree + a generated wtc twin, same mode resolution as the owned core, `for_each` needs no change — `FusedSink` already dispatches on `MAY_FILTER`), leaving the fallible `try_map` transition as the only materializer (at the builder call; the fallible terminals have no generation core). If you already own a `Vec`, `pipe(v)` stays zero-copy, and a `pipe_vec` constructor would add nothing.
+
+### Filter-chain generation (todo #46, 2026-11-08): landed
+
+Same-binary knob A/B (`YOUPIPE_RANGE_GEN_FILTER` 0 vs 1, temporary, removed at landing; 5 interleaved per-id rounds, `bench_ab.sh -B sync_vs_rayon --per-id`, rayon/range_gen/range_input controls all within noise):
+
+| cell | materialized | generation | Δ | pairwise |
+| ---- | ------------ | ---------- | --- | -------- |
+| `range_gen_filter/1M` (keep 50 %) | 794.5 µs | 357.3 µs | **−55.0 %** | 25/25 |
+| `range_gen_filter/4M` (keep 50 %) | 6.93 ms | 3.16 ms | **−54.4 %** | 25/25 |
+
+The removed share matches the 56–70 % attribution band of the no-filter owned calls (the filter twin keeps a survivor-sized output and the merge tree, so its absolute floor is higher). Controls: `range_gen` +0.3 %/−0.0 %, `range_input` +1.3 %/+0.2 %, `rayon_filter` ±2 % — no drift. Post-landing anchors: `range_gen_filter` @1M ≈ 357 µs / @4M ≈ 3.16 ms, vs `rayon_filter` 1.07 ms / 2.50 ms. Panic/drop accounting and the allocation proof are covered by `pipeline_integration.rs` (`test_pipe_range_filter_panic_drop_accounting`), `range_filter_wtc_panic.rs` (wtc walk) and `pipe_range_alloc.rs` (filter twin, 1 N-sized allocation).
 
 ## Fallible `try_map().try_collect()` vs rayon (`try_collect`, borrowed input)
 

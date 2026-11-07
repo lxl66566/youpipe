@@ -1405,6 +1405,210 @@ where
     }
 }
 
+// ── Zero-materialization filter collect ──
+//
+// `RangePipe::collect` on a `MAY_FILTER` chain used to materialize the
+// indices at the terminal ("fill once, then the shared filter core") because
+// the filter cores are input-driven: `filter_leaf` reads a `Slots<T>` slice,
+// `write_filter_rec_owned` ptr::reads it. But the input type here is `usize`
+// and the item at index `i` IS `base + i` — generating it inside the leaf
+// removes both the n-slot input buffer and the serial O(n) iota fill, exactly
+// like `par_range_gen_leaf` does for the filter-free core. The merge tree /
+// wtc geometry above the leaf is unchanged, so the survivor-handling and
+// panic/drop contracts carry over with one simplification: a generated item
+// is owned by the leaf loop and never stored, so there is NO input half to
+// clean on any path (the `par_range_gen_leaf` property) — only the output
+// half (the leaf `Vec` / `WtcLeafGuard` prefix) the materialized leaves
+// already handle.
+
+/// Generated-input twin of [`filter_leaf`]: generate `base..base + len`,
+/// apply `stages` and collect surviving outputs into a fresh `Vec`.
+///
+/// No unwind guard: unprocessed items were never generated (no input tail to
+/// drop — the [`par_range_gen_leaf`] property), and the partial `out` `Vec`
+/// drops naturally, exactly like the materialized leaf's.
+fn filter_gen_leaf<S>(base: usize, len: usize, stages: &S) -> Vec<S::Output>
+where
+    S: FusedStage<usize>,
+{
+    // Pre-allocate for the all-survive worst case (see `filter_leaf`).
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        if let Some(o) = stages.apply(base + i) {
+            out.push(o);
+        }
+    }
+    out
+}
+
+/// Generated-input twin of [`par_filter_rec`]: same tree shape (disjoint
+/// `[start, end)` sub-ranges, `l.extend(r)` concatenation, O(depth) moves per
+/// survivor) and the same panic contract — the unwinding leaf's partial `Vec`
+/// drops naturally and `pool.join` drops the waited-out sibling's `Vec`, so
+/// internal nodes need no cleanup match. The only difference: leaves generate
+/// their items instead of reading them from a shared `Slots`.
+fn par_filter_gen_rec<S>(
+    pool: &ComputePool,
+    base: usize,
+    start: usize,
+    end: usize,
+    stages: &S,
+    splits_left: usize,
+) -> Vec<S::Output>
+where
+    S: FusedStage<usize> + Sync,
+    S::Output: Send,
+{
+    if splits_left == 0 || end - start <= 1 {
+        return filter_gen_leaf(base + start, end - start, stages);
+    }
+    let mid = start + (end - start) / 2;
+    let (mut l, r) = pool.join(
+        || par_filter_gen_rec(pool, base, start, mid, stages, splits_left - 1),
+        || par_filter_gen_rec(pool, base, mid, end, stages, splits_left - 1),
+    );
+    l.extend(r);
+    l
+}
+
+/// Generated-input twin of [`write_filter_rec`]: same leaf-contiguous geometry
+/// and [`WtcLeafMeta`] record (so [`wtc_compact`] is shared), but the item is
+/// generated, not borrowed or read. The output-half [`WtcLeafGuard`] is the
+/// full cleanup — there is no input half (see the section comment).
+fn write_filter_rec_gen<S>(
+    pool: &ComputePool,
+    base: usize,
+    stages: &S,
+    start: usize,
+    end: usize,
+    splits_left: usize,
+    output: &Slots<S::Output>,
+    meta: &mut [WtcLeafMeta],
+) where
+    S: FusedStage<usize> + Sync,
+    S::Output: Send,
+{
+    if splits_left == 0 || end - start <= 1 {
+        // SAFETY: this leaf owns the disjoint output range `[start, end)`
+        // exclusively; the slots are uninit.
+        let out_ptr = unsafe { output.as_mut_slice(start, end) }.as_mut_ptr();
+        let mut g = WtcLeafGuard {
+            out_ptr,
+            written: 0,
+        };
+        for i in 0..(end - start) {
+            if let Some(o) = stages.apply(base + start + i) {
+                // SAFETY: `written` counts survivors among the items scanned
+                // so far, so the store stays inside this leaf's slice — even
+                // a keep-everything predicate cannot overflow it. Slot
+                // `written` is uninit; disjoint index.
+                unsafe { ptr::write(g.out_ptr.add(g.written), o) };
+                g.written += 1;
+            }
+        }
+        meta[0] = WtcLeafMeta {
+            start,
+            kept: g.written,
+        };
+        // Success: disarm the cleanup Drop.
+        std::mem::forget(g);
+        return;
+    }
+    let mid = start + (end - start) / 2;
+    let left_leaves = split_leaf_count(mid - start, splits_left - 1);
+    let (lmeta, rmeta) = meta.split_at_mut(left_leaves);
+    pool.join(
+        || {
+            write_filter_rec_gen(
+                pool,
+                base,
+                stages,
+                start,
+                mid,
+                splits_left - 1,
+                output,
+                lmeta,
+            );
+        },
+        || {
+            write_filter_rec_gen(pool, base, stages, mid, end, splits_left - 1, output, rmeta);
+        },
+    );
+}
+
+/// Drive the single-pass write-then-compact filter collect over a GENERATED
+/// range — [`fused_filter_collect_owned_wtc`]'s counterpart minus the input
+/// buffer. Same walk protocol: a stored meta means the leaf completed, a
+/// panicking leaf stores none, so the walk drops exactly the live survivors.
+///
+/// # Panics
+///
+/// Propagates any panic raised by `stages` after dropping every live output
+/// slot — nothing else exists to clean.
+fn fused_filter_gen_collect_wtc<S>(
+    pool: &ComputePool,
+    range: Range<usize>,
+    stages: &S,
+    depth: usize,
+) -> Vec<S::Output>
+where
+    S: FusedStage<usize> + Sync,
+    S::Output: Send,
+{
+    let n = range.len();
+    debug_assert!(n > 0);
+    let leaves = split_leaf_count(n, depth);
+    let output = Slots::uninit(n);
+    let mut meta = vec![WtcLeafMeta { start: 0, kept: 0 }; leaves];
+
+    let result = unwind::halt_unwinding(|| {
+        write_filter_rec_gen(pool, range.start, stages, 0, n, depth, &output, &mut meta);
+    });
+    if let Err(p) = result {
+        for m in &meta {
+            // SAFETY: a stored meta means the leaf completed —
+            // `[m.start, m.start + m.kept)` is fully init.
+            unsafe { output.drop_range(m.start, m.start + m.kept) };
+        }
+        // All live slots dropped: freeing the buffer just frees memory.
+        drop(output);
+        unwind::resume_unwinding(p);
+    }
+
+    wtc_compact(pool, output, &meta, depth)
+}
+
+/// Drive the filter-chain collect over a generated range — the generation
+/// twin of [`fused_filter_collect`]: same mode resolution (owned subset:
+/// merge default, `Wtc` via knob/builder, `Ctp` degrades — see
+/// [`resolve_owned_filter_collect_variant`]), no input buffer.
+///
+/// # Panics
+///
+/// Propagates any panic raised by `stages` (after the leaves' cleanup
+/// dropped all partial state).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn fused_filter_gen_collect<S>(
+    range: Range<usize>,
+    stages: &S,
+    splits: usize,
+    pool: &ComputePool,
+    mode: FilterCollectMode,
+) -> Vec<S::Output>
+where
+    S: FusedStage<usize> + Sync,
+    S::Output: Send,
+{
+    let n = range.len();
+    debug_assert!(n > 0);
+    match resolve_owned_filter_collect_variant(mode) {
+        OwnedFilterCollectVariant::Merge => {
+            par_filter_gen_rec(pool, range.start, 0, n, stages, splits)
+        },
+        OwnedFilterCollectVariant::Wtc => fused_filter_gen_collect_wtc(pool, range, stages, splits),
+    }
+}
+
 /// Hybrid strategy for `.try_collect()`'s no-filter fast path: like
 /// [`CollectStrategy`] it writes outputs into a shared `Slots<R>` at known
 /// indices, but the chunk driver is fallible — the first `Err(e)` is funnelled
@@ -4560,11 +4764,12 @@ pub fn pipe_range(range: Range<usize>) -> RangePipe<Identity, usize> {
 
 /// [`pipe_range`]'s builder. Mirrors [`Pipe`]'s builder surface (`.map` /
 /// `.filter` / `.try_map` / tuning setters — identical semantics, input type
-/// fixed to `usize`), but the filter-free `.collect()` / `.for_each()`
-/// terminals run the generation core: items are produced inside the leaves
-/// and no input buffer exists. Chains that *can* filter, and the fallible
-/// `.try_collect()` terminal, materialize the indices once at the terminal —
-/// the same serial fill `pipe(range)` always paid.
+/// fixed to `usize`), but the `.collect()` / `.for_each()` terminals run
+/// generation cores: items are produced inside the leaves — filter chains
+/// included (the filter cores' leaves generate their own items, todo #46) —
+/// and no input buffer exists. Only the fallible `.try_map()` transition
+/// materializes the indices, at the builder call — the fallible terminals
+/// have no generation core yet.
 pub struct RangePipe<S = Identity, O = usize> {
     range: Range<usize>,
     stages: S,
@@ -4603,8 +4808,7 @@ where
     }
 
     /// Append a filter stage — see [`Pipe::filter`]. Keeps items where `f`
-    /// returns `true`. Filter chains materialize the indices at the
-    /// terminal (see the [`RangePipe`] type doc).
+    /// returns `true`.
     pub fn filter(
         self,
         f: impl Fn(&O) -> bool + Send + Sync + 'static,
@@ -4622,8 +4826,9 @@ where
 
     /// Append a fallible map stage — see [`Pipe::try_map`]. Transitions into
     /// a [`TryPipe`] whose items are the materialized indices (the fallible
-    /// terminal has no generation core yet — the fallback equals
-    /// `pipe(range).try_map(..)`).
+    /// terminals have no generation core yet — the fallback equals
+    /// `pipe(range).try_map(..)`, with the fill paid here at the builder
+    /// call rather than at the terminal).
     #[allow(clippy::type_complexity)] // mirrors `Pipe::try_map`'s typestate chain
     pub fn try_map<N, E>(
         self,
@@ -4656,8 +4861,10 @@ where
     O: Send + 'static,
 {
     /// Execute the fused pipeline over the generated indices and collect the
-    /// results — the generation core (no input buffer) when the chain cannot
-    /// filter, the materialized [`Pipe::collect`] path otherwise.
+    /// results — the generation cores (no input buffer), filter chains
+    /// included (the filter cores' leaves generate their own items; −55 %
+    /// vs the materialized fallback at 1 M/4 M, todo #46 verdict in
+    /// sync-fused.md "Input materialization").
     ///
     /// # Panics
     ///
@@ -4677,11 +4884,12 @@ where
             TerminalPlan::Serial => serial_stage_collect(self.range, &self.stages),
             TerminalPlan::Parallel(plan) => {
                 if S::MAY_FILTER {
-                    // Filters change output cardinality (the range-tree path
-                    // needs materialized items): fill once, then the shared
-                    // filter core.
-                    fused_filter_collect(
-                        self.range.collect(),
+                    // Filters change output cardinality, so the filter cores
+                    // (per-leaf Vecs / wtc) apply — but the input is still
+                    // generated inside the leaves (no input buffer, no serial
+                    // fill).
+                    fused_filter_gen_collect(
+                        self.range,
                         &self.stages,
                         plan.depth,
                         pool,
@@ -4715,15 +4923,12 @@ where
         match terminal_plan(n, self.exec.config.workload, pool.num_workers()) {
             TerminalPlan::Serial => serial_stage_for_each(self.range, &self.stages, f),
             TerminalPlan::Parallel(plan) => {
+                // `FusedSink::consume` dispatches on `MAY_FILTER` itself
+                // (filtered items simply skip the closure), so the sink
+                // generation core covers filter chains for free — no input
+                // buffer exists to materialize.
                 let op = FusedSink(self.stages, f);
-                if S::MAY_FILTER {
-                    // `FusedSink::consume` honours filters, but the sink
-                    // generation core has no input buffer to read items
-                    // from — materialize.
-                    par_for_each(self.range.collect(), &op, plan, pool);
-                } else {
-                    par_range_gen_for_each(self.range, &op, plan, pool);
-                }
+                par_range_gen_for_each(self.range, &op, plan, pool);
             },
         }
     }

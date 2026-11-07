@@ -31,13 +31,9 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 
 ### 45. [P2] per-run ring recycling (channel construction cache)
 
-- Context: per-run assembly is the dominant residual @1K fixed cost — graph edges allocate ~1.4 µs/ring (3 rings/run, graph.md "Per-run assembly attribution") and the stream sharded terminal holds 17.1 µs of `with_fence/1K`'s 164 µs (streaming.md). Analogue of the pool recycling cache: cache drained-and-closed crossfire rings keyed by (slot size, capacity), via a fork `try_reset` extension (acceptable only when both endpoint refcounts are zero and the ring is empty — the same class as `pop_batch`).
+- Context: per-run assembly is the dominant residual @1K fixed cost — graph edges allocate ~1.4 µs/ring (3 rings/run, graph.md "Per-run assembly attribution") and the stream sharded terminal holds 17.1 µs of `with_fence/1K`'s 164 µs (streaming.md). Analogue of the pool recycling cache: cache drained-and-closed crossfire rings keyed on (slot size, capacity), via a fork `try_reset` extension (acceptable only when both endpoint refcounts are zero and the ring is empty — the same class as `pop_batch`).
 - Risk: the fork must stay diffable; the waker-registry reset semantics are the hard part.
 - Protocol: `stream_pipeline/with_fence/1000`, `graph_shapes/chain_cheap_graph/1000`, `sharded_term` @1K cells; default-off env gate, then per-id `-E` A/B.
 
 ---
 
-### 46. [P2] `pipe_range` filter without terminal materialization
-
-- Context: `RangePipe::filter`/`try_map` materialize the input buffer at the terminal (documented fallback) — measured 56–70 % of @1M/4M owned range calls (attribution.md "Input materialization"). The merge-tree leaves build a per-leaf Vec from generated indices, so generation-inside-the-leaf (e.g. `par_range_gen_leaf`) removes both the input buffer and the serial O(n) fill.
-- Protocol: new `range_gen_filter` cells in `sync_lightweight_input_materialize` @1M/4M against the `range_input`/`range_gen` rows; same-binary env gate feasible (terminals already know `MAY_FILTER`).

@@ -317,14 +317,83 @@ fn test_pipe_range_serial_pool_arm() {
 
 #[test]
 fn test_pipe_range_filter_chain() {
-    // Filter chains materialize the indices (documented fallback) —
-    // correctness must match the plain `pipe(range)` result exactly.
-    let r: Vec<usize> = pipe_range(0..10_000)
-        .map(|i: usize| i + 1)
+    // Non-zero start exercises the generation filter core's `base + i`
+    // arithmetic; correctness must match the plain `pipe(range)` result.
+    let r: Vec<usize> = pipe_range(1_000_000..1_020_000)
+        .map(|i: usize| i.wrapping_mul(3))
         .filter(|x: &usize| x % 3 == 0)
         .collect();
-    let expected: Vec<usize> = (0..10_000).map(|i| i + 1).filter(|x| x % 3 == 0).collect();
+    let expected: Vec<usize> = (1_000_000..1_020_000)
+        .map(|i: usize| i.wrapping_mul(3))
+        .filter(|x| x % 3 == 0)
+        .collect();
     assert_eq!(r, expected);
+}
+
+/// Panic through the generation filter core (merge tree): every *constructed*
+/// output must be dropped exactly once — the unwinding leaf's partial `Vec`
+/// and the waited-out siblings' `Vec`s all drop on the way out, and no input
+/// buffer exists to account for.
+#[test]
+fn test_pipe_range_filter_panic_drop_accounting() {
+    struct DropCounter {
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let n: usize = if cfg!(miri) {
+        500
+    } else {
+        20_000
+    };
+    let drops = Arc::new(AtomicUsize::new(0));
+    let constructed = Arc::new(AtomicUsize::new(0));
+    let (d, c) = (drops.clone(), constructed.clone());
+    // `n / 3 + 1` survives the `i % 3 != 0` filter (n/3 ≡ 0 mod 3 for these
+    // sizes), so the map always sees it — the panic is deterministic in both
+    // the serial and the parallel arm.
+    let panic_at = n / 3 + 1;
+
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let out: Vec<DropCounter> = pipe_range(0..n)
+            // Keep ~2/3 so survivor writes and drops interleave with the
+            // panic across leaves.
+            .filter(|i: &usize| i % 3 != 0)
+            .map(move |i: usize| {
+                assert!(i != panic_at, "boom");
+                c.fetch_add(1, Ordering::Relaxed);
+                DropCounter { drops: d.clone() }
+            })
+            .collect();
+        // Unreachable in practice; if scheduling avoided the panic, `out`'s
+        // drop keeps the accounting below valid.
+        drop(out);
+    }));
+    assert!(r.is_err(), "panic must propagate through the filter core");
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        constructed.load(Ordering::Relaxed),
+        "every constructed output must be dropped exactly once (no leak, no double drop)"
+    );
+}
+
+#[test]
+fn test_pipe_range_filter_for_each() {
+    // The sink generation core honours filters directly (filtered items skip
+    // the closure) — no materialization on this terminal.
+    let count = Arc::new(AtomicUsize::new(0));
+    let c = count.clone();
+    pipe_range(0..8_000)
+        .map(|i: usize| i * 2)
+        .filter(|x: &usize| x % 4 == 0)
+        .for_each(move |_x: usize| {
+            c.fetch_add(1, Ordering::Relaxed);
+        });
+    assert_eq!(count.load(Ordering::Relaxed), 4_000);
 }
 
 #[test]

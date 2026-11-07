@@ -197,7 +197,10 @@ fn bench_lightweight_owned_cold(c: &mut Criterion) {
 /// - `borrowed_floor` — `pipe_ref(&v)`: engine only, the reference for how much of `range_input` is
 ///   input materialization rather than engine;
 /// - `range_gen` — `pipe_range(0..n)`: the zero-materialization generation core (items generated in
-///   the leaves, no input buffer).
+///   the leaves, no input buffer);
+/// - `range_input_filter` / `range_gen_filter` — the filter-chain twins of the pair above (keep-50
+///   %): materialized owned filter collect vs the generation filter core (todo #46);
+/// - `rayon_filter` — rayon's own range filter collect, the family's drift anchor.
 ///
 /// 1M/4M (8/32 MB) avoid the 100K whole-group collapse regime; the sizes are
 /// the anchors documented to stay clean at +-1% in-group.
@@ -245,6 +248,41 @@ fn bench_input_materialize(c: &mut Criterion) {
             b.iter(|| {
                 let r: Vec<u64> = youpipe::pipe_range(0..size)
                     .map(|x: usize| black_box((x as u64).wrapping_add(1)))
+                    .collect();
+                black_box(r)
+            });
+        });
+
+        // Filter-chain twins of the pair above (todo #46): same map + a
+        // keep-50 % predicate, so `range_input_filter` − `range_gen_filter`
+        // isolates the input materialization the gen filter core removed
+        // (both sides pay the same predicate, survivor Vec and filter core;
+        // landed −55 % @1M/4M, 25/25). `rayon_filter` anchors cross-session
+        // drift.
+        group.bench_function(BenchmarkId::new("range_input_filter", size), |b| {
+            b.iter(|| {
+                let r: Vec<u64> = youpipe::pipe(0..size as u64)
+                    .map(|x| black_box(x.wrapping_add(1)))
+                    .filter(|x| x & 1 == 0)
+                    .collect();
+                black_box(r)
+            });
+        });
+        group.bench_function(BenchmarkId::new("range_gen_filter", size), |b| {
+            b.iter(|| {
+                let r: Vec<u64> = youpipe::pipe_range(0..size)
+                    .map(|x: usize| black_box((x as u64).wrapping_add(1)))
+                    .filter(|x| x & 1 == 0)
+                    .collect();
+                black_box(r)
+            });
+        });
+        group.bench_function(BenchmarkId::new("rayon_filter", size), |b| {
+            b.iter(|| {
+                let r: Vec<u64> = (0..size as u64)
+                    .into_par_iter()
+                    .map(|x| black_box(x.wrapping_add(1)))
+                    .filter(|x| x & 1 == 0)
                     .collect();
                 black_box(r)
             });

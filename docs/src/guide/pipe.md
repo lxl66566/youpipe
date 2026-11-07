@@ -106,11 +106,10 @@ let r: Vec<u64> = pipe_range(0..1_000_000)
 ```
 
 `pipe_range` has the same builder surface as `pipe` (`map`, `filter`,
-`try_map`, the tuning setters). Chains that can `filter` — and the fallible
-`try_collect()` terminal — materialize the indices once at the terminal
-(the same serial fill `pipe(range)` always paid); the filter-free `collect()`
-and `for_each()` run the generation core. If you already own a `Vec`, keep
-using `pipe(v)` — it reuses your buffer with zero copies.
+`try_map`, the tuning setters), and `collect()`/`for_each()` run generation
+cores for filter chains too — only the fallible `try_map` transition
+materializes the indices (at the builder call). If you already own a `Vec`,
+keep using `pipe(v)` — it reuses your buffer with zero copies.
 
 ## No global stage waits
 
