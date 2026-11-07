@@ -396,7 +396,7 @@ pub(crate) fn claim_scale_enabled() -> bool {
             panic!("YOUPIPE_CLAIM_SCALE: invalid value {other:?} (leave unset or use \"0\"/\"1\")")
         },
         // Unset = the default-on policy, async-tailed chains only (the
-        // scope predicate lives at the stream spawn sites).
+        // scope predicate lives in the stream engine's `ClaimKnobs::resolve`).
         Err(_) => true,
     })
 }

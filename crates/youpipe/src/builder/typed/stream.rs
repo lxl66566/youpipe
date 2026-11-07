@@ -514,6 +514,70 @@ fn fence_batch_send<T: Send + 'static, Tx: SendItem<T>>(
     tx.send_batch(batch, staged)
 }
 
+/// Claim and delivery knobs of one sync fan-out stage's workers, resolved
+/// once per spawn — the single policy source for [`spawn_stage_fanout`] and
+/// [`spawn_expand_stage_fanout`].
+#[derive(Clone, Copy)]
+struct ClaimKnobs {
+    /// Per-worker claim share of the batch cap (0 = batching off).
+    claim_cap: usize,
+    /// Claim scratch capacity and [`ClaimWindow`] ceiling.
+    scratch_cap: usize,
+    /// Staged batch delivery on the stage's output channel.
+    tx_batch: bool,
+}
+
+impl ClaimKnobs {
+    /// `workers`: the stage's worker count (one sender each). `feeds_async`:
+    /// the spawning factory's `OutChannel::FEEDS_ASYNC`.
+    // Forced, not `#[inline]`: the plain hint left each spawn core 16 B larger
+    // than the pre-extraction inline blocks, shifting hundreds of downstream
+    // functions of the bench binaries (layout-sensitive crate, see
+    // .cargo/config.toml); `inline(always)` restores the pre-extraction
+    // codegen (bench `.text` identical up to three reordered drop-glue fns).
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn resolve<R: AsyncRuntime>(ctx: &StreamCtx<'_, R>, workers: usize, feeds_async: bool) -> Self {
+        // Multi-consumer ring: the stage's workers share one receiver, so
+        // each claim is capped at a per-worker share of the batch cap
+        // (`per_worker_claim_cap`).
+        let claim_cap = per_worker_claim_cap(workers.max(1));
+        // Backlog-scaled claim window (YOUPIPE_CLAIM_SCALE, todo #34): with the
+        // knob on the scratch buffer is sized at the full batch cap and each
+        // worker's claim bound adapts (see `ClaimWindow`); off, the fixed
+        // per-worker share — byte-for-byte the pre-knob loops. Async-tailed
+        // chains only: pure-sync chains regressed under the coarser claim
+        // rhythm (`stream_pipeline/with_fence/100K` +60 %), and their stages
+        // drain the ring as fast as they claim — no backlog to amortize (the
+        // capacity floor's predicate, `ctx.has_async_stage`).
+        let scratch_cap =
+            if crate::handoff::claim_scale_enabled() && ctx.has_async_stage && claim_cap > 0 {
+                crate::handoff::batch_recv_cap()
+            } else {
+                claim_cap
+            };
+        // Batched output delivery (YOUPIPE_STREAM_TX_BATCH): stage the mapped
+        // claim batch, flush with one `try_send_batch` per free run + per-item
+        // blocking fallback. Zero-cap claims keep the per-item send (staging
+        // single-item batches only adds moves). Async-tailed chains are gated
+        // per hop by `YOUPIPE_ASYNC_TX_BATCH` (todo #34 re-measure against the
+        // M:N drivers): the mixed hop into the async stage wins batched, the
+        // sync→sync mid hops keep the per-item rhythm.
+        let tx_batch = crate::handoff::stream_tx_batch()
+            && claim_cap > 0
+            && match crate::handoff::async_tx_gate() {
+                crate::handoff::AsyncTxGate::Full => true,
+                crate::handoff::AsyncTxGate::MixedOnly => feeds_async || !ctx.has_async_stage,
+                crate::handoff::AsyncTxGate::Off => !ctx.has_async_stage,
+            };
+        Self {
+            claim_cap,
+            scratch_cap,
+            tx_batch,
+        }
+    }
+}
+
 /// Spawn `parallelism` workers that pull from `rx`, apply `stage`, and
 /// forward to `tx` — as pool jobs in pool mode, or as dedicated OS threads
 /// when [`StreamCtx::dedicated_threads`] is set. Each worker loops until its
@@ -555,39 +619,11 @@ fn spawn_stage_fanout<I, O, Tx, R>(
     R: AsyncRuntime,
 {
     let stage = Arc::new(stage);
-    // Multi-consumer ring: the workers below share `rx`, so each claim is
-    // capped at a per-worker share of the batch cap
-    // (`per_worker_claim_cap`).
-    let claim_cap = per_worker_claim_cap(txs.len().max(1));
-    // Backlog-scaled claim window (YOUPIPE_CLAIM_SCALE, todo #34): with the
-    // knob on the scratch buffer is sized at the full batch cap and each
-    // worker's claim bound adapts (see `ClaimWindow`); off, the fixed
-    // per-worker share — byte-for-byte the pre-knob loops. Async-tailed
-    // chains only: pure-sync chains regressed under the coarser claim
-    // rhythm (`stream_pipeline/with_fence/100K` +60 %), and their stages
-    // drain the ring as fast as they claim — no backlog to amortize (the
-    // capacity floor's predicate, `ctx.has_async_stage`).
-    let scratch_cap =
-        if crate::handoff::claim_scale_enabled() && ctx.has_async_stage && claim_cap > 0 {
-            crate::handoff::batch_recv_cap()
-        } else {
-            claim_cap
-        };
-    // Batched output delivery (YOUPIPE_STREAM_TX_BATCH): stage the mapped
-    // claim batch, flush with one `try_send_batch` per free run + per-item
-    // blocking fallback. Zero-cap claims keep the per-item send (staging
-    // single-item batches only adds moves). Async-tailed chains are gated
-    // per hop by `YOUPIPE_ASYNC_TX_BATCH` (todo #34 re-measure against the
-    // M:N drivers): the mixed hop into the async stage wins batched, the
-    // sync→sync mid hops keep the per-item rhythm (`feeds_async` is the
-    // spawning factory's `OutChannel::FEEDS_ASYNC`).
-    let tx_batch = crate::handoff::stream_tx_batch()
-        && claim_cap > 0
-        && match crate::handoff::async_tx_gate() {
-            crate::handoff::AsyncTxGate::Full => true,
-            crate::handoff::AsyncTxGate::MixedOnly => feeds_async || !ctx.has_async_stage,
-            crate::handoff::AsyncTxGate::Off => !ctx.has_async_stage,
-        };
+    let ClaimKnobs {
+        claim_cap,
+        scratch_cap,
+        tx_batch,
+    } = ClaimKnobs::resolve(ctx, txs.len(), feeds_async);
     // Collect all worker closures and submit as a single batch. This reduces
     // injector-queue notification overhead from N SeqCst fences + N JEC
     // increments (one per `submit`) down to 1 (one `submit_batch`), which
@@ -662,27 +698,16 @@ fn spawn_expand_stage_fanout<I, N, Tx, R>(
     R: AsyncRuntime,
 {
     let expand = Arc::new(expand);
-    // Per-worker claim share — see `spawn_stage_fanout` (an expand worker
-    // turns one input into many outputs, so a monopolized burst costs even
-    // more wall time than on a plain stage).
-    let claim_cap = per_worker_claim_cap(txs.len().max(1));
-    // Backlog-scaled claim window and the async-tail tx-batch gate — see
-    // `spawn_stage_fanout` (same knobs, same predicates). The staging
-    // flush cap sits at the batch cap so an expansion fan-out cannot grow
-    // the staging buffer with a whole claim batch's outputs.
-    let scratch_cap =
-        if crate::handoff::claim_scale_enabled() && ctx.has_async_stage && claim_cap > 0 {
-            crate::handoff::batch_recv_cap()
-        } else {
-            claim_cap
-        };
-    let tx_batch = crate::handoff::stream_tx_batch()
-        && claim_cap > 0
-        && match crate::handoff::async_tx_gate() {
-            crate::handoff::AsyncTxGate::Full => true,
-            crate::handoff::AsyncTxGate::MixedOnly => feeds_async || !ctx.has_async_stage,
-            crate::handoff::AsyncTxGate::Off => !ctx.has_async_stage,
-        };
+    // Same knobs as `spawn_stage_fanout`; the per-worker claim share matters
+    // more here (an expand worker turns one input into many outputs, so a
+    // monopolized burst costs even more wall time than on a plain stage).
+    let ClaimKnobs {
+        claim_cap,
+        scratch_cap,
+        tx_batch,
+    } = ClaimKnobs::resolve(ctx, txs.len(), feeds_async);
+    // The staging flush cap sits at the batch cap so an expansion fan-out
+    // cannot grow the staging buffer with a whole claim batch's outputs.
     let flush_cap = crate::handoff::batch_recv_cap().max(claim_cap).max(1);
     let jobs: Vec<_> = txs
         .into_iter()
@@ -1908,10 +1933,10 @@ pub struct StreamCtx<'a, R: AsyncRuntime = DefaultRuntime> {
     pub dedicated_threads: bool,
     /// Whether the chain contains any async stage (`StageSpawn::
     /// has_async_stage`). Gates the async family of the chain capacity
-    /// floor in [`Self::stage_buffer`] (and keeps async-tailed chains on
-    /// per-item sends, `spawn_stage_fanout`'s `tx_batch`): pure-sync chains
-    /// show no slow mode at the small default, so the lift binds only where
-    /// runtime-task wake-RTT pacing exists.
+    /// floor in [`Self::stage_buffer`] (and the fan-out stages' claim window
+    /// and async-tail tx-batch gate, [`ClaimKnobs::resolve`]): pure-sync
+    /// chains show no slow mode at the small default, so the lift binds only
+    /// where runtime-task wake-RTT pacing exists.
     pub(crate) has_async_stage: bool,
     /// Whether the chain contains a `Chunked`-mode fence (`StageSpawn::
     /// has_chunked_fence`). Gates the fence family of the chain capacity
