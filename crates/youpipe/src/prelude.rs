@@ -24,7 +24,7 @@ pub use crate::{
     StreamPipe, StreamStart, SyncStageOptions, TryPipe, TryPipeRef, Unordered, Workload,
     executor::{ComputePool, compute::MAX_COMPUTE_WORKERS},
     graph,
-    handoff::{Receiver, Sender, async_channel, channel},
+    handoff::{MpscReceiver, MpscSender, Receiver, Sender, async_channel, channel, mpsc_channel},
     pipe, pipe_range, pipe_ref,
     runtime::{AsyncRuntime, DefaultRuntime},
     scope::{PipelineScope, ScopedPipe, ScopedTryPipe, scope},

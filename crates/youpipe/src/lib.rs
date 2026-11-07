@@ -83,7 +83,10 @@ pub use executor::{ComputePool, KeepWarm, compute::MAX_COMPUTE_WORKERS};
 pub use graph::{
     AsyncNodeOptions, Collect, CollectSet, GraphBuilder, NodeHandle, NodeOptions, graph,
 };
-pub use handoff::{AsyncReceiver, AsyncSender, Receiver, Sender, async_channel, channel};
+pub use handoff::{
+    AsyncReceiver, AsyncSender, MpscReceiver, MpscSender, Receiver, Sender, async_channel, channel,
+    mpsc_channel,
+};
 #[cfg(feature = "tokio-runtime")]
 pub use runtime::TokioPool;
 pub use runtime::{AsyncRuntime, DefaultRuntime, NoRuntime};
