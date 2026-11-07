@@ -145,7 +145,7 @@ tokio             = { workspace = true, features = ["io-util", "net", "test-util
 # youpipe-concurrent-queue tests already use `cfg(loom)`).
 #
 # NOTE: setting RUSTFLAGS replaces the `[target.'cfg(all())'] rustflags` from
-# `.cargo/config.toml` (`-C panic=unwind -C llvm-args=-align-all-functions=5`),
+# `.cargo/config.toml` (`-C panic=unwind -C llvm-args=-align-all-functions=6`),
 # which only matter for release/bench builds — test builds are unaffected.
 #
 # Only the synchronization cores are modeled — the Registry spawns real OS

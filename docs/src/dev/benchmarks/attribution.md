@@ -103,8 +103,10 @@ An acceptance bench surfaced the sharpest instance of the layout trap yet: horiz
 Mitigation, now permanent in `.cargo/config.toml` under `[target.'cfg(all())']`:
 
 ```
-rustflags = ["-C", "panic=unwind", "-C", "llvm-args=-align-all-functions=5"]
+rustflags = ["-C", "panic=unwind", "-C", "llvm-args=-align-all-functions=6"]
 ```
+
+`=5` (32 B) was the value until 2026-11-08; the upgrade to `=6` (64 B) that closes the glue-emission face is recorded at the end of this section.
 
 Precedence note (2026-11): these flags originally sat in `[build] rustflags`, which any target-level rustflags anywhere in the config hierarchy silently voids — this host's `~/.cargo/config.toml` mold section did exactly that, so the mitigation never applied here (symbol census of the bench binary: 1789/3440 functions unaligned to 32 B). `[target.'cfg(all())']` always matches, wins the same precedence race and composes with the host table; after the move the census reads 3431/3440 aligned (the 9 stragglers are linker/PLT shims like `_init`/`_fini`).
 
@@ -118,6 +120,41 @@ Practical consequences:
 - The flag is repo-local: rustflags do not propagate to downstream crates, and neither does the lottery. A downstream binary's layout is an independent draw driven by its own dependency graph, so a "regression" of this class measured in our bench binary says nothing about theirs, and perf-sensitive downstream A/B comparisons need the same flag in their own `.cargo/config.toml`, where it covers the whole dependency graph.
 
 A fifth face of the lottery (2026-10-18): the same commit compiled in two independent `bench_ab.sh` materializations swings too, because cargo's metadata hash is path-dependent and each materialized worktree path yields a differently-laid-out bench binary. The cancel/fence/async 1K pair family in `sync_fuse` swung ±2–7 % across independent same-commit builds: one session's +4.0 % stable 0/9 "regression" of `cancel_pair_cpu_split/100000` measured −1.2 % in the next session's build of the identical commit, and the tell was non-monotonic (with-shortcut and without-shortcut bins both slow while the merged bin is not, impossible for a semantic effect). Verdicts for that family need same-commit re-materialization cross-checks, not just interleaved rounds.
+
+## 64 B upgrade landed (2026-11-08)
+
+`=5` → `=6` in `.cargo/config.toml`. 32 B pinned function entries but left each start on either phase of the 64 B grid, so an emitted-or-not glue decision (the [5d199e7 class](#v070-release-regression-check-2026-10-23)) could still shift a neighbouring hot loop across a 32 B uop-cache window; 64 B pins every function start mod 64 and closes that class. Landing A/B (recompile protocol, base=`main` 32 B vs side=working tree 64 B; criterion 5 interleaved per-id rounds, horizontal 5 alternating two-binary rounds, taskset 1–31):
+
+| criterion id | 32 B med | 64 B med | Δ | slower |
+|---|---|---|---|---|
+| sync_lightweight/youpipe_par_map_borrowed/1000000 | 174.4 µs | 173.3 µs | −0.6 % | 14/25 |
+| sync_lightweight/rayon_par_iter/1000000 (drift anchor) | 246.5 µs | 247.9 µs | +0.6 % | 10/25 |
+| graph_shapes/chain_cheap_graph/1000 | 127.8 µs | 128.2 µs | +0.3 % | 15/25 |
+| graph_shapes/chain_cheap_graph/100000 | 8.809 ms | 8.570 ms | −2.7 % | 13/25 |
+| graph_shapes/fanout_async_cheap_graph/100000 | 26.46 ms | 26.37 ms | −0.3 % | 15/25 |
+| stream_pipeline/single_stage_unordered/100000 | 61.72 µs | 65.71 µs | +6.5 % | 10/25 |
+
+| horizontal scenario/lib/n | 32 B med | 64 B med | Δ | slower |
+|---|---|---|---|---|
+| cpu_balanced/youpipe/100000 | 0.067 ms | 0.067 ms | +0.2 % | 4/5 |
+| cpu_balanced/youpipe/1000000 | 0.494 ms | 0.494 ms | +0.3 % | 3/5 |
+| cpu_balanced/rayon/100000 | 0.148 ms | 0.146 ms | −1.2 % | 1/5 |
+| cpu_balanced/rayon/1000000 | 0.628 ms | 0.627 ms | −0.1 % | 3/5 |
+| cpu_balanced_readback/youpipe/100000 | 0.077 ms | 0.078 ms | +0.9 % | 2/5 |
+| cpu_balanced_readback/youpipe/1000000 | 0.658 ms | 0.655 ms | −0.5 % | 1/5 |
+| cpu_balanced_readback/rayon/100000 | 0.146 ms | 0.163 ms | +11.5 % | 5/5 |
+| cpu_balanced_readback/rayon/1000000 | 0.723 ms | 0.879 ms | +21.6 % | 5/5 |
+
+The `stream_pipeline/single_stage_unordered` +6.5 % reads noise (10/25 dominant, 45 % spread, both sides step 90 µs → 61 µs mid-run — the family's known placement wobble). The lone large flag, horizontal `cpu_balanced_readback/rayon` +21.6 % @1M (+11.5 % @100K, 5/5 both), is **not** a 64 B cost — a same-flag twin-materialization control (each side rebuilt at a second, path-different worktree, 5 alternating rounds per pair) reads it as the 32 B side's lucky draw:
+
+| row (5-round medians) | 32 B n1 | 32 B n2 | 64 B n1 | 64 B n2 |
+|---|---|---|---|---|
+| cpu_balanced/rayon/1000000 | 0.626 ms | 0.465 ms (−25.6 %, 0/5) | 0.624 ms | 0.627 ms |
+| cpu_balanced_readback/rayon/1000000 | 0.722 ms | 0.876 ms (+21.4 %, 5/5) | 0.879 ms | 0.878 ms |
+
+The 32 B pair reproduces the fifth-face materialize band (±26 % on the rayon rows, opposite signs per row — the single-materialization A/B above happened to draw the fast end of `readback` and the typical end of `cpu_balanced`), while both 64 B materializations agree within ±0.5 % there and ±2.4 % across every row. Every youpipe row is flat across all four materializations (cpu_balanced ±0.6 %, readback ±1.3 %): **no systematic loss**, and the finer grid also damps the fifth face — cross-materialization spread on the rayon rows collapses from ±26 % (32 B) to ±2 % (64 B).
+
+Baselines re-rolled: every saved criterion baseline from before this switch is void — discard the first post-switch `change: …` output and re-anchor comparisons from a fresh base. Binary cost: the horizontal bench binary grows 34,035,688 → 34,070,744 bytes (+0.10 %); a `.text` census reads 2331/2338 FUNC symbols 64 B-aligned under `=6` (4 stragglers are linker/PLT shims) vs 1233/2337 under `=5`. The `cpu_balanced_readback/100K` youpipe wobble above is unaffected, as predicted (buffer placement, not code layout).
 
 Settled the same day by double-controlled A/B (solo cherry-pick and main-revert sides agreeing): the injector `is_empty()` advisory gate in `pop_injected_job` costs ~+2.3 % on `mixed_load/youpipe_stream_cpu/1000` and buys nothing measurable elsewhere, and the −8 % first attributed to it was itself a branch-level layout artifact. Kept for now (within the pair-family noise band, and the theory of skipping a locked op on idle passes still holds); revisit when next tuning the injector path.
 
@@ -256,7 +293,7 @@ Full-suite interleaved A/B, `v0.6.1` (0ddc9c2) vs the 0.7.0 tip: 11 criterion ta
 - `sync_reduce/rayon_sum/10000` +2.5 % (1/9): rayon control row, same layout drift.
 - `channel_throughput/std_mpsc_bounded/10000` +77 % noise: the documented bimodal std row (same flag as the v0.6.1 check).
 
-Horizontal rerun (5 interleaved rounds, cores 1–31) initially showed `cpu_balanced` youpipe 100K–4M +20…+40 % — **the one regression the criterion suite is blind to** (its `sync_lightweight/youpipe_par_map_borrowed/1M` twin stayed +0.1 %: different bench binary, different map closure, different layout draw). Interleaved same-session two-binary runs reproduced it; three independent materializations of HEAD agreed within ±1 %, so deterministic, not a draw. Bisect pinned it to 5d199e7 (stream tx batch): the `Vec::extend`-over-`drain` staging in `SendItem::send_batch` emits a panic landing pad that monomorphizes `drop_in_place::<Map<Drain<T>, _>>` per channel item type — three ~112 B glue functions that landed before the fused collect leaf in the single codegen unit and shifted its hot loop by 336 B (≡ 48 mod 64), across a 32 B uop-cache window boundary (disassembly: old and new loops byte-identical modulo the +0x770 shift). A new face of the [layout lottery](#codegen-layout-lottery-and-32-b-function-alignment-2026-10-06) that 32 B function alignment does not cure: glue emission, not function entry alignment, rolled the dice. Fixed by `stage_batch` (handoff/channel.rs): a panic-free pointer-move staging loop (reserve precedes every move) emits no landing pads and no per-type drop glue; `#[inline(never)]` makes the footprint caller-independent. Four independent builds verified flat (±2 %) against the pre-regression level. Structural mitigation left open: `-align-all-functions=6` (64 B) would pin every function start mod 64 and shrink this whole failure class, at the cost of re-rolling every bench baseline once.
+Horizontal rerun (5 interleaved rounds, cores 1–31) initially showed `cpu_balanced` youpipe 100K–4M +20…+40 % — **the one regression the criterion suite is blind to** (its `sync_lightweight/youpipe_par_map_borrowed/1M` twin stayed +0.1 %: different bench binary, different map closure, different layout draw). Interleaved same-session two-binary runs reproduced it; three independent materializations of HEAD agreed within ±1 %, so deterministic, not a draw. Bisect pinned it to 5d199e7 (stream tx batch): the `Vec::extend`-over-`drain` staging in `SendItem::send_batch` emits a panic landing pad that monomorphizes `drop_in_place::<Map<Drain<T>, _>>` per channel item type — three ~112 B glue functions that landed before the fused collect leaf in the single codegen unit and shifted its hot loop by 336 B (≡ 48 mod 64), across a 32 B uop-cache window boundary (disassembly: old and new loops byte-identical modulo the +0x770 shift). A new face of the [layout lottery](#codegen-layout-lottery-and-32-b-function-alignment-2026-10-06) that 32 B function alignment does not cure: glue emission, not function entry alignment, rolled the dice. Fixed by `stage_batch` (handoff/channel.rs): a panic-free pointer-move staging loop (reserve precedes every move) emits no landing pads and no per-type drop glue; `#[inline(never)]` makes the footprint caller-independent. Four independent builds verified flat (±2 %) against the pre-regression level. Structural mitigation landed 2026-11-08: `-align-all-functions=6` (64 B) pins every function start mod 64 and shrinks this whole failure class — the landing A/B and the one-time baseline re-roll are recorded in the [layout-lottery section](#codegen-layout-lottery-and-32-b-function-alignment-2026-10-06).
 
 Final 0.7.0 horizontal: fused CPU, io_async, io_blocking and cpu_unbalanced all reproduce the 0.6.1 readings within ±3 %; the streaming-engine scenarios capture the 0.7.0 gains — mixed_cpu_io/2K −5.5 %, real_doc/4K −3.1 %, real_web/2K −2.2 % vs the v0.6.1 session (data and charts refreshed in [counters.md](counters.md)).
 

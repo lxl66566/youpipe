@@ -13,20 +13,20 @@
 # pinned in Cargo.toml's `[profile.dev]` instead, where cargo can emit the
 # matching `-C debug-assertions=on`. Override or disable by setting
 # `RUSTFLAGS` in the environment.
-# `-C llvm-args=-align-all-functions=5` (32-byte function alignment): this
+# `-C llvm-args=-align-all-functions=6` (64-byte function alignment): this
 # crate is acutely codegen-layout-sensitive (single codegen unit — any
-# unrelated source edit reshuffles the hot loops' instruction layout).
-# Measured 2026-10: an async-only refactor (5e6bd83, code unreachable from
-# the sync path) regressed horizontal cpu_balanced 100K-4M by +29..+40 %
-# through pure layout shift; with 32 B function alignment the same commit
-# measures 1.00x against its parent. The flag costs nothing on the aligned
-# side (v0.6.0 base: 1.00x with/without) and converts the layout lottery
-# into a stable grid. Not a complete cure: function-entry alignment cannot
-# pin glue that may or may not be emitted at all — 5d199e7's Vec::extend
-# landing pad monomorphized per-type drop glue that shifted the fused leaf
-# ≡48 mod 64 (+33..+40 %, fixed in handoff/channel.rs `stage_batch`);
-# `-align-all-functions=6` (64 B) would close that class too but re-rolls
-# every bench baseline once (open, see attribution.md 2026-10-23).
+# unrelated source edit reshuffles the hot loops' instruction layout), with
+# measured pure-layout swings of +29..+40 % (full history in attribution.md's
+# layout-lottery section). 32 B (=5, adopted 2026-10) pinned function entries
+# but not glue that may or may not be emitted at all: 5d199e7's per-type drop
+# glue shifted a fused leaf ≡48 mod 64, across a 32 B uop-cache window
+# (+33..+40 %, fixed in handoff/channel.rs `stage_batch`). 64 B (2026-11-08)
+# pins every function start mod 64, closing that glue-emission class too; the
+# landing A/B (attribution.md, layout-lottery section) found no systematic
+# loss and damped the materialize-to-materialize spread of the rayon
+# control rows from ±26 % (32 B) to ±2 %. It re-rolled every bench baseline
+# once: saved criterion baselines from before the switch are void —
+# comparisons must start from a fresh base.
 # These live under `[target.'cfg(all())']`, not `[build]`: target-level
 # rustflags from ANY config file in the hierarchy (this host's
 # `~/.cargo/config.toml` sets `[target.'cfg(target_os = "linux")'] rustflags`
@@ -40,7 +40,7 @@ rustflags = [
   "-C",
   "panic=unwind",
   "-C",
-  "llvm-args=-align-all-functions=5",
+  "llvm-args=-align-all-functions=6",
 ]
 
 # Miri configuration.
