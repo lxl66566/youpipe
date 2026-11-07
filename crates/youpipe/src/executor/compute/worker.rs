@@ -577,6 +577,24 @@ mod tests {
         seen
     }
 
+    /// `single_cpu_pool_workers` rescanned until it observes at least `min`
+    /// entries or a 500 ms deadline passes; returns the last scan. The
+    /// /proc/self/task readdir tears under sibling tests' pool threads
+    /// spawning and exiting — a torn pass silently drops entries of this
+    /// test's own stable, already-pinned workers, so only a retry reaches a
+    /// verdict. Broken pinning never crosses `min` at any retry count, so
+    /// the retry cannot mask it (2026-11 flake, 1-in-7 full-suite runs).
+    #[cfg(all(target_os = "linux", not(miri)))]
+    fn single_cpu_pool_workers_until(allowed: &[u32], min: usize) -> Vec<u32> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut seen = single_cpu_pool_workers(allowed);
+        while seen.len() < min && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            seen = single_cpu_pool_workers(allowed);
+        }
+        seen
+    }
+
     #[cfg(all(target_os = "linux", not(miri)))]
     #[test]
     fn test_new_pinned_round_robins_past_the_cpu_set() {
@@ -589,7 +607,7 @@ mod tests {
         let pool = ComputePool::new_pinned(n);
         pool.registry().wait_until_primed();
 
-        let seen = single_cpu_pool_workers(&allowed);
+        let seen = single_cpu_pool_workers_until(&allowed, n);
         assert!(
             seen.len() >= n,
             "all {n} workers must be pinned, saw {} single-CPU workers",
@@ -618,7 +636,7 @@ mod tests {
         // Force the workers to exist before scanning /proc.
         pool.registry().wait_until_primed();
 
-        let mut distinct = single_cpu_pool_workers(&allowed);
+        let mut distinct = single_cpu_pool_workers_until(&allowed, n);
         assert!(
             distinct.len() >= n,
             "expected ≥{n} single-CPU workers, saw {distinct:?}"
