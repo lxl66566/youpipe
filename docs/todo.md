@@ -29,7 +29,6 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 - Risk: the fork must stay diffable; the waker-registry reset semantics are the hard part.
 - Protocol: `stream_pipeline/with_fence/1000`, `graph_shapes/chain_cheap_graph/1000`, `sharded_term` @1K cells; default-off env gate, then per-id `-E` A/B.
 
-
 ---
 
 ### 48. [P2] sharded-terminal per-shard depth caps the collector's batch claims (r5 audit)
@@ -39,9 +38,3 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 - Protocol: same-binary env knob (e.g. `YOUPIPE_SHARD_DEPTH`) flooring per-shard capacity at `max(current, batch_recv_cap())` when `YOUPIPE_BATCH_RECV` is on; `bench_ab.sh -E` per-id isolated interleaving on `sharded_term/single_unordered_{cheap,cpu}` + `single_ordered_cpu` @1K/@100K (the collector-paced cells), `workers2_cpu` / `multi2_cpu` as shallow-shape controls, `stream_pipeline/single_stage_{ordered,unordered}` + `mixed_load/youpipe_stream_cpu` as no-regression gates; accept only above the 2 % floor on the target cells with the controls flat.
 
 ---
-
-### 49. [P2] hotpath probe for `ReorderBuffer::insert_into` (r5 audit, caliber)
-
-- Context: every ordered drain (`drain_ordered_with` / `drain_ordered_sharded` / async twins) carries `#[hotpath::measure]`, but the reorder slice inside them has no probe — r5 had to size it by subtraction (`drain_ordered_sharded` 150.7 vs `drain_unordered_sharded` 164.5 ns/item: the reorder + scratch-drain + accounting slice is sub-noise on the in-order-dominated shape). The skew-heavy shapes (a straggler worker forcing the slot-write slow path per item; the 2026-10 `sharded_term/single_ordered_cpu` bistability investigation, ~29 vs ~80 ms from unchanged binaries) have no direct reading of the fast/slow path split inside `insert_into`. One `#[cfg_attr(feature = "hotpath", hotpath::measure)]` on `insert_into` (not also on `flush_ready_into` — the nested span would double-count) closes the gap; zero-cost with the feature off.
-- Dead-ends check: none — pure instrumentation.
-- Protocol: after landing the probe, rerun `stream-engine-ordered` (fast path ≈ 1 call/item) and a straggler-shaped variant before proposing any further ordered-path change; r5's negative result — ordered ≈ unordered within the family's bistability band, per-item reorder cost below the action floor — is the baseline any proposal must beat.

@@ -122,6 +122,11 @@ impl<T> ReorderBuffer<T> {
     /// `Vec` — the earlier `insert()`-returning-a-`Vec` shape cost a
     /// `malloc` + `free` per item purely to move one value, which at 100 k+
     /// items dominated the ordered collector's cost.
+    // Hotpath probe (todo #49): the direct fast/slow-path reading the
+    // ordered drains' own spans cannot give (the r5 audit had to size this
+    // slice by subtraction). NOT also on `flush_ready_into` — the nested
+    // span would double-count every flushed item.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn insert_into(&mut self, seq: u64, item: T, sink: &mut impl FnMut(T)) {
         // Fast path: item is exactly next expected and nothing is buffered.
         // `len == 0` implies every slot is unoccupied (occupied slots are

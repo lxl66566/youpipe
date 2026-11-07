@@ -16,6 +16,7 @@
 //! # true streaming engine (defeat the fused pass-through — see run_stream_engine):
 //! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- stream-engine 1000000 30
 //! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- stream-engine-ordered 1000000 20
+//! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- stream-engine-ordered-straggler 200000 10
 //! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- stream-engine-foreach 1000000 20
 //! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- stream-engine-fence 1000000 5
 //! cargo run --release -p youpipe-bench --bin hotpath-profile --features hotpath -- stream-engine-async 1000000 10
@@ -59,6 +60,18 @@ fn cpu_light(x: u64) -> u64 {
     x.wrapping_add(1)
 }
 
+/// ~300k dependent mul-adds ≈ 100 µs on the bench box (todo #49 straggler
+/// caliber): long enough that a whole `STRAGGLER_PERIOD` of cheap items
+/// piles into the reorder buffer behind one straggler. Black-boxed so the
+/// chain cannot fold.
+fn straggler_spin(x: u64) -> u64 {
+    let mut r = x;
+    for _ in 0..300_000 {
+        r = r.wrapping_mul(7).wrapping_add(13);
+    }
+    black_box(r)
+}
+
 fn main() {
     let _guard = HotpathGuardBuilder::new("hotpath_profile")
         .percentiles(&[50.0, 90.0, 95.0, 99.0, 99.9])
@@ -79,6 +92,10 @@ fn main() {
         Some("stream-engine-ordered") => {
             let (size, iters) = size_iters(&args, 1_000_000, 20);
             run_stream_engine_ordered(size, iters);
+        },
+        Some("stream-engine-ordered-straggler") => {
+            let (size, iters) = size_iters(&args, 200_000, 10);
+            run_stream_engine_ordered_straggler(size, iters);
         },
         Some("stream-engine-foreach") => {
             let (size, iters) = size_iters(&args, 1_000_000, 20);
@@ -196,6 +213,37 @@ fn run_stream_engine_ordered(size: usize, iters: usize) {
         black_box(out);
     }
     println!("ran stream-engine-ordered size={size} iters={iters}");
+}
+
+/// Straggler variant of [`run_stream_engine_ordered`] (todo #49 caliber):
+/// every `STRAGGLER_PERIOD`-th item pays a ~100 µs spin, so while one
+/// worker grinds a straggler the rest deliver higher seqs first and the
+/// collector's `ReorderBuffer::insert_into` takes the slot-write slow path
+/// per arriving item until the straggler lands and the buffered run
+/// flushes. Reads the fast/slow split directly off the `insert_into` probe
+/// (the 2026-10 bistability investigation had to size that slice by
+/// subtraction). Run in a SEPARATE process from the other scenarios — the
+/// `HotpathGuard` aggregates over the whole process lifetime.
+fn run_stream_engine_ordered_straggler(size: usize, iters: usize) {
+    const STRAGGLER_PERIOD: u64 = 2_000;
+    let token = CancellationToken::new();
+    let data: Vec<u64> = (0..size as u64).collect();
+    for _ in 0..iters {
+        let v = data.clone();
+        let out: Vec<u64> = v
+            .stream()
+            .ordered()
+            .with_cancel(token.clone())
+            .stage(|x: u64| {
+                if x % STRAGGLER_PERIOD == 0 {
+                    straggler_spin(x);
+                }
+                black_box(x.wrapping_add(1))
+            })
+            .run();
+        black_box(out);
+    }
+    println!("ran stream-engine-ordered-straggler size={size} iters={iters}");
 }
 
 /// `for_each` terminal variant of [`run_stream_engine`]: same dormant-token
