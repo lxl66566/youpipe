@@ -328,7 +328,7 @@ impl<T> ReorderBuffer<T> {
     }
 
     /// Current slot capacity (power of two). The array itself materializes
-    /// lazily on the first out-of-order arrival (see [`Self::ensure_slots`]);
+    /// lazily on the first out-of-order arrival (see `Self::ensure_slots`);
     /// this reports the reserved capacity regardless.
     #[must_use]
     pub fn capacity(&self) -> usize {

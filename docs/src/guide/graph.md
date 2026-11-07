@@ -147,7 +147,7 @@ edges and propagate closure downstream; `run()` returns once every sink has
 seen every upstream close.
 
 **Cancellation.** `with_cancel(token)` checks the
-[`CancellationToken`](https://docs.rs/youpipe/latest/youpipe/struct_CancellationToken.html)
+[`CancellationToken`](https://docs.rs/youpipe/latest/youpipe/struct.CancellationToken.html)
 on every node between claim batches — the batched data plane checks once per
 claim batch, so up to one batch per worker can still be accepted after
 `token.cancel()`; per-item paths check per item. An accepted batch is mapped

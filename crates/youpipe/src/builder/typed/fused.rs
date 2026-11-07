@@ -4157,7 +4157,7 @@ where
     /// not possible).
     ///
     /// Only trivially-empty batches (0-1 items or a single-threaded pool) run
-    /// sequentially — see [`prefers_serial`] for why batch-size guessing was
+    /// sequentially — see `prefers_serial` for why batch-size guessing was
     /// removed.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn collect(self) -> Vec<O> {

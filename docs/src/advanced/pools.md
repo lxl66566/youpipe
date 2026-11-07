@@ -22,7 +22,7 @@ it across runs — construction costs ~15 µs per worker (thread spawn +
 priming), which dominates tight loops:
 
 ```rust
-use youpipe::{ComputePool, stream};
+use youpipe::{ComputePool, prelude::*};
 
 // Blocking IO in a sync .stage(): oversubscribe. The global pool has one
 // thread per core, so each blocked thread idles its core; 512 threads fill
@@ -75,7 +75,7 @@ use youpipe::{ComputePool, prelude::*};
 // Hot loop of large saturated batches: −4…−7 % vs the unpinned pool.
 let pool = ComputePool::new_pinned(num_cpus);
 loop {
-    let r: Vec<_> = pipe_ref(&batch).map(transform).with_compute_pool(&pool).collect();
+    let r: Vec<_> = pipe_ref(&batch).map(transform).with_compute_pool(pool.clone()).collect();
 }
 ```
 
@@ -107,7 +107,7 @@ use youpipe::{ComputePool, prelude::*};
 let pool = ComputePool::global();
 let warm = pool.keep_warm();            // #[must_use]: hold it, don't drop
 for batch in batches {                  // gaps of at most ~100 µs
-    let r: Vec<_> = pipe_ref(&batch).map(transform).with_compute_pool(&pool).collect();
+    let r: Vec<_> = pipe_ref(&batch).map(transform).with_compute_pool(pool.clone()).collect();
 }
 drop(warm);                             // workers park per the default ladder
 ```
@@ -165,7 +165,7 @@ let r2 = batch_b.stream().with_async_pool(pool)
     .run();
 ```
 
-`TokioPool::build(n)` pins the worker count; `TokioPool::new(handle, n)`
+`TokioPool::build(n)` pins the worker count; `TokioPool::new(handle)`
 wraps an externally-managed runtime (you keep the `Runtime` alive). If
 runtime construction can fail and `.run()`'s panic is unacceptable, use
 `.try_run()`.

@@ -38,14 +38,14 @@ pub use crate::{
 /// Implemented for every `I: IntoIterator` so callers can write
 /// `items.pipe().map(...).collect()` or `items.stream().stage(...).run()`
 /// after a single `use youpipe::prelude::*;`. The methods are thin wrappers
-/// over the free functions [`pipe`](crate::pipe) / [`stream`](crate::stream)
+/// over the free functions [`pipe`] / [`stream`]
 /// and produce identical types — pick whichever style reads better at the
 /// call site.
 ///
 /// Not user-implementable: the blanket impl below already covers every
 /// `IntoIterator`; a hand-written impl could only duplicate it.
 pub trait IterExt: IntoIterator + Sized {
-    /// Build a fused CPU pipeline. Equivalent to [`pipe`](crate::pipe).
+    /// Build a fused CPU pipeline. Equivalent to [`pipe`].
     ///
     /// ```rust
     /// use youpipe::prelude::*;
@@ -59,7 +59,7 @@ pub trait IterExt: IntoIterator + Sized {
         pipe(self)
     }
 
-    /// Build a streaming pipeline. Equivalent to [`stream`](crate::stream).
+    /// Build a streaming pipeline. Equivalent to [`stream`].
     ///
     /// ```rust
     /// use youpipe::prelude::*;

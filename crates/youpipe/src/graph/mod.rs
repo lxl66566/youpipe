@@ -175,7 +175,7 @@ pub struct GraphBuilder<R: AsyncRuntime = DefaultRuntime> {
 
 impl GraphBuilder<DefaultRuntime> {
     /// Switch the async runtime backend type (e.g. to a custom
-    /// [`AsyncRuntime`](crate::AsyncRuntime) impl). Generic conversion in the
+    /// [`AsyncRuntime`] impl). Generic conversion in the
     /// spirit of `StreamPipe::with_async_pool`: the backend instance itself
     /// is built lazily per run, or attached with
     /// [`with_async_pool`](Self::with_async_pool) after switching.

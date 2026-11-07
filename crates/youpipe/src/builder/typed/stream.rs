@@ -1222,7 +1222,7 @@ mod sealed {
 }
 
 /// Completion-order output (the default). `.expand()` builds the per-item
-/// fan-out ([`ExpandStage`]): one channel message per *output* item, all
+/// fan-out (`ExpandStage`): one channel message per *output* item, all
 /// sharing the parent's seq — re-sequencing is impossible, hence `.ordered()`
 /// is unavailable on a chain containing this stage.
 pub struct Unordered;
@@ -1415,7 +1415,7 @@ pub struct GroupedAsyncStage<Prev, F> {
 }
 
 /// Async stage: `Fn(O) -> Future<Output = N>`, up to `io_concurrency` items
-/// in flight on the [`AsyncRuntime`](crate::AsyncRuntime) backend
+/// in flight on the [`AsyncRuntime`] backend
 /// (`handoff::mux`). Gated behind the `tokio-runtime` feature.
 #[cfg(feature = "tokio-runtime")]
 #[derive(Clone)]
@@ -4206,7 +4206,7 @@ impl<S, I, O, R: AsyncRuntime, M: StreamMode> StreamPipe<S, I, O, R, M> {
     }
 
     /// Set the async runtime's OS-thread count (streaming-only; async stages
-    /// multiplex [`PipelineConfig::io_concurrency`] in-flight items over these
+    /// multiplex `PipelineConfig::io_concurrency` in-flight items over these
     /// threads).
     ///
     /// # Panics
@@ -6342,12 +6342,12 @@ where
     /// Panics in the caller-side sink of [`for_each`](Self::for_each) and
     /// the fold/reduce combinators propagate normally (they run on the
     /// calling thread), as do panics in the input iterator (collected by
-    /// [`stream`](crate::stream) before any topology exists), or if the
+    /// [`stream`] before any topology exists), or if the
     /// async runtime cannot be constructed
     /// (e.g. OS thread/resource limits), or if `run()` is invoked inside an
     /// async context on a chain with an async stage (e.g. from a tokio/axum
     /// handler) — the terminal drives its collector via
-    /// [`AsyncRuntime::block_on`](crate::AsyncRuntime::block_on), which
+    /// [`AsyncRuntime::block_on`], which
     /// cannot block a thread that is running async tasks; wrap the call in
     /// `tokio::task::spawn_blocking` instead. To handle runtime
     /// construction failure gracefully, use [`try_run`](Self::try_run) or

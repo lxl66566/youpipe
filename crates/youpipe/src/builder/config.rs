@@ -327,7 +327,7 @@ impl PipelineConfig {
     ///
     /// # Panics
     ///
-    /// Panics if `n == 0` (see [`Self::set_compute_workers`]).
+    /// Panics if `n == 0` (see `Self::set_compute_workers`).
     #[must_use]
     pub fn with_compute_workers(mut self, n: usize) -> Self {
         self.set_compute_workers(n);
@@ -338,7 +338,7 @@ impl PipelineConfig {
     ///
     /// # Panics
     ///
-    /// Panics if `n == 0` (see [`PipelineConfig::require_nonzero`]).
+    /// Panics if `n == 0` (see `PipelineConfig::require_nonzero`).
     #[must_use]
     pub fn with_async_workers(mut self, n: usize) -> Self {
         self.async_workers = Self::require_nonzero(n, "with_async_workers").get();
@@ -351,7 +351,7 @@ impl PipelineConfig {
     ///
     /// # Panics
     ///
-    /// Panics if `n == 0` (see [`PipelineConfig::require_nonzero`]).
+    /// Panics if `n == 0` (see `PipelineConfig::require_nonzero`).
     #[must_use]
     pub fn with_buffer_size(mut self, n: usize) -> Self {
         self.buffer_size = Self::require_nonzero(n, "with_buffer_size").get();
@@ -360,11 +360,11 @@ impl PipelineConfig {
 
     /// Sets the number of concurrently in-flight async I/O tasks per async
     /// stage. Higher values trade memory for IO concurrency (see
-    /// [`PipelineConfig::io_concurrency`]). Streaming-only.
+    /// `PipelineConfig::io_concurrency`). Streaming-only.
     ///
     /// # Panics
     ///
-    /// Panics if `n == 0` (see [`PipelineConfig::require_nonzero`]).
+    /// Panics if `n == 0` (see `PipelineConfig::require_nonzero`).
     #[must_use]
     pub fn with_io_concurrency(mut self, n: usize) -> Self {
         self.io_concurrency = Self::require_nonzero(n, "with_io_concurrency").get();

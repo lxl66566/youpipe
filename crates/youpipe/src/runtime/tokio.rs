@@ -1,4 +1,4 @@
-//! Tokio backend for [`AsyncRuntime`](super::AsyncRuntime).
+//! Tokio backend for [`AsyncRuntime`].
 
 use std::{future::Future, sync::Arc};
 

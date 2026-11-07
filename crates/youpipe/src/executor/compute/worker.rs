@@ -9,7 +9,7 @@ use crate::pool::{self, Registry, join::Captured};
 /// Mutex/Condvar unless threads are actually sleeping.
 ///
 /// `ComputePool` is cheap to clone (one `Arc` clone + one atomic increment).
-/// Each clone holds a reference to the underlying [`Registry`]; the pool's
+/// Each clone holds a reference to the underlying `Registry`; the pool's
 /// worker threads stay alive until the last clone is dropped.
 pub struct ComputePool {
     registry: Arc<Registry>,
@@ -166,7 +166,7 @@ impl ComputePool {
     /// fast path (`inject_or_push`) when called from a worker of this pool.
     /// If the injector's cross-batch FIFO order is part of your protocol (a
     /// job injected before its dependents is popped first, like
-    /// [`Self::submit_injected`]), rely on `submit_batch`, not `submit`.
+    /// `Self::submit_injected`), rely on `submit_batch`, not `submit`.
     ///
     /// `I::IntoIter` must be [`ExactSizeIterator`] so the `JobRef`s stream
     /// straight into the injector's segment-reserving `push_n` — no

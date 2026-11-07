@@ -35,5 +35,3 @@ Priorities: P0 = high value / strong evidence; P1 = medium; P2 = experimental / 
 - Risk: the fork must stay diffable; the waker-registry reset semantics are the hard part.
 - Protocol: `stream_pipeline/with_fence/1000`, `graph_shapes/chain_cheap_graph/1000`, `sharded_term` @1K cells; default-off env gate, then per-id `-E` A/B.
 
----
-

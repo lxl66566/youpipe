@@ -122,3 +122,11 @@ needless_lifetimes      = "allow"
 # rustdoc-args. Silence the workspace-level unexpected_cfgs gate for
 # upstream's cfg surface.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(docsrs)"] }
+
+[lints.rustdoc]
+# Upstream doc comments link the pre-fork API surface (send_timeout/
+# recv_timeout under the tokio feature, the compat module) that is absent
+# or cfg-gated in this build; sources stay diffable against the fork repo,
+# so the stale links are silenced here (todo #47).
+broken_intra_doc_links = "allow"
+private_intra_doc_links = "allow"

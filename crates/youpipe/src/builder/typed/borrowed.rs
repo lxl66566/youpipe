@@ -68,7 +68,7 @@ use crate::builder::FilterCollectMode;
 /// assert_eq!(suffix_lens, vec![1; 10]); // "0".."9" — 1 char each
 /// ```
 ///
-/// [`scope`]: crate::scope
+/// [`scope`]: crate::scope()
 pub fn pipe_ref<T>(items: &[T]) -> PipeRef<'_, Identity, T, &T>
 where
     T: Sync,
@@ -86,7 +86,7 @@ where
 /// fixed to `&'a [T]` and items flowing as `&'a T`.
 ///
 /// The `'a` lifetime brands every stage closure, so closures may borrow
-/// stack-local data without [`scope`](crate::scope) — soundness rests on the
+/// stack-local data without [`scope`](crate::scope()) — soundness rests on the
 /// terminal blocking until every worker finishes (same invariant as
 /// [`ScopedPipe`](crate::ScopedPipe)).
 pub struct PipeRef<'a, S, T, O> {

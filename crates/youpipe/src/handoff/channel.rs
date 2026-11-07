@@ -716,7 +716,7 @@ pub trait SendItem<T>: Clone + Send + 'static {
         n
     }
 
-    /// Deliver every item of `batch`: stage it ([`stage_batch`]), then
+    /// Deliver every item of `batch`: stage it (`stage_batch`), then
     /// flush with [`Self::flush_staged`] — one `try_send_batch` for the
     /// free prefix, then per-item blocking [`Self::send`] for the
     /// remainder. Backpressure granularity (park per item, only when
@@ -757,7 +757,7 @@ pub trait SendItem<T>: Clone + Send + 'static {
     /// sent-prefix/remainder split exists exactly once.
     ///
     /// Contract: every slot of `staged` must be initialized on entry
-    /// ([`stage_batch`] or an equivalent clone-staging loop established
+    /// (`stage_batch` or an equivalent clone-staging loop established
     /// that).
     fn flush_staged(&self, staged: &mut [MaybeUninit<T>]) -> bool {
         // SAFETY: the caller upholds the initialization contract; the sent
@@ -949,7 +949,7 @@ pub trait AsyncSendItem<T: Send>: Clone + Send + Sync + 'static {
     /// [`SendItem::flush_staged`].
     ///
     /// Contract: every slot of `staged` must be initialized on entry
-    /// ([`stage_batch`] or an equivalent clone-staging loop established
+    /// (`stage_batch` or an equivalent clone-staging loop established
     /// that).
     fn flush_staged<'s>(
         &'s self,
