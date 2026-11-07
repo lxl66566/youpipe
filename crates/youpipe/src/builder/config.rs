@@ -169,6 +169,17 @@ pub enum ShardDepth {
     /// Floor each shard at the collector's batch claim cap
     /// (`YOUPIPE_BATCH_RECV`; the floor is inert while that knob is off).
     ClaimCap,
+    /// The built-in per-terminal-kind tier (the default): the expand
+    /// fan-out terminal resolves to [`ShardDepth::Slots`] (16) — one
+    /// claimed input burst amplifies into fan-out × per-item output
+    /// messages pushed into the worker's own shard, and at the ~8-slot
+    /// split depth the shard fills mid-burst so the expansion parks
+    /// against the collector's round-robin pass; every other terminal
+    /// keeps [`ShardDepth::Off`] (the #48 single-stage regressions).
+    /// Resolved where the compile-time terminal predicate is known
+    /// (`TermPolicy::resolve_tiers` via `StageSpawn::expand_fanout_terminal`);
+    /// an explicit env pin or `with_shard_depth` tier overrides it everywhere.
+    Default,
     /// No depth floor — the historical `max(4, buffer / workers)` sizing.
     Off,
     /// An explicit per-shard floor in slots (the A/B sweep caliber).
@@ -182,8 +193,25 @@ impl ShardDepth {
     pub(crate) fn resolved_floor(self) -> usize {
         match self {
             ShardDepth::ClaimCap => crate::handoff::batch_recv_cap(),
+            // Unreachable through the factory: `TermPolicy::resolve_tiers`
+            // lowers Default to a concrete tier before any shard is sized.
+            ShardDepth::Default => unreachable!("lowered in resolve_tiers"),
             ShardDepth::Off => 0,
             ShardDepth::Slots(n) => n.get(),
+        }
+    }
+
+    /// The built-in [`ShardDepth::Default`] tier for a terminal of the given
+    /// kind: the expand fan-out (unordered `expand_emit` chains and their
+    /// ordered counterparts) floors at 16 slots — the expand-scan winner
+    /// (target/bench-ab/expandscan; every expand variant won d16 vs off,
+    /// d32 lost @1K on three of four); everything else stays at the split
+    /// depth. `GroupedExpandStage` is unmeasured and stays `Off`.
+    pub(crate) fn terminal_default(expand_fanout: bool) -> Self {
+        if expand_fanout {
+            Self::Slots(std::num::NonZeroUsize::new(16).unwrap())
+        } else {
+            Self::Off
         }
     }
 }

@@ -1532,6 +1532,16 @@ pub trait StageSpawn<In: Send + Unpin + 'static> {
         false
     }
 
+    /// Whether this node is an expand fan-out ([`ExpandStage`] /
+    /// [`OrderedExpandStage`]) — read on the chain's outermost node, i.e.
+    /// the terminal, to resolve the built-in [`ShardDepth::Default`] tier
+    /// (see `TermPolicy::resolve_tiers`). Non-recursive by design: the
+    /// outermost stage IS the terminal, so no stage forwards it;
+    /// intermediate nodes are never asked.
+    fn expand_fanout_terminal(&self) -> bool {
+        false
+    }
+
     /// Attempt a **fused pass-through** execution: compose the whole chain
     /// into a single [`RangeOp`] and collect `items` on the fused index core
     /// (hybrid dispatch + zero-copy [`Slots`](super::slots::Slots)) —
@@ -1934,12 +1944,15 @@ pub(crate) struct TermPolicy {
 }
 
 impl TermPolicy {
-    /// Resolve from the env OnceLock tiers and the run's config.
-    fn resolve(config: &PipelineConfig) -> Self {
+    /// Resolve from the env OnceLock tiers and the run's config. The
+    /// terminal-kind predicate comes from the chain type
+    /// ([`StageSpawn::expand_fanout_terminal`] on the outermost node).
+    fn resolve(config: &PipelineConfig, expand_fanout_terminal: bool) -> Self {
         Self::resolve_tiers(
             crate::handoff::sharded_term_env(),
             crate::handoff::chain_floor_env(),
             crate::handoff::shard_depth_env(),
+            expand_fanout_terminal,
             config,
         )
     }
@@ -1954,6 +1967,7 @@ impl TermPolicy {
         sharded_env: Option<bool>,
         chain_floor_env: Option<ChainFloor>,
         shard_depth_env: Option<ShardDepth>,
+        expand_fanout_terminal: bool,
         config: &PipelineConfig,
     ) -> Self {
         Self {
@@ -1965,13 +1979,18 @@ impl TermPolicy {
                 ChainFloor::Default,
             )
             .resolved_slots(),
-            shard_depth: crate::handoff::resolve_knob(
+            shard_depth: match crate::handoff::resolve_knob(
                 shard_depth_env,
                 config.shard_depth,
-                // Off = the todo #48 A/B verdict (the claim-cap tier
-                // regressed every single-stage target cell).
-                ShardDepth::Off,
-            ),
+                // Default = the per-terminal-kind tier: the #48 A/B kept
+                // every non-expand terminal at Off; the expand scan
+                // (target/bench-ab/expandscan) lifted the expand terminal
+                // to Slots(16).
+                ShardDepth::Default,
+            ) {
+                ShardDepth::Default => ShardDepth::terminal_default(expand_fanout_terminal),
+                tier => tier,
+            },
         }
     }
 }
@@ -2795,6 +2814,10 @@ where
         self.prev.first_consumer_is_async().or(Some(false))
     }
 
+    fn expand_fanout_terminal(&self) -> bool {
+        true
+    }
+
     fn has_async_stage(&self) -> bool {
         self.prev.has_async_stage()
     }
@@ -3225,6 +3248,10 @@ where
 
     fn first_consumer_is_async(&self) -> Option<bool> {
         self.prev.first_consumer_is_async().or(Some(false))
+    }
+
+    fn expand_fanout_terminal(&self) -> bool {
+        true
     }
 
     fn has_async_stage(&self) -> bool {
@@ -5980,7 +6007,7 @@ where
         dedicated_threads,
         has_async_stage,
         has_chunked_fence,
-        terminal_policy: TermPolicy::resolve(&config),
+        terminal_policy: TermPolicy::resolve(&config, stages.expand_fanout_terminal()),
         lease,
         worker_slots_left: Cell::new(worker_slots_left),
         stages_left: Cell::new(stages_left),
@@ -7291,6 +7318,7 @@ mod tests {
             Some(false),
             Some(ChainFloor::Slots(NonZeroUsize::new(1024).unwrap())),
             None,
+            false,
             &cfg(
                 Some(true),
                 Some(ChainFloor::Slots(NonZeroUsize::new(65536).unwrap())),
@@ -7302,6 +7330,7 @@ mod tests {
             Some(true),
             Some(ChainFloor::Off),
             None,
+            false,
             &cfg(None, Some(ChainFloor::Default), None),
         );
         assert!(p.sharded && p.chain_floor.is_none());
@@ -7310,14 +7339,19 @@ mod tests {
             None,
             None,
             None,
+            false,
             &cfg(Some(false), Some(ChainFloor::Off), None),
         );
         assert!(!p.sharded && p.chain_floor.is_none());
         // Nothing set anywhere: the built-in defaults — bit-for-bit the
         // env-knob-only behavior.
-        let p = TermPolicy::resolve_tiers(None, None, None, &cfg(None, None, None));
+        let p = TermPolicy::resolve_tiers(None, None, None, false, &cfg(None, None, None));
         assert!(p.sharded && p.chain_floor == Some(crate::handoff::CHAIN_FLOOR_SLOTS));
-        assert_eq!(p.shard_depth, ShardDepth::Off, "the depth default is Off");
+        assert_eq!(
+            p.shard_depth,
+            ShardDepth::Off,
+            "non-expand terminals default to Off"
+        );
 
         // Shard depth: same tiers (todo #48).
         let slots = || ShardDepth::Slots(NonZeroUsize::new(1024).unwrap());
@@ -7326,6 +7360,7 @@ mod tests {
             None,
             None,
             Some(ShardDepth::Off),
+            false,
             &cfg(None, None, Some(ShardDepth::ClaimCap)),
         );
         assert_eq!(p.shard_depth, ShardDepth::Off);
@@ -7334,11 +7369,31 @@ mod tests {
             None,
             None,
             Some(ShardDepth::ClaimCap),
+            false,
             &cfg(None, None, Some(slots())),
         );
         assert_eq!(p.shard_depth, ShardDepth::ClaimCap);
         // Config shadows the built-in default.
-        let p = TermPolicy::resolve_tiers(None, None, None, &cfg(None, None, Some(slots())));
+        let p = TermPolicy::resolve_tiers(None, None, None, false, &cfg(None, None, Some(slots())));
+        assert_eq!(p.shard_depth, slots());
+
+        // Terminal-kind scoped default: the expand terminal's built-in
+        // tier is Slots(16); env/config tiers override it exactly as on
+        // the non-expand kind.
+        let p = TermPolicy::resolve_tiers(None, None, None, true, &cfg(None, None, None));
+        assert_eq!(
+            p.shard_depth,
+            ShardDepth::Slots(NonZeroUsize::new(16).unwrap())
+        );
+        let p = TermPolicy::resolve_tiers(
+            None,
+            None,
+            Some(ShardDepth::Off),
+            true,
+            &cfg(None, None, None),
+        );
+        assert_eq!(p.shard_depth, ShardDepth::Off);
+        let p = TermPolicy::resolve_tiers(None, None, None, true, &cfg(None, None, Some(slots())));
         assert_eq!(p.shard_depth, slots());
 
         // Async tx gate: same tiers, hop predicate applied.

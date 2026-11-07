@@ -426,3 +426,87 @@ bold = stable/dominant; d64 ≡ the `ClaimCap` tier at the default
 
 Depth stays a per-shape opt-in (`Off` default). Falsification index in
 [dead-ends.md](../dead-ends.md).
+
+### Expand-terminal depth scan: scoped default `Slots(16)` (todo #48 follow-up, 2026-11-08)
+
+The shape scan's one big winner family (the expand terminal, −31…−43 %
+at d16) got its own 3-sided scan with three added calibers — `expand_cpu`
+(per-input CPU), `expand_f4_cheap` (fan-out 4, the burst-amplification
+axis), `expand_ordered` (ordered expand) — over `off` / `d16` / `d32`
+(`bench_ab.sh -E`, 5 per-id isolated interleaved rounds, 32 cores,
+`target/bench-ab/expandscan`). d16 vs off, per cell (Δ% = d16 relative
+to off; verdict per the aggregator, dom = cross-round dominants):
+
+| id | @1K | @100K |
+| --- | --- | --- |
+| expand_cheap | **−30.9 % stable 25/25** | **−29.6 % dominant 0/25** |
+| expand_cpu | **−30.9 % stable 0/25** | **−46.0 % 0/25** (34 %/34 % spreads) |
+| expand_f4_cheap | **−43.4 % stable 25/25** | **−47.7 % stable 0/25** |
+| expand_ordered | **−7.8 % stable 0/25** | **−18.9 % dominant 0/25** |
+
+Every expand variant wins d16 over off at both sizes (minimum +7.8 %).
+d32 is NOT a consistent tier: it beats d16 only on `expand_f4_cheap`
+(−31.1 % @1K / −43.1 % @100K further) while LOSING on the fan-out-2
+family @1K (`expand_cpu` +2.2 %, `expand_cheap` +2.8 %,
+`expand_ordered` +3.8 % stable regression) — at 32 workers × 32 slots
+the lifted aggregate (1024) exceeds n = 1000, the same backpressure
+removal that regressed the single-stage shapes @1K in #48. d16 is the
+only tier with a uniform >2 % win across the family.
+
+Controls held: the non-expand cells on the same scan keep the #48
+readings (single-stage `single_*` @1K prefer off by 4–5 %, d32 regresses
+them +8…+55 %; `multi2_*` is flat at d16 vs off and only moves at deeper
+tiers — `multi2_cpu/100K` −3.6 % dominant at d32 vs d16, reproducing
+the 64-tier pattern; `multi3` flat; the inert-split `workers2` flat).
+
+Mechanism (same axis as the #48 falsification, inverted by the expand
+feeder's burst amplification): the #48 regression face is one racing
+producer parking a deep run while the collector's round-robin pass walks
+mostly-empty rings — the shallow cap bounds runaway and keeps the pass
+balanced. The expand terminal inverts both halves. Its "runaway" is the
+fan-out itself: one claimed input expands into fan-out × output messages
+pushed into the worker's own SPSC shard (self-produced, no cross-worker
+competition), so a ~8-slot shard fills mid-burst and parks the expansion
+against the collector's pass — the claim/expand/park/release ping-pong
+the d16 floor removes by giving one claim's whole amplified run room to
+land, after which the collector's batched claim drains it in one stamp
+walk. Deeper is not uniformly better because the pass-balance cost
+returns (d64 gives back half the win; d32's @1K lifted-aggregate effect
+above), so the tier sits at the smallest depth that absorbs the burst:
+16 slots covers fan-out 2 with margin and fan-out 4 with one collector
+pass of slack.
+
+Decision: the depth tier became `ShardDepth::Default` — the built-in
+per-terminal-kind default resolving to `Slots(16)` on the expand
+terminal (`ExpandStage` and `OrderedExpandStage`, the two measured
+kinds; `GroupedExpandStage` is unmeasured and stays `Off`) and `Off`
+everywhere else. Resolution keeps the knob precedence (env pin >
+`with_shard_depth` config > `Default`), so `YOUPIPE_SHARD_DEPTH=0`
+still recovers the flat split everywhere.
+
+### Expand-terminal depth default final A/B (todo #48, 2026-11-08)
+
+Post-landing confirmation on the changed tree, new binary (`def` = the
+scoped default, env unset, vs `off` = `YOUPIPE_SHARD_DEPTH=0`; same
+harness, 5 per-id isolated interleaved rounds,
+`target/bench-ab/expandfinal`). Δ% = def relative to off:
+
+| id | off | def | Δ% | verdict |
+| --- | --- | --- | --- | --- |
+| expand_f4_cheap @1K | 527.7 µs | 301.9 µs | **−42.8** | stable 0/25 |
+| expand_f4_cheap @100K | 43.6 ms | 22.91 ms | **−47.5** | stable 0/25 |
+| expand_cpu @1K | 291.6 µs | 202.3 µs | **−30.6** | 0/25 |
+| expand_cheap @1K | 291.5 µs | 201.1 µs | **−31.0** | stable 0/25 |
+| expand_cpu @100K | 23.65 ms | 12.86 ms | **−45.7** | stable 0/25 |
+| expand_cheap @100K | 17.88 ms | 12.51 ms | **−30.1** | dominant 0/25 |
+| expand_ordered @100K | 17.47 ms | 13.51 ms | **−22.7** | dominant 0/25 |
+| expand_ordered @1K | 251 µs | 229.4 µs | −8.6 | noise (5/25, direction consistent with the scan's stable −7.8 %) |
+| every `single_*`, `multi2_*`, `multi3_cpu`, `workers2_cpu` cell | — | — | ±5.3 | noise |
+
+Every expand cell favours def; every non-expand cell is noise — the
+scoped default changes nothing it does not own. One footnote for the
+record: `single_ordered_cpu/1K` read −2.2 % dominant (off faster) with
+a 67 % def-side round spread; def and off are behaviourally identical
+on that id (same binary, the tier only touches the expand terminal's
+shard capacity), so this is the documented same-binary wobble class,
+not a knob effect.

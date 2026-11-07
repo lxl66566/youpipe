@@ -23,7 +23,11 @@
 //!   terminal-behind-mid-channel depth scan);
 //! * `workers2_*` — `SyncStageOptions::workers(2)` small-terminal shape, the guard against
 //!   per-shard fixed cost regressing low-worker pipelines;
-//! * `expand_*` — expand terminal (per-shard multi-output).
+//! * `expand_*` — expand terminal calibers (the depth scan's biggest winner family): `expand_cheap`
+//!   is the original scan id (fanout 2); `expand_cpu` adds per-input CPU, `expand_f4_cheap`
+//!   quadruples the fanout (burst-amplification axis), and `expand_ordered` rides the
+//!   grouped-payload terminal (`.ordered().expand_emit` — one message per input, no message
+//!   amplification) so the scoped-default boundary is measurable.
 //!
 //! `cheap` (x+1) is the primary read: with near-zero per-item CPU the
 //! channel handoff dominates and the fan-in shape is directly visible;
@@ -220,6 +224,68 @@ fn bench_sharded_term(c: &mut Criterion) {
                 BatchSize::PerIteration,
             );
         });
+
+        group.bench_with_input(BenchmarkId::new("expand_cpu", size), &data, |b, data| {
+            b.iter_batched(
+                || warm_clone(data),
+                |v| {
+                    let r = stream(v)
+                        .with_cancel(cancel.clone())
+                        .expand_emit(|x: u64, out: &mut Vec<u64>| {
+                            let y = bb(cpu_work(x));
+                            out.push(y);
+                            out.push(y.wrapping_add(1));
+                        })
+                        .run();
+                    bb(r)
+                },
+                BatchSize::PerIteration,
+            );
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("expand_f4_cheap", size),
+            &data,
+            |b, data| {
+                b.iter_batched(
+                    || warm_clone(data),
+                    |v| {
+                        let r = stream(v)
+                            .with_cancel(cancel.clone())
+                            .expand_emit(|x: u64, out: &mut Vec<u64>| {
+                                for i in 0..4 {
+                                    out.push(x.wrapping_add(i));
+                                }
+                            })
+                            .run();
+                        bb(r)
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("expand_ordered", size),
+            &data,
+            |b, data| {
+                b.iter_batched(
+                    || warm_clone(data),
+                    |v| {
+                        let r = stream(v)
+                            .with_cancel(cancel.clone())
+                            .ordered()
+                            .expand_emit(|x: u64, out: &mut Vec<u64>| {
+                                out.push(x);
+                                out.push(x.wrapping_add(1));
+                            })
+                            .run();
+                        bb(r)
+                    },
+                    BatchSize::PerIteration,
+                );
+            },
+        );
     }
     group.finish();
 }
