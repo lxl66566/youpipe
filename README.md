@@ -9,6 +9,8 @@ youpipe is a parallel pipeline library for Rust. Items enter at the front, stage
   - A chain with only plain `.stage()` degrades to `Pipe`: channels and backpressure are elided, and output is in input order.
 - `graph()`: a DAG built at run time, with broadcast fan-out and fan-in that round-robins over in-edges. CPU nodes and IO nodes mix freely in one graph. Non-broadcast nodes pass items by move, with no `Clone` bound; broadcast nodes clone. Graph output always arrives in completion order (unordered).
 
+The bounded channels that carry items between stages are also exposed as standalone primitives — `channel` (MPMC), `mpsc_channel` (single consumer, CAS-free recv) and `async_channel` — usable without any pool or pipeline ([standalone channels](https://lxl66566.github.io/youpipe/guide/channels.html)).
+
 The scheduler is adapted from rayon-core. Every worker owns an `st3` LIFO deque, and idle workers steal from the other end, which suits both balanced and unbalanced loads. `scope()` accepts non-`'static` closures that borrow stack-local data.
 
 ## Quick start

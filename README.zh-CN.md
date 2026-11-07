@@ -9,6 +9,8 @@ youpipe 是一个 Rust 并行 pipeline 库。数据从入口输入，各阶段�
   - 只有普通 `.stage()` 时退化为 Pipe，此时 channel 和 backpressure 被省略，输出即为输入顺序。
 - `graph()`：运行期构建的 DAG，支持广播 fan-out、按入边轮询的 fan-in，CPU 节点和 IO 节点可在同一张图里混用。非广播节点走 move，无 `Clone` 约束；广播节点 clone。graph 输出一定是按完成顺序（乱序）。
 
+在 stage 之间承载数据的 bounded channel 也作为独立原语暴露——`channel`（MPMC）、`mpsc_channel`（单消费者，recv 无 CAS）与 `async_channel`——无需任何 pool 或 pipeline 即可使用（[独立 channel](https://lxl66566.github.io/youpipe/guide/channels.html)）。
+
 调度器改编自 rayon-core。每个 worker 持有 `st3` 的 LIFO 双端队列，空闲 worker 从队列另一端窃取任务，均衡与不均衡负载都适用。`scope()` 支持借用栈上局部数据的非 `'static` 闭包。
 
 ## 快速上手

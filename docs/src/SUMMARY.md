@@ -10,6 +10,7 @@
 - [DAG pipelines](guide/graph.md)
 - [Borrowing data](guide/scope.md)
 - [Fallible pipelines](guide/errors.md)
+- [Standalone channels](guide/channels.md)
 
 # Performance tuning
 
