@@ -344,10 +344,32 @@ pub(crate) fn drain_ordered_with<R, O>(
 /// already queued, and a plain `while let Ok(..) = rx.recv().await` would pay
 /// one waker-register/wake round-trip per item. The two-phase loop converts
 /// that per-item `await` cost into per-burst cost.
+///
+/// With the async recv-batch knob on ([`drain_unordered_async_with`], todo
+/// #50) each burst claims its ready run with one ring-cursor update per run
+/// (one MPSC `recv` SeqCst store per run on the head line the driver
+/// producers load for fullness) instead of one per item.
 #[cfg(feature = "tokio-runtime")]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) async fn drain_unordered_async<R, O>(rx: &R, mut sink: impl FnMut(O))
+pub(crate) async fn drain_unordered_async<R, O>(rx: &R, sink: impl FnMut(O))
 where
+    R: AsyncRecvItem<(u64, O)>,
+    O: Send,
+{
+    drain_unordered_async_with(rx, crate::handoff::async_drain_batch_cap(), sink).await;
+}
+
+/// [`drain_unordered_async`] with an explicit batch cap (0 = per-item, the
+/// historical loop byte-for-byte) so tests can drive the batch path
+/// without env-var gymnastics — the async twin of
+/// [`drain_unordered_with`].
+#[cfg(feature = "tokio-runtime")]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) async fn drain_unordered_async_with<R, O>(
+    rx: &R,
+    batch_cap: usize,
+    mut sink: impl FnMut(O),
+) where
     R: AsyncRecvItem<(u64, O)>,
     O: Send,
 {
@@ -356,14 +378,21 @@ where
     // awaits exactly one item to register a waker; the next iteration's
     // burst-drain picks up anything that arrived in the meantime.
     let mut slot = WakerSlot::new();
+    // Batch scratch, reused across bursts for the whole drain (see
+    // `drain_unordered_with`; capacity 0 = no alloc).
+    let mut scratch: Vec<(u64, O)> = Vec::with_capacity(batch_cap);
     drain_loop!(
         rx, anchor rx.recv_cached(&mut slot).await,
-        insert(_seq, item) { sink(item); }, eof { return; }
+        insert(_seq, item) { sink(item); }, eof { return; },
+        batch(batch_cap, scratch)
     );
 }
 
 /// Async counterpart of [`drain_ordered`]: re-sequences through a
-/// [`ReorderBuffer`] while burst-draining like [`drain_unordered_async`].
+/// [`ReorderBuffer`] while burst-draining like [`drain_unordered_async`]
+/// (with the async recv-batch knob on, burst runs claim under one cursor
+/// update per run — ordering never depends on the claim size, the
+/// `ReorderBuffer` re-sequences by `seq`).
 #[cfg(feature = "tokio-runtime")]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) async fn drain_ordered_async<R, O>(
@@ -371,6 +400,33 @@ pub(crate) async fn drain_ordered_async<R, O>(
     expected_items: usize,
     window: OrderedWindow,
     accounting: OrderedAccounting<'_>,
+    sink: impl FnMut(O),
+) where
+    R: AsyncRecvItem<(u64, O)>,
+    O: Send,
+{
+    drain_ordered_async_with(
+        rx,
+        expected_items,
+        window,
+        accounting,
+        crate::handoff::async_drain_batch_cap(),
+        sink,
+    )
+    .await;
+}
+
+/// [`drain_ordered_async`] with an explicit batch cap (0 = per-item, the
+/// historical loop byte-for-byte) — the async twin of
+/// [`drain_ordered_with`].
+#[cfg(feature = "tokio-runtime")]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) async fn drain_ordered_async_with<R, O>(
+    rx: &R,
+    expected_items: usize,
+    window: OrderedWindow,
+    accounting: OrderedAccounting<'_>,
+    batch_cap: usize,
     mut sink: impl FnMut(O),
 ) where
     R: AsyncRecvItem<(u64, O)>,
@@ -385,6 +441,8 @@ pub(crate) async fn drain_ordered_async<R, O>(
     };
     // Same per-collector waker-node slot as `drain_unordered_async`.
     let mut slot = WakerSlot::new();
+    // Batch scratch (see `drain_unordered_async_with`).
+    let mut scratch: Vec<(u64, O)> = Vec::with_capacity(batch_cap);
     drain_loop!(
         rx, anchor rx.recv_cached(&mut slot).await,
         insert(seq, item) { buffer.insert_into(seq, item, &mut sink); },
@@ -396,7 +454,8 @@ pub(crate) async fn drain_ordered_async<R, O>(
                 verify_ordered_accounting(&buffer, emitted, expected_items, cancel);
             }
             return;
-        }
+        },
+        batch(batch_cap, scratch)
     );
 }
 
@@ -571,7 +630,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handoff::{ChannelError, channel};
+    use crate::handoff::{ChannelError, TryRecvItem, channel, mpsc_async_channel};
 
     /// The drain family only needs `O: Send` (todo #8 lifetime item): the
     /// loops neither spawn nor store beyond the `ReorderBuffer`. Prove it
@@ -585,20 +644,13 @@ mod tests {
         struct DequeRecv<'q, 'd> {
             queue: std::cell::RefCell<&'q mut std::collections::VecDeque<(u64, &'d i32)>>,
         }
-        impl<'d> RecvItem<(u64, &'d i32)> for DequeRecv<'_, 'd> {
-            fn recv(&self) -> Result<(u64, &'d i32), ChannelError> {
-                self.queue
-                    .borrow_mut()
-                    .pop_front()
-                    .ok_or(ChannelError::Closed)
-            }
-
+        impl<'d> TryRecvItem<(u64, &'d i32)> for DequeRecv<'_, 'd> {
             fn try_recv(&self) -> Result<(u64, &'d i32), TryRecvError> {
                 self.recv().map_err(|_| TryRecvError::Closed)
             }
 
             // Test backing over a plain VecDeque: no native batch op, so
-            // the per-item fallback is spelled out (`RecvItem` does not
+            // the per-item fallback is spelled out (`TryRecvItem` does not
             // default it).
             fn try_recv_batch(&self, buf: &mut [std::mem::MaybeUninit<(u64, &'d i32)>]) -> usize {
                 let mut n = 0;
@@ -619,6 +671,15 @@ mod tests {
             }
         }
 
+        impl<'d> RecvItem<(u64, &'d i32)> for DequeRecv<'_, 'd> {
+            fn recv(&self) -> Result<(u64, &'d i32), ChannelError> {
+                self.queue
+                    .borrow_mut()
+                    .pop_front()
+                    .ok_or(ChannelError::Closed)
+            }
+        }
+
         let owned = [10, 20, 30];
         let items: Vec<(u64, &i32)> = vec![(2, &owned[2]), (0, &owned[0]), (1, &owned[1])];
         let mut queue: std::collections::VecDeque<(u64, &i32)> = items.into();
@@ -629,6 +690,56 @@ mod tests {
         assert_eq!(out.iter().map(|r| **r).collect::<Vec<_>>(), vec![
             10, 20, 30
         ]);
+    }
+
+    /// `drain_unordered_async_with` batch arm (todo #50 site (b)): the
+    /// pre-queued run is claimed under one cursor store per run (cap 2
+    /// forces three runs for five items), stragglers queued before the last
+    /// sender dropped are delivered BEFORE the EOF (the half-close
+    /// contract), and the collector returns once the channel reports
+    /// Closed. Driven on `block_on`: the fork's async endpoints are
+    /// runtime-agnostic and every item is already queued at the first
+    /// poll, so the anchor resolves through its slot-owned waker node
+    /// without a reactor (the same LocalPool shape the mux tests use).
+    #[cfg(feature = "tokio-runtime")]
+    #[test]
+    fn drain_unordered_async_batch_claims_runs_before_eof() {
+        let (tx, rx) = mpsc_async_channel::<(u64, u32)>(16);
+        for i in 0..5u32 {
+            tx.try_send((u64::from(i), i)).unwrap();
+        }
+        drop(tx);
+        let mut out = Vec::new();
+        futures::executor::block_on(drain_unordered_async_with(
+            &rx,
+            2, // < the ready run: multiple batch claims per drain
+            |i| out.push(i),
+        ));
+        assert_eq!(out, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// `drain_ordered_async_with` batch arm: ordering never depends on the
+    /// claim size — arrival shuffled, the seq tag re-sequences through the
+    /// `ReorderBuffer`, and the drain closes with the accounting exactly
+    /// balanced (emitted == expected, no drops).
+    #[cfg(feature = "tokio-runtime")]
+    #[test]
+    fn drain_ordered_async_batch_resequences_shuffled_arrival() {
+        let (tx, rx) = mpsc_async_channel::<(u64, u32)>(16);
+        for seq in [2u64, 0, 3, 1, 4] {
+            tx.try_send((seq, u32::try_from(seq).unwrap())).unwrap();
+        }
+        drop(tx);
+        let mut out = Vec::new();
+        futures::executor::block_on(drain_ordered_async_with(
+            &rx,
+            5,
+            OrderedWindow::open(5),
+            OrderedAccounting::Validate { cancel: None },
+            2,
+            |i| out.push(i),
+        ));
+        assert_eq!(out, vec![0, 1, 2, 3, 4]);
     }
 
     /// Pinned-window overflow through the real drain loop (the

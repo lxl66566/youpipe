@@ -21,6 +21,12 @@
 //! delivery — drained completion clusters go out per edge through
 //! [`AsyncOutlet::deliver_batch`] instead of one awaited send per item (see
 //! `handoff`'s knob table for the hop distinction).
+//!
+//! `YOUPIPE_ASYNC_CLAIM_BATCH` batches each driver's INTAKE claim (todo
+//! #50): the refill loop claims up to `claim_cap` items per ring-cursor run
+//! through [`AsyncIntake::try_claim_batch`] instead of one CAS per item.
+//! Acceptance granularity becomes per claim batch — a fired cancel token
+//! stops the next claim, the claimed run is accepted whole.
 
 use std::{
     future::{Future, poll_fn},
@@ -32,7 +38,9 @@ use std::{
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use super::{
-    channel::{AsyncReceiver, AsyncSendItem, TryRecvError, WakerSlot, stage_batch},
+    channel::{
+        AsyncReceiver, AsyncSendItem, Claim, TryRecvError, WakerSlot, claim_poll, stage_batch,
+    },
     worker::cancel_active,
 };
 use crate::sync::CancellationToken;
@@ -117,6 +125,39 @@ pub(crate) enum TryClaim<T> {
 pub(crate) trait AsyncIntake<T>: Send {
     /// Claim one item without parking.
     fn try_claim(&mut self) -> TryClaim<T>;
+    /// Claim up to `cap` items without parking, appending them to `out`
+    /// (which must be EMPTY on entry and keep its allocation — the same
+    /// scratch contract [`claim_poll`] documents). `Claim::Ready(n > 0)` =
+    /// `out` holds exactly the claimed run; `Claim::Empty` = nothing ready
+    /// right now (`out` still empty); `Claim::Closed` = every input
+    /// disconnected and drained.
+    ///
+    /// Default per-item fallback (`try_claim` in a fill loop): semantically
+    /// identical, only the per-run cursor amortization is lost — the graph
+    /// fan-in keeps this default (a batch claim stays within ONE ring;
+    /// its round sweep claims across rings, todo #50).
+    fn try_claim_batch(&mut self, out: &mut Vec<T>, cap: usize) -> Claim {
+        let mut closed = false;
+        while out.len() < cap {
+            match self.try_claim() {
+                TryClaim::Item(item) => out.push(item),
+                TryClaim::Empty => break,
+                TryClaim::Closed => {
+                    closed = true;
+                    break;
+                },
+            }
+        }
+        if out.is_empty() {
+            if closed {
+                Claim::Closed
+            } else {
+                Claim::Empty
+            }
+        } else {
+            Claim::Ready(out.len())
+        }
+    }
     /// Poll for one item: `Ready(Some)` = claimed, `Ready(None)` = every
     /// input closed and drained (EOF), `Pending` = `cx.waker()` is
     /// registered on every open input. Cancel-safety is structural — a poll
@@ -181,6 +222,15 @@ impl<T: Send + Unpin + 'static> AsyncIntake<T> for RxIntake<T> {
         }
     }
 
+    /// Native batch claim through [`claim_poll`] (the async claim's ring is
+    /// the same `AsyncReceiver` the sync claim path drives): one MPMC
+    /// `head` CAS per claimed run replaces one per item on the mixed ring
+    /// shared by every driver (todo #50 site (a); the 0-claim probe and the
+    /// half-close final drain are `claim_poll`'s, verbatim).
+    fn try_claim_batch(&mut self, out: &mut Vec<T>, cap: usize) -> Claim {
+        claim_poll(&self.rx, out, cap)
+    }
+
     /// Registration-free fast path first (`try_recv`), then one poll of the
     /// cached recv — on `Pending` the slot's waker node stays registered
     /// with the ring (slot-owned, no future held between polls), so an
@@ -242,7 +292,9 @@ enum Event<O, T> {
 ///
 /// `cap == 1` is the sequential loop, without an in-flight set. Delivery is
 /// per-item unless the `YOUPIPE_ASYNC_OUTLET_BATCH` knob arms the batched
-/// outlet ([`AsyncOutlet::deliver_batch`]); see `drive_inner`.
+/// outlet ([`AsyncOutlet::deliver_batch`]); claims are per-item unless
+/// `YOUPIPE_ASYNC_CLAIM_BATCH` arms the batched intake claim
+/// ([`AsyncIntake::try_claim_batch`]); see `drive_inner`.
 pub(crate) async fn drive<T, O, Fut>(
     intake: impl AsyncIntake<T>,
     map: impl Fn(T) -> Fut,
@@ -260,20 +312,23 @@ pub(crate) async fn drive<T, O, Fut>(
         out,
         cap,
         super::async_outlet_batch_cap(),
+        super::async_claim_batch_cap(),
         cancel,
     )
     .await;
 }
 
-/// [`drive`] with an explicit outlet batch cap (0 = per-item deliveries);
-/// the knob-free core so tests pin the batched semantics without the
-/// process-global env read.
+/// [`drive`] with an explicit outlet batch cap and claim batch cap (either
+/// 0 = per-item); the knob-free core so tests pin the batched semantics
+/// without the process-global env read.
+#[allow(clippy::too_many_arguments)]
 async fn drive_inner<T, O, Fut>(
     mut intake: impl AsyncIntake<T>,
     map: impl Fn(T) -> Fut,
     mut out: impl AsyncOutlet<O>,
     cap: usize,
     batch_cap: usize,
+    claim_cap: usize,
     cancel: Option<&CancellationToken>,
 ) where
     T: Send,
@@ -297,6 +352,27 @@ async fn drive_inner<T, O, Fut>(
     let mut head = pin!(None::<Fut>);
     // Claimed by the select, admitted by the refill below.
     let mut next: Option<T> = None;
+    // Batched-claim scratch (`YOUPIPE_ASYNC_CLAIM_BATCH`, todo #50): one
+    // `AsyncIntake::try_claim_batch` claims up to `claim_cap` items per
+    // cursor run; zero capacity when the claim cap is 0 (the historical
+    // per-item claims). Consumed LIFO (`pop`) — delivery is in completion
+    // order (seq-tagged for ordered runs), so claim order is irrelevant —
+    // and refilled only once empty, the scratch contract `claim_poll`
+    // asserts.
+    //
+    // The claim run is clamped to the driver's FREE admission capacity
+    // (`cap - in_flight`, see the refill below): an unclamped 64-run lets
+    // ONE driver hoard the ring's whole ready burst while its IO-paced
+    // admissions trickle out — every other driver parks on an empty ring
+    // and stage-wide IO parallelism collapses onto the hoarder's few
+    // in-flight slots (the gates A/B measured +245 % on
+    // `io_async_pure/youpipe_async/200`, 0/25). This is the async twin of
+    // the sync claim path's per-worker share (a driver's `cap` IS its
+    // MuxPlan share of `io_concurrency`): claim only what you can admit
+    // now. CPU-paced stages keep chunky claims — a cheap future resolves
+    // on its first inline poll, so `in_flight` never grows during the
+    // refill and the free capacity stays at the full share.
+    let mut claims: Vec<T> = Vec::with_capacity(claim_cap);
     // Input still claimable: no EOF and no cancel observed yet.
     let mut open = true;
     // Batched-outlet scratch: zero capacity when the batch cap is 0, so the
@@ -305,19 +381,58 @@ async fn drive_inner<T, O, Fut>(
     let mut staged: Vec<MaybeUninit<O>> = Vec::with_capacity(batch_cap);
     loop {
         let mut in_flight = overflow.len() + usize::from(head.is_some());
-        while open && in_flight < cap && (batch_cap == 0 || batch.len() < batch_cap) {
+        // The guard drops the historical `open` term: on EOF/cancel the
+        // already-claimed scratch items are ACCEPTED and still admitted
+        // (per-batch acceptance granularity, todo #50) — the loop exits
+        // through the empty-scratch arms below instead.
+        while in_flight < cap && (batch_cap == 0 || batch.len() < batch_cap) {
             let item = match next.take() {
                 Some(item) => item,
-                None => match intake.try_claim() {
-                    TryClaim::Item(item) => item,
-                    TryClaim::Empty => break,
-                    TryClaim::Closed => {
-                        open = false;
-                        break;
+                None => match claims.pop() {
+                    Some(item) => item,
+                    None if !open => break,
+                    None if claim_cap > 0 => {
+                        // Batched-claim arm: the cancel checkpoint is the
+                        // CLAIM boundary — the token check runs BEFORE the
+                        // claim, and the whole claimed run counts as
+                        // accepted (a fired token stops the NEXT claim,
+                        // never the items already claimed; the graph
+                        // engine's cancellation precedent, streaming.md
+                        // "Cancellation").
+                        if cancel_active(cancel) {
+                            open = false;
+                            break;
+                        }
+                        // `want` is the free admission capacity (>= 1
+                        // here — the refill guard just checked it), the
+                        // anti-hoarding clamp the scratch comment above
+                        // documents; the scratch keeps its full `claim_cap`
+                        // capacity for the unclamped `claim_cap == want`
+                        // case.
+                        let want = claim_cap.min(cap - in_flight);
+                        match intake.try_claim_batch(&mut claims, want) {
+                            Claim::Ready(_) => continue,
+                            Claim::Empty => break,
+                            Claim::Closed => {
+                                open = false;
+                                break;
+                            },
+                        }
+                    },
+                    // Historical per-item arm: claim first, then the token
+                    // check — the item that observes the token is dropped
+                    // unmapped.
+                    None => match intake.try_claim() {
+                        TryClaim::Item(item) => item,
+                        TryClaim::Empty => break,
+                        TryClaim::Closed => {
+                            open = false;
+                            break;
+                        },
                     },
                 },
             };
-            if cancel_active(cancel) {
+            if claim_cap == 0 && cancel_active(cancel) {
                 open = false;
                 break;
             }
@@ -361,10 +476,17 @@ async fn drive_inner<T, O, Fut>(
             return;
         }
         let event = if in_flight == 0 {
-            if !open {
-                return;
+            if claims.is_empty() {
+                if !open {
+                    return;
+                }
+                Event::Claimed(poll_fn(|cx| intake.poll_claim(cx)).await)
+            } else {
+                // Accepted-but-unadmitted claims remain (a full outlet
+                // batch stalled the refill): loop back and admit them
+                // before parking or exiting — the accepted-item contract.
+                continue;
             }
-            Event::Claimed(poll_fn(|cx| intake.poll_claim(cx)).await)
         } else {
             // The first completion, or an arrival while there is room. The
             // in-flight futures are polled first: completions free slots and
@@ -503,7 +625,9 @@ mod tests {
     }
 
     /// Spawn one driver over `rx` → `out` on `pool`; the flag flips when
-    /// `drive_inner` returns. `batch_cap` 0 is the knob-off per-item arm.
+    /// `drive_inner` returns. `batch_cap`/`claim_cap` 0 are the knob-off
+    /// per-item arms.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_driver(
         pool: &LocalPool,
         rx: AsyncReceiver<u32>,
@@ -511,6 +635,7 @@ mod tests {
         g: &Rc<Gated>,
         cap: usize,
         batch_cap: usize,
+        claim_cap: usize,
         cancel: Option<CancellationToken>,
     ) -> Rc<Cell<bool>> {
         let done = Rc::new(Cell::new(false));
@@ -524,6 +649,7 @@ mod tests {
                     TxOutlet::new(out),
                     cap,
                     batch_cap,
+                    claim_cap,
                     cancel.as_ref(),
                 )
                 .await;
@@ -548,7 +674,7 @@ mod tests {
         let (otx, orx) = async_channel::<u32>(16);
         let g = Gated::new(6);
         let mut pool = LocalPool::new();
-        let done = spawn_driver(&pool, rx, otx, &g, 3, batch_cap, None);
+        let done = spawn_driver(&pool, rx, otx, &g, 3, batch_cap, 0, None);
         for x in 0..5 {
             tx.try_send(x).unwrap();
         }
@@ -602,7 +728,7 @@ mod tests {
             g.open(x);
         }
         let mut pool = LocalPool::new();
-        let done = spawn_driver(&pool, rx, otx, &g, 2, batch_cap, None);
+        let done = spawn_driver(&pool, rx, otx, &g, 2, batch_cap, 0, None);
         for x in 0..6 {
             tx.try_send(x).unwrap();
         }
@@ -632,7 +758,7 @@ mod tests {
         let g = Gated::new(8);
         let mut pool = LocalPool::new();
         let token = CancellationToken::new();
-        let done = spawn_driver(&pool, rx, otx, &g, 4, 0, Some(token.clone()));
+        let done = spawn_driver(&pool, rx, otx, &g, 4, 0, 0, Some(token.clone()));
         for x in 0..8 {
             tx.try_send(x).unwrap();
         }
@@ -661,7 +787,7 @@ mod tests {
         drop(orx);
         let g = Gated::new(2);
         let mut pool = LocalPool::new();
-        let done = spawn_driver(&pool, rx, otx, &g, 2, 0, None);
+        let done = spawn_driver(&pool, rx, otx, &g, 2, 0, 0, None);
         tx.try_send(0).unwrap();
         tx.try_send(1).unwrap();
         pool.run_until_stalled();
@@ -750,7 +876,7 @@ mod tests {
             let (otx, orx) = async_channel::<u32>(16);
             let g = Gated::new(6);
             let mut pool = LocalPool::new();
-            let done = spawn_driver(&pool, rx, otx, &g, 3, batch_cap, None);
+            let done = spawn_driver(&pool, rx, otx, &g, 3, batch_cap, 0, None);
             for x in 0..6 {
                 tx.try_send(x).unwrap();
             }
@@ -805,7 +931,7 @@ mod tests {
         let g = Gated::new(8);
         let mut pool = LocalPool::new();
         let token = CancellationToken::new();
-        let done = spawn_driver(&pool, rx, otx, &g, 4, 4, Some(token.clone()));
+        let done = spawn_driver(&pool, rx, otx, &g, 4, 4, 0, Some(token.clone()));
         for x in 0..8 {
             tx.try_send(x).unwrap();
         }
@@ -858,6 +984,7 @@ mod tests {
                         TxOutlet::new(otx),
                         4,
                         4,
+                        0,
                         None,
                     )
                     .await;
@@ -904,6 +1031,7 @@ mod tests {
                         TxOutlet::new(otx),
                         4,
                         8,
+                        0,
                         None,
                     )
                     .await;
@@ -919,5 +1047,201 @@ mod tests {
         pool.run_until_stalled();
         assert!(done.get());
         assert_eq!(*got.borrow(), (0..8).collect::<Vec<u32>>());
+    }
+
+    // ── YOUPIPE_ASYNC_CLAIM_BATCH (todo #50 site (a)) ──
+
+    /// `RxIntake::try_claim_batch` pins `claim_poll`'s contract on the
+    /// async ring: the ready run, the 0-claim Empty probe (open channel),
+    /// and the half-close final drain before Closed.
+    #[test]
+    fn rx_intake_try_claim_batch_semantics() {
+        let (tx, rx) = async_channel::<u32>(16);
+        let mut intake = RxIntake::new(rx);
+        let mut scratch: Vec<u32> = Vec::with_capacity(8);
+
+        // open + empty -> Empty (no ring re-walk: try_recv is not called)
+        assert_eq!(intake.try_claim_batch(&mut scratch, 8), Claim::Empty);
+        assert_eq!(scratch, [] as [u32; 0]);
+
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        tx.try_send(3).unwrap();
+        assert_eq!(intake.try_claim_batch(&mut scratch, 8), Claim::Ready(3));
+        assert_eq!(scratch, vec![1, 2, 3]);
+        scratch.clear();
+
+        // half-close: stragglers claimed first, Closed only after the drain
+        tx.try_send(4).unwrap();
+        tx.try_send(5).unwrap();
+        drop(tx);
+        assert_eq!(intake.try_claim_batch(&mut scratch, 8), Claim::Ready(2));
+        assert_eq!(scratch, vec![4, 5]);
+        scratch.clear();
+        assert_eq!(intake.try_claim_batch(&mut scratch, 8), Claim::Closed);
+    }
+
+    /// The trait's default per-item `try_claim_batch` fallback (what the
+    /// graph fan-in keeps): fills the scratch through `try_claim` and
+    /// degrades to Ready(n) on a partial fill, Empty/Closed only from
+    /// scratch-empty scans.
+    #[test]
+    fn intake_default_try_claim_batch_fills_per_item() {
+        struct SeqIntake {
+            items: std::collections::VecDeque<u32>,
+        }
+        impl AsyncIntake<u32> for SeqIntake {
+            fn try_claim(&mut self) -> TryClaim<u32> {
+                self.items
+                    .pop_front()
+                    .map_or(TryClaim::Empty, TryClaim::Item)
+            }
+
+            fn poll_claim(&mut self, _cx: &mut Context<'_>) -> Poll<Option<u32>> {
+                unreachable!("not exercised by this probe")
+            }
+        }
+        let mut intake = SeqIntake {
+            items: vec![7, 8].into(),
+        };
+        let mut scratch = Vec::with_capacity(4);
+        assert_eq!(intake.try_claim_batch(&mut scratch, 4), Claim::Ready(2));
+        assert_eq!(scratch, vec![7, 8]);
+        scratch.clear();
+        assert_eq!(intake.try_claim_batch(&mut scratch, 4), Claim::Empty);
+    }
+
+    /// Cancel observed between claim batches (the batched twin of
+    /// `drive_cancel_delivers_accepted_items_only`): every item accepted
+    /// before the token is delivered, nothing further is claimed. The
+    /// per-item twin's "exactly one claim after cancel" probe counts ring
+    /// leftovers [5, 6, 7]; the batch arm's cancel checkpoint sits at the
+    /// claim BOUNDARY, so item 4 is never claimed — the leftover run is
+    /// [4, 5, 6, 7] (todo #50's documented probe shift).
+    #[test]
+    fn drive_batched_claim_cancel_delivers_accepted_items_only() {
+        let (tx, rx) = async_channel::<u32>(16);
+        let probe = rx.clone();
+        let (otx, orx) = async_channel::<u32>(16);
+        let g = Gated::new(8);
+        let mut pool = LocalPool::new();
+        let token = CancellationToken::new();
+        let done = spawn_driver(&pool, rx, otx, &g, 4, 0, 4, Some(token.clone()));
+        for x in 0..8 {
+            tx.try_send(x).unwrap();
+        }
+        pool.run_until_stalled();
+        // LIFO scratch: the run [0..4) is admitted tail-first
+        assert_eq!(g.started(), [3, 2, 1, 0], "one batch claimed the cap run");
+
+        token.cancel();
+        g.open(0);
+        pool.run_until_stalled();
+        assert_eq!(
+            g.started(),
+            [3, 2, 1, 0],
+            "the token stopped the next claim"
+        );
+        for x in 1..4 {
+            g.open(x);
+        }
+        pool.run_until_stalled();
+        assert!(done.get());
+        assert_eq!(drain(&orx), [0, 1, 2, 3]);
+        assert_eq!(drain(&probe), [4, 5, 6, 7], "no claim after the token");
+    }
+
+    /// A token firing MID-BATCH is the per-batch acceptance granularity
+    /// itself (todo #50, streaming.md "Cancellation" precedent): the map
+    /// closure cancels while the claimed run [0..4) is being admitted, and
+    /// the whole run still counts as accepted — the per-item arm would
+    /// drop item 1 (its claim observes the token) and leave it in no
+    /// man's land. Only the NEXT claim observes the token.
+    #[test]
+    fn drive_batched_claim_cancel_accepts_whole_claim_batch() {
+        let (tx, rx) = async_channel::<u32>(16);
+        let probe = rx.clone();
+        let (otx, orx) = async_channel::<u32>(16);
+        let mut pool = LocalPool::new();
+        let token = CancellationToken::new();
+        let done = {
+            let done = Rc::new(Cell::new(false));
+            let flag = Rc::clone(&done);
+            let cancel = token.clone();
+            pool.spawner()
+                .spawn_local(async move {
+                    drive_inner(
+                        RxIntake::new(rx),
+                        |x| {
+                            if x == 0 {
+                                cancel.cancel();
+                            }
+                            async move { x }
+                        },
+                        TxOutlet::new(otx),
+                        8,
+                        0,
+                        4,
+                        Some(&cancel),
+                    )
+                    .await;
+                    flag.set(true);
+                })
+                .unwrap();
+            done
+        };
+        for x in 0..8 {
+            tx.try_send(x).unwrap();
+        }
+        drop(tx);
+        pool.run_until_stalled();
+        assert!(done.get());
+        assert_eq!(drain(&orx), [0, 1, 2, 3], "the claimed run accepted whole");
+        assert_eq!(
+            drain(&probe),
+            [4, 5, 6, 7],
+            "the token stopped the next claim"
+        );
+    }
+
+    /// EOF mid-scratch: items already claimed when the input closes are
+    /// accepted — the refill admits them after the in-flight set drains,
+    /// and the driver exits only once the scratch is empty (the batched
+    /// shape of `drive_fills_cap_and_claims_while_busy`'s EOF wait). Under
+    /// the anti-hoarding clamp a claim run equals the free admission
+    /// capacity and is admitted in full, so the outlet-batch stall is the
+    /// one refill exit that leaves the scratch holding the unadmitted
+    /// remainder — `batch_cap` 1 stalls after every delivery.
+    #[test]
+    fn drive_batched_claim_eof_delivers_claimed_remainder() {
+        let (tx, rx) = async_channel::<u32>(16);
+        let (otx, orx) = async_channel::<u32>(16);
+        let g = Gated::new(4);
+        let mut pool = LocalPool::new();
+        let done = spawn_driver(&pool, rx, otx, &g, 2, 1, 4, None);
+        for x in 0..4 {
+            tx.try_send(x).unwrap();
+        }
+        pool.run_until_stalled();
+        // The clamped first claim is the free capacity 2: [0, 1], admitted
+        // LIFO.
+        assert_eq!(g.started(), [1, 0]);
+
+        drop(tx);
+        g.open(1);
+        pool.run_until_stalled();
+        assert_eq!(drain(&orx), [1]);
+        assert!(!done.get(), "the claimed remainder is still accepted");
+        // The freed slot re-claimed item 2 (the arrival arm's `poll_claim`);
+        // item 3 waits in the ring behind the closed input's straggler
+        // drain.
+        assert_eq!(g.started(), [1, 0, 2]);
+
+        for x in [0, 2, 3] {
+            g.open(x);
+        }
+        pool.run_until_stalled();
+        assert!(done.get());
+        assert_eq!(drain(&orx), [0, 2, 3]);
     }
 }

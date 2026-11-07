@@ -291,6 +291,26 @@ impl<T: Send + Unpin + 'static> Clone for AsyncSender<T> {
 }
 
 impl<T: Send + Unpin + 'static> AsyncReceiver<T> {
+    /// Async twin of [`SyncReceiver::try_recv_batch`] (the fork's
+    /// `AsyncRx::try_recv_batch`: read-only stamp walk + ONE `head` CAS per
+    /// claimed run, one merged producer-wake `fire_n` pass). Same contract:
+    /// 0 = nothing ready right now, NOT an Empty/Closed verdict.
+    ///
+    /// Probe caliber: one hotpath guard per *batch* (see
+    /// [`SyncReceiver::try_recv_batch`]).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncReceiver"))]
+    pub fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        self.rx.try_recv_batch(buf)
+    }
+
+    /// Async twin of [`SyncReceiver::is_disconnected`] (review P-6's
+    /// 0-claim probe on the async claim/drain faces).
+    #[must_use]
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "AsyncReceiver"))]
+    pub fn is_disconnected(&self) -> bool {
+        self.rx.is_disconnected()
+    }
+
     /// Poll-based cached recv (the fork's `AsyncRx::poll_recv_cached`) for
     /// poll-based claim loops (the async intakes' `poll_claim`): `Pending`
     /// leaves the waker node registered with the ring, owned by the slot —
@@ -471,21 +491,6 @@ impl<T: Send + 'static> RecvItem<T> for MpscReceiver<T> {
     fn recv(&self) -> Result<T, ChannelError> {
         MpscReceiver::recv(self)
     }
-
-    #[inline]
-    fn try_recv(&self) -> Result<T, TryRecvError> {
-        MpscReceiver::try_recv(self)
-    }
-
-    #[inline]
-    fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
-        MpscReceiver::try_recv_batch(self, buf)
-    }
-
-    #[inline]
-    fn is_disconnected(&self) -> bool {
-        MpscReceiver::is_disconnected(self)
-    }
 }
 
 // ── MPSC mixed-mode (sync sender + async single-consumer receiver) ──
@@ -593,6 +598,26 @@ impl<T: Send + Unpin + 'static> MpscAsyncReceiver<T> {
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         self.rx.try_recv().map_err(map_recv_err)
     }
+
+    /// MPSC async twin of [`MpscReceiver::try_recv_batch`] (one `recv`
+    /// cursor store per claimed run + one merged producer-wake `fire_n`
+    /// pass). Same contract: 0 = nothing ready right now, NOT an
+    /// Empty/Closed verdict.
+    ///
+    /// Probe caliber: one hotpath guard per *batch* (see
+    /// [`SyncReceiver::try_recv_batch`]).
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncReceiver"))]
+    pub fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        self.rx.try_recv_batch(buf)
+    }
+
+    /// Async twin of [`MpscReceiver::is_disconnected`] (review P-6's
+    /// 0-claim probe on the async terminal drain).
+    #[must_use]
+    #[cfg_attr(feature = "hotpath", hotpath::measure(impl_type = "MpscAsyncReceiver"))]
+    pub fn is_disconnected(&self) -> bool {
+        self.rx.is_disconnected()
+    }
 }
 
 /// Outcome of one non-blocking claim attempt ([`claim_poll`]).
@@ -614,7 +639,7 @@ pub(crate) enum Claim {
 /// capacity.
 ///
 /// Probe shape (review P-6): a 0-count batch on an open channel resolves to
-/// Empty via [`RecvItem::is_disconnected`] — one load of the cold tx-count
+/// Empty via [`TryRecvItem::is_disconnected`] — one load of the cold tx-count
 /// line — instead of a second ring walk through `try_recv`. Multi-worker
 /// empty-ring polling previously paid that walk twice, doubling exactly the
 /// stamp/head cache-line bouncing the spin backoff exists to throttle
@@ -628,7 +653,7 @@ pub(crate) enum Claim {
 /// last sender dropped are still delivered.
 pub(crate) fn claim_poll<R, T>(rx: &R, scratch: &mut Vec<T>, batch_cap: usize) -> Claim
 where
-    R: RecvItem<T>,
+    R: TryRecvItem<T>,
 {
     // Contract: scratch must be empty on entry (call sites drain it fully —
     // `drain(..)` also on their abort paths) and have capacity for at least
@@ -848,31 +873,11 @@ impl<T: Send + 'static> SendItem<T> for SyncSender<T> {
 /// A sync receiver that can `recv` (blocking) and `try_recv` (non-blocking).
 /// Implemented by both [`SyncReceiver`] (MPMC) and [`MpscReceiver`] (MPSC) so
 /// collector functions can be generic over either.
-pub trait RecvItem<T> {
+pub trait RecvItem<T>: TryRecvItem<T> {
     fn recv(&self) -> Result<T, ChannelError>;
-    fn try_recv(&self) -> Result<T, TryRecvError>;
-    /// Non-blocking batch claim of the ready prefix into `buf`; returns the
-    /// count. 0 = nothing ready right now — NOT an Empty/Closed verdict
-    /// (call [`Self::try_recv`] to distinguish). Required, not defaulted:
-    /// every real backing has a native batch op, and a silent per-item
-    /// fallback here would be a performance trap for a future backing on
-    /// the default-on batched paths (a test-only backing may spell its own
-    /// per-item fallback out).
-    fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize;
-
-    /// Whether every sender has been dropped — one load of the tx-count
-    /// line, no ring walk (see [`SyncReceiver::is_disconnected`]). Lets a
-    /// 0-count batch claim resolve to Empty/Closed without a second probe
-    /// through `try_recv` (review P-6).
-    fn is_disconnected(&self) -> bool;
 }
 
-impl<T: Send + 'static> RecvItem<T> for SyncReceiver<T> {
-    #[inline]
-    fn recv(&self) -> Result<T, ChannelError> {
-        SyncReceiver::recv(self)
-    }
-
+impl<T: Send + 'static> TryRecvItem<T> for SyncReceiver<T> {
     #[inline]
     fn try_recv(&self) -> Result<T, TryRecvError> {
         SyncReceiver::try_recv(self)
@@ -889,18 +894,55 @@ impl<T: Send + 'static> RecvItem<T> for SyncReceiver<T> {
     }
 }
 
-/// `try_recv`-only subset shared by the sync and async MPSC receivers, so
-/// the sharded terminals' round-robin burst pass (`ShardSet::drain_pass`)
-/// is written once for both flavours (the full `RecvItem` cannot cover the
-/// async side: its `recv` returns a future, not a blocking call).
+impl<T: Send + 'static> RecvItem<T> for SyncReceiver<T> {
+    #[inline]
+    fn recv(&self) -> Result<T, ChannelError> {
+        SyncReceiver::recv(self)
+    }
+}
+
+/// The non-blocking claim surface (`try_recv` + `try_recv_batch` +
+/// `is_disconnected`) shared by ALL FOUR receiver flavours — sync and async
+/// alike — so every non-blocking burst rhythm (the sharded terminals'
+/// round-robin pass `ShardSet::drain_pass`, [`claim_poll`], and the batch
+/// arms of the async terminal drains) is written once for both flavours
+/// (the full `RecvItem` cannot cover the async side: its `recv` returns a
+/// future, not a blocking call). [`RecvItem`] and [`AsyncRecvItem`] both
+/// inherit this, so a blocking- or awaiting-drain bound keeps the whole
+/// claim surface.
 pub trait TryRecvItem<T> {
     fn try_recv(&self) -> Result<T, TryRecvError>;
+
+    /// Non-blocking batch claim of the ready prefix into `buf`; returns the
+    /// count. 0 = nothing ready right now — NOT an Empty/Closed verdict
+    /// (call [`Self::try_recv`] to distinguish). Required, not defaulted:
+    /// every real backing has a native batch op, and a silent per-item
+    /// fallback here would be a performance trap for a future backing on
+    /// the default-on batched paths (a test-only backing may spell its own
+    /// per-item fallback out).
+    fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize;
+
+    /// Whether every sender has been dropped — one load of the tx-count
+    /// line, no ring walk (see [`SyncReceiver::is_disconnected`]). Lets a
+    /// 0-count batch claim resolve to Empty/Closed without a second probe
+    /// through `try_recv` (review P-6).
+    fn is_disconnected(&self) -> bool;
 }
 
 impl<T: Send + 'static> TryRecvItem<T> for MpscReceiver<T> {
     #[inline]
     fn try_recv(&self) -> Result<T, TryRecvError> {
         MpscReceiver::try_recv(self)
+    }
+
+    #[inline]
+    fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        MpscReceiver::try_recv_batch(self, buf)
+    }
+
+    #[inline]
+    fn is_disconnected(&self) -> bool {
+        MpscReceiver::is_disconnected(self)
     }
 }
 
@@ -909,13 +951,26 @@ impl<T: Send + Unpin + 'static> TryRecvItem<T> for MpscAsyncReceiver<T> {
     fn try_recv(&self) -> Result<T, TryRecvError> {
         MpscAsyncReceiver::try_recv(self)
     }
+
+    #[inline]
+    fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        MpscAsyncReceiver::try_recv_batch(self, buf)
+    }
+
+    #[inline]
+    fn is_disconnected(&self) -> bool {
+        MpscAsyncReceiver::is_disconnected(self)
+    }
 }
 
-/// Async counterpart to [`RecvItem`]: `recv().await` and `try_recv`. Both
+/// Async counterpart to [`RecvItem`]: `recv().await` / `recv_cached().await`
+/// over the inherited [`TryRecvItem`] claim surface (todo #50: the batch
+/// arm of the async terminal drains needs `try_recv_batch` /
+/// `is_disconnected` with the same no-default anti-trap shape). Both
 /// [`AsyncReceiver`] (MPMC) and [`MpscAsyncReceiver`] (MPSC) implement this
 /// so the async collector can drain either backing with one implementation,
 /// avoiding code duplication between the MPMC and MPSC terminal paths.
-pub trait AsyncRecvItem<T> {
+pub trait AsyncRecvItem<T>: TryRecvItem<T> {
     /// Wait for one item. Resolves to `Err(ChannelError::Closed)` once every
     /// sender has been dropped.
     fn recv(&self) -> impl Future<Output = Result<T, ChannelError>>;
@@ -926,7 +981,6 @@ pub trait AsyncRecvItem<T> {
         &'s self,
         slot: &'s mut WakerSlot,
     ) -> impl Future<Output = Result<T, ChannelError>>;
-    fn try_recv(&self) -> Result<T, TryRecvError>;
 }
 
 /// Async counterpart to [`SendItem`]: the cached-park send used by async
@@ -1069,6 +1123,23 @@ impl<T: Send + Unpin + 'static> AsyncSendItem<T> for MpscAsyncSender<T> {
     }
 }
 
+impl<T: Send + Unpin + 'static> TryRecvItem<T> for AsyncReceiver<T> {
+    #[inline]
+    fn try_recv(&self) -> Result<T, TryRecvError> {
+        AsyncReceiver::try_recv(self)
+    }
+
+    #[inline]
+    fn try_recv_batch(&self, buf: &mut [MaybeUninit<T>]) -> usize {
+        AsyncReceiver::try_recv_batch(self, buf)
+    }
+
+    #[inline]
+    fn is_disconnected(&self) -> bool {
+        AsyncReceiver::is_disconnected(self)
+    }
+}
+
 impl<T: Send + Unpin + 'static> AsyncRecvItem<T> for AsyncReceiver<T> {
     #[inline]
     async fn recv(&self) -> Result<T, ChannelError> {
@@ -1078,11 +1149,6 @@ impl<T: Send + Unpin + 'static> AsyncRecvItem<T> for AsyncReceiver<T> {
     #[inline]
     async fn recv_cached<'s>(&'s self, slot: &'s mut WakerSlot) -> Result<T, ChannelError> {
         AsyncReceiver::recv_cached(self, slot).await
-    }
-
-    #[inline]
-    fn try_recv(&self) -> Result<T, TryRecvError> {
-        AsyncReceiver::try_recv(self)
     }
 }
 
@@ -1095,11 +1161,6 @@ impl<T: Send + Unpin + 'static> AsyncRecvItem<T> for MpscAsyncReceiver<T> {
     #[inline]
     async fn recv_cached<'s>(&'s self, slot: &'s mut WakerSlot) -> Result<T, ChannelError> {
         MpscAsyncReceiver::recv_cached(self, slot).await
-    }
-
-    #[inline]
-    fn try_recv(&self) -> Result<T, TryRecvError> {
-        MpscAsyncReceiver::try_recv(self)
     }
 }
 
@@ -1193,11 +1254,7 @@ mod tests {
         }
     }
 
-    impl RecvItem<i32> for ProbeMock {
-        fn recv(&self) -> Result<i32, ChannelError> {
-            unreachable!("claim_poll never blocks")
-        }
-
+    impl TryRecvItem<i32> for ProbeMock {
         fn try_recv(&self) -> Result<i32, TryRecvError> {
             self.recv_calls.set(self.recv_calls.get() + 1);
             if self.disconnected {
@@ -1214,6 +1271,12 @@ mod tests {
 
         fn is_disconnected(&self) -> bool {
             self.disconnected
+        }
+    }
+
+    impl RecvItem<i32> for ProbeMock {
+        fn recv(&self) -> Result<i32, ChannelError> {
+            unreachable!("claim_poll never blocks")
         }
     }
 

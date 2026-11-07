@@ -223,7 +223,7 @@ impl<R> ShardSet<R> {
                 // Batch claim first (one cursor store per run).
                 if can_batch {
                     let claimed =
-                        RecvItem::try_recv_batch(&self.rxs[i], scratch.spare_capacity_mut());
+                        TryRecvItem::try_recv_batch(&self.rxs[i], scratch.spare_capacity_mut());
                     if claimed > 0 {
                         // SAFETY: try_recv_batch initialized exactly the
                         // prefix.
@@ -243,13 +243,13 @@ impl<R> ShardSet<R> {
                     // after delivering any stragglers pushed before the last
                     // sender dropped (the half-close contract, see
                     // `claim_poll`).
-                    if !RecvItem::is_disconnected(&self.rxs[i]) {
+                    if !TryRecvItem::is_disconnected(&self.rxs[i]) {
                         break;
                     }
                 }
                 // No batchable run: one per-item try_recv resolves the
                 // 0-claim (empty / in-flight / closed).
-                match RecvItem::try_recv(&self.rxs[i]) {
+                match TryRecvItem::try_recv(&self.rxs[i]) {
                     Ok(item) => sink(item),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Closed) => {

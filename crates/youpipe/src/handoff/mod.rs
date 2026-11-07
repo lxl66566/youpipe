@@ -446,6 +446,82 @@ pub(crate) fn async_tx_gate_env() -> Option<AsyncTxGate> {
 // default cap; "N" (>= 2) = on with batch cap N (the driver's in-flight
 // bound caps the batch anyway). Runtime knob so A/B benches compare the
 // same binary.
+// `YOUPIPE_ASYNC_CLAIM_BATCH` (todo #50 site (a)) batches the M:N async
+// drivers' INTAKE claims: `drive_inner`'s refill loop claims up to `cap`
+// items out of the stage's mixed ring with ONE MPMC `head` CAS per run
+// (`RxIntake::try_claim_batch` -> `claim_poll`) instead of one CAS per
+// item — the async twin of the sync claim path's `YOUPIPE_BATCH_RECV`
+// (r6 hotpath: `AsyncReceiver::try_recv` at 1.00 calls/item, P50 411 ns on
+// the mixed ring shared by all ~31 drivers, 4.22 s CPU over a 2.25 s
+// process). Acceptance granularity becomes per claim batch — a fired
+// cancel token stops the NEXT claim, the already-claimed run is accepted
+// whole (the graph engine's cancellation precedent). The graph fan-in
+// intake keeps per-item claims through the trait's default fallback (a
+// batch stays within ONE ring; its round sweep claims across rings).
+// The claim run is CLAMPED to the driver's free admission capacity
+// (`cap - in_flight`, the async twin of the sync claim path's per-worker
+// share — a driver's MuxPlan cap IS its share): an unclamped 64-run lets
+// one driver hoard the ring's ready burst while its IO-paced admissions
+// trickle out and every peer parks on the empty ring (the unclamped first
+// cut's gates read +245 % on `io_async_pure/youpipe_async/200`, 0/25 —
+// dead-ends.md). Values: unset = default ON at the cap above (promoted
+// 2026-11-08: station −5.8…−10.5 % stable, parky gates flat); "0" = the
+// historical per-item claims; "1" = on with the default cap; "N" (>= 2) =
+// on with cap N (clamped to 4096).
+static ASYNC_CLAIM_BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Batch cap for the async drivers' intake claims; 0 = per-item claims.
+pub(crate) fn async_claim_batch_cap() -> usize {
+    *ASYNC_CLAIM_BATCH.get_or_init(|| match std::env::var("YOUPIPE_ASYNC_CLAIM_BATCH") {
+        Ok(v) if v == "1" || v.is_empty() => DEFAULT_BATCH_RECV_CAP,
+        Ok(v) if v == "0" => 0,
+        Ok(v) => match v.parse::<usize>() {
+            Ok(n) if (2..=4096).contains(&n) => n,
+            _ => panic!(
+                "YOUPIPE_ASYNC_CLAIM_BATCH: invalid value {v:?} (leave unset, or use \
+                 \"0\"/\"1\"/a cap in 2..=4096)"
+            ),
+        },
+        // Unset = the default policy (see the knob comment above).
+        Err(_) => DEFAULT_BATCH_RECV_CAP,
+    })
+}
+
+// `YOUPIPE_ASYNC_DRAIN_BATCH` (todo #50 site (b)) batches the ASYNC
+// TERMINAL COLLECTORS' burst phase: `drain_unordered_async` /
+// `drain_ordered_async` claim each burst's ready run with ONE MPSC `recv`
+// SeqCst store per run (`AsyncRecvItem::try_recv_batch` -> the fork's
+// flavor-agnostic `ChannelShared::try_recv_batch`) instead of one store
+// per item on the head line the driver producers load for fullness (r6
+// hotpath: `MpscAsyncReceiver::try_recv` at 1.00 calls/item, 14.6 % of the
+// 225 ms caller-thread drain span; terminal arrivals are clumpy by
+// construction — `YOUPIPE_ASYNC_OUTLET_BATCH` merges each flush's consumer
+// wakes into one `fire_n`). The async twin of `YOUPIPE_BATCH_RECV`'s
+// terminal-drain arm; the anchor/await structure is unchanged, burst
+// internals only. Default OFF (todo #50 verdict, 2026-11-08): every
+// terminal-paced row read noise (−2.5…+3.1 %, no stable read above the
+// 2 % floor) — the shape is claim-side paced. Values: "0" = the
+// historical per-item burst; "1" = on with the default cap; "N" (>= 2) =
+// on with cap N (clamped to 4096).
+static ASYNC_DRAIN_BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Batch cap for the async terminal collectors' burst drain; 0 = per-item.
+pub(crate) fn async_drain_batch_cap() -> usize {
+    *ASYNC_DRAIN_BATCH.get_or_init(|| match std::env::var("YOUPIPE_ASYNC_DRAIN_BATCH") {
+        Ok(v) if v == "1" || v.is_empty() => DEFAULT_BATCH_RECV_CAP,
+        Ok(v) if v == "0" => 0,
+        Ok(v) => match v.parse::<usize>() {
+            Ok(n) if (2..=4096).contains(&n) => n,
+            _ => panic!(
+                "YOUPIPE_ASYNC_DRAIN_BATCH: invalid value {v:?} (leave unset, or use \
+                 \"0\"/\"1\"/a cap in 2..=4096)"
+            ),
+        },
+        // Unset = the default policy (see the knob comment above).
+        Err(_) => 0,
+    })
+}
+
 static ASYNC_OUTLET_BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Batch cap for the async outlet delivery; 0 = per-item deliveries.

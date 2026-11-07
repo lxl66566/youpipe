@@ -510,3 +510,58 @@ a 67 % def-side round spread; def and off are behaviourally identical
 on that id (same binary, the tier only touches the expand terminal's
 shard capacity), so this is the documented same-binary wobble class,
 not a knob effect.
+
+
+## Async recv batching (`YOUPIPE_ASYNC_CLAIM_BATCH` / `YOUPIPE_ASYNC_DRAIN_BATCH`, todo #50, 2026-11-08)
+
+The fork's batch-recv machinery surfaced on the async rx faces (`AsyncRx::try_recv_batch`,
+`MpscAsyncReceiver` twin; `TryRecvItem` supertrait over all four receiver flavours),
+then the two sites were knobbed and A/B'd separately (`bench_ab.sh -E` same-binary
+runtime knobs, 5 per-id isolated rounds, taskset protocol).
+
+Site (a), the M:N drivers' intake claim — first cut **unclamped** (a raw 64-run per
+ring-cursor CAS):
+
+| id | Δ% | dom | verdict |
+|---|---|---|---|
+| `sharded_term_async/async1_cpu/100000` | −12.6 | 25/25 | improvement*stable* |
+| `sync_fuse/async_pair_cpu_merged/1000` | −11.3 | 25/25 | improvement*stable* |
+| `sharded_term_async/async1_cheap/100000` | −10.5 | 24/25 | improvement |
+| `sharded_term_async/async1_cpu/1000` | −6.9 | 25/25 | improvement*stable* |
+| `sharded_term_async/async1_cheap/1000` | −6.3 | 25/25 | improvement*stable* |
+
+… but the parky gates collapsed (**all stable regressions, 0/25**):
+`io_async_pure/youpipe_async/200` **+245.4 %**, `io_async_mixed/youpipe_mixed_async/200`
+**+245.4 %**, `io_async_pure/2000` **+20.1 %**, `io_async_mixed/2000` **+16.3 %**
+(spreads <1.5 % on the 200 rows); `mixed_load/youpipe_stream_cpu` noise. Mechanism:
+a claim run 8–64× the driver's admission cap lets one driver hoard the ring's ready
+burst — claimed items leave the ring and are invisible to the peers, whose IO waits
+have not started, so stage-wide IO parallelism collapses onto the hoarder's few
+in-flight slots (the sync claim path's per-worker share is the exact precedent;
+see [../dead-ends.md](../dead-ends.md)). Fix: clamp the claim run to the free
+admission capacity (`claim_cap.min(cap - in_flight)`) — claim only what you can
+admit now. Clamped re-run:
+
+| id | Δ% | dom | verdict |
+|---|---|---|---|
+| `sync_fuse/async_pair_cpu_merged/1000` | −10.5 | 25/25 | improvement*stable* |
+| `sharded_term_async/async1_cheap/1000` | −6.5 | 25/25 | improvement*stable* |
+| `sharded_term_async/async1_cheap/100000` | −6.2 | 25/25 | improvement*stable* |
+| `sharded_term_async/async1_cpu/1000` | −5.8 | 25/25 | improvement*stable* |
+| `sharded_term_async/async1_cpu/100000` | −2.2 | 19/25 | noise |
+
+…and the gates went flat: `io_async_pure/{200,2000}` −0.2/−0.8 %, `io_async_mixed`
++0.1/+0.5 %, `mixed_load/1000` −0.3 % (all noise, dominance ≤16/25);
+`mixed_load/100000` −14.5 % on a 15.5/45.9 % spread (19/25) — the fused row's
+documented bimodal band, noise. **Verdict: promoted to default on at cap 64.** The
+clamp trades away part of the deep 100K-cpu amortization (−12.6 → −2.2 noise) — the
+safe rhythm, not the hoarding one.
+
+Site (b), the async terminal collectors' burst drain (`YOUPIPE_ASYNC_DRAIN_BATCH`,
+`drain_*_async` batch arm over `MpscAsyncReceiver::try_recv_batch`): every
+terminal-paced row noise — `async1_cheap/100000` +3.1 % (8/25), `async1_ordered_cpu/100000`
+−2.5 % (22/25), `async0_cheap/100000` −2.1 % (20/25), `async1_cpu/100000` −1.6 %
+(15/25). The r6 attribution's 14.6 % caller-thread span share was real, but the
+shape's wall is claim-side paced (site (a) dominates); once claims batch, the
+collector's per-item store sits under the throughput line. **Verdict: default off**,
+kept as the A/B vehicle.

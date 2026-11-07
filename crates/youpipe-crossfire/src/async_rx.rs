@@ -9,6 +9,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -262,6 +263,20 @@ impl<F: Flavor> AsyncRx<F> {
     #[inline(always)]
     pub fn try_recv(&self) -> Result<F::Item, TryRecvError> {
         self.shared.try_recv()
+    }
+
+    /// youpipe fork extension (batch recv): non-blocking batch claim of
+    /// the ready prefix into `out`; returns the count claimed (0 = nothing
+    /// ready right now — NOT an Empty/Closed verdict; call
+    /// [`Self::try_recv`] to distinguish). Async twin of
+    /// [`AsyncTx::try_send_batch`], batch face of [`Rx::try_recv_batch`]:
+    /// the flavor-agnostic `ChannelShared::try_recv_batch` (MPMC: a read-
+    /// only stamp walk + ONE `head` CAS per run; MPSC: one `recv` SeqCst
+    /// store per run) plus one merged producer-wake pass (`fire_n`) —
+    /// instead of one of each per item.
+    #[inline]
+    pub fn try_recv_batch(&self, out: &mut [MaybeUninit<F::Item>]) -> usize {
+        self.shared.try_recv_batch(out)
     }
 
     /// This method use with [select](crate::select::Select), guarantee non-blocking
@@ -1162,5 +1177,101 @@ mod cached_tests {
         assert!(rx.recv().await.is_err());
         // Both delivered items drop after recv, the cancelled one in Drop.
         assert_eq!(drops.load(Ordering::SeqCst), 3);
+    }
+}
+
+// youpipe fork extension tests (batch recv on the async rx face): the
+// wrapper only delegates to `ChannelShared::try_recv_batch` (already
+// covered on the sync faces and the queues' own tests); these pin the
+// public async API contract — ready-run claim, the inconclusive 0, and
+// the half-close drain — on both bounded flavors, without a runtime
+// (every op here is non-blocking).
+#[cfg(test)]
+mod batch_tests {
+    use crate::{AsyncRx, TryRecvError, mpmc, mpsc};
+
+    // Inherent-method call through `&AsyncRx<F>` (what `MAsyncRx` derefs
+    // to); `claim_now` keeps the buf/set_len dance in one place.
+    fn claim_now<F: crate::flavor::Flavor>(
+        rx: &AsyncRx<F>, out: &mut Vec<F::Item>,
+    ) -> usize {
+        let n = rx.try_recv_batch(out.spare_capacity_mut());
+        // SAFETY: try_recv_batch initialized exactly out's new tail [..n).
+        unsafe { out.set_len(out.len() + n) };
+        n
+    }
+
+    #[test]
+    fn mpmc_async_batch_claims_ready_run() {
+        let (tx, rx) = mpmc::bounded_async::<u32>(16);
+        for i in 0..5u32 {
+            tx.try_send(i).unwrap();
+        }
+        let mut got = Vec::with_capacity(8);
+        assert_eq!(claim_now(&rx, &mut got), 5);
+        assert_eq!(got, vec![0, 1, 2, 3, 4]);
+        // Open + drained: 0, and NOT a verdict — try_recv distinguishes.
+        assert_eq!(claim_now(&rx, &mut got), 0);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        drop(tx);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn mpsc_async_batch_drains_before_disconnected() {
+        let (tx, rx) = mpsc::bounded_async::<u32>(16);
+        for i in 0..4u32 {
+            tx.try_send(i).unwrap();
+        }
+        drop(tx);
+        let mut got = Vec::with_capacity(8);
+        assert_eq!(claim_now(&rx, &mut got), 4, "queued stragglers first");
+        assert_eq!(got, vec![0, 1, 2, 3]);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
+    }
+
+    #[test]
+    fn mpmc_async_batch_multi_producer_exactly_once() {
+        const P: usize = 3;
+        const N: u32 = 500;
+        let (tx, rx) = mpmc::bounded_async::<u32>(8);
+        let mut hs = Vec::new();
+        for p in 0..P {
+            let tx = tx.clone();
+            let base = p as u32 * N;
+            hs.push(std::thread::spawn(move || {
+                for i in 0..N {
+                    // Park-free push on a bounded ring: spin on Full (the
+                    // async send would need a runtime; try_send keeps the
+                    // test runtime-free).
+                    let mut v = base + i;
+                    while let Err(crate::TrySendError::Full(item)) = tx.try_send(v) {
+                        v = item;
+                        std::thread::yield_now();
+                    }
+                }
+            }));
+        }
+        drop(tx);
+        let mut got = Vec::new();
+        let mut buf: Vec<u32> = Vec::with_capacity(6);
+        loop {
+            if claim_now(&rx, &mut buf) == 0 {
+                match rx.try_recv() {
+                    Ok(v) => {
+                        got.push(v);
+                        continue;
+                    }
+                    Err(TryRecvError::Empty) => std::thread::yield_now(),
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+            got.append(&mut buf);
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        got.sort_unstable();
+        assert_eq!(got, (0..P as u32 * N).collect::<Vec<_>>());
     }
 }
