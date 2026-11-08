@@ -482,3 +482,28 @@ The release round (`target/relbench-report.md` §3.2/§3.3) left two flags pendi
 No segment reproduces the +2.8 % stable; the recoverable signal is a ≤ ~2 % cumulative headwind concentrated at `e7d25e0` (async-stage mux adds an edge of cost to this sync-shaped async chain), stacked with un-reproducible remainder from the original group-pass session. Accepted: the same commit family lands −10…−56 % on chain/diamond graph and async rows, and chasing a non-stable +1.2 % would put those at risk. Revisit only if a future release A/B re-flags this id stable.
 
 Methodology notes: (1) a per-id filter must use the id form criterion actually matches — `BenchmarkId` function names keep their embedded `/` (`expand_heavy/ordered_push/fanout=64`); the `_`-joined form in compare.py tables is criterion's on-disk directory naming and silently matches nothing as a filter, producing empty compare tables (a no-op A/B; the empty table is the tell). (2) Same-rev two-label sides materialize independent worktrees (bench_ab.sh caches per label dir), so a same-commit recompile A/B needs no cache-key tricks — verified by distinct binary md5 despite identical source.
+
+## `stream_pipeline` 100 K bimodality: glibc trim/mmap-threshold churn (2026-11-08, pinned in-harness)
+
+The `single_stage_{unord,ord}ered/100000` pair — the family whose "placement wobble" recurs through this file (90 µs → 61 µs mid-run steps, the +6.5 % 64 B cell, ±200 % group-pass flags) — is root-caused, and the bench harness now pins it away (`benches/common/alloc.rs`, called from `common::criterion()` for every criterion target and from the horizontal bench's `main`): `mallopt(M_TRIM_THRESHOLD, -1)` + `mallopt(M_MMAP_THRESHOLD, 32 MiB)` at process entry. The A/B below ran with 64 MiB (glibc 2.44 accepts it); the landed value is mallopt(3)'s documented 64-bit ceiling `DEFAULT_MMAP_THRESHOLD_MAX`, which older glibc requires (larger values return 0) and which is policy-identical for every buffer below it — horizontal's 4M-element (32 MiB) buffers keep their historical mmap path.
+
+Mode census (same session, bench.lock, one binary per side, source-identical except the pin):
+
+| process draw | u/100000 median | per-sample (criterion sample.json) |
+| --- | --- | --- |
+| solo, unpinned (9 draws, 06:13–06:46) | 61.2–62.2 µs | tight |
+| group pass, unpinned (7 draws) | 105–271 µs | 102–617 µs, steps mid-run |
+| group pass, pinned (5 draws) | 61.2–68.6 µs | 60.2–74.1 µs |
+| solo, pinned (2 draws) | 60.8–61.1 µs | tight |
+
+The one pinned draw with samples up to 1.1 ms overlapped another worktree's rustc build (host load ≈ 16) — external, not allocator state; two clean draws around it bracket 60.2–63.9 µs. The 1K-size ids stay at 9.3–9.7 µs on both sides throughout (their buffers are far below every threshold).
+
+Mechanism (glibc 2.44): the timed iteration frees two ~800 KiB buffers (input clone + output). Freeing a large *mmap'd* chunk RAISES glibc's dynamic mmap threshold above it (a free cannot grow the top chunk), after which same-size allocations come from the sbrk heap with `trim_threshold = 2x mmap threshold`; whether the process then rests in a stable heap or oscillates brk-shrink/brk-regrow plus fresh-page first-touch faults depends on what earlier ids left in the heap and bins. Hence the id-order dependence: solo, the first free settles the policy and the id stays fast; in a group pass the 1K ids precondition the heap and the 100 K id lands in the churn. Discriminator (strace over the whole id run): slow mode 7499 brk calls, fast mode 9. `LD_PRELOAD`ing the same two mallopt calls onto an unpinned binary restores the solo number, and per the glibc manual an explicit mallopt disables the dynamic adjustment — which is what the in-harness pin relies on to make the outcome order-independent (heap never shrinks, big buffers never migrate to mmap).
+
+The channel-throughput family's documented group-pass inflation (medians ~2–3x the per-id ones, streaming.md "Channel throughput") is the same order-dependence class: with the pin, group-pass youpipe rows drop toward their per-id numbers (youpipe_mpmc/10000 354→171–284 µs, /100000 2.69→1.29–1.32 ms; youpipe_mpsc/10000 572→278–289 µs) while the crossbeam control row stays flat (420→374–409 µs @10K). Within-mode wobble remains — placement sensitivity itself is not the allocator's to fix, and the `taskset 1-31` protocol for that group stands.
+
+Practical consequences:
+
+- Every absolute number recorded for the 100 K `single_stage` (and channel-throughput group-pass) ids before 2026-11-08 is order-dependent by construction; the verdict protocol (per-id isolated interleaving, already the rule for these families) dodged the poisoning, group-pass readings did not. The flags this file records on those cells (v0.6.1/v0.7.0 checks, the 0-claim probe's +5.3 %, the 64 B cell's +6.5 % "noise") should be read as allocator-mode artifacts unless re-measured.
+- Baselines for these ids are void — again — after the pin (the 64 B upgrade note above already re-rolled them once the same day; the pin's shift on the poisoned ids is far larger than that re-roll).
+- The pin is harness-only: a downstream user's allocator policy is their own environment, and nothing in the library assumes it.

@@ -202,7 +202,7 @@ Both conclusions carry through the composition: the convoy fix survives the merg
 
 ## Channel throughput
 
-Two-thread ping-pong (1 producer, 1 consumer, `u64`), all bounded rows at capacity 256. Caliber note (2026-10 fix): the old table compared bounded crossfire against unbounded `std::sync::mpsc::channel`; the unbounded channel does no capacity accounting and never blocks the producer, so that column was not a like-for-like row. Rows are now named by caliber (`*_bounded`/`*_unbounded`, `*_mpmc`/`*_mpsc`). Numbers are medians of 5 interleaved rounds, `taskset 1-31`; the 1P1C shape is placement-sensitive (unpinned runs collapse up to −58 %), so pinning is mandatory for this group.
+Two-thread ping-pong (1 producer, 1 consumer, `u64`), all bounded rows at capacity 256. Caliber note (2026-10 fix): the old table compared bounded crossfire against unbounded `std::sync::mpsc::channel`; the unbounded channel does no capacity accounting and never blocks the producer, so that column was not a like-for-like row. Rows are now named by caliber (`*_bounded`/`*_unbounded`, `*_mpmc`/`*_mpsc`). Numbers are medians of 5 interleaved rounds, `taskset 1-31`; the 1P1C shape is placement-sensitive (unpinned runs collapse up to −58 %), so pinning is mandatory for this group. The group-pass median inflation this group also showed (~2–3x the per-id numbers) was glibc trim/mmap-threshold churn, pinned away in-harness since 2026-11-08 ([attribution.md](attribution.md) glibc section); the taskset protocol addresses the residual within-mode wobble.
 
 | Size | youpipe_mpmc | youpipe_mpsc | crossbeam_bounded | std_mpsc_bounded | std_mpsc_unbounded |
 | ---- | ------------ | ------------ | ----------------- | ---------------- | ------------------ |

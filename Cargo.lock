@@ -5181,6 +5181,7 @@ dependencies = [
  "crossbeam-channel",
  "futures",
  "futures-util",
+ "libc",
  "log",
  "loom",
  "rayon",

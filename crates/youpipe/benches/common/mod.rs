@@ -29,6 +29,8 @@
 //! benchmarked code path, and A/B runs always apply the same environment to
 //! both sides (perf/bench-suite does this by construction).
 
+mod alloc;
+
 use std::time::Duration;
 
 use criterion::Criterion;
@@ -64,6 +66,7 @@ pub fn keep_warm_hint(arm: bool) -> Option<KeepWarm> {
 
 /// Build the shared `Criterion` config (see module docs).
 pub fn criterion() -> Criterion {
+    alloc::pin_glibc_allocator();
     Criterion::default()
         .sample_size(env_parse("BENCH_SAMPLE_SIZE", 20))
         .warm_up_time(Duration::from_millis(env_parse("BENCH_WARMUP_MS", 1_000)))

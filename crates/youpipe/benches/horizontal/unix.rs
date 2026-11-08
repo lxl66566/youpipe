@@ -19,6 +19,12 @@ use futures::{future::join_all, prelude::*};
 use rayon::prelude::*;
 use youpipe::{ComputePool, PipelineConfig, TokioPool, Workload, pipe_ref, stream};
 
+// Shared allocator-policy pin (`common/alloc.rs`): every bench process runs
+// one allocator policy. Its effect on the `cpu_balanced_readback/100K`
+// placement wobble (attribution.md) is unmeasured.
+#[path = "../common/alloc.rs"]
+mod bench_alloc;
+
 // ── CLI / harness knobs ──
 
 struct Config {
@@ -1263,6 +1269,7 @@ fn real_web() -> Scenario {
 }
 
 pub(crate) fn main() {
+    bench_alloc::pin_glibc_allocator();
     let cfg = parse_args();
     eprintln!(
         "horizontal bench: rounds={} measure_ms={} out={}",

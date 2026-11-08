@@ -125,6 +125,8 @@ crossbeam-channel = { workspace = true }
 # re-exported by the handoff wrapper.
 crossfire         = { workspace = true }
 futures           = "0.3"
+# benches/common/alloc.rs: mallopt for the glibc allocator-policy pin.
+libc              = { workspace = true }
 rayon             = { workspace = true }
 tokio             = { workspace = true, features = ["io-util", "net", "test-util"] }
 
