@@ -503,9 +503,11 @@ pub(crate) fn async_claim_batch_cap() -> usize {
 // 2 % floor) — the shape is claim-side paced. Values: "0" = the
 // historical per-item burst; "1" = on with the default cap; "N" (>= 2) =
 // on with cap N (clamped to 4096).
+#[cfg(feature = "tokio-runtime")]
 static ASYNC_DRAIN_BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Batch cap for the async terminal collectors' burst drain; 0 = per-item.
+#[cfg(feature = "tokio-runtime")]
 pub(crate) fn async_drain_batch_cap() -> usize {
     *ASYNC_DRAIN_BATCH.get_or_init(|| match std::env::var("YOUPIPE_ASYNC_DRAIN_BATCH") {
         Ok(v) if v == "1" || v.is_empty() => DEFAULT_BATCH_RECV_CAP,

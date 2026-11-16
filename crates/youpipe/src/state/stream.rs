@@ -630,7 +630,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handoff::{ChannelError, TryRecvItem, channel, mpsc_async_channel};
+    #[cfg(feature = "tokio-runtime")]
+    use crate::handoff::mpsc_async_channel;
+    use crate::handoff::{ChannelError, TryRecvItem, channel};
 
     /// The drain family only needs `O: Send` (todo #8 lifetime item): the
     /// loops neither spawn nor store beyond the `ReorderBuffer`. Prove it

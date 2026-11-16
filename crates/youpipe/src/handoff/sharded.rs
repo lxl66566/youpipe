@@ -25,11 +25,11 @@
 //! residual (c)).
 
 #[cfg(feature = "tokio-runtime")]
-use super::channel::{
-    MpscAsyncReceiver, MpscAsyncSender, TryRecvItem, WakerSlot, mpsc_async_channel,
-};
+use super::channel::{MpscAsyncReceiver, MpscAsyncSender, WakerSlot, mpsc_async_channel};
 use super::{
-    channel::{ChannelError, MpscReceiver, MpscSender, RecvItem, TryRecvError, mpsc_channel},
+    channel::{
+        ChannelError, MpscReceiver, MpscSender, RecvItem, TryRecvError, TryRecvItem, mpsc_channel,
+    },
     closed_set::ClosedSet,
 };
 use crate::ShardDepth;
