@@ -29,11 +29,15 @@ jobs:
       RUSTC_WRAPPER: "sccache"
     steps:
       - uses: actions/checkout@v6
+      - name: Setup sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: dtolnay/rust-toolchain@stable
       - uses: cargo-bins/cargo-binstall@main
         if: matrix.tests
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - run: cargo binstall -y --no-symlinks cargo-nextest
         if: matrix.tests
-      - name: Setup sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
-      - uses: dtolnay/rust-toolchain@stable
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - run: ${{ matrix.cmd }}

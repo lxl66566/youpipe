@@ -185,7 +185,8 @@ per-test hard timeout (profile `timeout`/`timeouts.*` keys are silently
 ignored — verified empirically), so each *group* carries the deadline
 instead. Single-binary groups (lib, pipeline_integration) are exactly
 serial-equivalent; bundled groups' full serial sum sits far below one
-budget (census below), so no legitimate run truncates. In exchange every
+budget (census below), so no legitimate run truncates. CI doubles the
+group deadline to 3600s (test.yml's `MIRI_TIMEOUT_SECS`): on the 4-core hosted runner the lib group alone measured 1520s worst-case — 84% of the 1800s default. In exchange every
 test is its own process: a wedged or aborting test no longer takes its
 binary down — on Windows this turned two instant whole-binary aborts
 (stream_reduce, pipeline_integration) into single-test failures with

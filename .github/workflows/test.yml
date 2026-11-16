@@ -19,11 +19,15 @@ jobs:
       # Docs edits land through PRs like code; gate intra-book links before
       # any toolchain setup (fails fast, needs only bash + git).
       - run: perf/verify/linkcheck.sh
-      - uses: cargo-bins/cargo-binstall@main
-      - run: cargo binstall -y --no-symlinks cargo-nextest
       - name: Setup sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - uses: dtolnay/rust-toolchain@stable
+      - uses: cargo-bins/cargo-binstall@main
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - run: cargo binstall -y --no-symlinks cargo-nextest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - run: cargo nextest run --all-features --no-tests pass && cargo test --doc && cargo check --examples
       - run: cargo check --no-default-features --examples
       - run: cargo clippy --all-features --all-targets -- -D warnings
@@ -31,22 +35,31 @@ jobs:
   miri:
     name: miri (perf/verify/miri.sh)
     runs-on: ubuntu-latest
-    timeout-minutes: 100
+    timeout-minutes: 130
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
       # Parallel test jobs inside miri.sh's nextest groups (4 = the runner's
       # core count; the script's local default is 8).
       MIRI_JOBS: "4"
+      # miri.sh's per-group deadline: on this 4-core runner the lib group
+      # alone measured 1520s worst-case — 84% of the script's 1800s default
+      # — so the budget doubles here; the job/step timeouts stay the global
+      # bound against a wedge.
+      MIRI_TIMEOUT_SECS: "3600"
     steps:
       - uses: actions/checkout@v6
-      - uses: cargo-bins/cargo-binstall@main
-      - run: cargo binstall -y --no-symlinks cargo-nextest
       - name: Setup sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
+      - uses: cargo-bins/cargo-binstall@main
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - run: cargo binstall -y --no-symlinks cargo-nextest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       # Canonical runner, full default target list: lib + doctests + every
       # miri-meaningful integration binary + the vendored crossfire lib. The
       # strict MIRIFLAGS combo (tree-borrows + ignore-leaks), per-target
@@ -54,7 +67,8 @@ jobs:
       # (per-target durations: docs/src/dev/testing.md "Suite duration
       # census"; workloads scale down via `cfg!(miri)`).
       - run: perf/verify/miri.sh
-        timeout-minutes: 90
+        # Worst observed full pass: 57.5 min on this runner.
+        timeout-minutes: 120
 
   loom:
     name: loom model tests (perf/verify/loom.sh)
