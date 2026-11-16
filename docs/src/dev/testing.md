@@ -8,9 +8,9 @@ timeouts and the required flag combinations):
 perf/verify/miri.sh            # lib + integration binaries + vendored crossfire lib
                               # (default path: `cargo miri nextest run`, -j 8;
                               #  MIRI_SERIAL=1 restores the one-binary-at-a-time loop)
-perf/verify/loom.sh            # youpipe + vendored queue + crossfire + st3 models
-                              # (four independent blocks run concurrently;
-                              #  LOOM_SERIAL=1 restores sequential execution)
+perf/verify/loom.sh            # youpipe (two builds) + vendored queue + crossfire + st3 models
+                              # (five independent blocks run concurrently; LOOM_BLOCKS
+                              #  selects a subset, LOOM_SERIAL=1 sequential execution)
 perf/verify/linkcheck.sh       # mdbook intra-book link targets (docs/src)
 perf/verify/full.sh            # one-shot release gate: native + miri + loom + bench
                               # (--stage native,miri,... runs/ resumes a subset)
@@ -52,12 +52,16 @@ disconnect-while-parked, the close-vs-rearm stale-entry interleaving,
 `park_timeout`, multi-threaded contention), also part of `miri.sh`.
 
 The pool's synchronization cores (`pool/sleep.rs`, `pool/latch.rs`,
-`pool/sleep_mask.rs`) source their atomics, locks, and
-`thread_yield` from `youpipe-sys` — *nothing else in youpipe does* — so under
-`--cfg loom` exactly those primitives become model-checked simulations
-while the rest of the crate keeps real ones. `Registry` spawns real OS
-threads (which loom cannot simulate), so the model tests drive the
-primitives directly with `loom::thread`:
+`pool/sleep_mask.rs`, `handoff/notify.rs`) source their atomics, locks, and
+`thread_yield` from `youpipe-sys`, and so do the lock users the models
+drive (`handoff/ring_cache.rs`, `executor/compute/pool_cache.rs`,
+`graph/exec.rs`'s `DoneCounter`) plus the two registry counters that
+switch atomic backend (`keep_warm`, `parking_slots`) — every other
+registry atomic stays `std`, so the real-thread tests keep running on
+real primitives. Under `--cfg loom` exactly those sources become
+model-checked simulations. `Registry` spawns real OS threads (which loom
+cannot simulate), so the model tests drive the primitives directly with
+`loom::thread`:
 
 ```sh
 # Model tests live in #[cfg(all(test, loom))] mod loom_tests
@@ -67,7 +71,10 @@ primitives directly with `loom::thread`:
 # The `--cfg loom` rustflag (NOT a cargo feature — see Cargo.toml for the
 # rationale) is the ecosystem-standard loom switch, matching crossbeam and
 # the vendored youpipe-concurrent-queue.
-RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
+RUSTFLAGS="--cfg loom" cargo test -p youpipe --lib -- loom_tests
+# The st3-deque models (#[cfg(all(test, loom, st3_loom))] mod st3_loom_tests)
+# need the vendored st3 simulated as well, so they run in a second build:
+RUSTFLAGS="--cfg loom --cfg st3_loom" cargo test -p youpipe --lib -- loom_tests
 ```
 
 The vendored `youpipe-crossfire` is the one deliberate exception to the
@@ -148,12 +155,12 @@ The one work-scan face outside the loom cores is pinned deterministically:
 `WorkerThread::steal`'s `Busy`-retry contract — an open `Worker::drain`
 booking on the victim makes every `steal_and_pop` return `Busy`, dropping
 the drain mid-booking releases it for the retry — is a unit test in
-`pool/registry.rs` driving the st3 API directly. A youpipe loom model
-cannot race it: under the `--cfg loom` block st3 compiles with real
-atomics (its simulations need the fork's own `st3_loom` cfg, see above),
-so such a model would pass vacuously; booking contention is instead
-model-checked by the fork's `multi_stealer`/`drain_overflow` models in the
-st3 block.
+`pool/registry.rs` driving the st3 API directly; booking contention stays
+with the fork's `multi_stealer`/`drain_overflow` models in the st3 block.
+The youpipe-side models that do race the deque (`st3_loom_tests`: the
+`push_batch` overflow split and its steal race) run in the second youpipe
+block, which carries `--cfg st3_loom` so the deque's atomics and buffer
+cells are simulated too.
 
 `CountLatch::wait_spin`'s spin budget (`OFF_POOL_SPIN_ITERS`) shrinks to 2
 under loom to keep the model's state space small; the budget's only
@@ -385,7 +392,7 @@ prints wall time, the summary aggregates, any failure exits nonzero):
 | ------ | ------------------------------------------------------------------------ | ---------------------------------- |
 | native | `cargo nextest run` (workspace, `-j 8`, `--retries 1 --no-fail-fast`) + `cargo test --doc` + clippy `-D warnings` (default features everywhere; the CI-parity `--all-features` clippy line runs on unix only — youpipe's hotpath feature pulls hotpath-cpu, which `compile_error!`s off macOS/Linux) | 10–13 s (514 tests + 92 doctests), 3/3 green |
 | miri   | `perf/verify/miri.sh` (nextest-parallel)                                 | ~470 s (rc=1: host-specific miri findings, see above) |
-| loom   | `perf/verify/loom.sh` (concurrent blocks)                                | 262–269 s                          |
+| loom   | `perf/verify/loom.sh` (concurrent blocks)                                | 262–269 s (four blocks; the st3-deque-model commit added the fifth) |
 | bench  | `perf/bench-suite/bench-full.sh` (owned by perf/bench-suite; errors loudly when absent) | ~756 s end-to-end (build 164 + youpipe 465 + forks 127; horizontal/gungraun skip on this host with reasons) |
 
 The workspace nextest/clippy runs exclude youpipe-bench,
@@ -549,23 +556,37 @@ native build; per-binary interpreter startup ≤ 4 s).
 
 ## Loom
 
-31 models total: pool cores 16 (sleep 4, latch 3, sleep_mask 9), st3 6,
-concurrent-queue 3, crossfire waker-registry 6. Documented per-model range
-0.3 s–2 min under exploration → full `perf/verify/loom.sh` pass ≈ 10–30
-min. Not re-timed this round (no loom-relevant changes in the audited
-range).
+73 models total: youpipe 28 (sleep 4, latch 3, sleep_mask 3, registry 11,
+graph DoneCounter 2, pool_cache 3, ring_cache 2) plus 3 st3-deque models
+in the second youpipe build, concurrent-queue 3, st3 12, crossfire 27
+(waker registry 15, `try_reset` 4, `ArrayQueue` batches 6, MPSC batches
+2). Documented per-model range 0.3 s–2 min under exploration; Linux
+32-core (2026-11-17, warm builds): youpipe 1.1 s, youpipe+st3 3.9 s,
+queue 0.8 s, crossfire 17 s, and the st3 block's multi-stealer models
+dominate at ~297 s.
 
-Since 2026-11-04 the four blocks (youpipe models / concurrent-queue /
-st3 / crossfire) run CONCURRENTLY as background jobs: each keeps its own
-per-block timeout (youpipe unbounded, queue 600 s, st3 1800 s,
-crossfire 600 s — unchanged), output is captured per block and printed
-in the original order after all finish (no interleaving), and the exit
-code aggregates all four. Windows 32-core (2026-11-04): 262–269 s vs
-~427 s serial — the win is host-shape-dependent because st3's
-exploration (~260 s) dominates here; on the Linux census host all four
-blocks are multi-minute and the overlap saves the three shorter blocks
-entirely. `LOOM_SERIAL=1` restores one-at-a-time execution for
-bisecting.
+Since 2026-11-04 the blocks run CONCURRENTLY as background jobs, since
+2026-11-16 as five (youpipe / youpipe+st3 / concurrent-queue / st3 /
+crossfire): each keeps its own per-block timeout (youpipe builds 1200 s
+each — both budget a cold full dep-tree build, and the two builds cannot
+share a target dir; queue 600 s, st3 1800 s, crossfire 600 s), output is
+captured per block and printed in the original order after all finish
+(no interleaved), and the exit code aggregates all of them. The
+`st3_loom` youpipe build compiles into its own `target/loom-st3`: in one
+shared dir the two blocks' rustflags would flip youpipe's dep tree
+between two fingerprints — a full rebuild per block per script run, and
+one block's compile co-running against the other's models slows the
+heavy ones down ~100x until the block timeout fires (measured
+2026-11-17: rc=124 at 600 s against 3.9 s of tests on an idle host).
+`LOOM_SERIAL=1` restores one-at-a-time execution for bisecting, and
+`LOOM_BLOCKS="youpipe youpipe_st3 queue st3 crossfire"` selects a subset
+— exploration is deterministic, so a vendored block whose inputs are
+unchanged since its last green run (fork source, block flags,
+Cargo.lock's loom version) repeats itself; CI runs the full default.
+Windows 32-core (2026-11-04, four blocks): 262–269 s vs ~427 s serial —
+the win is host-shape-dependent because st3's exploration dominates
+there; on the Linux census host the overlap likewise saves the four
+shorter blocks entirely.
 
 ## Benches
 

@@ -1,5 +1,7 @@
+#[cfg(not(loom))]
 use alloc::alloc::{alloc_zeroed, handle_alloc_error};
 use alloc::boxed::Box;
+#[cfg(not(loom))]
 use core::alloc::Layout;
 use core::mem::{MaybeUninit, size_of};
 use core::ptr;
@@ -83,6 +85,7 @@ struct Block<T> {
 }
 
 impl<T> Block<T> {
+    #[cfg(not(loom))]
     const LAYOUT: Layout = {
         let layout = Layout::new::<Self>();
         assert!(

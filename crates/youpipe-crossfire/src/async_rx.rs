@@ -1188,13 +1188,11 @@ mod cached_tests {
 // (every op here is non-blocking).
 #[cfg(test)]
 mod batch_tests {
-    use crate::{AsyncRx, TryRecvError, mpmc, mpsc};
+    use crate::{mpmc, mpsc, AsyncRx, TryRecvError};
 
     // Inherent-method call through `&AsyncRx<F>` (what `MAsyncRx` derefs
     // to); `claim_now` keeps the buf/set_len dance in one place.
-    fn claim_now<F: crate::flavor::Flavor>(
-        rx: &AsyncRx<F>, out: &mut Vec<F::Item>,
-    ) -> usize {
+    fn claim_now<F: crate::flavor::Flavor>(rx: &AsyncRx<F>, out: &mut Vec<F::Item>) -> usize {
         let n = rx.try_recv_batch(out.spare_capacity_mut());
         // SAFETY: try_recv_batch initialized exactly out's new tail [..n).
         unsafe { out.set_len(out.len() + n) };

@@ -1330,9 +1330,12 @@ mod tests {
 /// registry, so the models assert the protocol's outcome over the reachable
 /// thread orders; their scheduling points are the thread boundaries and the
 /// `terminate` latches, whose sets are modeled.
+///
+/// Handles are `std::sync::Arc` (via `super::*`): no modeled protocol races
+/// the refcount, and `WorkerThread`'s field is the production type.
 #[cfg(all(test, loom))]
 mod loom_tests {
-    use loom::{cell::UnsafeCell, sync::Arc};
+    use loom::cell::UnsafeCell;
 
     use super::*;
     use crate::builder::ParkingLease;
@@ -1506,7 +1509,7 @@ mod loom_tests {
     /// Registry with `num_threads` pre-created but never spawned workers:
     /// `num_threads()` (the lease cap) is `thread_infos.len()`, while
     /// `spawned == 0` keeps every spawn/terminate path out of the model.
-    fn unspawned_registry(num_threads: usize) -> std::sync::Arc<Registry> {
+    fn unspawned_registry(num_threads: usize) -> Arc<Registry> {
         partially_spawned_registry(num_threads, 0, 1)
     }
 
@@ -1519,7 +1522,7 @@ mod loom_tests {
         num_threads: usize,
         spawned: usize,
         terminate_count: usize,
-    ) -> std::sync::Arc<Registry> {
+    ) -> Arc<Registry> {
         assert!(spawned <= num_threads);
         let thread_infos = (0..num_threads)
             .map(|_| {
@@ -1527,7 +1530,7 @@ mod loom_tests {
                 ThreadInfo::new(worker.stealer())
             })
             .collect();
-        std::sync::Arc::new(Registry {
+        Arc::new(Registry {
             thread_infos,
             spawned: AtomicUsize::new(spawned),
             sleep: Sleep::new(num_threads),
@@ -1574,7 +1577,7 @@ mod loom_tests {
 
             let leasers: Vec<_> = (0..2)
                 .map(|_| {
-                    let leaser_registry = std::sync::Arc::clone(&registry);
+                    let leaser_registry = Arc::clone(&registry);
                     loom::thread::spawn(move || lease_and_return(&leaser_registry))
                 })
                 .collect();
@@ -1609,7 +1612,7 @@ mod loom_tests {
 
             let racers: Vec<_> = (0..2)
                 .map(|_| {
-                    let racer_registry = std::sync::Arc::clone(&registry);
+                    let racer_registry = Arc::clone(&registry);
                     loom::thread::spawn(move || {
                         if racer_registry.try_reserve_parking(REQUEST) {
                             // Only this thread can release between its own CAS
@@ -1666,11 +1669,11 @@ mod loom_tests {
         loom::model(|| {
             let registry = unspawned_registry(CAP);
             assert!(registry.try_reserve_parking(1));
-            let lease = ParkingLease::new(std::sync::Arc::clone(&registry), 1);
+            let lease = ParkingLease::new(Arc::clone(&registry), 1);
             assert_eq!(registry.parking_used(), 1);
 
             let job = lease.wrap_job(|| {});
-            let job_registry = std::sync::Arc::clone(&registry);
+            let job_registry = Arc::clone(&registry);
             let worker = loom::thread::spawn(move || {
                 job();
                 assert!(
@@ -1724,7 +1727,7 @@ mod loom_tests {
         loom::model(|| {
             let registry = unspawned_registry(CAP);
             assert!(registry.try_reserve_parking(RESERVED));
-            let lease = ParkingLease::new(std::sync::Arc::clone(&registry), RESERVED);
+            let lease = ParkingLease::new(Arc::clone(&registry), RESERVED);
 
             let workers: Vec<_> = (0..SPAWNED)
                 .map(|_| {
@@ -1733,7 +1736,7 @@ mod loom_tests {
                 })
                 .collect();
 
-            let bystander_registry = std::sync::Arc::clone(&registry);
+            let bystander_registry = Arc::clone(&registry);
             let bystander = loom::thread::spawn(move || {
                 for _ in 0..ROUNDS {
                     if bystander_registry.try_reserve_parking(1) {
@@ -1788,7 +1791,7 @@ mod loom_tests {
 
             let callers: Vec<_> = (0..2)
                 .map(|_| {
-                    let caller_registry = std::sync::Arc::clone(&registry);
+                    let caller_registry = Arc::clone(&registry);
                     loom::thread::spawn(move || caller_registry.terminate())
                 })
                 .collect();
@@ -1919,7 +1922,7 @@ mod loom_tests {
             }
             let broadcasts_before = terminate_broadcasts();
 
-            let owner_registry = std::sync::Arc::clone(&registry);
+            let owner_registry = Arc::clone(&registry);
             let owner = loom::thread::spawn(move || {
                 owner_registry.terminate();
                 // Only the backstop's decrement can follow this one.

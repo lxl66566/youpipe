@@ -129,7 +129,7 @@ mod loom_shim {
         /// `ptr::read`/`ptr::write` dance would bypass its bookkeeping).
         #[inline]
         pub fn wait<'a, T>(&self, guard: &mut MutexGuard<'a, T>) {
-            super::loom_shim::condvar_wait(&self.0, guard);
+            condvar_wait(&self.0, guard);
         }
 
         #[inline]

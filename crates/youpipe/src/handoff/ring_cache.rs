@@ -344,8 +344,9 @@ mod loom_tests {
     }
 
     /// One take hands out one parked allocation, and the rebuild runs with the
-    /// mutex released: the second taker's nested take inside its own rebuild
-    /// must not deadlock.
+    /// mutex released: the second taker's take must not deadlock against the
+    /// first taker's rebuild, whose taken handle re-acquires the mutex on
+    /// drop.
     ///
     /// Cost: 266 executions, 0.04 s.
     #[test]

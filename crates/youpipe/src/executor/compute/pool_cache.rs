@@ -381,25 +381,23 @@ mod loom_tests {
 
             let clearer_cache = Arc::clone(&cache);
             let clearer = loom::thread::spawn(move || clear_from(&*clearer_cache));
-            let mut accquirers = Vec::with_capacity(2);
+            let mut acquirers = Vec::with_capacity(2);
             for k in [1, 2] {
-                let accquirer_cache = Arc::clone(&cache);
-                accquirers.push(loom::thread::spawn(move || {
-                    acquire_from(&*accquirer_cache, k, |key| {
-                        Probe::new(key, &accquirer_cache)
-                    })
+                let acquirer_cache = Arc::clone(&cache);
+                acquirers.push(loom::thread::spawn(move || {
+                    acquire_from(&*acquirer_cache, k, |key| Probe::new(key, &acquirer_cache))
                 }));
             }
 
             let cleared = clearer.join().unwrap();
             assert_eq!(cleared, CACHE_CAPACITY, "every parked pool is cleared");
-            let ids: Vec<usize> = accquirers
+            let ids: Vec<usize> = acquirers
                 .into_iter()
                 .map(|thread| thread.join().unwrap().id)
                 .collect();
             assert_eq!(ids, [1, 2], "each key resolves to its own pool");
             // Leftover is either empty (the clear ran last) or exactly the pools
-            // the accquirers re-inserted after it.
+            // the acquirers re-inserted after it.
             let guard = cache.lock();
             assert!(guard.slots.len() <= 2, "nothing else is parked");
             drop(guard);

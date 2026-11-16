@@ -14,14 +14,19 @@
 # vendored queue: without it the spsc models explore for hours (round-2
 # lesson; with it the whole suite finishes in seconds).
 #
-# The five blocks are independent (different packages / cfg names), so they
-# run CONCURRENTLY as background jobs; each keeps its own per-block timeout
-# (embedded in the block functions — unchanged from the serial era), block
-# output goes to a temp file and is cat'ed in order once all blocks finish
-# (no interleaved stdout), and the exit code aggregates all five (any
-# failure -> nonzero). Set LOOM_SERIAL=1 for the old one-at-a-time
-# execution (e.g. when bisecting a model failure and co-running blocks'
-# CPU contention is suspected).
+# The five blocks are independent (different packages / cfg names / target
+# dirs), so they run CONCURRENTLY as background jobs; each keeps its own
+# per-block timeout (embedded in the block functions), block output goes to
+# a temp file and is cat'ed in order once all blocks finish (no interleaved
+# stdout), and the exit code aggregates all five (any failure -> nonzero).
+# Set LOOM_SERIAL=1 for the old one-at-a-time execution (e.g. when bisecting
+# a model failure and co-running blocks' CPU contention is suspected).
+#
+# LOOM_BLOCKS="youpipe youpipe_st3 queue st3 crossfire" (default: all five)
+# runs a subset — a local convenience: loom exploration is deterministic, so
+# a vendored block whose inputs are unchanged since its last green run (fork
+# source, block flags, Cargo.lock's loom version) repeats itself. CI runs
+# the full default.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -39,10 +44,12 @@ wrap_timeout() {
 }
 
 # Each block's command mirrors the serial-era invocation verbatim (cfg
-# names, env overrides, --release, --report-time, filters, per-block
-# timeouts: youpipe 600, youpipe+st3 600, queue 600, st3 1800, crossfire 600).
+# names, env overrides, --release, --report-time, filters). Per-block
+# timeouts: youpipe 1200, youpipe+st3 1200, queue 600, st3 1800, crossfire
+# 600 — the two youpipe ones budget a cold full dep-tree build each (their
+# rustflags differ, so the two builds cannot share a target dir).
 block_youpipe() {
-    RUSTFLAGS="--cfg loom" wrap_timeout 600 \
+    RUSTFLAGS="--cfg loom" wrap_timeout 1200 \
         cargo test -p youpipe --lib -- loom_tests
 }
 block_youpipe_st3() {
@@ -50,7 +57,15 @@ block_youpipe_st3() {
     # st3 compiled with its own `st3_loom` cfg, so the crate is rebuilt with
     # both rustflags. Under `--cfg loom` alone those models still pass, but
     # vacuously (st3 keeps real atomics, loom sees one schedule).
-    RUSTFLAGS="--cfg loom --cfg st3_loom" wrap_timeout 600 \
+    #
+    # Separate target dir too: in the shared one this block's extra rustflag
+    # flips youpipe's dep tree between two fingerprints — a full rebuild per
+    # block per script run, and one block's compile co-running against the
+    # other's model exploration slows the heavy models down ~100x until the
+    # block timeout fires (measured 2026-11-17: rc=124 at 600 s against 3.9 s
+    # of tests on an idle host). A private dir keeps the fingerprint stable.
+    CARGO_TARGET_DIR=target/loom-st3 \
+        RUSTFLAGS="--cfg loom --cfg st3_loom" wrap_timeout 1200 \
         cargo test -p youpipe --lib -- loom_tests
 }
 block_queue() {
@@ -83,6 +98,42 @@ LABEL_QUEUE="vendored youpipe-concurrent-queue loom models"
 LABEL_ST3="vendored youpipe-st3 loom models"
 LABEL_CROSSFIRE="vendored youpipe-crossfire loom models (waker registry)"
 
+ALL_BLOCKS=(youpipe youpipe_st3 queue st3 crossfire)
+
+# LOOM_BLOCKS selects a subset (see the header); the default runs all five.
+if [[ -n ${LOOM_BLOCKS:-} ]]; then
+    read -ra BLOCKS <<<"$LOOM_BLOCKS"
+    [[ ${#BLOCKS[@]} -gt 0 ]] || { echo "LOOM_BLOCKS selects nothing" >&2; exit 2; }
+    for block in "${BLOCKS[@]}"; do
+        [[ " ${ALL_BLOCKS[*]} " == *" $block "* ]] || {
+            echo "unknown LOOM_BLOCKS entry: $block (valid: ${ALL_BLOCKS[*]})" >&2
+            exit 2
+        }
+    done
+else
+    BLOCKS=("${ALL_BLOCKS[@]}")
+fi
+
+block_cmd() { # <name>: run that block's command
+    case $1 in
+        youpipe) block_youpipe ;;
+        youpipe_st3) block_youpipe_st3 ;;
+        queue) block_queue ;;
+        st3) block_st3 ;;
+        crossfire) block_crossfire ;;
+    esac
+}
+
+block_label() { # <name>
+    case $1 in
+        youpipe) echo "$LABEL_YOUPIPE" ;;
+        youpipe_st3) echo "$LABEL_YOUPIPE_ST3" ;;
+        queue) echo "$LABEL_QUEUE" ;;
+        st3) echo "$LABEL_ST3" ;;
+        crossfire) echo "$LABEL_CROSSFIRE" ;;
+    esac
+}
+
 overall=0
 
 finish_block() { # <label> <rc> <logfile>
@@ -101,38 +152,28 @@ finish_block() { # <label> <rc> <logfile>
 }
 
 if [[ ${LOOM_SERIAL:-0} == 1 ]]; then
-    echo "==> $LABEL_YOUPIPE"
-    block_youpipe || finish_block "$LABEL_YOUPIPE" $? /dev/null
-    echo "==> $LABEL_YOUPIPE_ST3"
-    block_youpipe_st3 || finish_block "$LABEL_YOUPIPE_ST3" $? /dev/null
-    echo "==> $LABEL_QUEUE"
-    block_queue || finish_block "$LABEL_QUEUE" $? /dev/null
-    echo "==> $LABEL_ST3"
-    block_st3 || finish_block "$LABEL_ST3" $? /dev/null
-    echo "==> $LABEL_CROSSFIRE"
-    block_crossfire || finish_block "$LABEL_CROSSFIRE" $? /dev/null
+    for block in "${BLOCKS[@]}"; do
+        echo "==> $(block_label "$block")"
+        block_cmd "$block" || finish_block "$(block_label "$block")" $? /dev/null
+    done
 else
     tmpdir=$(mktemp -d)
-    block_youpipe     >"$tmpdir/youpipe.log"     2>&1 & pid_youpipe=$!
-    block_youpipe_st3 >"$tmpdir/youpipe_st3.log" 2>&1 & pid_youpipe_st3=$!
-    block_queue       >"$tmpdir/queue.log"       2>&1 & pid_queue=$!
-    block_st3         >"$tmpdir/st3.log"         2>&1 & pid_st3=$!
-    block_crossfire   >"$tmpdir/crossfire.log"   2>&1 & pid_crossfire=$!
-
-    # wait <pid> returns the job's exit status without tripping set -e.
-    wait $pid_youpipe     || rc_youpipe=$?
-    wait $pid_youpipe_st3 || rc_youpipe_st3=$?
-    wait $pid_queue       || rc_queue=$?
-    wait $pid_st3         || rc_st3=$?
-    wait $pid_crossfire   || rc_crossfire=$?
+    names=()
+    pids=()
+    for block in "${BLOCKS[@]}"; do
+        block_cmd "$block" >"$tmpdir/$block.log" 2>&1 &
+        names+=("$block")
+        pids+=($!)
+    done
 
     # Deterministic output order (same as the serial era), one block at a
     # time; the [ok]/FAIL/TIMEOUT markers preserve which output is whose.
-    finish_block "$LABEL_YOUPIPE"     "${rc_youpipe:-0}"     "$tmpdir/youpipe.log"
-    finish_block "$LABEL_YOUPIPE_ST3" "${rc_youpipe_st3:-0}" "$tmpdir/youpipe_st3.log"
-    finish_block "$LABEL_QUEUE"       "${rc_queue:-0}"       "$tmpdir/queue.log"
-    finish_block "$LABEL_ST3"         "${rc_st3:-0}"         "$tmpdir/st3.log"
-    finish_block "$LABEL_CROSSFIRE"   "${rc_crossfire:-0}"   "$tmpdir/crossfire.log"
+    # wait <pid> returns the job's exit status without tripping set -e.
+    for i in "${!names[@]}"; do
+        rc=0
+        wait "${pids[$i]}" || rc=$?
+        finish_block "$(block_label "${names[$i]}")" "$rc" "$tmpdir/${names[$i]}.log"
+    done
     rmdir "$tmpdir" 2>/dev/null || true
 fi
 
