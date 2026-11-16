@@ -9,6 +9,9 @@
 //!     claim a run of slots with ONE cursor CAS instead of one per item
 //!     (see docs/src/dev/streaming.md "Batched ring operations" in the
 //!     youpipe repo).
+//!   - youpipe fork extension (2026-11): the atomics come from
+//!     `loom::sync::atomic` under the `loom` feature, so `mod loom_tests`
+//!     model-checks the batch claim protocol.
 //!
 //! Fork from crossbeam-queue crate commit 5a154def002304814d50f3c7658bd30eb46b2fad
 //!
@@ -53,8 +56,12 @@ use crate::flavor::Token;
 use core::mem::{self, MaybeUninit};
 use core::panic::{RefUnwindSafe, UnwindSafe};
 use core::ptr;
+#[cfg(not(feature = "loom"))]
 use core::sync::atomic::{self, AtomicUsize, Ordering};
 use crossbeam_utils::{Backoff, CachePadded};
+#[cfg(feature = "loom")]
+// Modeled atomics; the slot payloads stay in core's UnsafeCell.
+use loom::sync::atomic::{self, AtomicUsize, Ordering};
 
 /// A slot in a queue.
 struct Slot<T> {
@@ -326,10 +333,12 @@ impl<T, const MP: bool, const MC: bool> ArrayQueue<T, MP, MC> {
     /// youpipe fork extension (batch send): claim a run of consecutively
     /// FREE slots with ONE tail CAS, then write the values. Non-blocking
     /// prefix semantics: sends `values[..n]` where `n` is the longest free
-    /// run found (0 = nothing sendable right now — full or CAS lost after
-    /// bounded retries). Backpressure granularity is unchanged from
-    /// per-item send: callers fall back to per-item blocking sends for the
-    /// remainder.
+    /// run found (0 = nothing sendable from this snapshot — full, a stale
+    /// `Relaxed` tail read whose walk lands on a slot a peer has already
+    /// published, or CAS lost after bounded retries). Backpressure
+    /// granularity is unchanged from per-item send: callers fall back to
+    /// per-item blocking sends for the remainder, which re-reads the tail
+    /// and is what makes the stale-snapshot 0 harmless.
     ///
     /// # Safety
     ///
@@ -593,12 +602,26 @@ impl<T, const MP: bool, const MC: bool> ArrayQueue<T, MP, MC> {
     }
 }
 
+/// Reads a cursor through `&mut self`: the std atomics expose `get_mut`,
+/// loom's modeled ones only a relaxed load.
+#[cfg(not(feature = "loom"))]
+#[inline]
+fn final_cursor(cursor: &mut CachePadded<AtomicUsize>) -> usize {
+    *cursor.get_mut()
+}
+
+#[cfg(feature = "loom")]
+#[inline]
+fn final_cursor(cursor: &mut CachePadded<AtomicUsize>) -> usize {
+    cursor.load(Ordering::Relaxed)
+}
+
 impl<T, const MP: bool, const MC: bool> Drop for ArrayQueue<T, MP, MC> {
     fn drop(&mut self) {
         if mem::needs_drop::<T>() {
             // Get the index of the head.
-            let head = *self.head.get_mut();
-            let tail = *self.tail.get_mut();
+            let head = final_cursor(&mut self.head);
+            let tail = final_cursor(&mut self.tail);
 
             let hix = head & (self.one_lap - 1);
             let tix = tail & (self.one_lap - 1);
@@ -769,5 +792,492 @@ mod batch_tests {
         // exactly-once: any duplicate or loss breaks both checks
         assert_eq!(all.len(), total);
         assert_eq!(all, (0..u32::try_from(P).unwrap() * N).collect::<Vec<_>>());
+    }
+}
+
+// Model-checked batch claim tests. Run with:
+//   cargo test -p youpipe-crossfire --features loom --lib --release -- loom_
+//
+// The seam above swaps only the atomics, so a slot's payload write is not a
+// modeled access and a model can only switch threads on a modeled atomic.
+// `write_claimed` has none between its two halves (`value` store, then the
+// Release stamp), so the window those two halves order is not schedulable
+// here: what the models assert is that every claim a consumer makes carries
+// a tag its producer published and that each tag is claimed exactly once,
+// which is what a claim taken through a published stamp implies. The
+// consumer-visible side of slot reuse (a head CAS that lost, a 0 return, a
+// re-claim of a run) is fully modeled.
+//
+// `pop_batch`'s "four CAS retries exhausted" exit needs four preemptions
+// inside one call and is not schedulable at the suite's preemption budget
+// (0 of them reached at LOOM_MAX_PREEMPTIONS=2 and 3, measured); both zero
+// returns leave the head unstored, so a 0 return claiming nothing is pinned
+// by the partial drain that follows the joins.
+//
+// The producer side (`try_push_batch` + `write_claimed`) has the same seam
+// shape: one modeled tail CAS, then a `value` store and a Release stamp per
+// slot with no modeled access in between, so the model cannot order a slot's
+// two halves either. What it does pin is the pair of contracts the call
+// makes: the claimed prefix is exactly what the consumers receive (no split,
+// no duplicate, no phantom claim) and the values left in `values[n..]` drop
+// exactly once each, the split `flush_staged`'s `assume_init_read` loop
+// depends on.
+//
+// `try_push_batch`'s `0` returns, measured at the suite's budget over the
+// three models below (6496 / 13142 / 10390 schedules explored): the
+// four-retry-exhausted exit is never reached — with two producers committing
+// one claim each, a producer can lose at most one tail CAS, so that exit is
+// structurally unreachable. Two claim-free exits are reachable: the `n == 0`
+// walk over a genuinely occupied prefix, and a `Relaxed` tail read stale by
+// at least one peer claim — the walk then starts before the peer's run and
+// breaks on its published stamp, so a ring with free slots reports 0 (in
+// `loom_try_push_batch_claims_publish_their_prefix`, whose two batches fit
+// the ring, every observed zero return is that stale one). Neither advances a
+// cursor, which the consumed multiset and the quiescent `len()` pin; in both
+// cases the caller's per-item fallback re-reads the tail.
+//
+// Falsification, temporary patches not committed: an unconditional
+// `tail.store(pos)` in place of the MP claim CAS makes all three models report
+// a lost and a duplicated tag, so the CAS is load-bearing under the model;
+// publishing a run's stamps only after writing every value survives all
+// three, which is exactly the window this seam cannot see.
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Never a published tag, so a buffer slot pop_batch wrote always
+    /// differs from one it left alone.
+    const SENTINEL: u32 = u32::MAX;
+
+    /// Polls per consumer. A consumer that spins on a 0 return explodes the
+    /// state space (every poll is a preemption point), so the remainder is
+    /// drained single-threaded after the joins instead.
+    const POLLS: usize = 3;
+
+    /// One poll: asserts the prefix contract and returns the claimed tags.
+    /// `n <= buf.len()`, `buf[..n]` holds queue-published tags, `buf[n..]` is
+    /// untouched.
+    fn poll_once(
+        queue: &ArrayQueue<u32, true, true>, buf: &mut [MaybeUninit<u32>], total: u32,
+    ) -> Vec<u32> {
+        for slot in buf.iter_mut() {
+            *slot = MaybeUninit::new(SENTINEL);
+        }
+        let n = queue.pop_batch(buf);
+        assert!(n <= buf.len(), "claimed {n} slots into a {}-slot buffer", buf.len());
+        let mut got = Vec::with_capacity(n);
+        for slot in buf.iter().take(n) {
+            // SAFETY: pop_batch initialized exactly buf[..n].
+            let tag = *unsafe { slot.assume_init_ref() };
+            assert!(tag < total, "read tag {tag} outside the published range");
+            got.push(tag);
+        }
+        for slot in buf.iter().skip(n) {
+            // SAFETY: the sentinel loop above initialized the whole buffer.
+            assert_eq!(*unsafe { slot.assume_init_ref() }, SENTINEL, "pop_batch touched buf[n..]");
+        }
+        got
+    }
+
+    /// One consumer: `POLLS` polls with a yield between them so the producer
+    /// can publish. A 0 return is legal and claims nothing; what proves
+    /// nothing was stranded is the drain that follows the joins.
+    fn consumer_polls(queue: &ArrayQueue<u32, true, true>, k: usize, total: u32) -> Vec<u32> {
+        let mut buf = vec![MaybeUninit::new(SENTINEL); k];
+        let mut got = Vec::new();
+        for _ in 0..POLLS {
+            got.extend(poll_once(queue, &mut buf, total));
+            loom::thread::yield_now();
+        }
+        got
+    }
+
+    /// Drains what the consumers left behind. Runs after every thread joined,
+    /// so the ring is quiescent and a 0 return means empty: an item stranded
+    /// by a claimed-but-unpublished slot cannot be recovered here.
+    fn drain_rest(queue: &ArrayQueue<u32, true, true>, total: u32) -> Vec<u32> {
+        let mut buf = [MaybeUninit::new(SENTINEL); 4];
+        let mut got = Vec::new();
+        loop {
+            let tags = poll_once(queue, &mut buf, total);
+            if tags.is_empty() {
+                return got;
+            }
+            got.extend(tags);
+        }
+    }
+
+    fn assert_conserved(mut tags: Vec<u32>, total: u32) {
+        tags.sort_unstable();
+        assert_eq!(tags, (0..total).collect::<Vec<u32>>(), "a claim was split or duplicated");
+    }
+
+    #[test]
+    fn loom_pop_batch_conserves_a_single_batch_claim() {
+        // One producer claims three slots in one CAS and publishes them one
+        // by one; two consumers of different batch widths poll the same head
+        // through that window.
+        loom::model(|| {
+            const TOTAL: u32 = 3;
+            let queue = Arc::new(ArrayQueue::<u32, true, true>::new(4));
+            let producer = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || {
+                    let mut batch =
+                        [MaybeUninit::new(0u32), MaybeUninit::new(1u32), MaybeUninit::new(2u32)];
+                    // SAFETY: `batch` is fully initialized and the ring is empty.
+                    assert_eq!(unsafe { queue.try_push_batch(&mut batch) }, TOTAL as usize);
+                })
+            };
+            let wide = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || consumer_polls(&queue, 2, TOTAL))
+            };
+            let narrow = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || consumer_polls(&queue, 1, TOTAL))
+            };
+
+            producer.join().unwrap();
+            let mut tags = wide.join().unwrap();
+            tags.extend(narrow.join().unwrap());
+            tags.extend(drain_rest(&queue, TOTAL));
+            assert_conserved(tags, TOTAL);
+            assert_eq!(queue.len(), 0);
+        });
+    }
+
+    #[test]
+    fn loom_pop_batch_interleaves_item_and_batch_publication() {
+        // Per-item pushes and a two-slot batch claim fill the same ring
+        // behind one consumer: each writer stamps its slot only after
+        // writing it, so the ring order the consumer claims has no hole it
+        // could read through.
+        loom::model(|| {
+            const TOTAL: u32 = 4;
+            let queue = Arc::new(ArrayQueue::<u32, true, true>::new(4));
+            let batch = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || {
+                    let mut batch = [MaybeUninit::new(0u32), MaybeUninit::new(1u32)];
+                    // SAFETY: `batch` is fully initialized; the claimed prefix
+                    // is moved out and the written tail stays owned here.
+                    let n = unsafe { queue.try_push_batch(&mut batch) };
+                    // A tail load that predates the peer's claim makes the walk
+                    // come back short (documented: the caller falls back to
+                    // per-item pushes); the ring never fills, so they succeed.
+                    for tag in n..2 {
+                        let value = MaybeUninit::new(tag as u32);
+                        // SAFETY: TOTAL <= capacity, so the ring never fills.
+                        assert!(unsafe { queue.push_with_ptr(value.as_ptr()) });
+                    }
+                })
+            };
+            let item = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || {
+                    for tag in 2..TOTAL {
+                        let value = MaybeUninit::new(tag);
+                        // SAFETY: TOTAL <= capacity, so the ring never fills.
+                        assert!(unsafe { queue.push_with_ptr(value.as_ptr()) });
+                    }
+                })
+            };
+            let consumer = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || consumer_polls(&queue, 2, TOTAL))
+            };
+
+            batch.join().unwrap();
+            item.join().unwrap();
+            let mut tags = consumer.join().unwrap();
+            tags.extend(drain_rest(&queue, TOTAL));
+            assert_conserved(tags, TOTAL);
+            assert_eq!(queue.len(), 0);
+        });
+    }
+
+    #[test]
+    fn loom_pop_batch_racing_runs_never_reclaim_a_lost_run() {
+        // One four-slot claim published slot by slot while two consumers
+        // claim two slots per call: whoever loses the head CAS must retry
+        // from the winner's head and never re-claim the run it lost.
+        loom::model(|| {
+            const TOTAL: u32 = 4;
+            let queue = Arc::new(ArrayQueue::<u32, true, true>::new(4));
+            let producer = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || {
+                    let mut batch = [
+                        MaybeUninit::new(0u32),
+                        MaybeUninit::new(1u32),
+                        MaybeUninit::new(2u32),
+                        MaybeUninit::new(3u32),
+                    ];
+                    // SAFETY: `batch` is fully initialized; the ring is empty
+                    // and holds exactly these four entries.
+                    assert_eq!(unsafe { queue.try_push_batch(&mut batch) }, TOTAL as usize);
+                })
+            };
+            let first = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || consumer_polls(&queue, 2, TOTAL))
+            };
+            let second = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || consumer_polls(&queue, 2, TOTAL))
+            };
+
+            producer.join().unwrap();
+            let mut tags = first.join().unwrap();
+            tags.extend(second.join().unwrap());
+            tags.extend(drain_rest(&queue, TOTAL));
+            assert_conserved(tags, TOTAL);
+            assert_eq!(queue.len(), 0);
+
+            // A 0 return claimed nothing, so the drained ring holds no
+            // phantom claim: both read facades agree it is empty and a fresh
+            // claim publishes over the same slots.
+            let mut out = [MaybeUninit::new(SENTINEL)];
+            assert_eq!(queue.pop_batch(&mut out), 0);
+            assert!(queue.pop(false).is_none());
+            let mut fresh = [MaybeUninit::new(TOTAL)];
+            // SAFETY: `fresh` is fully initialized and the ring is drained.
+            assert_eq!(unsafe { queue.try_push_batch(&mut fresh) }, 1);
+            assert_eq!(queue.pop_batch(&mut out), 1);
+            assert_eq!(*unsafe { out[0].assume_init_ref() }, TOTAL);
+        });
+    }
+
+    /// One producer: one batch claim, then the documented per-item fallback
+    /// for the tail the claim did not move (`flush_staged`'s shape).
+    fn push_batch_then_items(queue: &ArrayQueue<u32, true, true>, tags: &[u32]) {
+        let mut values: Vec<MaybeUninit<u32>> =
+            tags.iter().copied().map(MaybeUninit::new).collect();
+        // SAFETY: `values` is fully initialized; the claimed prefix is moved
+        // out of it and the tail is still owned here.
+        let n = unsafe { queue.try_push_batch(&mut values) };
+        assert!(n <= tags.len(), "claimed {n} slots of a {}-value batch", tags.len());
+        for slot in &mut values[n..] {
+            // SAFETY: the two batches fit the ring together, so the per-item
+            // push always finds a free slot and never parks.
+            assert!(unsafe { queue.push_with_ptr(slot.as_ptr()) });
+        }
+    }
+
+    #[test]
+    fn loom_try_push_batch_claims_publish_their_prefix() {
+        // Two producers claim a run each in one tail CAS and push the rest per
+        // item; one consumer polls two slots per call through both publication
+        // windows.
+        loom::model(|| {
+            const TOTAL: u32 = 4;
+            let queue = Arc::new(ArrayQueue::<u32, true, true>::new(4));
+            let first = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || push_batch_then_items(&queue, &[0, 1]))
+            };
+            let second = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || push_batch_then_items(&queue, &[2, 3]))
+            };
+            let consumer = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || consumer_polls(&queue, 2, TOTAL))
+            };
+
+            first.join().unwrap();
+            second.join().unwrap();
+            let mut tags = consumer.join().unwrap();
+            tags.extend(drain_rest(&queue, TOTAL));
+            // A claim is only counted once the consumer can see its slots, so
+            // a split claim, a re-claim and a claim the fallback then pushed
+            // again all break this multiset.
+            assert_conserved(tags, TOTAL);
+            assert_eq!(queue.len(), 0);
+        });
+    }
+
+    /// Payload whose drop bumps a per-tag counter: the counter is the
+    /// ownership witness (2 = double drop, 0 = leak).
+    struct Tagged {
+        tag: u32,
+        drops: Arc<Vec<AtomicUsize>>,
+    }
+
+    impl Drop for Tagged {
+        fn drop(&mut self) {
+            self.drops[self.tag as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn new_drop_log(total: u32) -> Arc<Vec<AtomicUsize>> {
+        Arc::new((0..total).map(|_| AtomicUsize::new(0)).collect())
+    }
+
+    /// Claims as much of `tags` as the ring has free slots and drops the tail
+    /// it kept. Returns `(claimed tags, tail tags)`.
+    fn push_tagged_batch(
+        queue: &ArrayQueue<Tagged, true, true>, tags: &[u32], drops: &Arc<Vec<AtomicUsize>>,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let mut values: Vec<MaybeUninit<Tagged>> = tags
+            .iter()
+            .map(|&tag| MaybeUninit::new(Tagged { tag, drops: Arc::clone(drops) }))
+            .collect();
+        // SAFETY: `values` is fully initialized; entries [..n] are moved out
+        // and entries [n..] stay owned here.
+        let n = unsafe { queue.try_push_batch(&mut values) };
+        assert!(n <= tags.len(), "claimed {n} slots of a {}-value batch", tags.len());
+        let mut kept = Vec::new();
+        for slot in values.iter_mut().skip(n) {
+            // SAFETY: try_push_batch left entries [n..] initialized.
+            let value = unsafe { slot.assume_init_read() };
+            kept.push(value.tag);
+        }
+        (tags[..n].to_vec(), kept)
+    }
+
+    /// Pops up to `rounds` batches and drops every claimed value (that drop is
+    /// the consumer half of the exactly-once count).
+    fn consume_tagged(queue: &ArrayQueue<Tagged, true, true>, rounds: usize) -> Vec<u32> {
+        let mut buf: Vec<MaybeUninit<Tagged>> = (0..4).map(|_| MaybeUninit::uninit()).collect();
+        let mut got = Vec::new();
+        for _ in 0..rounds {
+            let n = queue.pop_batch(&mut buf);
+            for slot in buf.iter_mut().take(n) {
+                // SAFETY: pop_batch initialized exactly buf[..n].
+                let value = unsafe { slot.assume_init_read() };
+                got.push(value.tag);
+            }
+            loom::thread::yield_now();
+        }
+        got
+    }
+
+    fn drain_tagged(queue: &ArrayQueue<Tagged, true, true>) -> Vec<u32> {
+        let mut got = Vec::new();
+        loop {
+            let round = consume_tagged(queue, 1);
+            if round.is_empty() {
+                return got;
+            }
+            got.extend(round);
+        }
+    }
+
+    #[test]
+    fn loom_try_push_batch_owns_only_the_moved_prefix() {
+        // Five values against a four-slot ring: whichever producer claims
+        // second gets a short claim and the tail it walked past stays its own
+        // to drop, while every value the ring took is dropped by the consumer.
+        loom::model(|| {
+            const TOTAL: u32 = 5;
+            let drops = new_drop_log(TOTAL);
+            let queue = Arc::new(ArrayQueue::<Tagged, true, true>::new(4));
+            let three = {
+                let (queue, drops) = (Arc::clone(&queue), Arc::clone(&drops));
+                loom::thread::spawn(move || push_tagged_batch(&queue, &[0, 1, 2], &drops))
+            };
+            let two = {
+                let (queue, drops) = (Arc::clone(&queue), Arc::clone(&drops));
+                loom::thread::spawn(move || push_tagged_batch(&queue, &[3, 4], &drops))
+            };
+            let consumer = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || consume_tagged(&queue, POLLS))
+            };
+
+            let (claimed_three, kept_three) = three.join().unwrap();
+            let (claimed_two, kept_two) = two.join().unwrap();
+            let mut consumed = consumer.join().unwrap();
+            consumed.extend(drain_tagged(&queue));
+
+            // Every value is either consumed from the ring or dropped by the
+            // producer that kept it, and never both.
+            let mut accounted = claimed_three.clone();
+            accounted.extend(claimed_two.iter().copied());
+            accounted.extend(kept_three.iter().copied());
+            accounted.extend(kept_two.iter().copied());
+            accounted.sort_unstable();
+            assert_eq!(accounted, (0..TOTAL).collect::<Vec<u32>>(), "a value was claimed twice");
+
+            let mut claimed = claimed_three;
+            claimed.extend(claimed_two);
+            claimed.sort_unstable();
+            consumed.sort_unstable();
+            assert_eq!(consumed, claimed, "the ring handed back something other than the claim");
+
+            for (tag, count) in drops.iter().enumerate() {
+                assert_eq!(count.load(Ordering::Relaxed), 1, "tag {tag} not dropped exactly once");
+            }
+            assert_eq!(queue.len(), 0);
+        });
+    }
+
+    #[test]
+    fn loom_try_push_batch_zero_return_claims_nothing() {
+        // One producer claims the whole four-slot ring, so the peer's
+        // single-value batch either lands in the slot a consumer freed or
+        // walks into a full ring and returns 0. The tags consumed are exactly
+        // the claimed ones in either case, and after a 0 return the documented
+        // per-item fallback still places the value.
+        loom::model(|| {
+            const TOTAL: u32 = 5;
+            let queue = Arc::new(ArrayQueue::<u32, true, true>::new(4));
+            let wide = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || {
+                    let mut values: Vec<MaybeUninit<u32>> = (0..4).map(MaybeUninit::new).collect();
+                    // SAFETY: `values` is fully initialized; the unsent tail
+                    // stays owned here and is simply dropped (u32 has none).
+                    unsafe { queue.try_push_batch(&mut values) }
+                })
+            };
+            let narrow = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || {
+                    let mut values = [MaybeUninit::new(4u32)];
+                    // SAFETY: `values` is fully initialized.
+                    unsafe { queue.try_push_batch(&mut values) }
+                })
+            };
+            let consumer = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || consumer_polls(&queue, 2, TOTAL))
+            };
+
+            let wide_claimed = wide.join().unwrap();
+            let narrow_claimed = narrow.join().unwrap();
+            let mut tags = consumer.join().unwrap();
+            tags.extend(drain_rest(&queue, TOTAL));
+
+            // The narrow claim runs second in the full-ring interleavings, so
+            // it either takes the one slot a consumer freed or nothing at all.
+            assert!(narrow_claimed <= 1, "narrow claimed {narrow_claimed} of one value");
+            assert!(wide_claimed <= 4, "wide claimed {wide_claimed} of four values");
+            let mut expected: Vec<u32> = (0..u32::try_from(wide_claimed).unwrap()).collect();
+            if narrow_claimed == 1 {
+                expected.push(4);
+            }
+            tags.sort_unstable();
+            assert_eq!(tags, expected, "a 0 return claimed a slot nothing published");
+            assert_eq!(queue.len(), 0);
+
+            if narrow_claimed == 0 {
+                // Documented fallback: the caller retries per item. The retry
+                // is applied on the quiescent ring, because a per-item push
+                // issued right after the 0 return has to wait for a consumer to
+                // free a slot, and that blocking spin never terminates on the
+                // branch where the producer is the last runnable thread.
+                let mut fresh = [MaybeUninit::new(4u32)];
+                // SAFETY: `fresh` is fully initialized; the ring is drained.
+                assert_eq!(unsafe { queue.try_push_batch(&mut fresh) }, 1);
+                let mut out = [MaybeUninit::new(SENTINEL)];
+                assert_eq!(queue.pop_batch(&mut out), 1);
+                assert_eq!(*unsafe { out[0].assume_init_ref() }, 4);
+                assert_eq!(queue.len(), 0);
+            }
+        });
     }
 }

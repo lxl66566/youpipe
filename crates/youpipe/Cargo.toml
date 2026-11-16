@@ -130,30 +130,39 @@ libc              = { workspace = true }
 rayon             = { workspace = true }
 tokio             = { workspace = true, features = ["io-util", "net", "test-util"] }
 
-# ── Concurrency-model testing of the pool's synchronization cores ──
-# Loom is activated by the `--cfg loom` rustflag (the ecosystem-standard
-# approach, same as crossbeam / tokio / the vendored `youpipe-st3`), NOT by a
-# cargo feature:
+# ── Concurrency-model testing ──
+# Loom is activated by rustflags, never by a cargo feature:
 #
-#   RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
+#   RUSTFLAGS="--cfg loom --cfg st3_loom" cargo test -p youpipe --lib -- loom_tests
 #
-# Why a rustflag rather than a feature: a feature is part of the public
-# semver surface and gets unified across the dependency graph, so an
-# unrelated downstream `--features loom` (or a future optional dep named
-# `loom`) would silently rebuild youpipe's sync primitives on loom's
-# simulated atomics in production. A `--cfg` only exists for the explicit
-# command line that sets it. The flag also applies uniformly to youpipe and
-# any dependency that follows the same convention (the vendored
-# youpipe-concurrent-queue tests already use `cfg(loom)`).
+# `--cfg loom` is the ecosystem-standard spelling (crossbeam, tokio, the
+# vendored youpipe-concurrent-queue) and switches `youpipe-sys`; `--cfg
+# st3_loom` is the vendored st3 deque's own switch. Both must be on the same
+# command line: a model spanning the deque only explores when st3's atomics
+# and buffer cells are simulated too.
+#
+# Why a rustflag rather than a feature: a feature is part of the public semver
+# surface and is unified across the dependency graph, so it fires everywhere
+# the crate is built — including `cargo nextest run --all-features` in CI,
+# where a loom feature must then panic (`loom` primitives abort with "cannot
+# access Loom execution state from outside a Loom model"). The rustflag only
+# exists for the command line that sets it, and it is the only way to reach
+# the dependencies' own switches: a feature cannot pass Rustflags on.
+#
+# The vendored crossfire is the exception that keeps it that way end to end:
+# its waker registry selects `loom::sync` by its own `loom` feature, which the
+# CI `--all-features` build also enables; its models therefore stay in their
+# own `perf/verify/loom.sh` block instead of being reachable from a youpipe
+# model (docs/todo.md #51).
 #
 # NOTE: setting RUSTFLAGS replaces the `[target.'cfg(all())'] rustflags` from
 # `.cargo/config.toml` (`-C panic=unwind -C llvm-args=-align-all-functions=6`),
 # which only matter for release/bench builds — test builds are unaffected.
 #
-# Only the synchronization cores are modeled — the Registry spawns real OS
-# threads, which loom cannot simulate, so tests drive the primitives
-# directly with `loom::thread`. Regular (real-thread) unit tests cannot run
-# on simulated primitives, hence the `-- loom_tests` filter.
+# Only the synchronization cores and the st3 deque are modeled — the Registry
+# spawns real OS threads, which loom cannot simulate, so tests drive the
+# primitives directly with `loom::thread`. Regular (real-thread) unit tests
+# cannot run on simulated primitives, hence the `-- loom_tests` filter.
 [target."cfg(loom)".dependencies]
 loom = { workspace = true }
 
@@ -165,8 +174,8 @@ default         = ["tokio-runtime"]
 # feature exists purely to instrument reproduction runs of intermittent
 # lost-wakeup hangs (todo P1 #14).
 crossfire-trace = ["crossfire/trace_log", "dep:log"]
-# (No `loom` feature: loom model-checking is driven by the `--cfg loom`
-# rustflag instead — see `[target.'cfg(loom)'.dependencies]` below.)
+# (No `loom` feature: loom model-checking is driven by rustflags — see the
+# `[target."cfg(loom)".dependencies]` block above for why.)
 # ── Optional permanent instrumentation (zero-cost when off) ──
 # `hotpath` is an optional dependency; when none of these features are enabled
 # the `#[cfg_attr(feature = "hotpath", hotpath::measure)]` probes are stripped at

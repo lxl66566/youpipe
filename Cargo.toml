@@ -64,8 +64,10 @@ pedantic                = { level = "warn", priority = -1 }
 wildcard_imports        = "allow"
 
 [workspace.lints.rust]
-# `loom` is activated by `RUSTFLAGS="--cfg loom"` (see youpipe's manifest), not a feature
-unexpected_cfgs       = { level = "warn", check-cfg = ["cfg(loom)"] }
+# `loom` is activated by `RUSTFLAGS="--cfg loom"` (see youpipe's manifest), not a feature.
+# `st3_loom` is the vendored st3 deque's own switch; rustflags reach every crate, so
+# youpipe's st3-deque model gates on it to stay out of builds where the deque is not modeled.
+unexpected_cfgs       = { level = "warn", check-cfg = ["cfg(loom)", "cfg(st3_loom)"] }
 unsafe_code           = "allow"
 unused_qualifications = "warn"
 

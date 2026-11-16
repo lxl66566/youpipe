@@ -1180,7 +1180,7 @@ pub enum TryRecvError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -1379,29 +1379,60 @@ mod tests {
         }
     }
 
+    /// Per-slot drop recorder: every `DropCounted` logs its own id, so the
+    /// accounting below pins per-slot exactly-once instead of a total that a
+    /// double drop on one slot and a skipped destructor on another could
+    /// balance out.
+    #[derive(Default)]
+    struct Drops(Mutex<Vec<usize>>);
+
+    impl Drops {
+        /// Recorded ids, sorted: a repeated id is a second drop of that slot,
+        /// a missing id leaked its destructor.
+        fn recorded(&self) -> Vec<usize> {
+            let mut ids = self.0.lock().unwrap().clone();
+            ids.sort_unstable();
+            ids
+        }
+    }
+
+    struct DropCounted {
+        id: usize,
+        drops: Arc<Drops>,
+    }
+
+    impl Drop for DropCounted {
+        fn drop(&mut self) {
+            self.drops.0.lock().unwrap().push(self.id);
+        }
+    }
+
+    /// `n` items with ids `0..n`, all reporting into `drops`.
+    fn numbered_items(drops: &Arc<Drops>, n: usize) -> Vec<DropCounted> {
+        (0..n)
+            .map(|id| DropCounted {
+                id,
+                drops: drops.clone(),
+            })
+            .collect()
+    }
+
     /// Closed mid-batch: the unsent remainder must run its destructors (the
     /// `Vec<MaybeUninit<_>>` staging would otherwise drop them silently) —
     /// the failed `send` consumes item 0, the explicit drop covers 1..8.
     #[test]
     fn send_batch_closed_mid_batch_runs_destructors() {
-        let counter = Arc::new(Drops::default());
+        let drops = Arc::new(Drops::default());
         let (tx, rx) = mpsc_channel::<DropCounted>(4);
         drop(rx);
-        let mut batch: Vec<_> = (0..8).map(|_| DropCounted(counter.clone())).collect();
+        let mut batch = numbered_items(&drops, 8);
         let mut staged: Vec<MaybeUninit<DropCounted>> = Vec::with_capacity(8);
         assert!(!SendItem::send_batch(&tx, &mut batch, &mut staged));
-        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 8);
-    }
-
-    #[derive(Default)]
-    struct Drops(std::sync::atomic::AtomicUsize);
-
-    struct DropCounted(Arc<Drops>);
-
-    impl Drop for DropCounted {
-        fn drop(&mut self) {
-            self.0.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        assert_eq!(
+            drops.recorded(),
+            (0..8).collect::<Vec<usize>>(),
+            "every item must run its destructor exactly once"
+        );
     }
 
     /// `AsyncSendItem::flush_staged` keeps item order across the
@@ -1436,15 +1467,200 @@ mod tests {
     /// `Vec<MaybeUninit<_>>` drop would skip them silently.
     #[test]
     fn async_flush_staged_closed_mid_batch_runs_destructors() {
-        let counter = Arc::new(Drops::default());
+        let drops = Arc::new(Drops::default());
         let (tx, rx) = mpsc_async_channel::<DropCounted>(4);
         drop(rx);
-        let mut batch: Vec<_> = (0..8).map(|_| DropCounted(counter.clone())).collect();
+        let mut batch = numbered_items(&drops, 8);
         let mut staged: Vec<MaybeUninit<DropCounted>> = Vec::with_capacity(8);
         stage_batch(&mut batch, &mut staged);
         let mut slot = WakerSlot::new();
         let alive = futures::executor::block_on(tx.flush_staged(&mut staged, &mut slot));
         assert!(!alive);
-        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 8);
+        assert_eq!(
+            drops.recorded(),
+            (0..8).collect::<Vec<usize>>(),
+            "every item must run its destructor exactly once"
+        );
+    }
+
+    /// Deterministic `SendItem` + `AsyncSendItem` double for the flush
+    /// accounting: `try_send_batch` claims exactly `take` slots and keeps
+    /// them, then the per-item sends walk the rest and the `fail_at`-th
+    /// (0-based) reports the channel closed, dropping its own item the way a
+    /// closed `send` does. A real channel cannot produce this split: with the
+    /// receiver gone `try_send_batch` claims 0, so only a double can pin a
+    /// non-empty sent prefix followed by a close.
+    #[derive(Clone)]
+    struct FlushMock {
+        take: usize,
+        fail_at: Option<usize>,
+        claimed: Arc<Mutex<Vec<DropCounted>>>,
+        sent: Arc<Mutex<Vec<DropCounted>>>,
+        dropped_by_send: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl FlushMock {
+        fn new(take: usize, fail_at: Option<usize>) -> Self {
+            Self {
+                take,
+                fail_at,
+                claimed: Arc::new(Mutex::new(Vec::new())),
+                sent: Arc::new(Mutex::new(Vec::new())),
+                dropped_by_send: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// # Safety
+        ///
+        /// Every slot of `values` must be initialized on entry; the claimed
+        /// prefix is moved out.
+        unsafe fn claim(&self, values: &mut [MaybeUninit<DropCounted>]) -> usize {
+            let n = self.take.min(values.len());
+            let mut claimed = self.claimed.lock().unwrap();
+            for slot in &mut values[..n] {
+                // SAFETY: every slot is initialized on entry (trait contract)
+                // and only the claimed prefix [..n) is moved out.
+                claimed.push(unsafe { slot.assume_init_read() });
+            }
+            n
+        }
+
+        fn deliver(&self, item: DropCounted) -> Result<(), ChannelError> {
+            let mut sent = self.sent.lock().unwrap();
+            if self.fail_at == Some(sent.len()) {
+                drop(sent);
+                self.dropped_by_send.lock().unwrap().push(item.id);
+                drop(item);
+                Err(ChannelError::Closed)
+            } else {
+                sent.push(item);
+                Ok(())
+            }
+        }
+
+        fn ids(items: &Arc<Mutex<Vec<DropCounted>>>) -> Vec<usize> {
+            items.lock().unwrap().iter().map(|item| item.id).collect()
+        }
+    }
+
+    impl SendItem<DropCounted> for FlushMock {
+        fn send(&self, item: DropCounted) -> Result<(), ChannelError> {
+            self.deliver(item)
+        }
+
+        fn try_send(&self, _item: DropCounted) -> Result<(), TrySendError<DropCounted>> {
+            unreachable!("flush_staged drives try_send_batch and send")
+        }
+
+        unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<DropCounted>]) -> usize {
+            // SAFETY: forwarded to the inherent method's contract.
+            unsafe { self.claim(values) }
+        }
+    }
+
+    impl AsyncSendItem<DropCounted> for FlushMock {
+        fn send_cached<'s>(
+            &'s self,
+            item: DropCounted,
+            _slot: &'s mut WakerSlot,
+        ) -> impl Future<Output = Result<(), ChannelError>> + Send {
+            // Never pends: the double answers immediately.
+            std::future::ready(self.deliver(item))
+        }
+
+        fn try_send(&self, _item: DropCounted) -> Result<(), TrySendError<DropCounted>> {
+            unreachable!("flush_staged drives try_send_batch and send_cached")
+        }
+
+        unsafe fn try_send_batch(&self, values: &mut [MaybeUninit<DropCounted>]) -> usize {
+            // SAFETY: forwarded to the inherent method's contract.
+            unsafe { self.claim(values) }
+        }
+    }
+
+    /// Asserts one flush against the mock's recorded traffic: `try_send_batch`
+    /// claimed `0..take`, the per-item sends resumed exactly at that count, the
+    /// failing one dropped its own item, and the flush dropped exactly the
+    /// discarded suffix. Dropping the mock closes the set, so every id must
+    /// appear exactly once.
+    fn assert_flush_accounting(tx: FlushMock, drops: &Arc<Drops>, n: usize) {
+        let take = tx.take;
+        let sent = FlushMock::ids(&tx.sent);
+        let dropped_by_send = tx.dropped_by_send.lock().unwrap().clone();
+        assert_eq!(
+            FlushMock::ids(&tx.claimed),
+            (0..take).collect::<Vec<usize>>(),
+            "try_send_batch must claim the leading prefix"
+        );
+        assert_eq!(
+            sent,
+            (take..take + sent.len()).collect::<Vec<usize>>(),
+            "per-item sends must resume at the try_send_batch count"
+        );
+        match tx.fail_at {
+            None => assert!(dropped_by_send.is_empty(), "no send may fail"),
+            Some(fail_at) => assert_eq!(
+                dropped_by_send,
+                vec![take + fail_at],
+                "the failing send drops its own item"
+            ),
+        }
+        // The flush owns everything past the failing send's slot; no claimed
+        // or sent id may appear here.
+        let unsent = match tx.fail_at {
+            None => Vec::new(),
+            Some(fail_at) => (take + fail_at..n).collect::<Vec<usize>>(),
+        };
+        assert_eq!(
+            drops.recorded(),
+            unsent,
+            "the flush must drop exactly the unsent suffix"
+        );
+        drop(tx);
+        assert_eq!(
+            drops.recorded(),
+            (0..n).collect::<Vec<usize>>(),
+            "every slot must drop exactly once"
+        );
+    }
+
+    /// `SendItem::flush_staged` drop accounting: on a closed per-item send the
+    /// discarded suffix slots drop exactly once, the sent prefix is never
+    /// dropped again, and the per-item sends resume at `try_send_batch`'s
+    /// count.
+    #[test]
+    fn flush_staged_drop_accounting() {
+        for (take, fail_at) in [(8, None), (2, None), (3, Some(1)), (0, Some(0))] {
+            let drops = Arc::new(Drops::default());
+            let mut batch = numbered_items(&drops, 8);
+            let mut staged: Vec<MaybeUninit<DropCounted>> = Vec::with_capacity(8);
+            stage_batch(&mut batch, &mut staged);
+            let tx = FlushMock::new(take, fail_at);
+            let alive = SendItem::flush_staged(&tx, &mut staged);
+            assert_eq!(alive, fail_at.is_none(), "take {take} fail_at {fail_at:?}");
+            assert_flush_accounting(tx, &drops, 8);
+        }
+    }
+
+    /// Async twin: `AsyncSendItem::flush_staged` repeats the move-out
+    /// bookkeeping inline (its awaits cannot share the sync body), so it needs
+    /// its own run through the same traffic table.
+    #[test]
+    fn async_flush_staged_drop_accounting() {
+        for (take, fail_at) in [(8, None), (2, None), (3, Some(1)), (0, Some(0))] {
+            let drops = Arc::new(Drops::default());
+            let mut batch = numbered_items(&drops, 8);
+            let mut staged: Vec<MaybeUninit<DropCounted>> = Vec::with_capacity(8);
+            stage_batch(&mut batch, &mut staged);
+            let tx = FlushMock::new(take, fail_at);
+            let mut slot = WakerSlot::new();
+            let alive = futures::executor::block_on(AsyncSendItem::flush_staged(
+                &tx,
+                &mut staged,
+                &mut slot,
+            ));
+            assert_eq!(alive, fail_at.is_none(), "take {take} fail_at {fail_at:?}");
+            assert_flush_accounting(tx, &drops, 8);
+        }
     }
 }

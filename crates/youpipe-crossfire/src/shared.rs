@@ -4,7 +4,14 @@ pub(crate) use crate::flavor::{ChannelSharedSelect, Flavor, FlavorSelect, Token}
 use crate::trace_log;
 pub(crate) use crate::waker::*;
 pub(crate) use crate::waker_registry::*;
+#[cfg(feature = "loom")]
+// loom has no compiler_fence; a full fence is its modeled superset.
+use loom::sync::atomic::fence as compiler_fence;
+#[cfg(feature = "loom")]
+// Modeled atomics: the endpoint refcount claim is what `loom_tests` drives.
+use loom::sync::atomic::{fence, AtomicUsize, Ordering};
 use std::mem::MaybeUninit;
+#[cfg(not(feature = "loom"))]
 use std::sync::atomic::{compiler_fence, fence, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -583,5 +590,258 @@ mod recycle_tests {
         }
         drop(tx);
         drop(rx);
+    }
+}
+
+// Model-checked tests. Run with:
+//   LOOM_MAX_PREEMPTIONS=2 cargo test -p youpipe-crossfire --features loom --lib --release -- loom_
+//
+// The `-- loom_` filter is mandatory: `mod recycle_tests` above drives real
+// threads and cannot share a build with simulated primitives.
+//
+// Modeled: both claim CASes, both rollback branches, the reset's writes into
+// the ring (`ArrayQueue` carries the same seam) and into both waker
+// registries, and the exclusivity of the claim. Not modeled: endpoint
+// park/wake — no model here blocks, so every send/recv below completes on
+// the try path. Measured on Windows (32 cores, LOOM_MAX_PREEMPTIONS=2):
+// 420 / 35 / 420 / 20 executions, all four under 0.05 s together.
+//
+// Falsification, temporary patches not committed:
+// - dropping the sender rollback of the receiver-CAS branch leaves the
+//   sender count at 1: `loom_try_reset_refuses_a_surviving_endpoint` fails.
+// - `store(0)` in place of either rollback decrement clobbers a racing
+//   weak upgrade's refcount and fails the model that owns that branch.
+// - `store(1)` in place of the claim CAS makes both runs believe they own
+//   the ring: loom reports the concurrent `UnsafeCell` write, and the
+//   success count is 2.
+// - A `Relaxed` success ordering on the sender claim passes all four. The
+//   registry `reset()` under the same mutexes the previous run's `close()`
+//   released already orders the two runs, and the ring writes the claim
+//   orders are plain atomics, which are not racy by construction; that half
+//   of the ordering has no independent detector at this seam.
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+    use crate::mpmc;
+    use crate::{MRx, MTx, ReceiverType, SenderType};
+    use loom::cell::UnsafeCell;
+
+    /// Polls per resetter. A resetter that spins explodes the state space
+    /// (every poll is a preemption point), so the polls are bounded and the
+    /// quiescent state is asserted after the joins instead.
+    const POLLS: usize = 2;
+
+    /// One unchecked `usize` cell per model, plus the accessors the
+    /// assertions use. loom's `UnsafeCell` also tracks causality, so a read
+    /// without a happens-before edge to the write reports a violation
+    /// instead of silently succeeding.
+    #[derive(Debug)]
+    struct Cell(UnsafeCell<usize>);
+
+    impl Cell {
+        fn new(data: usize) -> Self {
+            Self(UnsafeCell::new(data))
+        }
+
+        fn read(&self) -> usize {
+            self.0.with(|cell| unsafe { *cell })
+        }
+
+        /// Claim the cell for `id`; a second holder trips the assertion.
+        fn enter(&self, id: usize) {
+            self.0.with_mut(|cell| {
+                assert_eq!(unsafe { *cell }, 0, "two runs hold the shared at once");
+                unsafe { *cell = id };
+            });
+        }
+
+        /// Release the cell for `id`.
+        fn exit(&self, id: usize) {
+            self.0.with_mut(|cell| {
+                assert_eq!(unsafe { *cell }, id, "release of a foreign claim");
+                unsafe { *cell = 0 };
+            });
+        }
+    }
+
+    // loom's checked cell is `!Sync`; the crate shares its own unchecked
+    // cells behind manual `Sync` impls (`Slot`, the waker node), and so does
+    // this bookkeeping.
+    unsafe impl Sync for Cell {}
+
+    #[test]
+    fn loom_try_reset_refuses_a_surviving_endpoint() {
+        // A receiver outlives the sender's drop, so every attempt claims the
+        // sender count and then fails the receiver CAS: that rollback is a
+        // decrement, because a weak upgrade may bump the claimed count in
+        // between. Three threads: this one is the resetter.
+        loom::model(|| {
+            let (tx, rx) = mpmc::bounded_blocking::<usize>(2);
+            let shared = tx.shared_handle();
+            let weak = tx.downgrade();
+            tx.send(7).unwrap();
+
+            let dropper = loom::thread::spawn(move || drop(tx));
+            let upgrader = {
+                let shared = shared.clone();
+                loom::thread::spawn(move || {
+                    // Succeeds only inside a claim window; a refused upgrade
+                    // leaves the count alone.
+                    if let Some(tx) = weak.upgrade::<MTx<mpmc::Array<usize>>>() {
+                        assert!(!shared.is_tx_closed(), "a live upgrade must not read as closed");
+                        drop(tx);
+                    }
+                })
+            };
+
+            for _ in 0..POLLS {
+                assert!(!shared.try_reset(), "a live receiver must refuse the reset");
+                loom::thread::yield_now();
+            }
+            upgrader.join().unwrap();
+            dropper.join().unwrap();
+            // A surviving claim would read as a live sender.
+            assert_eq!(shared.get_tx_count(), 0);
+            assert_eq!(shared.get_rx_count(), 1);
+            // Refusals leave the ring and both registries alone.
+            assert_eq!(shared.len(), 1);
+            assert_eq!(shared.get_wakers_count(), (0, 0));
+            drop(rx);
+        });
+    }
+
+    #[test]
+    fn loom_try_reset_settles_the_previous_run() {
+        // The previous run publishes its teardown mark and then drops the last
+        // endpoints; a successful claim must leave the rebuilt channel at the
+        // constructor state and nothing the settled run wrote may be lost.
+        loom::model(|| {
+            let (tx, rx) = mpmc::bounded_blocking::<usize>(2);
+            let shared = tx.shared_handle();
+            tx.send(1).unwrap();
+            assert_eq!(rx.recv(), Ok(1));
+            let teardown = Arc::new(Cell::new(0usize));
+
+            let prev = {
+                let teardown = teardown.clone();
+                loom::thread::spawn(move || {
+                    teardown.enter(1);
+                    drop(rx);
+                    drop(tx);
+                })
+            };
+            let next = {
+                let shared = shared.clone();
+                let teardown = teardown.clone();
+                loom::thread::spawn(move || {
+                    for _ in 0..POLLS {
+                        if !shared.try_reset() {
+                            loom::thread::yield_now();
+                            continue;
+                        }
+                        // Constructor state: both counts, the ring and both
+                        // registries are the ones the rebuilt pair assumes.
+                        assert_eq!(shared.get_tx_count(), 1);
+                        assert_eq!(shared.get_rx_count(), 1);
+                        assert!(shared.is_empty());
+                        assert_eq!(shared.get_wakers_count(), (0, 0));
+                        assert_eq!(teardown.read(), 1, "the claim must see the settled run");
+                        // The claimed counts are the rebuilt pair's.
+                        let tx: MTx<mpmc::Array<usize>> = SenderType::new(shared.clone());
+                        let rx: MRx<mpmc::Array<usize>> = ReceiverType::new(shared);
+                        tx.send(9).unwrap();
+                        assert_eq!(rx.recv(), Ok(9));
+                        return;
+                    }
+                })
+            };
+
+            next.join().unwrap();
+            prev.join().unwrap();
+            // The rebuilt pair dropped with its thread, so the ring is
+            // claimable again either way.
+            assert_eq!(shared.get_tx_count(), 0);
+            assert_eq!(shared.get_rx_count(), 0);
+            assert!(shared.is_empty());
+        });
+    }
+
+    #[test]
+    fn loom_try_reset_rollbacks_preserve_a_racing_upgrade() {
+        // Both rollbacks are decrements, not stores: a weak upgrade that
+        // bumped the claimed count must survive them. The live item keeps
+        // `inner.try_reset` refusing, so the attempt walks both refcount
+        // CASes and then rolls both back. Three threads: this one resets.
+        loom::model(|| {
+            let (tx, rx) = mpmc::bounded_blocking::<usize>(2);
+            let shared = tx.shared_handle();
+            let weak = tx.downgrade();
+            tx.send(7).unwrap();
+
+            let dropper = loom::thread::spawn(move || drop(tx));
+            let upgrader = {
+                let shared = shared.clone();
+                loom::thread::spawn(move || {
+                    // Succeeds only inside a claim window; a refused upgrade
+                    // leaves the count alone.
+                    if let Some(tx) = weak.upgrade::<MTx<mpmc::Array<usize>>>() {
+                        assert!(!shared.is_tx_closed(), "a live upgrade must not read as closed");
+                        drop(tx);
+                    }
+                })
+            };
+
+            drop(rx);
+            for _ in 0..POLLS {
+                assert!(!shared.try_reset(), "an undrained ring must refuse the reset");
+                loom::thread::yield_now();
+            }
+            upgrader.join().unwrap();
+            dropper.join().unwrap();
+            // Every claim rolled back, and the leftover item is untouched.
+            assert_eq!(shared.get_tx_count(), 0);
+            assert_eq!(shared.get_rx_count(), 0);
+            assert_eq!(shared.len(), 1);
+            assert_eq!(shared.get_wakers_count(), (0, 0));
+        });
+    }
+
+    #[test]
+    fn loom_try_reset_claims_the_shared_exclusively() {
+        // Two runs take the same quiescent allocation out of the recycling
+        // cache: exactly one may reset it, and only that run may hold it.
+        loom::model(|| {
+            let (tx, rx) = mpmc::bounded_blocking::<usize>(2);
+            let shared = tx.shared_handle();
+            tx.send(1).unwrap();
+            assert_eq!(rx.recv(), Ok(1));
+            drop(tx);
+            drop(rx);
+
+            let holder = Arc::new(Cell::new(0usize));
+            let run = |id: usize| {
+                let shared = shared.clone();
+                let holder = holder.clone();
+                loom::thread::spawn(move || {
+                    if !shared.try_reset() {
+                        return false;
+                    }
+                    holder.enter(id);
+                    assert_eq!(shared.get_tx_count(), 1);
+                    assert_eq!(shared.get_rx_count(), 1);
+                    assert!(shared.is_empty());
+                    holder.exit(id);
+                    true
+                })
+            };
+            let first = run(1);
+            let second = run(2);
+            let won =
+                [first.join().unwrap(), second.join().unwrap()].iter().filter(|won| **won).count();
+            assert_eq!(won, 1, "the claim is exclusive");
+            assert_eq!(shared.get_tx_count(), 1);
+            assert_eq!(shared.get_rx_count(), 1);
+            assert_eq!(holder.read(), 0, "a run still holds the shared");
+        });
     }
 }

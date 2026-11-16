@@ -2398,4 +2398,196 @@ mod loom_tests {
             assert_ne!(abandoned.load(Ordering::SeqCst), 0);
         });
     }
+
+    // ── Batch data-plane wakes (L4) ──
+    // `try_send_batch`/`try_recv_batch` fire one merged `_fire_n(n)` pass for
+    // the n items they moved (shared.rs). The ring is not modeled, so these
+    // models drive `fire_n` with the same n the batch paths pass: a batch of n
+    // events reaches n distinct committed waiters, a commit inside the
+    // collection window is not skipped, and a migrated waiter still redirects
+    // the wake to the fresh one.
+
+    // No lost wake: a batch of n events spends them on n distinct committed
+    // waiters, and no waiter is submitted twice. T1's node carries the stale
+    // duplicate entry a spurious re-arm leaves behind — were that duplicate a
+    // second delivery, the fourth waiter would still be Waiting after three
+    // events.
+    #[test]
+    fn loom_fire_n_spends_batch_events_on_distinct_committed_waiters() {
+        loom::model(|| {
+            let reg = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            // Two committed waiters registered before the batch is fired.
+            let b = ArcWaker::new_blocking();
+            reg.reg_waker(&b);
+            b.commit_waiting();
+            let d = ArcWaker::new_blocking();
+            reg.reg_waker(&d);
+            d.commit_waiting();
+            let committed1 = Arc::new(AtomicUsize::new(0));
+            let committed2 = Arc::new(AtomicUsize::new(0));
+
+            let t1 = {
+                let reg = reg.clone();
+                let committed1 = committed1.clone();
+                loom::thread::spawn(move || {
+                    let mut o_waker: Option<ArcWaker> = None;
+                    <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+                    // Spurious wakeup inside the episode: re-arm, leaving the
+                    // first entry stale.
+                    <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+                    reg.commit_waiting(&o_waker);
+                    committed1.store(1, Ordering::SeqCst);
+                    o_waker.unwrap()
+                })
+            };
+
+            let t2 = {
+                let reg = reg.clone();
+                let committed2 = committed2.clone();
+                loom::thread::spawn(move || {
+                    let mut o_waker: Option<ArcWaker> = None;
+                    <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+                    reg.commit_waiting(&o_waker);
+                    committed2.store(1, Ordering::SeqCst);
+                    o_waker.unwrap()
+                })
+            };
+
+            wait_committed(&committed1);
+            wait_committed(&committed2);
+            reg.fire_n(3);
+            let a = t1.join().unwrap();
+            let c = t2.join().unwrap();
+
+            let waiters = [&a, &b, &c, &d];
+            let woken = waiters.iter().filter(|w| w.get_state() == WakerState::Woken as u8).count();
+            assert_eq!(woken, 3, "three events wake three distinct committed waiters");
+
+            // The fourth event completes the set; the stale duplicate is
+            // inert (dropped by the stamp gate, never a delivery).
+            reg.fire_n(1);
+            for w in waiters {
+                assert_eq!(w.get_state(), WakerState::Woken as u8);
+            }
+            assert_eq!(reg.fire(), WakeResult::Next);
+            assert_eq!(reg.len(), 0);
+        });
+    }
+
+    // A waiter committing inside the batch's collect→wake window is never
+    // skipped. Both receivers are queued before the batch fires, so the
+    // collection pops both entries; their commits race the out-of-lock wake
+    // loop, so each entry is collected either while Init (an event-free wake
+    // punches the node to Woken and the commit's Init→Waiting CAS then fails,
+    // the receiver re-polls) or while Waiting (one event delivered). A skipped
+    // receiver would end Waiting with no entry left, which is the lost wake
+    // this batching could introduce by handing the collected set to the wake
+    // loop instead of re-reading the queue per item.
+    #[test]
+    fn loom_fire_n_does_not_skip_waiters_committing_in_the_collect_window() {
+        loom::model(|| {
+            let reg = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let registered = Arc::new(AtomicUsize::new(0));
+
+            let spawn_receiver = |reg: Arc<RegistryMulti>, registered: Arc<AtomicUsize>| {
+                loom::thread::spawn(move || {
+                    let mut o_waker: Option<ArcWaker> = None;
+                    <RegistryMulti as RegistryRecv>::reg_waker_blocking(&reg, &mut o_waker);
+                    registered.fetch_add(1, Ordering::SeqCst);
+                    // Races the batch fire's collect-to-wake span.
+                    let state = reg.commit_waiting(&o_waker);
+                    (o_waker.unwrap(), state)
+                })
+            };
+            let t1 = spawn_receiver(reg.clone(), registered.clone());
+            let t2 = spawn_receiver(reg.clone(), registered.clone());
+
+            while registered.load(Ordering::SeqCst) < 2 {
+                loom::thread::yield_now();
+            }
+            reg.fire_n(2);
+            for handle in [t1, t2] {
+                let (node, commit_state) = handle.join().unwrap();
+                assert_eq!(
+                    node.get_state(),
+                    WakerState::Woken as u8,
+                    "receiver skipped by the batch wake"
+                );
+                assert!(
+                    commit_state == WakerState::Waiting as u8
+                        || commit_state == WakerState::Woken as u8,
+                    "commit must observe Waiting or the punched Woken"
+                );
+            }
+            assert_eq!(reg.len(), 0);
+        });
+    }
+
+    // `loom_wake_after_waiter_migration_redirects_to_fresh_waiter` on the
+    // batch path: T1 is a committed reg1 waiter whose entry the batch pops,
+    // then the episode dies and the node re-arms on reg2 before the wake
+    // reads it. The event must be handed back (`remaining += wasted`) and
+    // land on the fresh committed waiter, never on the migrated node's new
+    // episode.
+    #[test]
+    fn loom_fire_n_redirects_migrated_wake_to_fresh_waiter() {
+        loom::model(|| {
+            let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let reg2 = Arc::new(<RegistryMulti as RegistryRecv>::new());
+            let committed3 = Arc::new(AtomicUsize::new(0));
+            // T1's episode outcome: 1 = abandon won (the wake had not landed
+            // when the episode died), 2 = a wake landed first (legitimate
+            // delivery to this episode).
+            let abandoned = Arc::new(AtomicUsize::new(0));
+
+            let node = ArcWaker::new_blocking();
+
+            let t1 = {
+                let reg1 = reg1.clone();
+                let reg2 = reg2.clone();
+                let abandoned = abandoned.clone();
+                let node = node.clone_node();
+                loom::thread::spawn(move || {
+                    reg1.reg_waker(&node);
+                    node.commit_waiting();
+                    let ok = node.abandon().is_ok();
+                    abandoned.store(if ok { 1 } else { 2 }, Ordering::SeqCst);
+                    node.reset();
+                    reg2.reg_waker(&node);
+                    node.commit_waiting();
+                })
+            };
+
+            let t3 = {
+                let reg1 = reg1.clone();
+                let committed3 = committed3.clone();
+                loom::thread::spawn(move || {
+                    let other = ArcWaker::new_blocking();
+                    reg1.reg_waker(&other);
+                    other.commit_waiting();
+                    committed3.store(1, Ordering::SeqCst);
+                    other
+                })
+            };
+
+            // Only the fresh waiter is barriered; the migration races the
+            // batch fire's pop-to-wake span.
+            wait_committed(&committed3);
+            reg1.fire_n(1);
+            let other = t3.join().unwrap();
+            t1.join().unwrap();
+            if abandoned.load(Ordering::SeqCst) == 1 {
+                assert_eq!(
+                    other.get_state(),
+                    WakerState::Woken as u8,
+                    "event spent on the migrated waiter, fresh waiter stranded"
+                );
+            }
+            // node ends Woken (legitimate delivery, redirected wake or the
+            // stamped steal) or Waiting (entry skipped); reg2's fire settles
+            // it to Woken either way.
+            let _ = reg2.fire();
+            assert_eq!(node.get_state(), WakerState::Woken as u8);
+        });
+    }
 }

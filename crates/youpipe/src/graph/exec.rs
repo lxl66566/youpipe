@@ -5,7 +5,7 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Mutex},
 };
 
 use super::{
@@ -64,34 +64,47 @@ impl<R: AsyncRuntime> AsyncSpawner for R {
 /// completion signal; the main thread is never a pool worker in pool mode
 /// (the nested-run case takes the dedicated-thread fallback), so parking on
 /// the condvar is safe.
+///
+/// The pair comes from `youpipe_sys` rather than `std` so production runs on
+/// `parking_lot` (no poisoning to recover from, fairer wake order) and
+/// `--cfg loom` swaps in the model-checked pair the `loom_tests` gate drives.
+/// The `std::sync::Mutex` imported above stays: it backs the collect-sink
+/// buffer and the panic slot, which hold run data across the graph walk and
+/// are not modeled here.
 #[derive(Clone)]
-pub(crate) struct DoneCounter(Arc<(Mutex<usize>, Condvar)>);
+pub(crate) struct DoneCounter(Arc<(youpipe_sys::Mutex<usize>, youpipe_sys::Condvar)>);
 
 impl DoneCounter {
     pub(crate) fn new(total: usize) -> Self {
-        Self(Arc::new((Mutex::new(total), Condvar::new())))
+        Self(Arc::new((
+            youpipe_sys::Mutex::new(total),
+            youpipe_sys::Condvar::new(),
+        )))
     }
 
+    /// Account one finished job. The count is only ever decremented, so a
+    /// second decrement for the same job cannot happen by construction;
+    /// `saturating_sub` only keeps such a caller bug from wrapping the count
+    /// to `usize::MAX` and parking every waiter forever.
     fn dec(&self) {
         let (lock, cv) = &*self.0;
-        let mut guard = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = lock.lock();
         *guard = guard.saturating_sub(1);
+        // One broadcast, at the moment the count reaches zero; there is no
+        // other wake source, so a waiter can only observe count 0 after it.
         if *guard == 0 {
             cv.notify_all();
         }
     }
 
+    /// Block until every job finished. The `while` re-checks the count (a
+    /// broadcast proves the count reached zero, not that the waiter's own
+    /// condition is settled).
     fn wait(&self) {
         let (lock, cv) = &*self.0;
-        let mut guard = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = lock.lock();
         while *guard > 0 {
-            guard = cv
-                .wait(guard)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cv.wait(&mut guard);
         }
     }
 }
@@ -828,4 +841,133 @@ pub(crate) fn run_graph<R: AsyncRuntime>(builder: GraphBuilder<R>) -> std::io::R
     core.done.wait();
     resume_stored_panic(&core.panic);
     Ok(())
+}
+
+/// The run's completion gate: no waiter may return with a job outstanding, and
+/// the single broadcast at zero must release every waiter.
+///
+/// Not modeled: `GraphCore::dispatch_jobs`'s caught-panic decrement path — loom
+/// drives the real unwinding machinery, so a modeled panic aborts the
+/// interleaving instead of exploring it. `graph::tests`'
+/// `node_panic_propagates_to_run_caller` (plus the feeder and async variants)
+/// cover that path on real threads.
+///
+/// Layout: three threads and `LOOM_MAX_PREEMPTIONS=2` per model — one model is
+/// the decrementing thread with two waiters, the other is the waiting thread
+/// with two decrementers. Counters are constructed inside the model:
+/// `youpipe_sys`'s primitives may only be touched inside a loom execution.
+///
+/// Falsification runs (temporary edits): dropping the `notify_all` at zero
+/// deadlocks both models; `notify_one` deadlocks the two-waiter model and
+/// leaves the one-waiter model green; returning from `wait` without parking
+/// fails both on the publication assertion; `saturating_sub` ->
+/// `wrapping_sub` fails the over-decrement assertion. `wait`'s `while` -> `if`
+/// stays green — loom's condvar has no spurious wake and the count is monotone,
+/// so the re-check is unreachable in the model and only guards
+/// `parking_lot`'s spurious wakes.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use loom::{cell::UnsafeCell, sync::Arc};
+
+    use super::*;
+
+    /// Value the decrementing thread publishes before it decrements.
+    const PUBLISHED: u8 = 0x2a;
+
+    /// `wait` must park while any job is outstanding, and the broadcast at
+    /// zero must release *both* waiters: `notify_one` leaves the second parked
+    /// and a missing notify leaves both parked, so loom reports the deadlock
+    /// either way and the single broadcast cannot be traded for per-waiter
+    /// signalling.
+    ///
+    /// The publication read is what makes an early return falsifiable: both
+    /// waiters read the cell the decrementing thread wrote before its first
+    /// `dec`, so a `wait` returning with the count still positive reads a stale
+    /// value or races the write (loom's causality tracker panics).
+    ///
+    /// Cost: 873 executions, 0.12 s.
+    #[test]
+    fn broadcast_after_the_last_decrement_returns_every_waiter() {
+        loom::model(|| {
+            let done = DoneCounter::new(2);
+            let published = Arc::new(UnsafeCell::new(0u8));
+
+            let mut waiters = Vec::with_capacity(2);
+            for _ in 0..2 {
+                let waiter_done = done.clone();
+                let waiter_published = Arc::clone(&published);
+                waiters.push(loom::thread::spawn(move || {
+                    waiter_done.wait();
+                    // SAFETY: `wait` returned, so the count reached zero after
+                    // the decrementer's write, and the lock hand-off publishes
+                    // it.
+                    let seen = waiter_published.with(|ptr| unsafe { *ptr });
+                    assert_eq!(seen, PUBLISHED, "wait returned before the last decrement");
+                }));
+            }
+
+            let observed = done.clone();
+            let decrementer_published = Arc::clone(&published);
+            let decrementer = loom::thread::spawn(move || {
+                // SAFETY: single writer; both reads are licensed by `wait`.
+                decrementer_published.with_mut(|ptr| unsafe { *ptr = PUBLISHED });
+                done.dec();
+                done.dec();
+            });
+
+            decrementer.join().unwrap();
+            for waiter in waiters {
+                waiter.join().unwrap();
+            }
+            assert_eq!(count(&observed), 0, "every job must be accounted for");
+            // A stray second decrement (a caller bug no protocol can reach:
+            // `dispatch_jobs` wraps exactly one `dec` per job) must not wrap the
+            // count and re-arm the gate.
+            observed.dec();
+            assert_eq!(
+                count(&observed),
+                0,
+                "over-decrement must not wrap the count"
+            );
+        });
+    }
+
+    /// The other side of no-early-return: the run's main thread is itself a
+    /// waiter. Whatever order the two decrements land in, the return is ordered
+    /// after the lock hand-off of the decrement that crossed zero, so the
+    /// marker written before the *first* decrement is already visible.
+    ///
+    /// Cost: 115 executions, 0.01 s.
+    #[test]
+    fn wait_returns_only_after_the_last_decrement() {
+        loom::model(|| {
+            let done = DoneCounter::new(2);
+            let published = Arc::new(UnsafeCell::new(0u8));
+
+            let writer_published = Arc::clone(&published);
+            let writer_done = done.clone();
+            let writer = loom::thread::spawn(move || {
+                // SAFETY: single writer; the read below is licensed by `wait`.
+                writer_published.with_mut(|ptr| unsafe { *ptr = PUBLISHED });
+                writer_done.dec();
+            });
+            let other_done = done.clone();
+            let other = loom::thread::spawn(move || other_done.dec());
+
+            done.wait();
+            // SAFETY: `wait` returned, so both decrements landed; the last one's
+            // release of the lock orders this read after the write.
+            let seen = published.with(|ptr| unsafe { *ptr });
+            assert_eq!(seen, PUBLISHED, "wait returned with a job outstanding");
+
+            writer.join().unwrap();
+            other.join().unwrap();
+            assert_eq!(count(&done), 0);
+        });
+    }
+
+    /// The counter's current value, read under its own lock.
+    fn count(done: &DoneCounter) -> usize {
+        *done.0.0.lock()
+    }
 }

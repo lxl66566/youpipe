@@ -9,6 +9,9 @@
 //!     items with ONE `recv` SeqCst store, amortizing the per-item cursor
 //!     update over the batch (see docs/src/dev/streaming.md "Batched ring
 //!     operations" in the youpipe repo).
+//!   - youpipe fork extension (2026-11): the atomics come from
+//!     `loom::sync::atomic` under the `loom` feature, so `mod loom_tests`
+//!     model-checks the batch pair.
 //!
 //! Fork from crossbeam-queue crate commit 5a154def002304814d50f3c7658bd30eb46b2fad
 //!
@@ -53,8 +56,12 @@ use crate::flavor::Token;
 use core::mem::{self, MaybeUninit};
 use core::panic::{RefUnwindSafe, UnwindSafe};
 use core::ptr;
+#[cfg(not(feature = "loom"))]
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crossbeam_utils::{Backoff, CachePadded};
+#[cfg(feature = "loom")]
+// Modeled atomics; the slot payloads stay in core's UnsafeCell.
+use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// A slot in a queue.
 struct Slot<T> {
@@ -564,11 +571,25 @@ impl<T> ArrayQueueMpsc<T> {
     }
 }
 
+/// Reads a packed cursor through `&mut self`: the std atomics expose
+/// `get_mut`, loom's modeled ones only a relaxed load.
+#[cfg(not(feature = "loom"))]
+#[inline]
+fn final_cursor(cursor: &mut CachePadded<AtomicU64>) -> u64 {
+    *cursor.get_mut()
+}
+
+#[cfg(feature = "loom")]
+#[inline]
+fn final_cursor(cursor: &mut CachePadded<AtomicU64>) -> u64 {
+    cursor.load(Ordering::Relaxed)
+}
+
 impl<T> Drop for ArrayQueueMpsc<T> {
     fn drop(&mut self) {
         if mem::needs_drop::<T>() {
-            let recv_val = *self.recv.get_mut();
-            let sender_val = *self.sender.get_mut();
+            let recv_val = final_cursor(&mut self.recv);
+            let sender_val = final_cursor(&mut self.sender);
 
             let head = recv_val as u32;
             let tail = sender_val as u32;
@@ -845,5 +866,212 @@ mod batch_tests {
         }
         got.sort_unstable();
         assert_eq!(got, (0..u32::try_from(P).unwrap() * N).collect::<Vec<_>>());
+    }
+}
+
+// Model-checked batch claim tests. Run with:
+//   cargo test -p youpipe-crossfire --features loom --lib --release -- loom_
+//
+// Cost at LOOM_MAX_PREEMPTIONS=2 (release): the two-sender model explores
+// 83262 schedules in 4.8 s, the lap-skip one 570 in 0.04 s.
+//
+// The seam above swaps only the atomics, so a slot's payload write is not a
+// modeled access and a model can only switch threads on a modeled atomic.
+// `try_push_batch` has no modeled access between a slot's `value` write and its
+// Release stamp, so that window is not schedulable here: what the models assert
+// is that the consumer's stream carries exactly the tags the sender word
+// published, each once and in its own claim's order, which is what a claim
+// taken through a published stamp and a non-regressing cached head implies.
+// Every claim over a live slot overwrites a value the consumer has not read
+// yet, so the stream is the witness for the whole free-slot computation.
+//
+// `ArrayQueueMpsc` has no single-producer variant: one sender word CAS serves
+// any number of producers, and one receiver word store serves the single
+// consumer. The second model covers that store half, which has no CAS to fall
+// back on, across the lap skip.
+//
+// Falsification, temporary patches not committed: dropping the phantom-position
+// accounting from `real_positions`, regressing the cached head by one on every
+// claim, and publishing a slot ahead of what the consumer read all fail both
+// models with a lost and a duplicated tag; an unconditional `sender.store` in
+// place of the claim CAS fails the two-sender model only, because a lone sender
+// never loses that CAS.
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Never a published tag: a slot a claim did not write keeps this.
+    const SENTINEL: u32 = u32::MAX;
+
+    /// Claim rounds per sender: the production rhythm re-derives the unsent
+    /// remainder and retries, and the retry is what reaches the cached-head
+    /// refresh path once the ring reports full.
+    const ROUNDS: usize = 2;
+
+    /// Polls per consumer. A consumer that spins on a 0 return explodes the
+    /// state space (every poll is a preemption point), so the remainder is
+    /// drained single-threaded after the joins instead.
+    const POLLS: usize = 3;
+
+    /// Claims `tags` over at most `ROUNDS` rounds and returns what the ring
+    /// took, in claim order. The remainder is dropped here; in production the
+    /// caller's per-item fallback owns it.
+    fn push_batch_rounds(queue: &ArrayQueueMpsc<u32>, tags: &[u32]) -> Vec<u32> {
+        let mut claimed = Vec::new();
+        let mut rest = tags;
+        for _ in 0..ROUNDS {
+            if rest.is_empty() {
+                break;
+            }
+            let mut values: Vec<MaybeUninit<u32>> =
+                rest.iter().copied().map(MaybeUninit::new).collect();
+            // SAFETY: `values` is fully initialized; the claimed prefix is
+            // moved out and the unsent tail stays owned here (u32 has no drop).
+            let n = unsafe { queue.try_push_batch(&mut values) };
+            assert!(n <= rest.len(), "claimed {n} of a {}-value batch", rest.len());
+            claimed.extend_from_slice(&rest[..n]);
+            rest = &rest[n..];
+            loom::thread::yield_now();
+        }
+        claimed
+    }
+
+    /// One poll: asserts the prefix contract and returns the claimed tags.
+    /// `n <= out.len()`, `out[..n]` holds published tags, `out[n..]` is
+    /// untouched.
+    fn pop_once(queue: &ArrayQueueMpsc<u32>, out: &mut [MaybeUninit<u32>], total: u32) -> Vec<u32> {
+        for slot in out.iter_mut() {
+            *slot = MaybeUninit::new(SENTINEL);
+        }
+        let n = queue.pop_batch(out);
+        assert!(n <= out.len(), "claimed {n} slots into a {}-slot buffer", out.len());
+        let mut got = Vec::with_capacity(n);
+        for slot in out.iter().take(n) {
+            // SAFETY: pop_batch initialized exactly out[..n].
+            let tag = *unsafe { slot.assume_init_ref() };
+            assert!(tag < total, "read tag {tag} outside the published range");
+            got.push(tag);
+        }
+        for slot in out.iter().skip(n) {
+            // SAFETY: the sentinel loop above initialized the whole buffer.
+            assert_eq!(*unsafe { slot.assume_init_ref() }, SENTINEL, "pop_batch touched out[n..]");
+        }
+        got
+    }
+
+    /// One consumer: `POLLS` polls with a yield between them so a sender can
+    /// claim a run the consumer just freed.
+    fn consumer_polls(queue: &ArrayQueueMpsc<u32>, k: usize, total: u32) -> Vec<u32> {
+        let mut buf = vec![MaybeUninit::new(SENTINEL); k];
+        let mut got = Vec::new();
+        for _ in 0..POLLS {
+            got.extend(pop_once(queue, &mut buf, total));
+            loom::thread::yield_now();
+        }
+        got
+    }
+
+    /// Drains what the consumer left behind. Runs after every thread joined, so
+    /// the ring is quiescent and a 0 return means empty.
+    fn drain_rest(queue: &ArrayQueueMpsc<u32>, total: u32) -> Vec<u32> {
+        let mut buf = [MaybeUninit::new(SENTINEL); 4];
+        let mut got = Vec::new();
+        loop {
+            let tags = pop_once(queue, &mut buf, total);
+            if tags.is_empty() {
+                return got;
+            }
+            got.extend(tags);
+        }
+    }
+
+    /// The stream must carry exactly the claimed tags: a claim over a live slot
+    /// loses one value and duplicates another, a re-claimed run duplicates.
+    fn assert_conserved(consumed: &[u32], claimed: &[u32]) {
+        let mut got = consumed.to_vec();
+        got.sort_unstable();
+        let mut want = claimed.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want, "the ring handed back something other than the claim");
+    }
+
+    #[test]
+    fn loom_mpsc_batch_claims_from_two_senders_keep_the_stream_intact() {
+        // Two senders claim three and two slots against a four-slot ring while
+        // the single consumer polls two slots per call. The claim moves the
+        // tail past the slots it takes with one CAS; a cached head that
+        // regressed (occupied slots computed as free) or a free run that counts
+        // the phantom positions past the last buffer slot both land on a live
+        // slot and break the stream.
+        loom::model(|| {
+            const TOTAL: u32 = 5;
+            let queue = Arc::new(ArrayQueueMpsc::<u32>::new(4));
+            let three = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || push_batch_rounds(&queue, &[0, 1, 2]))
+            };
+            let two = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || push_batch_rounds(&queue, &[3, 4]))
+            };
+            let consumer = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || consumer_polls(&queue, 2, TOTAL))
+            };
+
+            let claimed_three = three.join().unwrap();
+            let claimed_two = two.join().unwrap();
+            let mut consumed = consumer.join().unwrap();
+            consumed.extend(drain_rest(&queue, TOTAL));
+
+            let mut claimed = claimed_three.clone();
+            claimed.extend(claimed_two.iter().copied());
+            assert_conserved(&consumed, &claimed);
+            // FIFO: each sender's own claims arrive in the order it made them.
+            let order_three: Vec<u32> = consumed.iter().copied().filter(|t| *t < 3).collect();
+            assert_eq!(order_three, claimed_three, "a claim's slots arrived out of order");
+            let order_two: Vec<u32> = consumed.iter().copied().filter(|t| *t >= 3).collect();
+            assert_eq!(order_two, claimed_two, "a claim's slots arrived out of order");
+            assert_eq!(queue.len(), 0);
+        });
+    }
+
+    #[test]
+    fn loom_mpsc_receiver_store_returns_a_whole_batch_across_the_lap_skip() {
+        // Capacity 3 has no power-of-two lap: the last buffer slot skips to the
+        // next lap base, so a claim and the consumer's head walk both take the
+        // skip. The consumer publishes a whole batch's head with one plain
+        // `SeqCst` store and no CAS, and that store is what returns all three
+        // slots to the sender word at once.
+        loom::model(|| {
+            const TOTAL: u32 = 7;
+            let queue = Arc::new(ArrayQueueMpsc::<u32>::new(3));
+            let sender = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || push_batch_rounds(&queue, &[0, 1, 2, 3, 4, 5, 6]))
+            };
+            let consumer = {
+                let queue = Arc::clone(&queue);
+                loom::thread::spawn(move || consumer_polls(&queue, 3, TOTAL))
+            };
+
+            let claimed = sender.join().unwrap();
+            let mut consumed = consumer.join().unwrap();
+            consumed.extend(drain_rest(&queue, TOTAL));
+            assert_conserved(&consumed, &claimed);
+            // One sender: the whole stream is its claim order, so a run the
+            // walk skipped or repeated shows up here.
+            assert_eq!(consumed, claimed, "a claim's slots arrived out of order");
+            assert_eq!(queue.len(), 0);
+
+            // Quiescent: the drained ring publishes a whole lap to the next
+            // claim, and those values come back in claim order.
+            let again = push_batch_rounds(&queue, &[TOTAL, TOTAL + 1, TOTAL + 2]);
+            assert_eq!(again.len(), 3, "the drained ring must take a whole lap");
+            let mut out = [MaybeUninit::new(SENTINEL); 3];
+            assert_eq!(pop_once(&queue, &mut out, TOTAL + 3), again);
+            assert_eq!(queue.len(), 0);
+        });
     }
 }

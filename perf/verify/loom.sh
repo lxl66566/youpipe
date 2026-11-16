@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# Loom model-check runner. Loom is switched on by the `--cfg loom` rustflag
-# (NOT a cargo feature — see Cargo.toml / docs/src/dev/testing.md), so this script
-# is the canonical entry point:
+# Loom model-check runner. The switches differ per crate (see Cargo.toml /
+# docs/src/dev/testing.md), so this script is the canonical entry point:
 #
-#   * youpipe's sync-core models (`#[cfg(all(test, loom))] mod loom_tests`)
+#   * youpipe's sync-core models (`#[cfg(all(test, loom))] mod loom_tests`),
+#     `--cfg loom`
+#   * the same crate plus the st3-deque model, in a second build that also
+#     carries the vendored st3's `--cfg st3_loom`
 #   * the vendored youpipe-concurrent-queue models (cfg(loom))
 #   * the vendored youpipe-st3 models (cfg(st3_loom))
+#   * the vendored youpipe-crossfire waker-registry models (feature loom)
 #
 # LOOM_MAX_PREEMPTIONS=2 (upstream CI's setting) is essential for the
 # vendored queue: without it the spsc models explore for hours (round-2
 # lesson; with it the whole suite finishes in seconds).
 #
-# The four blocks are independent (different packages / cfg names), so they
+# The five blocks are independent (different packages / cfg names), so they
 # run CONCURRENTLY as background jobs; each keeps its own per-block timeout
 # (embedded in the block functions — unchanged from the serial era), block
 # output goes to a temp file and is cat'ed in order once all blocks finish
-# (no interleaved stdout), and the exit code aggregates all four (any
+# (no interleaved stdout), and the exit code aggregates all five (any
 # failure -> nonzero). Set LOOM_SERIAL=1 for the old one-at-a-time
 # execution (e.g. when bisecting a model failure and co-running blocks'
 # CPU contention is suspected).
@@ -37,9 +40,18 @@ wrap_timeout() {
 
 # Each block's command mirrors the serial-era invocation verbatim (cfg
 # names, env overrides, --release, --report-time, filters, per-block
-# timeouts: youpipe unbounded, queue 600, st3 1800, crossfire 600).
+# timeouts: youpipe 600, youpipe+st3 600, queue 600, st3 1800, crossfire 600).
 block_youpipe() {
-    RUSTFLAGS="--cfg loom" cargo test --lib -- loom_tests
+    RUSTFLAGS="--cfg loom" wrap_timeout 600 \
+        cargo test -p youpipe --lib -- loom_tests
+}
+block_youpipe_st3() {
+    # Separate build from block_youpipe: the st3-deque models need the vendored
+    # st3 compiled with its own `st3_loom` cfg, so the crate is rebuilt with
+    # both rustflags. Under `--cfg loom` alone those models still pass, but
+    # vacuously (st3 keeps real atomics, loom sees one schedule).
+    RUSTFLAGS="--cfg loom --cfg st3_loom" wrap_timeout 600 \
+        cargo test -p youpipe --lib -- loom_tests
 }
 block_queue() {
     RUSTFLAGS="--cfg loom" wrap_timeout 600 \
@@ -66,6 +78,7 @@ block_crossfire() {
 }
 
 LABEL_YOUPIPE="youpipe loom models"
+LABEL_YOUPIPE_ST3="youpipe loom models with the st3 deque modeled"
 LABEL_QUEUE="vendored youpipe-concurrent-queue loom models"
 LABEL_ST3="vendored youpipe-st3 loom models"
 LABEL_CROSSFIRE="vendored youpipe-crossfire loom models (waker registry)"
@@ -90,6 +103,8 @@ finish_block() { # <label> <rc> <logfile>
 if [[ ${LOOM_SERIAL:-0} == 1 ]]; then
     echo "==> $LABEL_YOUPIPE"
     block_youpipe || finish_block "$LABEL_YOUPIPE" $? /dev/null
+    echo "==> $LABEL_YOUPIPE_ST3"
+    block_youpipe_st3 || finish_block "$LABEL_YOUPIPE_ST3" $? /dev/null
     echo "==> $LABEL_QUEUE"
     block_queue || finish_block "$LABEL_QUEUE" $? /dev/null
     echo "==> $LABEL_ST3"
@@ -98,23 +113,26 @@ if [[ ${LOOM_SERIAL:-0} == 1 ]]; then
     block_crossfire || finish_block "$LABEL_CROSSFIRE" $? /dev/null
 else
     tmpdir=$(mktemp -d)
-    block_youpipe   >"$tmpdir/youpipe.log"   2>&1 & pid_youpipe=$!
-    block_queue     >"$tmpdir/queue.log"     2>&1 & pid_queue=$!
-    block_st3       >"$tmpdir/st3.log"       2>&1 & pid_st3=$!
-    block_crossfire >"$tmpdir/crossfire.log" 2>&1 & pid_crossfire=$!
+    block_youpipe     >"$tmpdir/youpipe.log"     2>&1 & pid_youpipe=$!
+    block_youpipe_st3 >"$tmpdir/youpipe_st3.log" 2>&1 & pid_youpipe_st3=$!
+    block_queue       >"$tmpdir/queue.log"       2>&1 & pid_queue=$!
+    block_st3         >"$tmpdir/st3.log"         2>&1 & pid_st3=$!
+    block_crossfire   >"$tmpdir/crossfire.log"   2>&1 & pid_crossfire=$!
 
     # wait <pid> returns the job's exit status without tripping set -e.
-    wait $pid_youpipe   || rc_youpipe=$?
-    wait $pid_queue     || rc_queue=$?
-    wait $pid_st3       || rc_st3=$?
-    wait $pid_crossfire || rc_crossfire=$?
+    wait $pid_youpipe     || rc_youpipe=$?
+    wait $pid_youpipe_st3 || rc_youpipe_st3=$?
+    wait $pid_queue       || rc_queue=$?
+    wait $pid_st3         || rc_st3=$?
+    wait $pid_crossfire   || rc_crossfire=$?
 
     # Deterministic output order (same as the serial era), one block at a
     # time; the [ok]/FAIL/TIMEOUT markers preserve which output is whose.
-    finish_block "$LABEL_YOUPIPE"   "${rc_youpipe:-0}"   "$tmpdir/youpipe.log"
-    finish_block "$LABEL_QUEUE"     "${rc_queue:-0}"     "$tmpdir/queue.log"
-    finish_block "$LABEL_ST3"       "${rc_st3:-0}"       "$tmpdir/st3.log"
-    finish_block "$LABEL_CROSSFIRE" "${rc_crossfire:-0}" "$tmpdir/crossfire.log"
+    finish_block "$LABEL_YOUPIPE"     "${rc_youpipe:-0}"     "$tmpdir/youpipe.log"
+    finish_block "$LABEL_YOUPIPE_ST3" "${rc_youpipe_st3:-0}" "$tmpdir/youpipe_st3.log"
+    finish_block "$LABEL_QUEUE"       "${rc_queue:-0}"       "$tmpdir/queue.log"
+    finish_block "$LABEL_ST3"         "${rc_st3:-0}"         "$tmpdir/st3.log"
+    finish_block "$LABEL_CROSSFIRE"   "${rc_crossfire:-0}"   "$tmpdir/crossfire.log"
     rmdir "$tmpdir" 2>/dev/null || true
 fi
 
