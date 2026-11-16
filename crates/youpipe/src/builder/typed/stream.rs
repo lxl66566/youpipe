@@ -7072,9 +7072,10 @@ mod tests {
     /// real engine the unwind drops the panicking generator's state —
     /// sender first, payload to the catch later — so an EOF-gated drain
     /// reading the slot at the sender-drop edge swallows the panic. Here
-    /// the unwind tail is simulated with a fixed stall: the "sender
-    /// dropped" edge fires, the record lands `stall` later, and the settle
-    /// gate must bridge the two. Pre-fix, the equivalent immediate read at
+    /// the unwind tail is simulated with a release barrier: the "sender
+    /// dropped" edge fires, the task parks before its panic until the
+    /// observer has sampled that edge, and the settle gate must bridge the
+    /// two. Pre-fix, the equivalent immediate read at
     /// the edge (asserted below for documentation) observed the empty slot
     /// — the exact swallow the 2026-10-25 stakeout caught 15/1365 runs.
     #[cfg(all(test, feature = "tokio-runtime"))]
@@ -7088,11 +7089,11 @@ mod tests {
         };
 
         /// Stand-in for the panicking task body: announces the sender-drop
-        /// (EOF) edge, stalls — widening the unwind window from
-        /// nanoseconds to a fixed delay — then panics.
+        /// (EOF) edge, parks until the observer releases the simulated
+        /// unwind tail, then panics.
         struct BoomAfterDrop {
             dropped: mpsc::Sender<()>,
-            stall: Duration,
+            release: mpsc::Receiver<()>,
         }
         impl Future for BoomAfterDrop {
             type Output = ();
@@ -7100,7 +7101,10 @@ mod tests {
             fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
                 let this = self.get_mut();
                 this.dropped.send(()).expect("drop signal");
-                std::thread::sleep(this.stall);
+                // The simulated unwind tail as a synchronization point: a
+                // sleep window can be lost to scheduling on loaded runners
+                // or under miri, collapsing the ordering under test.
+                this.release.recv().expect("release signal");
                 panic!("task boom");
             }
         }
@@ -7116,18 +7120,14 @@ mod tests {
             unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
         }
 
-        let stall = Duration::from_millis(if cfg!(miri) {
-            10
-        } else {
-            100
-        });
         let (tx_dropped, rx_dropped) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
         let slot: PanicSlot = Arc::new(std::sync::Mutex::new(None));
         let gate = Arc::new(TaskSettleGate::new());
         let mut task = CatchTaskPanic {
             fut: BoomAfterDrop {
                 dropped: tx_dropped,
-                stall,
+                release: release_rx,
             },
             slot: Arc::clone(&slot),
             settle: Arc::clone(&gate),
@@ -7143,14 +7143,16 @@ mod tests {
         rx_dropped
             .recv_timeout(Duration::from_secs(5))
             .expect("sender-drop edge must fire");
-        // Pre-fix face (documented): the immediate read at the EOF edge
-        // sees the empty slot — the record is `stall` away.
+        // Pre-fix face, by construction: the task parks before its panic
+        // until the release below, so the immediate read at the EOF edge
+        // sees the empty slot — the swallow the settle gate closes.
         assert!(
             slot.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_none(),
-            "stall must keep the record pending at the EOF edge"
+            "slot must still be empty at the EOF edge"
         );
+        release_tx.send(()).expect("release the panic");
         // The fix: the drain waits for every task's final poll before
         // reading, so the payload is guaranteed visible.
         assert!(gate.wait_settled(), "settle must complete within the bound");
