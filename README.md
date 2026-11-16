@@ -69,7 +69,7 @@ The full manual is at [lxl66566.github.io/youpipe](https://lxl66566.github.io/yo
 
 The comparison covers seven workloads against rayon, tokio, `futures::stream` and hand-written `std::thread` pipelines: balanced and skewed CPU work, async and blocking IO, mixed sync plus async, and two realistic three-stage pipelines, one of them HTTP over a local mock server.
 
-youpipe stays at the front in every workload class. On CPU pipelines it beats rayon across the 1K–100K element range by up to about 5×, and the two draw level at 1M elements, where memory bandwidth is the limit. Realistic three-stage pipelines run up to 28% ahead of hand-written tokio channel code. Pure async IO lands within a few percentage points of futures.
+youpipe stays at the front in every workload class. On CPU pipelines it beats rayon across the 1K–100K element range by up to about 5× and stays ahead into the memory-bandwidth-bound 1M–4M range. Realistic three-stage pipelines run up to 25% ahead of hand-written tokio channel code. Pure async IO lands within a few percentage points of futures.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">

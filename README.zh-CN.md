@@ -69,7 +69,7 @@ let union: Vec<u64> = g.run_collect(out);
 
 对比对象为 rayon、tokio、`futures::stream` 与手写 `std::thread` pipeline，覆盖七类负载：均衡与倾斜的 CPU 计算、异步与阻塞 IO、同步加异步混合，以及两个真实的三阶段 pipeline，其中一个走本地 mock server 上的 HTTP。
 
-youpipe 在各类负载下均处于前列。CPU pipeline 在 1K–100K 元素区间快于 rayon，最高约 5 倍，1M 元素时两者持平，此时受内存带宽限制。真实三阶段 pipeline 比手写 tokio 通道代码快最多 28%。纯异步 IO 与 futures 相差几个百分点。
+youpipe 在各类负载下均处于前列。CPU pipeline 在 1K–100K 元素区间快于 rayon，最高约 5 倍，在受内存带宽限制的 1M–4M 区间保持领先。真实三阶段 pipeline 比手写 tokio 通道代码快最多 25%。纯异步 IO 与 futures 相差几个百分点。
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/lxl66566/youpipe/main/docs/src/assets/bench-cpu.svg" alt="CPU pipelines: youpipe vs rayon vs hand-written std threads">
