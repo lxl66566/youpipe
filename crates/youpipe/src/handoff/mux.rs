@@ -26,7 +26,10 @@
 //! #50): the refill loop claims up to `claim_cap` items per ring-cursor run
 //! through [`AsyncIntake::try_claim_batch`] instead of one CAS per item.
 //! Acceptance granularity becomes per claim batch — a fired cancel token
-//! stops the next claim, the claimed run is accepted whole.
+//! stops the next claim, the claimed run is accepted whole. Scoped to
+//! intakes with a native batch face ([`AsyncIntake::NATIVE_CLAIM_BATCH`]):
+//! fill-loop fallbacks measured slower under the batched admission rhythm
+//! (the graph fan-in, 2026-11-16 — see the const's doc).
 
 use std::{
     future::{Future, poll_fn},
@@ -123,6 +126,20 @@ pub(crate) enum TryClaim<T> {
 
 /// One driver's input side.
 pub(crate) trait AsyncIntake<T>: Send {
+    /// Whether [`Self::try_claim_batch`] amortizes a shared cursor run (one
+    /// ring-head CAS per claimed run) over [`Self::try_claim`]. Gates the
+    /// `YOUPIPE_ASYNC_CLAIM_BATCH` arm in [`drive`]: an intake whose batch
+    /// form is only the per-item fill-loop fallback pays the claim-batch
+    /// admission rhythm with no amortization to show for it — measured
+    /// 2026-11-16 on the graph shapes (the `AsyncFanIn` intake): +5.4 % /
+    /// +3.3 % stable on `fanin_async_{cpu,cheap}_graph/100000`, +3.2 % on
+    /// `fanout_async_cheap_graph/100000` (0/9 dominant, same-binary knob
+    /// A/B) — so those intakes compile the arm out and keep the historical
+    /// per-item claims verbatim. Only a native batch face (the stream
+    /// engine's [`RxIntake`], whose measured station win −5.8…−10.5 % is
+    /// the knob's stated basis) rides the knob.
+    const NATIVE_CLAIM_BATCH: bool = false;
+
     /// Claim one item without parking.
     fn try_claim(&mut self) -> TryClaim<T>;
     /// Claim up to `cap` items without parking, appending them to `out`
@@ -135,7 +152,9 @@ pub(crate) trait AsyncIntake<T>: Send {
     /// Default per-item fallback (`try_claim` in a fill loop): semantically
     /// identical, only the per-run cursor amortization is lost — the graph
     /// fan-in keeps this default (a batch claim stays within ONE ring;
-    /// its round sweep claims across rings, todo #50).
+    /// its round sweep claims across rings, todo #50), and its
+    /// [`NATIVE_CLAIM_BATCH`] = false keeps the batched-claim arm off
+    /// entirely (see the const's doc).
     fn try_claim_batch(&mut self, out: &mut Vec<T>, cap: usize) -> Claim {
         let mut closed = false;
         while out.len() < cap {
@@ -214,6 +233,8 @@ impl<T: Send + Unpin + 'static> RxIntake<T> {
 }
 
 impl<T: Send + Unpin + 'static> AsyncIntake<T> for RxIntake<T> {
+    const NATIVE_CLAIM_BATCH: bool = true;
+
     fn try_claim(&mut self) -> TryClaim<T> {
         match self.rx.try_recv() {
             Ok(item) => TryClaim::Item(item),
@@ -293,26 +314,34 @@ enum Event<O, T> {
 /// `cap == 1` is the sequential loop, without an in-flight set. Delivery is
 /// per-item unless the `YOUPIPE_ASYNC_OUTLET_BATCH` knob arms the batched
 /// outlet ([`AsyncOutlet::deliver_batch`]); claims are per-item unless
-/// `YOUPIPE_ASYNC_CLAIM_BATCH` arms the batched intake claim
-/// ([`AsyncIntake::try_claim_batch`]); see `drive_inner`.
-pub(crate) async fn drive<T, O, Fut>(
-    intake: impl AsyncIntake<T>,
+/// `YOUPIPE_ASYNC_CLAIM_BATCH` arms the batched intake claim AND the intake
+/// has a native batch face ([`AsyncIntake::NATIVE_CLAIM_BATCH`] — fill-loop
+/// fallbacks keep the per-item claims, see the const's doc); see
+/// `drive_inner`.
+pub(crate) async fn drive<T, O, Fut, I>(
+    intake: I,
     map: impl Fn(T) -> Fut,
     out: impl AsyncOutlet<O>,
     cap: usize,
     cancel: Option<&CancellationToken>,
 ) where
+    I: AsyncIntake<T>,
     T: Send,
     O: Send,
     Fut: Future<Output = O>,
 {
+    let claim_cap = if I::NATIVE_CLAIM_BATCH {
+        super::async_claim_batch_cap()
+    } else {
+        0
+    };
     drive_inner(
         intake,
         map,
         out,
         cap,
         super::async_outlet_batch_cap(),
-        super::async_claim_batch_cap(),
+        claim_cap,
         cancel,
     )
     .await;
@@ -1243,5 +1272,80 @@ mod tests {
         pool.run_until_stalled();
         assert!(done.get());
         assert_eq!(drain(&orx), [0, 2, 3]);
+    }
+
+    // ── [`AsyncIntake::NATIVE_CLAIM_BATCH`] gate ──
+
+    /// An intake whose `try_claim_batch` is only the per-item fill-loop
+    /// fallback must run the HISTORICAL per-item claim arm through `drive`
+    /// even with the `YOUPIPE_ASYNC_CLAIM_BATCH` knob at its default-on cap
+    /// (the process env is unset here, so `drive` reads 64): the fallback's
+    /// batched admission rhythm measured slower on the graph shapes with no
+    /// cursor amortization to show for it (see the const's doc). The
+    /// discriminator is the cancel checkpoint: the per-item arm claims item
+    /// 4 and drops it on the token check (ring leftover [5, 6, 7]); the
+    /// batched arm's checkpoint sits before the claim, so item 4 is never
+    /// claimed (leftover [4, 5, 6, 7] — the batched-twin probe shift).
+    #[test]
+    fn drive_gate_keeps_fallback_intakes_on_per_item_claims() {
+        struct FallbackIntake(RxIntake<u32>);
+        impl AsyncIntake<u32> for FallbackIntake {
+            fn try_claim(&mut self) -> TryClaim<u32> {
+                self.0.try_claim()
+            }
+
+            fn poll_claim(&mut self, cx: &mut Context<'_>) -> Poll<Option<u32>> {
+                self.0.poll_claim(cx)
+            }
+        }
+
+        let (tx, rx) = async_channel::<u32>(16);
+        let probe = rx.clone();
+        let (otx, orx) = async_channel::<u32>(16);
+        let g = Gated::new(8);
+        let mut pool = LocalPool::new();
+        let token = CancellationToken::new();
+        let done = {
+            let done = Rc::new(Cell::new(false));
+            let flag = Rc::clone(&done);
+            let map = g.map();
+            let cancel = token.clone();
+            pool.spawner()
+                .spawn_local(async move {
+                    drive(
+                        FallbackIntake(RxIntake::new(rx)),
+                        map,
+                        TxOutlet::new(otx),
+                        4,
+                        Some(&cancel),
+                    )
+                    .await;
+                    flag.set(true);
+                })
+                .unwrap();
+            done
+        };
+        for x in 0..8 {
+            tx.try_send(x).unwrap();
+        }
+        pool.run_until_stalled();
+        assert_eq!(g.started(), [0, 1, 2, 3], "claimed one item at a time");
+
+        token.cancel();
+        g.open(0);
+        pool.run_until_stalled();
+        assert_eq!(g.started(), [0, 1, 2, 3], "item 4 observed the token");
+        for x in 1..4 {
+            g.open(x);
+        }
+        pool.run_until_stalled();
+        assert!(done.get());
+        assert_eq!(drain(&orx), [0, 1, 2, 3]);
+        assert_eq!(
+            drain(&probe),
+            [5, 6, 7],
+            "exactly one claim after cancel — the fallback intake stayed on the per-item arm \
+             despite the knob's default-on cap"
+        );
     }
 }

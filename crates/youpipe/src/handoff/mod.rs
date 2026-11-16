@@ -455,19 +455,27 @@ pub(crate) fn async_tx_gate_env() -> Option<AsyncTxGate> {
 // the mixed ring shared by all ~31 drivers, 4.22 s CPU over a 2.25 s
 // process). Acceptance granularity becomes per claim batch — a fired
 // cancel token stops the NEXT claim, the already-claimed run is accepted
-// whole (the graph engine's cancellation precedent). The graph fan-in
-// intake keeps per-item claims through the trait's default fallback (a
-// batch stays within ONE ring; its round sweep claims across rings).
+// whole (the graph engine's cancellation precedent). Scoped 2026-11-16 to
+// intakes with a native batch face (`AsyncIntake::NATIVE_CLAIM_BATCH`,
+// i.e. the stream engine's `RxIntake`): the graph fan-in intake keeps
+// per-item claims through the trait's default fallback — a batch stays
+// within ONE ring, its round sweep claims across rings — and paying the
+// batched admission rhythm for that zero amortization measured +5.4/+3.3 %
+// stable on `fanin_async_{cpu,cheap}_graph/100000` and +3.2 % on
+// `fanout_async_cheap_graph/100000` (0/9 dominant, same-binary knob A/B;
+// readings in benchmarks/graph.md "Async claim batch scoped"). The knob
+// can no longer arm the arm on fallback intakes — the const override is
+// the falsification surface.
 // The claim run is CLAMPED to the driver's free admission capacity
 // (`cap - in_flight`, the async twin of the sync claim path's per-worker
 // share — a driver's MuxPlan cap IS its share): an unclamped 64-run lets
 // one driver hoard the ring's ready burst while its IO-paced admissions
 // trickle out and every peer parks on the empty ring (the unclamped first
 // cut's gates read +245 % on `io_async_pure/youpipe_async/200`, 0/25 —
-// dead-ends.md). Values: unset = default ON at the cap above (promoted
-// 2026-11-08: station −5.8…−10.5 % stable, parky gates flat); "0" = the
-// historical per-item claims; "1" = on with the default cap; "N" (>= 2) =
-// on with cap N (clamped to 4096).
+// dead-ends.md). Values: unset = default ON at the cap above for native
+// intakes (promoted 2026-11-08: station −5.8…−10.5 % stable, parky gates
+// flat); "0" = the historical per-item claims; "1" = on with the default
+// cap; "N" (>= 2) = on with cap N (clamped to 4096).
 static ASYNC_CLAIM_BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Batch cap for the async drivers' intake claims; 0 = per-item claims.

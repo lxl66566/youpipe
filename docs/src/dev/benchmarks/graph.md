@@ -289,3 +289,31 @@ shards). Net: a small real regression on the stream shapes it targeted,
 noise on the graph side. The knob stays default-off (the A/B vehicle
 and the fork's reset surface are kept — both miri-clean); the @1K
 assembly residual remains owned by per-job pool submission.
+
+## Async claim batch scoped off the graph fan-in (2026-11-16)
+
+The v0.9.0 → v0.10.0 release A/B flagged `fanin_async_{cpu,cheap}_graph`
+@100K +7.1/+5.1 % stable and `fanout_async_{cpu,cheap}_graph` +2.5/+1.8 %
+(sync gates noise; @1K rows improved). Attribution legs:
+
+| leg (per-id, 3 interleaved rounds) | verdict |
+| --- | --- |
+| v0.9.0 unaligned vs v0.9.0 + the 64 B grid (`.cargo/config.toml` control; census 23.3 % → 99.6 % FUNC 64B-aligned) | clean — +2.6/+2.3 % noise on the fanout rows, ≤+1.2 % elsewhere, nothing dominant: the alignment materialization is NOT the release regression (it bounds the cross-commit layout confound at ~2 %, matching the anchor drift) |
+| v0.9.0 + grid vs HEAD (same grid) | the regression is source-level: fanin_cpu +7.1 % (0/9), fanin_cheap +5.1 % (0/9), fanout_cpu +2.5 % (0/9) |
+| HEAD, `YOUPIPE_ASYNC_OUTLET_BATCH` 64 vs 0 | fanin rows noise (±0.5 %); fanout keeps its −15.5/−12.9 % outlet win — the source-feed batching (ca107dc) is exonerated on fanin |
+| HEAD, `YOUPIPE_ASYNC_CLAIM_BATCH` 64 vs 0 | **the cause**: 0 is faster by 5.4 % (fanin_cpu, 0/9), 3.3 % stable (fanin_cheap), 3.2 % (fanout_cheap); the claim=0 medians land on the v0.9.0-grid control's numbers (52.2 vs 51.7 ms etc.), i.e. near-full recovery |
+
+Mechanism: todo #50's claim arm is native only on `RxIntake` (the stream
+engine's single-ring intake — its −5.8…−10.5 % station win is the knob's
+basis). The graph engine's async nodes ride `AsyncFanIn`, whose
+`try_claim_batch` is the per-item fill-loop fallback: no cursor CAS is
+amortized, while the arm still reshapes the refill's admission rhythm
+(claims staged in a scratch Vec, admitted LIFO, cancel checkpoint at the
+claim boundary) for every claimed item. 8bb30f9's landing A/B gated only
+stream-engine ids, so the graph face paid the rhythm change unmeasured.
+
+Fix: `AsyncIntake::NATIVE_CLAIM_BATCH` (compile-time gate) — `drive` arms
+the claim arm only for intakes whose batch form amortizes a shared cursor
+run; fallback intakes keep the historical per-item claims verbatim
+(`drive_gate_keeps_fallback_intakes_on_per_item_claims` pins the
+discriminating cancel-granularity probe).
