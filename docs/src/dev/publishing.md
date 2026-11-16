@@ -81,7 +81,7 @@ Checklist per release:
    that feature combination in regular development (gungraun's bench build
    is what surfaced the 0.6.0 gating gaps — dead async paths, an ungated
    test binary, a doctest calling `stage_async_with`), so it needs an
-   explicit check or it silently rots.
+   explicit check or it silently rots. Tag pushes (`v*`) additionally trigger the CI `portability` matrix (`.github/workflows/portability.yml`): macOS arm64 runs the full test suite — covering the non-Linux affinity fallback path and real weak-memory ordering that x86's TSO hides — and Windows runs a compile check, since `hotpath-cpu` `compile_error!`s on non-macOS/Linux so `--all-features` lives on the macOS leg only.
 3. `cargo package -p <crate> --list` for each crate: no stray files. The
    `youpipe` package directory is self-contained (`src/`, `benches/`,
    `tests/`, `examples/`, README symlink), so docs/tooling can't leak into

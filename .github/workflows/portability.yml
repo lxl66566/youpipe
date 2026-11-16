@@ -1,0 +1,39 @@
+name: Portability
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  portability:
+    # macos-latest is arm64: exercises the non-Linux affinity fallback path
+    # (youpipe-sys) and real weak-memory ordering that x86's TSO hides.
+    # Windows compiles only: hotpath-cpu compile_error!s on non-macOS/Linux,
+    # so --all-features stays on the macOS leg.
+    name: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Mirrors the Linux test job's command chain minus clippy.
+          - os: macos-latest
+            tests: true
+            cmd: cargo nextest run --all-features --no-tests pass && cargo test --doc && cargo check --examples
+          - os: windows-latest
+            cmd: cargo check --all-targets
+    runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cargo-bins/cargo-binstall@main
+        if: matrix.tests
+      - run: cargo binstall -y --no-symlinks cargo-nextest
+        if: matrix.tests
+      - name: Setup sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ${{ matrix.cmd }}
