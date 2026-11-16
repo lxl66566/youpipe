@@ -12,8 +12,8 @@
 # Stages:
 #   native  cargo nextest (workspace) + doctests + clippy -D warnings
 #           (default features), plus the CI-parity --all-features clippy
-#           line on unix only — youpipe-hotpath's hotpath-cpu feature
-#           compile_error!s off macOS/Linux
+#           line on unix only — youpipe's hotpath-cpu feature forwards to
+#           upstream hotpath's, which compile_error!s off macOS/Linux
 #   miri    perf/verify/miri.sh (nextest-parallel; see its header)
 #   loom    perf/verify/loom.sh (concurrent blocks; see its header)
 #   bench   perf/bench-suite/bench-full.sh (owned by perf/bench-suite,

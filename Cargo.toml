@@ -7,7 +7,6 @@ members         = [
   "crates/youpipe-criterion-perf-counters",
   "crates/youpipe-crossfire",
   "crates/youpipe-gungraun",
-  "crates/youpipe-hotpath",
   "crates/youpipe-st3",
   "crates/youpipe-sys",
 ]
@@ -35,6 +34,7 @@ license      = "Apache-2.0"
 [workspace.dependencies]
 criterion         = "0.8"
 crossbeam-channel = "0.5"
+hotpath           = "0.31.3"
 libc              = "0.2"
 log               = "0.4"
 loom              = "0.7"
@@ -47,9 +47,6 @@ tokio             = { version = "1", features = ["macros", "rt-multi-thread", "s
 # consumers need divergent `default-features`.
 concurrent-queue = { package = "youpipe-concurrent-queue", path = "crates/youpipe-concurrent-queue", version = "0.10.0" }
 crossfire        = { package = "youpipe-crossfire", path = "crates/youpipe-crossfire", version = "0.10.0" }
-# youpipe's probes and the bench binary's HotpathGuard share process-global
-# state: both crates must resolve one hotpath instance.
-hotpath          = { package = "youpipe-hotpath", path = "crates/youpipe-hotpath", version = "0.10.0" }
 st3              = { package = "youpipe-st3", path = "crates/youpipe-st3", version = "0.10.0" }
 youpipe-sys      = { path = "crates/youpipe-sys", version = "0.10.0" }
 

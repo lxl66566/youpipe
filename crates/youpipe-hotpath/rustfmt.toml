@@ -1,3 +1,0 @@
-# Vendored fork: keep the source byte-identical to upstream — exclude it
-# from the workspace-wide `cargo fmt --all`.
-ignore = ["/src"]

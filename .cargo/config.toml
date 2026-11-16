@@ -14,6 +14,12 @@
 # `force = false` (the default) keeps any caller-supplied `MIRIFLAGS`.
 [env]
 MIRIFLAGS = { value = "-Zmiri-ignore-leaks", force = false }
+# Upstream hotpath's alloc stack defaults to depth 64, which aborts under
+# youpipe's recursive join ladders: each active recursion level holds an
+# alloc-stack push, so nested measured frames exceed 64 under
+# `hotpath-alloc`. Read via `env!` when the `hotpath` crate compiles, so it
+# must be present at build time, not runtime.
+HOTPATH_ALLOC_MAX_DEPTH = "1024"
 
 # ── Performance overrides ──
 #
